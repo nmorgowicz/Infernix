@@ -47,6 +47,12 @@ enum class QType : std::uint16_t {
     // GGUF Q8_0 blocks (an FP16 scale, then 32 int8 codes): the block geometry of Q8_0 PLE n-gram rows
     // (ops::ple_embed_q8_0), never a stored Weight format; Q8_0 matrices are imported as Q8_G32_FP16.
     GGML_Q8_0 = 24,
+    // Four-bit grouped codes with one FP16 scale per 32, 128 or 256 K elements (row-split; Gemma 4 31B's
+    // trunk projections, tensor-formats.md). Appended after 24: the container stores format names, so the
+    // values never reach an artifact.
+    Q4_G32_FP16  = 25,
+    Q4_G128_FP16 = 26,
+    Q4_G256_FP16 = 27,
 };
 
 // Whether `format` is a row-scaled FP8 format (row_scale_v1: BF16 or FP32 row multipliers).

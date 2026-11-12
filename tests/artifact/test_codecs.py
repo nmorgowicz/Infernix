@@ -7,6 +7,7 @@ import torch
 
 from tools.artifact.layouts import (
     block_scale_geometry,
+    row_split_geometry,
 )
 from tools.artifact.codecs.direct import decode_direct, encode_direct
 from tools.artifact.codecs.nvfp4 import decode_nvfp4_words, encode_nvfp4
@@ -99,6 +100,39 @@ def test_direct_layout_preserves_exact_little_endian_words(
             b"\x98\x0f\x71",
             b"",
             id="q4",
+        ),
+        pytest.param(
+            "q4_g32_fp16",
+            33,
+            32,
+            128,
+            256,
+            (-8, -7, -1, 0, 1, 7),
+            b"\x98\x0f\x71",
+            b"",
+            id="q4-g32",
+        ),
+        pytest.param(
+            "q4_g128_fp16",
+            129,
+            128,
+            256,
+            256,
+            (-8, -7, -1, 0, 1, 7),
+            b"\x98\x0f\x71",
+            b"",
+            id="q4-g128",
+        ),
+        pytest.param(
+            "q4_g256_fp16",
+            385,
+            256,
+            512,
+            256,
+            (-8, -7, -1, 0, 1, 7),
+            b"\x98\x0f\x71",
+            b"",
+            id="q4-g256",
         ),
         pytest.param(
             "q5_g64_fp16",
@@ -197,3 +231,30 @@ def test_nvfp4_known_vector_geometry_swizzle_tail_and_round_trip():
     assert torch.equal(decoded_packed, packed)
     assert torch.equal(decoded_scales, scales)
     assert bytes(decoded_divisor.reshape(1).view(torch.uint8).numpy()) == divisor
+
+
+@pytest.mark.parametrize(
+    ("format_name", "k", "accepted"),
+    [
+        ("q4_g32_fp16", 5376, True),
+        ("q4_g128_fp16", 5376, True),
+        ("q4_g256_fp16", 5376, True),
+        ("q4_g256_fp16", 21504, True),
+        ("q4_g128_fp16", 129, True),  # padded to 256
+        ("q4_g256_fp16", 129, True),  # padded to 256: one group
+        ("q4_g256_fp16", 257, False),  # padded to 384, not a multiple of 256
+        ("q4_g256_fp16", 640, False),  # already 128-aligned (640 = 5 * 128), not a multiple of 256
+    ],
+)
+def test_coarse_q4_groups_require_padded_k_to_divide_the_group(format_name, k, accepted):
+    if accepted:
+        geometry = row_split_geometry(format_name, (16, k))
+        group = int(format_name.split("_g")[1].split("_")[0])
+        groups = geometry.k_pad // group
+        # Per row: group / 2 code bytes and one FP16 scale for each of the k_pad / group groups.
+        assert geometry.groups_per_row == groups
+        assert geometry.base_bytes == 16 * groups * (group // 2)
+        assert geometry.scale_bytes == 16 * groups * 2
+    else:
+        with pytest.raises(ValueError, match="multiple of its group size"):
+            row_split_geometry(format_name, (16, k))

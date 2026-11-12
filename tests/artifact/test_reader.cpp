@@ -1,6 +1,7 @@
 #include "artifact/binder.h"
 #include "artifact/reader.h"
 #include "artifact/fixture.h"
+#include "artifact/formats.h"
 #include "core/weight_view.h"
 
 #include <algorithm>
@@ -162,6 +163,38 @@ void geometry_and_views() {
         "block-FP8 expert bank layout accepted another format");
 }
 
+// Gemma 4 31B's trunk q4 formats: closed-form geometry at real projection shapes (K = 5376 hidden, 21504
+// the down projection's K), names persisted by the container, and the coarse groups' K divisibility.
+void gemma_q4_geometry() {
+    struct Case {
+        QType format;
+        const char* name;
+        std::uint64_t group;
+    };
+    for (const Case c : {Case{QType::Q4_G32_FP16, "q4_g32_fp16", 32}, Case{QType::Q4_G128_FP16, "q4_g128_fp16", 128},
+                         Case{QType::Q4_G256_FP16, "q4_g256_fp16", 256}}) {
+        require(parse_format(c.name) == c.format && format_name(c.format) == c.name,
+                "the container lost a Gemma q4 format name");
+        for (const auto& [n, k] : {std::pair<std::uint64_t, std::uint64_t>{16384, 5376}, {5376, 21504}}) {
+            const auto g      = weight_geometry(c.format, QuantLayout::RowSplit, std::array<std::uint64_t, 2>{n, k});
+            const auto groups = k / c.group;
+            require(g.group_size == c.group && g.padded_columns == k && g.code_bytes_per_row == k / 2 &&
+                        g.high_bytes_per_row == 0 && g.scale_bytes_per_row == groups * 2,
+                    "q4 row geometry differs from K / 2 code bytes and one FP16 scale a group");
+            require(g.code_bytes == n * (k / 2) && g.scale_offset == (g.code_bytes + 255) / 256 * 256 &&
+                        g.bytes == g.scale_offset + n * groups * 2,
+                    "q4 plane offsets or total bytes differ from the row-split layout");
+        }
+    }
+    // Groups divide the 128-padded K exactly: 640 is a multiple of 128 and of 32, but not of 256.
+    rejects<std::invalid_argument>(
+        [&] { (void)weight_geometry(QType::Q4_G256_FP16, QuantLayout::RowSplit, std::array<std::uint64_t, 2>{16, 640}); },
+        "q4_g256 accepted a K that is not a multiple of 256");
+    rejects<std::invalid_argument>(
+        [&] { (void)weight_geometry(QType::Q4_G128_FP16, QuantLayout::RowSplit, std::array<std::uint64_t, 2>{16, 192}); },
+        "q4_g128 accepted a K that is not a multiple of 128");
+}
+
 void invalid_directories() {
     Fixture fixture;
     const auto bad = [&](auto mutate) {
@@ -240,6 +273,7 @@ int main(int argc, char** argv) {
     try {
         file_set_and_bindings();
         geometry_and_views();
+        gemma_q4_geometry();
         invalid_directories();
         // Optional production-writer fixture or explicitly selected real artifact.
         if (argc == 2) {

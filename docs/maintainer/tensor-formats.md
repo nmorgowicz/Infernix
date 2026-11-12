@@ -24,6 +24,9 @@ Grouped quantized-weight formats preserve signed codes plus one scale per logica
 |---|---:|---:|---:|---|---:|
 | `q2_g64_fp16` | 2 | 64 | `[-2, 1]` | one signed binary16 scale/group | 2.25 |
 | `q4_g64_fp16` | 4 | 64 | `[-8, 7]` | one binary16 scale/group | 4.25 |
+| `q4_g32_fp16` | 4 | 32 | `[-8, 7]` | one binary16 scale/group | 4.50 |
+| `q4_g128_fp16` | 4 | 128 | `[-8, 7]` | one binary16 scale/group | 4.125 |
+| `q4_g256_fp16` | 4 | 256 | `[-8, 7]` | one binary16 scale/group | 4.0625 |
 | `q5_g64_fp16` | 5 | 64 | `[-16, 15]` | one binary16 scale/group | 5.25 |
 | `q6_g64_fp16` | 6 | 64 | `[-32, 31]` | one binary16 scale/group | 6.25 |
 | `q8_g32_fp16` | 8 | 32 | `[-127, 127]` | one binary16 scale/group | 8.50 |
@@ -240,7 +243,11 @@ logical parameter role.
 
 The identifiers record code width, group size and scale type. For example, `q4_g64_fp16` uses
 4-bit signed codes and one IEEE-754 binary16 scale per group of 64 weights. `q2_g64_fp16`,
-`q5_g64_fp16`, `q6_g64_fp16`, and `q8_g32_fp16` follow the same naming convention.
+`q5_g64_fp16`, `q6_g64_fp16`, and `q8_g32_fp16` follow the same naming convention. The three further
+4-bit formats, `q4_g32_fp16`, `q4_g128_fp16`, and `q4_g256_fp16`, keep the same code plane and scale
+type with a group of 32, 128, or 256 K elements (Gemma 4 31B's trunk projections). A group size
+larger than 64 requires the 128-padded K to be a multiple of it; their code planes are `K / 2` bytes a
+row, and their scale plane is `K / group` binary16 words a row.
 
 The parser resolves names through the format registry. `Q2`, `Q4`, `Q5`, `Q6`, and `Q8` are prose
 abbreviations; artifacts store the complete canonical names.

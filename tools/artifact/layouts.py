@@ -189,7 +189,10 @@ CONTIGUOUS_LE_V1 = Layout("contiguous_le_v1", 256, frozenset(("bf16", "fp32", "i
 ROW_SPLIT_K128_V1 = Layout(
     "row_split_k128_v1",
     256,
-    frozenset(("q2_g64_fp16", "q4_g64_fp16", "q5_g64_fp16", "q6_g64_fp16", "q8_g32_fp16")),
+    frozenset((
+        "q2_g64_fp16", "q4_g64_fp16", "q4_g32_fp16", "q4_g128_fp16", "q4_g256_fp16", "q5_g64_fp16", "q6_g64_fp16",
+        "q8_g32_fp16",
+    )),
 )
 BLOCK_SCALE_K16_M128X4_V1 = Layout(
     "block_scale_k16_m128x4_v1",
@@ -309,6 +312,10 @@ def row_split_geometry(
         raise ValueError("row_split_k128_v1 requires a grouped quantized format")
     n, k = _shape(shape, rank=2)
     k_pad = align_up(k, K_ALIGNMENT)
+    if k_pad % spec.group_size:
+        raise ValueError(
+            f"{spec.name} requires K padded to 128 ({k_pad}) to be a multiple of its group size"
+        )
     groups_per_row = k_pad // spec.group_size
     # The base plane: whole bytes (8), low nibbles (4-6), or the 2-bit codes four to a byte (2).
     base_bytes_per_group = (
