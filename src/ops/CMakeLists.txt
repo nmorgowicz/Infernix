@@ -23,6 +23,7 @@ target_link_libraries(infernix_gemma4_ops PRIVATE infernix_core infernix_cuda_ru
 include("${CMAKE_CURRENT_LIST_DIR}/gemma4_small_ops.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/gemma4_q4.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/gemma4_fp8.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/gemma4_attention.cmake")
 
 include(basic_sources.cmake)
 include("${CMAKE_CURRENT_LIST_DIR}/attn_input_proj/sources.cmake")

@@ -99,6 +99,26 @@ cases of one unsharded invocation. `--geometry d256-h24-kv4|d256-h16-kv2|d256-h3
 `--columns LO-HI` keep only the causal cases of that geometry and of calls of LO to HI columns per
 row; a temporary switch's entry uses them to run only the calls its switch reaches.
 
+Gemma attention uses `infernix_ops_gemma4_attention_test` with members `gemma4_attention`
+and `gemma4_fp8_kv`: sliding D256 and global D512 attention against independent FP64
+oracles, including paged-cache holes, empty rows and changed-position Graph replay.
+The FP8 suite also checks cache encoding/append and explicit FP8-QK. Six CTest entries
+cover the default and `--split 0|1` arms; each arm runs in a fresh process because temporary
+switches are immutable after first use. `--segments 1..13` forces a D512 prefill split count
+before that snapshot (`INFERNIX_TMP_GEMMA4_ATTN_SPLIT_K`: 0 auto, 1 unsplit).
+
+```bash
+ctest --test-dir build -R '^infernix_gemma4_(attention|fp8_kv)(_split[01])?_test$' \
+  -j1 --output-on-failure
+./build/tests/infernix_ops_gemma4_attention_test gemma4_fp8_kv \
+  --benchmark --chunks 128,512,640,1024 --histories 8192,32768,131072
+```
+
+The manual benchmark emits CUDA-event samples/medians and kernel-resource diagnostics for
+36 synthetic cells (four chunks, three histories, BF16 KV / FP8 KV with BF16-QK / FP8-QK).
+The 128-token cells also check sampled outputs against every visible key in an FP64
+reference. These are attention-Op measurements, not model-serving throughput or quality.
+
 The lossless route's exact Python oracles (`tests/ops/lossless_cr_oracle.py`, which evaluates on every
 core, and `lossless_ops_oracle.py`) keep their deterministic output in `build/tests/oracle-cache/`, keyed by
 their sources and the Python version, so a tree computes it once per oracle change.

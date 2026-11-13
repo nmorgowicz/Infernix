@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "infernix/ops/gemma4_kv_append.h"
 #include "infernix/ops/gemma4_qkv_prep.h"
 #include "ops/op_family.h"
 #include "ops/op_tester.h"
@@ -151,6 +152,36 @@ int run_case(const Case& c) {
     const auto q_bits = bits_of(dq_out);
     const auto k_bits = bits_of(dk_pages);
     const auto v_bits = bits_of(dv_pages);
+
+    // Isolate append from norm/RoPE arithmetic: reappend the represented fused K/V rows
+    // into fresh background pages. Every byte, including untouched slots, must agree.
+    // The independent FP64 oracle below still checks the produced row values.
+    std::vector<std::uint16_t> append_k(k_split.size()), append_v(v_split.size());
+    for (int t = 0; t < c.tokens; ++t) {
+        for (int h = 0; h < c.kv_heads; ++h) {
+            for (int i = 0; i < d; ++i) {
+                const std::size_t row = (static_cast<std::size_t>(t) * c.kv_heads + h) * d + i;
+                const std::size_t at = page_index(c, pages, h, positions[t], i);
+                append_k[row] = k_bits[at];
+                append_v[row] = v_bits[at];
+            }
+        }
+    }
+    GuardedDeviceBuffer dak(append_k.size() * 2), dav(append_v.size() * 2),
+        dk_append(page_count * 2), dv_append(page_count * 2);
+    dak.copy_from_host(append_k.data(), dak.bytes());
+    dav.copy_from_host(append_v.data(), dav.bytes());
+    dk_append.copy_from_host(background_bits.data(), dk_append.bytes());
+    dv_append.copy_from_host(background_bits.data(), dv_append.bytes());
+    Tensor ak(dak.data(), DType::BF16, {d, c.kv_heads, c.tokens});
+    Tensor av(dav.data(), DType::BF16, {d, c.kv_heads, c.tokens});
+    Tensor ak_pages(dk_append.data(), DType::BF16, {d, kPage, c.kv_heads, pages});
+    Tensor av_pages(dv_append.data(), DType::BF16, {d, kPage, c.kv_heads, pages});
+    ops::gemma4_kv_append(ak, av, pos_tensor, ak_pages, av_pages, table_tensor, nullptr);
+    cuda_synchronize();
+    failures += verify_exact("fused versus external append K", k_bits, bits_of(dk_append));
+    failures += verify_exact("fused versus external append V", v_bits, bits_of(dv_append));
+    failures += dk_append.verify_guards("append K") + dv_append.verify_guards("append V");
 
     std::vector<double> got, expected;
     for (int t = 0; t < c.tokens; ++t) {

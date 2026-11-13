@@ -69,6 +69,9 @@ constexpr Registration kSwitches[] = {
     // Gemma trunk shapes to the exact route (E4M3 codes, FP32 group scales; deterministic) from 128 tokens
     // instead of the fused/baked row-scaled routes. The scoring A/B arm; the default is unchanged.
     {"INFERNIX_TMP_Q4_EXACT", Scope::Gemma4, Kind::Flag},
+    // Gemma D512 prefill split-K diagnostic: 0 keeps wave-aware selection; 1..13
+    // forces the segment count (ops/launcher/gemma4_attention_mma_d512.cu).
+    {"INFERNIX_TMP_GEMMA4_ATTN_SPLIT_K", Scope::Gemma4, Kind::Value},
 };
 constexpr std::size_t kCount = std::size(kSwitches);
 
@@ -234,6 +237,9 @@ std::string describe(Scope scope) {
         (void)gw_shape();
     }
     std::string out;
+    if ((static_cast<unsigned>(scope) & static_cast<unsigned>(Scope::Gemma4)) != 0) {
+        (void)integer("INFERNIX_TMP_GEMMA4_ATTN_SPLIT_K", 0, 0, 13);
+    }
     for (std::size_t i = 0; i < kCount; ++i) {
         if ((static_cast<unsigned>(kSwitches[i].scope) & static_cast<unsigned>(scope)) == 0) { continue; }
         if (kSwitches[i].kind == Kind::Flag) { (void)flag(kSwitches[i].name); }
