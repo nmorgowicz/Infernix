@@ -655,6 +655,19 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
     });
 }
 
+void Engine::apply_tool_choice(PreparedPrompt& prompt, const ToolChoice& choice) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (prompt.impl_ == nullptr) { throw std::invalid_argument("PreparedPrompt is empty"); }
+    if (auto* gemma_prompt = std::get_if<models::gemma4::PreparedPrompt>(&prompt.impl_->value)) {
+        models::gemma4::Frontend::apply_tool_choice(*gemma_prompt, choice);
+        prompt.impl_->summary = gemma_prompt->summary();
+        if (prompt.impl_->summary.prompt_tokens > impl_->capacity()) {
+            throw RequestError(ContextLengthDetails{.prompt_tokens = prompt.impl_->summary.prompt_tokens,
+                                                    .max_context = impl_->capacity()});
+        }
+    }
+}
+
 std::vector<TokenId> Engine::tokenize_text(std::string_view text) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return impl_->with_frontend([&](const auto& frontend) { return frontend.tokenize_text(text); });
@@ -730,8 +743,14 @@ ScoreResult Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t firs
     return result;
 }
 
-std::uint32_t Engine::count_tokens(PromptInput input, const PreparationControl& control) const {
+std::uint32_t Engine::count_tokens(PromptInput input, const PreparationControl& control,
+                                   const ToolChoice& tool_choice) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->gemma && tool_choice.mode == ToolChoiceMode::Required) {
+        auto prompt = prepare(std::move(input), control);
+        apply_tool_choice(prompt, tool_choice);
+        return prompt.summary().prompt_tokens;
+    }
     return impl_->with_frontend([&](const auto& frontend) { return frontend.count_tokens(std::move(input), control); });
 }
 
@@ -781,11 +800,7 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
         resolved_options.execution.thinking.end_turn_in_thinking = true;
     }
 
-    // A required or named tool choice is a forced opener appended to the Gemma prompt.
-    if (auto* gemma_prompt = std::get_if<models::gemma4::PreparedPrompt>(&prompt.impl_->value)) {
-        models::gemma4::Frontend::apply_tool_choice(*gemma_prompt, resolved_options.tool_choice);
-        prompt.impl_->summary = gemma_prompt->summary();
-    }
+    apply_tool_choice(prompt, resolved_options.tool_choice);
 
     const PromptSummary prompt_summary = prompt.impl_->summary;
     if (prompt_summary.prompt_tokens > impl_->options.max_context) {

@@ -486,6 +486,20 @@ void history_checks(const g4::Frontend& frontend) {
     check(throws_invalid(frontend, with_arguments(std::string(300, '[') + std::string(300, ']'))),
           "arguments nested past the bound are invalid_prompt input");
 
+    // Chat Completions preserves unmatched result history for model-specific handling. Gemma's
+    // template would silently skip this exact HTTP-smoke request without frontend validation.
+    infernix::PromptInput orphan;
+    orphan.messages.push_back(message(infernix::ChatRole::User, "Call echo."));
+    orphan.messages.push_back(message(infernix::ChatRole::Tool, "ok"));
+    orphan.messages.back().tool_call_id = "missing_call";
+    bool rejected = false;
+    try { (void)frontend.prepare(std::move(orphan)); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    check(rejected, "orphan tool result fails preparation as invalid_prompt");
+    auto wrong_id = with_arguments("{}");
+    wrong_id.messages.back().tool_call_id = "missing_call";
+    check(throws_invalid(frontend, wrong_id), "tool result must match the preceding assistant call id");
+
     // The extras no Gemma template reads stay refused.
     auto deferred = with_arguments("{}");
     deferred.options.deferred_tool_jsons.push_back(declaration("later"));

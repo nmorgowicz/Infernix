@@ -84,10 +84,11 @@ Args default_args(const LibraryScan& scan, const ScannedModel& model, const Host
         add("--prefill-chunk", "auto");
         add("--logits-dtype", "bf16");
         add("--no-prefix-reuse");
+        add("--spec", "off");
     }
 
     // Speculative decoding: the Engine picks the drafter measured fastest for the artifact.
-    const ScannedDrafter* drafter = model.accepts_draft_model ? best_drafter(scan, model) : nullptr;
+    const ScannedDrafter* drafter = !gemma4 && model.accepts_draft_model ? best_drafter(scan, model) : nullptr;
     if (!gemma4 && (has_drafter_component || drafter != nullptr)) {
         add("--spec", "auto");
         add("--draft-tokens", "auto");

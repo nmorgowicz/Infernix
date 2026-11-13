@@ -24,6 +24,15 @@ using Tokens = std::vector<TokenId>;
 void require(bool condition, const char* message) {
     if (!condition) { throw std::runtime_error(message); }
 }
+void require_tokens(const Tokens& actual, const Tokens& expected, const char* message) {
+    if (actual == expected) { return; }
+    std::fprintf(stderr, "%s\nexpected:", message);
+    for (const auto id : expected) { std::fprintf(stderr, " %d", id); }
+    std::fprintf(stderr, "\nactual:  ");
+    for (const auto id : actual) { std::fprintf(stderr, " %d", id); }
+    std::fputc('\n', stderr);
+    throw std::runtime_error(message);
+}
 Tokens tokens(std::size_t count, std::uint32_t seed) {
     Tokens result;
     for (std::size_t i = 0; i < count; ++i) {
@@ -178,6 +187,45 @@ RequestOptions request() {
     out.stop.include_model_defaults = false;
     return out;
 }
+// Prompt-side selection must be visible before a protocol counts input tokens. Zero-output
+// submission exercises the real public Engine transition without another model forward.
+void tool_choice_accounting(Engine& engine) {
+    PromptInput input;
+    ChatMessage user;
+    user.role = ChatRole::User;
+    MessagePart part;
+    part.kind = MessagePartKind::Text;
+    part.text = "Call echo.";
+    user.parts.push_back(std::move(part));
+    input.messages.push_back(std::move(user));
+    input.options.enable_thinking = false;
+    input.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"echo","parameters":{"type":"object","properties":{}}}})");
+    for (const bool named : {false, true}) {
+        auto prompt = engine.prepare(input);
+        const auto before = prompt.summary().prompt_tokens;
+        ToolChoice choice;
+        choice.mode = ToolChoiceMode::Required;
+        if (named) { choice.allowed_names = std::vector<std::string>{"echo"}; }
+        engine.apply_tool_choice(prompt, choice);
+        const auto final_count = prompt.summary().prompt_tokens;
+        const std::string opener = named ? "<|tool_call>call:echo" : "<|tool_call>call:";
+        require(final_count > before && final_count == prompt.token_ids().size() &&
+            engine.detokenize_bytes(prompt.token_ids()).ends_with(opener),
+            "public tool selection did not expose the final prompt count and opener");
+        engine.apply_tool_choice(prompt, choice);
+        require(prompt.summary().prompt_tokens == final_count, "public tool selection appended twice");
+        require(engine.count_tokens(input, {}, choice) == final_count,
+            "token counting and finalized submission disagree on the forced opener");
+        RequestOptions options;
+        options.execution.requested_output_tokens = 0;
+        options.tool_choice = choice;
+        const auto result = engine.submit(std::move(prompt), std::move(options)).wait();
+        require(result.prompt.prompt_tokens == final_count && result.generated_token_ids.empty(),
+            "submission changed the prompt count already published to the protocol");
+    }
+    std::puts("PASS public required/named tool-choice prompt-count finalization and idempotent submission");
+}
 void public_recovery(const char* artifact) {
     EngineOptions options;
     options.artifact_path = artifact;
@@ -190,10 +238,13 @@ void public_recovery(const char* artifact) {
     options.speculative.backend_auto = false;
     options.speculative.backend = SpeculativeBackend::None;
     Engine engine(options);
+    tool_choice_accounting(engine);
     const auto prompt = tokens(257, 21);
     const auto other = tokens(129, 22);
     const auto reference = engine.generate(engine.prepare_tokens(prompt), request()).generated_token_ids;
     const auto queued_reference = engine.generate(engine.prepare_tokens(other), request()).generated_token_ids;
+    require_tokens(engine.generate(engine.prepare_tokens(prompt), request()).generated_token_ids, reference,
+        "interleaved clean request changed output before fault injection");
     const auto recoveries = engine.runtime_stats().device_memory_recoveries;
     runtime::testing::hold_units(true);
     auto first = engine.submit(engine.prepare_tokens(prompt), request());
@@ -209,8 +260,8 @@ void public_recovery(const char* artifact) {
     require(failed, "the public Engine did not surface the retryable shortage");
     require(second.wait().generated_token_ids == queued_reference, "recovery lost or changed the queued request");
     require(engine.runtime_stats().device_memory_recoveries == recoveries + 1, "Engine did not count its recovery");
-    require(engine.generate(engine.prepare_tokens(prompt), request()).generated_token_ids == reference,
-            "Engine recovery changed the next request");
+    require_tokens(engine.generate(engine.prepare_tokens(prompt), request()).generated_token_ids, reference,
+        "Engine recovery changed the next request");
     runtime::testing::set_nonfinite_fault(2); // first decode, after the first output was committed
     failed = false;
     try { (void)engine.generate(engine.prepare_tokens(prompt), request()); }

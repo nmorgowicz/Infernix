@@ -245,7 +245,11 @@ public:
     void fail_all_cleanup() noexcept;
     [[nodiscard]] bool recover_after_failure() noexcept;
     void shutdown_cleanup() noexcept;
+    // This dense cold-cache Program has no elastic Host prefix/expert tier, SSD transfers or
+    // maintenance producer. Its fixed KV, graph operands and pinned staging remain reserved for
+    // execution, so idle and between-round maintenance have no resize or deferred work to apply.
     void maintain() noexcept {}
+    void maintain_busy() noexcept {}
     void set_maintenance_waker(std::function<void()>) noexcept {}
     [[nodiscard]] std::uint64_t engine_thread_cpus() const noexcept { return 0; }
     [[nodiscard]] std::optional<ExpertCacheTotals> expert_cache_totals() const noexcept { return std::nullopt; }

@@ -125,6 +125,11 @@ public:
     [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> token_ids,
                                                 bool allow_prefix_identity = true) const;
 
+    // Applies a model's prompt-side tool selection before callers account or inspect the prompt.
+    // Gemma required/named choices append their forced opener; Qwen leaves the prompt unchanged.
+    // Reapplying the same choice (including submit's application) never appends it twice.
+    void apply_tool_choice(PreparedPrompt& prompt, const ToolChoice& choice) const;
+
     // Artifact-tokenizer raw-text encoding. No chat template or implicit special token is added.
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
 
@@ -146,8 +151,10 @@ public:
     [[nodiscard]] ScoreResult score_tokens(std::vector<TokenId> tokens, std::uint32_t first_target,
                                            ScoreOptions options = {});
 
+    // Includes any model-owned prompt suffix selected by tool_choice, as submission does.
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input,
-                                             const PreparationControl& control = {}) const;
+                                             const PreparationControl& control = {},
+                                             const ToolChoice& tool_choice = {}) const;
     [[nodiscard]] ModelSamplingDefaults sampling_defaults() const;
 
     // Establishes queue membership synchronously with a fixed output consumer mode. Destroying an

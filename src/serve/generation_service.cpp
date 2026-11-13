@@ -543,6 +543,9 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
             .cancellation = CancellationView(is_cancelled),
         };
         infernix::PreparedPrompt prompt = engine_->prepare(std::move(input), control);
+        // Finalize prompt-side selection before budgets, protocol input usage and prompt-id logs.
+        // submit applies the same operation idempotently for direct Engine callers.
+        engine_->apply_tool_choice(prompt, request_options.tool_choice);
         check_preparation_control(prepared.lifetime->deadline, is_cancelled,
                                   queue_retry_after_seconds());
         prepared.enable_thinking = prompt.summary().starts_in_reasoning;
@@ -632,7 +635,7 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
             .cancellation = CancellationView(is_cancelled),
         };
         const int prompt_tokens =
-            static_cast<int>(engine_->count_tokens(std::move(input), control));
+            static_cast<int>(engine_->count_tokens(std::move(input), control, request.tool_choice));
         check_preparation_control(deadline, is_cancelled, queue_retry_after_seconds());
         return prompt_tokens;
     } catch (const ApiException&) { throw; } catch (const infernix::RequestError& exception) {

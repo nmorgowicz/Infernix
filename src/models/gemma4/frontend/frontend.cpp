@@ -136,8 +136,20 @@ Json template_context(const PromptInput& input, ChatTemplateRoleSupport support)
     }
     if (options.preserve_thinking) { context["preserve_thinking"] = *options.preserve_thinking; }
     Json messages = Json::array();
+    const ChatMessage* tool_parent = nullptr;
     for (std::size_t i = 0; i < input.messages.size(); ++i) {
         const auto& message = input.messages[i];
+        if (message.role == ChatRole::Tool) {
+            // Gemma's template renders results only while scanning the preceding assistant's
+            // calls, and skips standalone tool messages. Refuse an orphan instead of losing it.
+            if (message.tool_call_id.empty() || !tool_parent ||
+                tool_parent->role != ChatRole::Assistant ||
+                std::none_of(tool_parent->tool_calls.begin(), tool_parent->tool_calls.end(),
+                    [&](const ToolCall& call) { return call.id == message.tool_call_id; })) {
+                throw std::invalid_argument("gemma4 tool result '" + message.tool_call_id +
+                    "' does not match a call in the preceding assistant turn");
+            }
+        } else { tool_parent = &message; }
         ChatRole role = message.role;
         if (role == ChatRole::Developer) {
             if (i == 0 && !support.leading_developer) {
