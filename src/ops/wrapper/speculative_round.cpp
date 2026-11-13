@@ -19,12 +19,21 @@ constexpr std::int32_t kSparseTokenDomain      = 248077;
 constexpr std::int32_t kSparseMaxBatch         = 8;
 
 std::size_t speculative_workspace_row_bytes(std::int32_t token_domain, std::int32_t min_drafts,
-                                            std::int32_t max_drafts) {
-    if (min_drafts >= kSpeculativeSamplerMaxColumns) { return 0; }
-    return make_sampling_workspace_layout(token_domain,
-                                          std::min(max_drafts + 1, kSpeculativeSamplerMaxColumns),
-                                          kSpeculativeSamplerMaxColumns)
+                                            std::int32_t max_drafts,
+                                            std::int32_t cap = kSamplerFastCandidates) {
+    const std::int32_t max_columns = sampler_speculative_max_columns(cap);
+    if (min_drafts >= max_columns) { return 0; }
+    return make_sampling_workspace_layout(token_domain, std::min(max_drafts + 1, max_columns),
+                                          max_columns, cap)
         .bytes;
+}
+
+void require_capacity(std::int32_t top_k_capacity, const char* op) {
+    if (!sampler_capacity_valid(top_k_capacity)) {
+        throw std::invalid_argument(std::string(op) + ": top_k_capacity must be " +
+                                    std::to_string(kSamplingFastTopK) + " or " +
+                                    std::to_string(kSamplingMaxTopK));
+    }
 }
 
 void require_contiguous_nonnull(const Tensor& t, const char* op, const char* name) {
@@ -89,13 +98,15 @@ std::size_t speculative_accept_greedy_drafts_workspace_capacity_bytes(std::int32
                                                                       std::int32_t min_drafts,
                                                                       std::int32_t max_drafts,
                                                                       std::int32_t min_batch,
-                                                                      std::int32_t max_batch) {
+                                                                      std::int32_t max_batch,
+                                                                      std::int32_t top_k_capacity) {
     if (token_domain <= 0 || min_drafts <= 0 || max_drafts < min_drafts || min_batch <= 0 ||
         max_batch < min_batch || max_drafts == std::numeric_limits<std::int32_t>::max()) {
         throw std::invalid_argument("speculative accept workspace: invalid draft interval");
     }
+    require_capacity(top_k_capacity, "speculative accept workspace");
     const std::size_t row_bytes =
-        speculative_workspace_row_bytes(token_domain, min_drafts, max_drafts);
+        speculative_workspace_row_bytes(token_domain, min_drafts, max_drafts, top_k_capacity);
     if (row_bytes != 0 &&
         static_cast<std::size_t>(max_batch) > std::numeric_limits<std::size_t>::max() / row_bytes) {
         throw std::overflow_error("speculative accept workspace capacity overflows size_t");
@@ -236,8 +247,10 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
                                       Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
                                       Tensor& licensed_counts, Tensor& accepted,
                                       std::int32_t token_domain, const SamplingConfig* configs,
-                                      WorkspaceArena& workspace, cudaStream_t stream) {
+                                      WorkspaceArena& workspace, cudaStream_t stream,
+                                      std::int32_t top_k_capacity) {
     constexpr const char* op = "speculative_accept_greedy_drafts";
+    require_capacity(top_k_capacity, op);
     const std::int32_t k     = drafts.ne[0];
     const std::int32_t batch = drafts.ne[1];
     if (k < 1) { throw std::invalid_argument("speculative_accept_greedy_drafts: K must be >=1"); }
@@ -266,11 +279,12 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
     }
     auto scratch_scope = workspace.scope();
     const std::size_t bytes =
-        speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, batch, batch);
+        speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, batch, batch,
+                                                                  top_k_capacity);
     const DeviceSpan scratch = bytes == 0 ? DeviceSpan{} : workspace.alloc_bytes(bytes);
     detail::speculative_accept_greedy_drafts_launch(
         target_tokens, logits, drafts, current_extents, lengths, anchors, licensed_tokens,
-        licensed_counts, accepted, token_domain, configs, scratch, stream);
+        licensed_counts, accepted, token_domain, configs, scratch, stream, top_k_capacity);
 }
 
 void speculative_accept_sparse_drafts(

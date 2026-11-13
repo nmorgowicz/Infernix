@@ -24,10 +24,14 @@ struct SpeculativeAcceptExecutionEnvelope {
 };
 
 // Caller-owned transient capacity for every draft-count and batch-size pair in the inclusive
-// domains. token_domain is the fixed sampling profile; invalid domains throw.
+// domains. token_domain is the fixed sampling profile; invalid domains throw. top_k_capacity
+// (kSamplingFastTopK or kSamplingMaxTopK) selects the sampling pipeline exactly as in sampling.h
+// and must equal the value passed to speculative_accept_greedy_drafts(); the wide pipeline's
+// multi-block route serves at most 16 verification columns (wider rounds need no workspace).
 [[nodiscard]] std::size_t speculative_accept_greedy_drafts_workspace_capacity_bytes(
     std::int32_t token_domain, std::int32_t min_drafts, std::int32_t max_drafts,
-    std::int32_t min_batch, std::int32_t max_batch);
+    std::int32_t min_batch, std::int32_t max_batch,
+    std::int32_t top_k_capacity = kSamplingFastTopK);
 
 /**
  * Op: speculative_prepare_verify_inputs
@@ -156,13 +160,18 @@ void speculative_one_hot_proposals(const Tensor& skip_rows, const Tensor& drafts
  * Workspace:
  *   Caller-owned transient storage reported by
  *   speculative_accept_greedy_drafts_workspace_capacity_bytes().
+ *
+ * Top-k capacity:
+ *   Every column's truncation is the exact top_k of sampling.h with top_k up to top_k_capacity
+ *   (20 or 64), so a row whose top_k is at most 20 draws the same tokens at either capacity.
  */
 void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor& logits,
                                       const Tensor& drafts, const Tensor& current_extents,
                                       Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
                                       Tensor& licensed_counts, Tensor& accepted,
                                       std::int32_t token_domain, const SamplingConfig* configs,
-                                      WorkspaceArena& workspace, cudaStream_t stream);
+                                      WorkspaceArena& workspace, cudaStream_t stream,
+                                      std::int32_t top_k_capacity = kSamplingFastTopK);
 
 // Caller-owned transient capacity over the inclusive draft-count and batch intervals.
 // The raw-greedy execution envelope requires no workspace.

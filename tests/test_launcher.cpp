@@ -375,6 +375,17 @@ void test_library() {
               contains(dense_args, {"--host-context-mib", "52000"}),
           "Qwen3.8-27B defaults follow the README's recommended settings");
     check(!has_flag(dense_args, "--draft-model"), "bundled drafters take no --draft-model");
+    ScannedModel gemma;
+    gemma.model_type = "gemma4_text";
+    gemma.native_context = 131072;
+    const Args gemma_args = default_args(scan, gemma, rtx5090);
+    check(contains(gemma_args, {"--max-context", "131072"}) &&
+              contains(gemma_args, {"--max-concurrency", "1"}) &&
+              contains(gemma_args, {"--kv-dtype", "fp8"}) &&
+              contains(gemma_args, {"--logits-dtype", "bf16"}) &&
+              contains(gemma_args, {"--prefill-chunk", "auto"}) &&
+              has_flag(gemma_args, "--no-prefix-reuse") && !has_flag(gemma_args, "--host-context-mib"),
+          "Gemma launcher defaults use automatic full-context prefill with supported execution options");
     // On a 32 GB RTX 5090 this artifact started with at most ~196,000 tokens beside the Engine's
     // 1 GiB headroom (240,000 failed): the default stays inside that, with room for other programs.
     const std::uint64_t fit = fitting_27b_context(dense, rtx5090);

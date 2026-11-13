@@ -82,12 +82,13 @@ ProgramDevicePlan Program::plan_device(const Model& model, const ProgramOptions&
         plan.workspace = std::max<std::uint64_t>(plan.workspace,
             gemma4_layer_workspace_bytes(layer, static_cast<int>(options.prefill_chunk)));
     }
-    // One logits tile and the sampler share the arena, not concurrent layer intermediates.
+    // One logits tile and the sampler share the arena, not concurrent layer intermediates. The
+    // arena is sized for the 64-wide sampler, which serves requests with top_k above 20.
     plan.workspace = std::max<std::uint64_t>(plan.workspace,
         gemma4_logits_workspace_bytes(geometry.output_head, options.causal_scoring ? kScoreTile : 1));
     plan.workspace = std::max<std::uint64_t>(plan.workspace,
         gemma4_logits_workspace_bytes(geometry.output_head, 1) +
-        ops::sampling_workspace_capacity_bytes(static_cast<int>(public_tokens), 1, 1));
+        ops::sampling_workspace_capacity_bytes(static_cast<int>(public_tokens), 1, 1, ops::kSamplingMaxTopK));
     plan.workspace = aligned(plan.workspace + 4096);
     plan.prepared_row_scales = geometry.derived_device_bytes;
     // The affine capacity curve starts where all sliding rings have reached their fixed size.
@@ -164,6 +165,10 @@ struct ProgramImpl {
     struct PrefillGraph { DecodeGraphDefinition definition; DecodeGraphExecutable executable; };
     std::array<PrefillGraph, kGraphWidths.size()> prefill_graphs;
     std::size_t graph_measured_bytes = 0;
+    // Sampling pipeline width: the 20-wide path serves requests with top_k <= 20 (every request the
+    // fast path served before), the 64-wide path the rest. The decode graph embeds the sampler, so a
+    // change recaptures it (select_sampler).
+    std::int32_t sampler_capacity = ops::kSamplingFastTopK;
 
     std::shared_ptr<const RequestPlan> request;
     std::unique_ptr<ResumeData> binding_resume;
@@ -314,7 +319,7 @@ struct ProgramImpl {
         auto logical = step.slice(0, 1, 1);
         auto values = logits(1);
         ops::sample(values, out, static_cast<int>(config().vocab_size), sampling_device,
-            logical, purpose, workspace, stream);
+            logical, purpose, workspace, stream, sampler_capacity);
     }
     void decode_body() {
         layers_body(1);
@@ -337,6 +342,12 @@ struct ProgramImpl {
         CUDA_CHECK(cudaMemsetAsync(positions.data, 0, sizeof(std::int32_t), stream));
         decode_body();
         CUDA_CHECK(cudaStreamSynchronize(stream));
+        // Settle the wide sampler's module load eagerly: a later recapture of the decode graph for
+        // a top_k above 20 must not meet a first kernel launch inside stream capture.
+        sampler_capacity = ops::kSamplingMaxTopK;
+        sample_body(ops::kSamplePurposeDecode);
+        sampler_capacity = ops::kSamplingFastTopK;
+        CUDA_CHECK(cudaStreamSynchronize(stream));
         decode_definition.capture(stream, [this] { decode_body(); });
         decode_graph.instantiate(decode_definition);
         decode_graph.upload(stream);
@@ -352,8 +363,23 @@ struct ProgramImpl {
         CUDA_CHECK(cudaStreamSynchronize(stream));
         workspace.reset();
     }
+    void select_sampler(const ResolvedSamplingParameters& s) {
+        const std::int32_t needed =
+            s.top_k > ops::kSamplingFastTopK ? ops::kSamplingMaxTopK : ops::kSamplingFastTopK;
+        if (needed == sampler_capacity) { return; }
+        sampler_capacity = needed;
+        if (!options.use_cuda_graph) { return; }
+        // Earlier work on the stream finishes before the old executable is released.
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        decode_graph.reset();
+        decode_definition.reset();
+        decode_definition.capture(stream, [this] { decode_body(); });
+        decode_graph.instantiate(decode_definition);
+        decode_graph.upload(stream);
+    }
     void upload_sampler() {
         const auto& s = request->sampling;
+        select_sampler(s);
         sampling_host = {};
         sampling_host.temperature = s.temperature; sampling_host.top_k = s.top_k;
         sampling_host.top_p = s.top_p; sampling_host.min_p = s.min_p;
@@ -518,11 +544,11 @@ RequestBasePlan Program::plan_request(PreparedPrompt&& prompt, const runtime::Re
         }
     }
     const auto& s = options.sampling;
-    if (!std::isfinite(s.temperature) || s.temperature < 0 || s.top_k < 1 || s.top_k > 20 ||
+    if (!std::isfinite(s.temperature) || s.temperature < 0 || s.top_k < 1 || s.top_k > ops::kSamplingMaxTopK ||
         !std::isfinite(s.top_p) || s.top_p <= 0 || s.top_p > 1 ||
         !std::isfinite(s.min_p) || s.min_p < 0 || s.min_p > 1 ||
         !std::isfinite(s.presence_penalty) || !std::isfinite(s.frequency_penalty)) {
-        throw std::invalid_argument("Gemma4 P4 sampling requires finite parameters and top_k in [1,20]");
+        throw std::invalid_argument("Gemma4 sampling requires finite parameters and top_k in [1,64]");
     }
     auto plan = std::make_shared<detail::RequestPlan>();
     plan->owner = impl_.get(); plan->tokens = std::move(prompt.tokens_);

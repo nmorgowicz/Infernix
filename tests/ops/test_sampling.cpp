@@ -19,6 +19,7 @@
 #include <memory>
 #include <random>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -105,7 +106,8 @@ std::vector<int> greedy_oracle(const std::vector<float>& logits, int physical_ro
 Distribution distribution_oracle(const std::vector<float>& column, int token_domain,
                                  const ops::SamplingConfig& config,
                                  const std::vector<int>* counts         = nullptr,
-                                 const std::vector<std::uint32_t>* mask = nullptr) {
+                                 const std::vector<std::uint32_t>* mask = nullptr,
+                                 int capacity = ops::kSamplingFastTopK) {
     std::vector<Candidate> candidates;
     candidates.reserve(token_domain);
     for (int token = 0; token < token_domain; ++token) {
@@ -121,8 +123,8 @@ Distribution distribution_oracle(const std::vector<float>& column, int token_dom
         return a.token < b.token;
     });
 
-    int cap = 20;
-    if (config.top_k > 0 && config.top_k < 20) { cap = config.top_k; }
+    int cap = capacity;
+    if (config.top_k > 0 && config.top_k < capacity) { cap = config.top_k; }
     cap = std::min(cap, static_cast<int>(candidates.size()));
     candidates.resize(static_cast<std::size_t>(cap));
 
@@ -168,7 +170,7 @@ RunResult run_batch(const std::vector<float>& logits, int physical_rows, int tok
                     std::vector<ops::SamplingConfig> configs,
                     const std::vector<int>& logical_positions, int purpose,
                     const std::vector<std::vector<int>>& initial_counts = {},
-                    DType logits_dtype = DType::BF16) {
+                    DType logits_dtype = DType::BF16, int capacity = ops::kSamplingFastTopK) {
     const int batch = static_cast<int>(configs.size());
     if (batch <= 0 || logical_positions.size() != configs.size() ||
         logits.size() != static_cast<std::size_t>(physical_rows) * configs.size() ||
@@ -204,11 +206,11 @@ RunResult run_batch(const std::vector<float>& logits, int physical_rows, int tok
     Tensor out_tensor(device_out.data(), DType::I32, {batch});
     Tensor positions_tensor(device_positions.p, DType::I32, {batch});
     const std::size_t workspace_bytes =
-        ops::sampling_workspace_capacity_bytes(token_domain, batch, batch);
+        ops::sampling_workspace_capacity_bytes(token_domain, batch, batch, capacity);
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
     ops::sample(logits_tensor, out_tensor, token_domain,
                 static_cast<const ops::SamplingConfig*>(device_configs.p), positions_tensor,
-                purpose, workspace, nullptr);
+                purpose, workspace, nullptr, capacity);
     cuda_synchronize();
 
     RunResult result;
@@ -247,7 +249,7 @@ RunResult run_homogeneous_batch(const std::vector<float>& logits, int physical_r
                                 int token_domain, int batch, ops::SamplingConfig config,
                                 int first_position, int purpose,
                                 const std::vector<int>* initial_counts = nullptr,
-                                DType logits_dtype = DType::BF16) {
+                                DType logits_dtype = DType::BF16, int capacity = ops::kSamplingFastTopK) {
     std::vector<ops::SamplingConfig> configs(static_cast<std::size_t>(batch), config);
     std::vector<int> positions(static_cast<std::size_t>(batch));
     for (int row = 0; row < batch; ++row) {
@@ -258,12 +260,14 @@ RunResult run_homogeneous_batch(const std::vector<float>& logits, int physical_r
         row_counts.assign(static_cast<std::size_t>(batch), *initial_counts);
     }
     return run_batch(logits, physical_rows, token_domain, std::move(configs), positions, purpose,
-                     row_counts, logits_dtype);
+                     row_counts, logits_dtype, capacity);
 }
 
+// per_row, when given, replaces the homogeneous `config` with one config per batch row.
 RunResult run_repeated(const std::vector<float>& column, int token_domain, int total, int batch,
                        ops::SamplingConfig config, int position, int purpose,
-                       DType logits_dtype = DType::BF16) {
+                       DType logits_dtype = DType::BF16, int capacity = ops::kSamplingFastTopK,
+                       const std::vector<ops::SamplingConfig>* per_row = nullptr) {
     if (batch <= 0 || total <= 0 || total % batch != 0) {
         throw std::invalid_argument("repeated sample count must be a positive batch multiple");
     }
@@ -273,6 +277,7 @@ RunResult run_repeated(const std::vector<float>& column, int token_domain, int t
     DeviceBuffer device_logits                  = to_device(input_bytes);
     GuardedDeviceBuffer collected(static_cast<std::size_t>(total) * sizeof(std::int32_t));
     std::vector<ops::SamplingConfig> configs(static_cast<std::size_t>(batch), config);
+    if (per_row != nullptr) { configs = *per_row; }
     const std::vector<ops::SamplingConfig> expected_configs = configs;
     DeviceBuffer device_configs                             = to_device(configs);
     std::vector<int> positions(static_cast<std::size_t>(total));
@@ -281,7 +286,7 @@ RunResult run_repeated(const std::vector<float>& column, int token_domain, int t
 
     Tensor logits_tensor(device_logits.p, logits_dtype, {physical_rows, batch});
     const std::size_t workspace_bytes =
-        ops::sampling_workspace_capacity_bytes(token_domain, batch, batch);
+        ops::sampling_workspace_capacity_bytes(token_domain, batch, batch, capacity);
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
 
     for (int produced = 0; produced < total; produced += batch) {
@@ -291,7 +296,7 @@ RunResult run_repeated(const std::vector<float>& column, int token_domain, int t
         Tensor positions_tensor(pos, DType::I32, {batch});
         ops::sample(logits_tensor, out_tensor, token_domain,
                     static_cast<const ops::SamplingConfig*>(device_configs.p), positions_tensor,
-                    purpose, workspace, nullptr);
+                    purpose, workspace, nullptr, capacity);
     }
     cuda_synchronize();
 
@@ -1018,6 +1023,204 @@ int increment_licensed_counts_contract() {
     return failures;
 }
 
+// Candidate ids spread over the whole vocabulary: neighbours land in different 512-token
+// partial tiles and different merge groups, so the exact-truncation checks cross every stage.
+std::vector<int> scattered_ids(int token_domain, int count) {
+    count            = std::min(count, (token_domain - 2) / 2);
+    const int stride = std::max(2, (token_domain - 2) / count);
+    std::vector<int> ids(static_cast<std::size_t>(count));
+    for (int j = 0; j < count; ++j) {
+        ids[static_cast<std::size_t>(j)] = 1 + j * stride + (j * 37) % (stride / 2 + 1);
+    }
+    return ids;
+}
+
+// flat: every candidate has the same logit, so top_k keeps the k lowest ids (the tie-break) and
+// the kept set is uniform. Graded: distinct decreasing logits give an uneven distribution whose
+// support edge is the k-th ranked token.
+std::vector<float> topk_column(int physical_rows, int token_domain, const std::vector<int>& ids,
+                               bool flat) {
+    std::vector<float> column(static_cast<std::size_t>(physical_rows), -20.0f);
+    for (std::size_t j = 0; j < ids.size(); ++j) {
+        column[static_cast<std::size_t>(ids[j])] = flat ? 3.0f : 3.0f - 0.0371f * static_cast<float>(j);
+    }
+    if (physical_rows > token_domain) {
+        column[static_cast<std::size_t>(token_domain)]      = 100.0f;
+        column[static_cast<std::size_t>(physical_rows) - 1] = 200.0f;
+    }
+    round_to_bf16(column);
+    return column;
+}
+
+int wide_topk_case(int physical_rows, int token_domain, int top_k, bool flat, int total,
+                   int batch = 8, DType dtype = DType::BF16) {
+    const std::vector<int> ids      = scattered_ids(token_domain, 100);
+    const std::vector<float> column = topk_column(physical_rows, token_domain, ids, flat);
+    ops::SamplingConfig config;
+    config.temperature = 1.0f;
+    config.top_k       = top_k;
+    config.seed        = 424200u + static_cast<unsigned>(top_k);
+    const Distribution oracle =
+        distribution_oracle(column, token_domain, config, nullptr, nullptr, ops::kSamplingMaxTopK);
+    const std::size_t expected_support = static_cast<std::size_t>(
+        top_k <= 0 ? ops::kSamplingMaxTopK : std::min(top_k, static_cast<int>(ops::kSamplingMaxTopK)));
+    if (oracle.tokens.size() != expected_support) {
+        std::cerr << "wide top-k oracle fixture has unexpected support " << oracle.tokens.size()
+                  << '\n';
+        return 1;
+    }
+    const RunResult result = run_repeated(column, token_domain, total, batch, config, 5000,
+                                          ops::kSamplePurposeDecode, dtype, ops::kSamplingMaxTopK);
+    const std::string label = std::string("wide sample ") + (dtype == DType::FP32 ? "FP32 " : "BF16 ") +
+                              "top_k=" + std::to_string(top_k) + (flat ? " flat" : " graded") +
+                              " domain=" + std::to_string(token_domain) +
+                              " B=" + std::to_string(batch);
+    return result.integrity_failures + verify_distribution(label.c_str(), result.tokens, oracle);
+}
+
+int wide_topk_exactness_contract() {
+    int failures          = 0;
+    constexpr int samples = 32768;
+    for (const bool flat : {true, false}) {
+        // Multi-block routes: smallest multi-block shape, a mid shape, the Qwen vocabulary with
+        // padded physical rows, and Gemma's vocabulary.
+        for (const int top_k : {21, 33, 64}) {
+            failures += wide_topk_case(257, 257, top_k, flat, samples);
+            failures += wide_topk_case(1030, 1027, top_k, flat, samples);
+            failures += wide_topk_case(248320, 248077, top_k, flat, samples);
+            failures += wide_topk_case(262144, 262144, top_k, flat, samples);
+        }
+        for (const int top_k : {22, 32, 47, 63}) {
+            failures += wide_topk_case(262144, 262144, top_k, flat, samples);
+        }
+        // Requests above the capacity and top_k=0 keep the full 64 candidates.
+        failures += wide_topk_case(262144, 262144, 100, flat, samples);
+        failures += wide_topk_case(262144, 262144, 0, flat, samples);
+        // Single-block route (domain at most one tile).
+        failures += wide_topk_case(200, 200, 40, flat, samples);
+    }
+    // The largest multi-block vocabulary (32 groups x 32 partials: the final merge tile is
+    // exactly full), with batch 1 and 4.
+    failures += wide_topk_case(524288, 524288, 64, true, 8192, 4);
+    failures += wide_topk_case(524288, 524288, 64, false, 8192, 1);
+    // FP32 logits take the same wide pipeline.
+    failures += wide_topk_case(262144, 262144, 64, false, samples, 8, DType::FP32);
+    failures += wide_topk_case(1030, 1027, 40, true, samples, 8, DType::FP32);
+    return failures;
+}
+
+// Beyond the multi-block route (more than 16 lanes, or a vocabulary above 524288 tokens) the
+// wide pipeline streams tiles through a single block per row; it must stay exact.
+int wide_topk_fallback_contract() {
+    int failures = 0;
+    for (const int domain : {4097, 248077, 600000}) {
+        for (const bool flat : {true, false}) {
+            const int batch = domain == 600000 ? 8 : 17;
+            failures += wide_topk_case(domain + 3, domain, 40, flat, batch * 256, batch);
+        }
+    }
+    failures += wide_topk_case(4100, 4097, 40, false, 17 * 256, 17, DType::FP32);
+    return failures;
+}
+
+// Rows with different top_k share one wide launch; each keeps its own exact prefix.
+int wide_topk_heterogeneous_contract() {
+    int failures       = 0;
+    const int top_ks[] = {1, 5, 20, 21, 33, 40, 63, 64};
+    for (const int domain : {257, 248077}) {
+        const std::vector<int> ids      = scattered_ids(domain, 100);
+        const std::vector<float> column = topk_column(domain + 3, domain, ids, false);
+        std::vector<ops::SamplingConfig> configs(8);
+        std::vector<Distribution> oracles;
+        for (int row = 0; row < 8; ++row) {
+            configs[static_cast<std::size_t>(row)].temperature = 1.0f;
+            configs[static_cast<std::size_t>(row)].top_k       = top_ks[row];
+            configs[static_cast<std::size_t>(row)].seed        = 90001u + static_cast<unsigned>(row);
+            oracles.push_back(distribution_oracle(column, domain,
+                                                  configs[static_cast<std::size_t>(row)], nullptr,
+                                                  nullptr, ops::kSamplingMaxTopK));
+        }
+        constexpr int total    = 65536;
+        const RunResult result = run_repeated(column, domain, total, 8, configs[0], 100,
+                                              ops::kSamplePurposeDecode, DType::BF16,
+                                              ops::kSamplingMaxTopK, &configs);
+        failures += result.integrity_failures;
+        for (int row = 0; row < 8; ++row) {
+            std::vector<int> mine;
+            for (std::size_t i = static_cast<std::size_t>(row); i < result.tokens.size(); i += 8) {
+                mine.push_back(result.tokens[i]);
+            }
+            const std::string label = "wide mixed-batch row top_k=" + std::to_string(top_ks[row]) +
+                                      " domain=" + std::to_string(domain);
+            failures += verify_distribution(label.c_str(), mine,
+                                            oracles[static_cast<std::size_t>(row)]);
+        }
+    }
+    return failures;
+}
+
+// A row with top_k <= 20 draws the same token from the 20-wide and the 64-wide pipeline.
+int fast_topk_unchanged_contract() {
+    int failures = 0;
+    for (const int domain : {257, 4097, 248077}) {
+        const std::vector<int> ids      = scattered_ids(domain, 100);
+        const std::vector<float> column = topk_column(domain + 3, domain, ids, false);
+        for (const int top_k : {1, 5, 13, 20}) {
+            ops::SamplingConfig config;
+            config.temperature   = 0.9f;
+            config.top_k         = top_k;
+            config.top_p         = 0.97f;
+            config.seed          = 31337u + static_cast<unsigned>(top_k);
+            const RunResult fast = run_repeated(column, domain, 1024, 8, config, 7000,
+                                                ops::kSamplePurposeDecode, DType::BF16,
+                                                ops::kSamplingFastTopK);
+            const RunResult wide = run_repeated(column, domain, 1024, 8, config, 7000,
+                                                ops::kSamplePurposeDecode, DType::BF16,
+                                                ops::kSamplingMaxTopK);
+            failures += fast.integrity_failures + wide.integrity_failures;
+            const std::string label = "top_k=" + std::to_string(top_k) +
+                                      " 20-wide equals 64-wide domain=" + std::to_string(domain);
+            failures += verify_exact(label.c_str(), wide.tokens, fast.tokens);
+        }
+    }
+    return failures;
+}
+
+int capacity_query_contract() {
+    int failures      = 0;
+    const auto expect = [&](bool ok, const char* what) {
+        if (!ok) {
+            std::cerr << "capacity query contract failed: " << what << '\n';
+            ++failures;
+        }
+    };
+    constexpr int wide = ops::kSamplingMaxTopK;
+    expect(ops::sampling_workspace_capacity_bytes(257, 1, 1) ==
+               ops::sampling_workspace_capacity_bytes(257, 1, 1, ops::kSamplingFastTopK),
+           "default capacity is the 20-wide pipeline");
+    expect(ops::sampling_workspace_capacity_bytes(248077, 8, 8, wide) >
+               ops::sampling_workspace_capacity_bytes(248077, 8, 8),
+           "the wide pipeline needs more workspace");
+    expect(ops::sampling_workspace_capacity_bytes(256, 1, 16, wide) == 0 &&
+               ops::sampling_workspace_capacity_bytes(257, 17, 17, wide) == 0,
+           "wide single-block and lane limits");
+    // Multi-block vocabulary ceilings: 25 groups x 25 partials x 512 and 32 x 32 x 512.
+    expect(ops::sampling_workspace_capacity_bytes(320000, 1, 1) != 0 &&
+               ops::sampling_workspace_capacity_bytes(320001, 1, 1) == 0,
+           "20-wide multi-block ceiling");
+    expect(ops::sampling_workspace_capacity_bytes(524288, 1, 1, wide) != 0 &&
+               ops::sampling_workspace_capacity_bytes(524289, 1, 1, wide) == 0,
+           "64-wide multi-block ceiling");
+    for (const int bad : {0, 1, 19, 21, 32, 65, -64}) {
+        try {
+            (void)ops::sampling_workspace_capacity_bytes(257, 1, 1, bad);
+            std::cerr << "sampling workspace accepted capacity " << bad << '\n';
+            ++failures;
+        } catch (const std::invalid_argument&) {}
+    }
+    return failures;
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(sampling) {
@@ -1047,6 +1250,11 @@ INFERNIX_OP_TEST(sampling) {
     failures += capped_distribution_contract();
     failures += tied_boundary_distribution_contract();
     failures += real_shape_distribution_contract();
+    failures += capacity_query_contract();
+    failures += wide_topk_exactness_contract();
+    failures += wide_topk_heterogeneous_contract();
+    failures += wide_topk_fallback_contract();
+    failures += fast_topk_unchanged_contract();
     failures += fp32_greedy_contract();
     failures += fp32_distribution_contract();
     failures += rng_key_contract();

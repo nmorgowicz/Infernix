@@ -6,22 +6,39 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <string>
 
 namespace infernix::ops {
 
+namespace {
+
+void require_capacity(std::int32_t top_k_capacity, const char* op) {
+    if (!sampler_capacity_valid(top_k_capacity)) {
+        throw std::invalid_argument(std::string(op) + ": top_k_capacity must be " +
+                                    std::to_string(kSamplingFastTopK) + " or " +
+                                    std::to_string(kSamplingMaxTopK));
+    }
+}
+
+} // namespace
+
 std::size_t sampling_workspace_capacity_bytes(std::int32_t token_domain, std::int32_t min_lanes,
-                                              std::int32_t max_lanes) {
+                                              std::int32_t max_lanes,
+                                              std::int32_t top_k_capacity) {
     if (token_domain <= 0 || min_lanes <= 0 || max_lanes < min_lanes) {
         throw std::invalid_argument("sampling workspace: invalid profile or lane interval");
     }
+    require_capacity(top_k_capacity, "sampling workspace");
     if (token_domain <= kSamplerTileItems || min_lanes > kSamplerMaxColumns) { return 0; }
     return detail::sampling_workspace_exact_bytes(token_domain,
-                                                  std::min(max_lanes, kSamplerMaxColumns));
+                                                  std::min(max_lanes, kSamplerMaxColumns),
+                                                  top_k_capacity);
 }
 
 void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
             const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,
-            WorkspaceArena& workspace, cudaStream_t stream) {
+            WorkspaceArena& workspace, cudaStream_t stream, std::int32_t top_k_capacity) {
+    require_capacity(top_k_capacity, "sample");
     if (logits.dtype != DType::BF16 && logits.dtype != DType::FP32) {
         throw std::invalid_argument("sample: logits must be BF16 or FP32");
     }
@@ -55,10 +72,10 @@ void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
 
     auto scratch_scope = workspace.scope();
     const std::size_t bytes =
-        sampling_workspace_capacity_bytes(token_domain, logits.ne[1], logits.ne[1]);
+        sampling_workspace_capacity_bytes(token_domain, logits.ne[1], logits.ne[1], top_k_capacity);
     const DeviceSpan scratch = bytes == 0 ? DeviceSpan{} : workspace.alloc_bytes(bytes);
     detail::sample_batch_launch(logits, out, token_domain, configs, logical_positions, purpose,
-                                scratch, stream);
+                                scratch, stream, top_k_capacity);
 }
 
 void increment_token_counts(const Tensor& token_ids, Tensor& token_counts, cudaStream_t stream) {

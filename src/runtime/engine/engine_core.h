@@ -806,15 +806,35 @@ private:
         {
             std::lock_guard lock(request->mutex);
             if (streaming && timing) { request->events.emplace_back(std::move(*timing)); }
-            for (OutputDelta& delta : output) {
-                std::string& full = delta.channel == OutputChannel::Reasoning ? request->reasoning
-                                                                              : request->content;
-                full += delta.text;
-                if (streaming) { request->events.emplace_back(std::move(delta)); }
-            }
-            // The result's calls come from the session at terminal time; only a stream needs the steps.
-            if (streaming) {
-                for (ToolCallDelta& call : output.tool_calls()) { request->events.emplace_back(std::move(call)); }
+            if constexpr (requires { output.publication_order(); }) {
+                const auto publish_text = [&](OutputDelta& delta) {
+                    std::string& full = delta.channel == OutputChannel::Reasoning ? request->reasoning
+                                                                                  : request->content;
+                    full += delta.text;
+                    if (streaming) { request->events.emplace_back(std::move(delta)); }
+                };
+                if (output.publication_order().empty()) {
+                    for (OutputDelta& delta : output) { publish_text(delta); }
+                } else {
+                    for (const auto& item : output.publication_order()) {
+                        if (item.tool_call) {
+                            if (streaming) {
+                                request->events.emplace_back(std::move(output.tool_calls()[item.index]));
+                            }
+                        } else { publish_text(output.begin()[item.index]); }
+                    }
+                }
+            } else {
+                for (OutputDelta& delta : output) {
+                    std::string& full = delta.channel == OutputChannel::Reasoning ? request->reasoning
+                                                                                  : request->content;
+                    full += delta.text;
+                    if (streaming) { request->events.emplace_back(std::move(delta)); }
+                }
+                // The result's calls come from the session at terminal time; only a stream needs the steps.
+                if (streaming) {
+                    for (ToolCallDelta& call : output.tool_calls()) { request->events.emplace_back(std::move(call)); }
+                }
             }
         }
         if (streaming) { request->cv.notify_one(); }

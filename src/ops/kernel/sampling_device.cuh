@@ -22,29 +22,37 @@ namespace infernix::ops {
 
 using SamplingPartialSort =
     cub::BlockMergeSort<unsigned long long, kSamplerBlock, kSamplerItemsPerThread>;
-using SamplingGroupSort =
-    cub::BlockMergeSort<unsigned long long, kSamplerGroupBlock, kSamplerGroupItemsPerThread>;
+template <int Cap>
+using SamplingGroupSort = cub::BlockMergeSort<unsigned long long, kSamplerGroupBlock,
+                                              sampler_group_items_per_thread(Cap)>;
 inline constexpr int kSamplingTileWarps              = kSamplerBlock / 32;
 inline constexpr int kSamplingTileIndexBits          = 9;
 inline constexpr unsigned int kSamplingTileIndexMask = (1u << kSamplingTileIndexBits) - 1u;
 static_assert(kSamplerPartialTileItems == (1 << kSamplingTileIndexBits));
 
-using SamplingTileWarpSort     = cub::WarpMergeSort<unsigned long long, kSamplerItemsPerThread>;
+template <int Items>
+using SamplingTileWarpSort     = cub::WarpMergeSort<unsigned long long, Items>;
 using SamplingBf16TileWarpSort = cub::WarpMergeSort<unsigned int, kSamplerItemsPerThread>;
 
+// One warp sorts 32 * Items keys and keeps its first Cap ranks; warp 0 then merges the
+// kSamplingTileWarps lists. Items is kSamplerItemsPerThread for the partial stage and
+// sampler_group_items_per_thread(Cap) for the group stage.
+template <int Items = kSamplerItemsPerThread, int Cap = kSamplerFastCandidates>
 struct SamplingTileTopKStorage {
-    typename SamplingTileWarpSort::TempStorage warp[kSamplingTileWarps];
-    unsigned long long candidates[kSamplingTileWarps * kSamplerCandidateCap];
+    typename SamplingTileWarpSort<Items>::TempStorage warp[kSamplingTileWarps];
+    unsigned long long candidates[kSamplingTileWarps * Cap];
 };
 
+template <int Cap = kSamplerFastCandidates>
 struct SamplingBf16TileTopKStorage {
     typename SamplingBf16TileWarpSort::TempStorage warp[kSamplingTileWarps];
-    unsigned int candidates[kSamplingTileWarps * kSamplerCandidateCap];
+    unsigned int candidates[kSamplingTileWarps * Cap];
 };
 
+template <int Cap = kSamplerFastCandidates>
 union SamplingPartialTopKStorage {
-    SamplingTileTopKStorage fp32;
-    SamplingBf16TileTopKStorage bf16;
+    SamplingTileTopKStorage<kSamplerItemsPerThread, Cap> fp32;
+    SamplingBf16TileTopKStorage<Cap> bf16;
 };
 
 struct SamplingKeyGreater {
@@ -143,33 +151,34 @@ __device__ __forceinline__ int sampling_key_index(unsigned long long key) {
     return id_from_order_key(key);
 }
 
+// top_k is clamped to the launch capacity: top_k <= 0 (no explicit limit) or a top_k at or above
+// the capacity both select the full Cap set. The speculative round runs the fast capacity only.
+template <int Cap = kSamplerFastCandidates>
 __device__ __forceinline__ int sampling_candidate_cap(const SamplingConfig& cfg,
                                                       std::int32_t vocab) {
-    // top_k is clamped to the pipeline cap: top_k <= 0 (no explicit limit) or a
-    // top_k larger than the cap both select the full kSamplerCandidateCap set.
-    int cap = kSamplerCandidateCap;
+    int cap = Cap;
     if (cfg.top_k > 0 && cfg.top_k < cap) { cap = cfg.top_k; }
     if (vocab < cap) { cap = vocab; }
     return cap;
 }
 
+template <int Cap = kSamplerFastCandidates>
 __device__ __forceinline__ int sampling_partial_offset(const SamplingWorkspace& workspace, int col,
                                                        int partial, int j) {
-    return ((col * workspace.partial_stride + partial) * kSamplerCandidateCap) + j;
+    return ((col * workspace.partial_stride + partial) * Cap) + j;
 }
 
-__device__ inline void sampling_store_tile_topk(unsigned long long (&keys)[kSamplerItemsPerThread],
-                                                int cap, SamplingWorkspace workspace, int col,
-                                                int partial, SamplingTileTopKStorage& storage) {
+template <int Cap = kSamplerFastCandidates, int Items>
+__device__ inline void sampling_store_tile_topk(unsigned long long (&keys)[Items], int cap,
+                                                SamplingWorkspace workspace, int col, int partial,
+                                                SamplingTileTopKStorage<Items, Cap>& storage) {
     const int warp = static_cast<int>(threadIdx.x) >> 5;
     const int lane = static_cast<int>(threadIdx.x) & 31;
-    SamplingTileWarpSort(storage.warp[warp]).Sort(keys, SamplingKeyGreater{});
+    SamplingTileWarpSort<Items>(storage.warp[warp]).Sort(keys, SamplingKeyGreater{});
 #pragma unroll
-    for (int item = 0; item < kSamplerItemsPerThread; ++item) {
-        const int rank = lane * kSamplerItemsPerThread + item;
-        if (rank < kSamplerCandidateCap) {
-            storage.candidates[warp * kSamplerCandidateCap + rank] = keys[item];
-        }
+    for (int item = 0; item < Items; ++item) {
+        const int rank = lane * Items + item;
+        if (rank < Cap) { storage.candidates[warp * Cap + rank] = keys[item]; }
     }
     __syncthreads();
 
@@ -178,8 +187,7 @@ __device__ inline void sampling_store_tile_topk(unsigned long long (&keys)[kSamp
         constexpr unsigned int kMergeMask = (1u << kSamplingTileWarps) - 1u;
         int position                      = 0;
         for (int rank = 0; rank < cap; ++rank) {
-            const unsigned long long key =
-                storage.candidates[lane * kSamplerCandidateCap + position];
+            const unsigned long long key = storage.candidates[lane * Cap + position];
             const unsigned int high     = static_cast<unsigned int>(key >> 32);
             const unsigned int max_high = __reduce_max_sync(kMergeMask, high);
             const unsigned int low      = high == max_high ? static_cast<unsigned int>(key) : 0u;
@@ -188,7 +196,7 @@ __device__ inline void sampling_store_tile_topk(unsigned long long (&keys)[kSamp
                 __ballot_sync(kMergeMask, high == max_high && low == max_low);
             const int source = __ffs(static_cast<int>(winners)) - 1;
             if (lane == 0) {
-                const int off = sampling_partial_offset(workspace, col, partial, rank);
+                const int off = sampling_partial_offset<Cap>(workspace, col, partial, rank);
                 workspace.partial_keys[off] =
                     (static_cast<unsigned long long>(max_high) << 32) | max_low;
             }
@@ -197,20 +205,19 @@ __device__ inline void sampling_store_tile_topk(unsigned long long (&keys)[kSamp
     }
 }
 
+template <int Cap = kSamplerFastCandidates>
 __device__ inline void sampling_store_bf16_tile_topk(unsigned int (&keys)[kSamplerItemsPerThread],
                                                      int cap, int tile_start,
                                                      SamplingWorkspace workspace, int col,
                                                      int partial,
-                                                     SamplingBf16TileTopKStorage& storage) {
+                                                     SamplingBf16TileTopKStorage<Cap>& storage) {
     const int warp = static_cast<int>(threadIdx.x) >> 5;
     const int lane = static_cast<int>(threadIdx.x) & 31;
     SamplingBf16TileWarpSort(storage.warp[warp]).Sort(keys, SamplingUintGreater{});
 #pragma unroll
     for (int item = 0; item < kSamplerItemsPerThread; ++item) {
         const int rank = lane * kSamplerItemsPerThread + item;
-        if (rank < kSamplerCandidateCap) {
-            storage.candidates[warp * kSamplerCandidateCap + rank] = keys[item];
-        }
+        if (rank < Cap) { storage.candidates[warp * Cap + rank] = keys[item]; }
     }
     __syncthreads();
 
@@ -219,12 +226,12 @@ __device__ inline void sampling_store_bf16_tile_topk(unsigned int (&keys)[kSampl
         constexpr unsigned int kMergeMask = (1u << kSamplingTileWarps) - 1u;
         int position                      = 0;
         for (int rank = 0; rank < cap; ++rank) {
-            const unsigned int key     = storage.candidates[lane * kSamplerCandidateCap + position];
+            const unsigned int key     = storage.candidates[lane * Cap + position];
             const unsigned int best    = __reduce_max_sync(kMergeMask, key);
             const unsigned int winners = __ballot_sync(kMergeMask, key == best);
             const int source           = __ffs(static_cast<int>(winners)) - 1;
             if (lane == 0) {
-                const int off = sampling_partial_offset(workspace, col, partial, rank);
+                const int off = sampling_partial_offset<Cap>(workspace, col, partial, rank);
                 workspace.partial_keys[off] = sampling_expand_bf16_tile_sort_key(best, tile_start);
             }
             if (lane == source) { ++position; }
@@ -232,8 +239,9 @@ __device__ inline void sampling_store_bf16_tile_topk(unsigned int (&keys)[kSampl
     }
 }
 
+template <int Cap = kSamplerFastCandidates>
 __device__ __forceinline__ int sampling_dist_offset(int col, int j) {
-    return col * kSamplerCandidateCap + j;
+    return col * Cap + j;
 }
 
 // Whether a row's logits take sampling_adjusted_logit's penalties or its open-reasoning exclusion (the
@@ -372,14 +380,14 @@ __device__ __forceinline__ float sampling_logit(float value) { return value; }
 // All threads of the block must call. Small-column exact truncated support
 // builder used by unit tests and any <=256-token column. It sorts one shared
 // tile and then applies the same top-p/min-p renormalization as the large path.
-template <class Logit>
+template <int Cap = kSamplerFastCandidates, class Logit>
 __device__ inline void
 sampling_build_truncated_small(const Logit* logits, std::int64_t base, std::int32_t vocab,
                                const SamplingConfig& cfg, float* tile_val, int* tile_idx,
                                float* cand_val, int* cand_idx, float* prob, int* n_support,
                                const std::int32_t* overlay = nullptr, int overlay_len = 0) {
     const int tid = threadIdx.x;
-    const int cap = sampling_candidate_cap(cfg, vocab);
+    const int cap = sampling_candidate_cap<Cap>(cfg, vocab);
     if (tid < kSamplerTileItems) {
         if (tid < vocab) {
             const float x = sampling_adjusted_logit(sampling_logit(logits[base + tid]), tid, cfg,
@@ -448,6 +456,114 @@ __device__ inline void sampling_build_truncated_block_fast(
     }
     __syncthreads();
     sampling_normalize_support(cfg, cand_val, cand_idx, prob, n_support, fast_cap);
+}
+
+// Single-block fallback for the wide capacity. Per-thread candidate lists of 64 do not fit in
+// registers or shared memory, so the vocabulary streams through in 512-key tiles: each tile is
+// block-sorted, its first `cap` keys are merge-ranked against the running top-`cap` set held in
+// shared memory, and the best `cap` of the union survive. Keys are unique (the token id is part
+// of the key), except the zero sentinel, whose tie-break below keeps the merge a permutation.
+// Cost is one block sort per 512 tokens, so this route exists for shapes the multi-block route
+// cannot hold (more than 16 columns, or vocabularies beyond 524288 tokens), not for speed.
+template <int Cap, class Logit>
+__device__ inline void sampling_build_truncated_block_stream(
+    const Logit* logits, std::int64_t base, std::int32_t vocab, const SamplingConfig& cfg,
+    typename SamplingPartialSort::TempStorage& sort_storage, unsigned long long* run,
+    unsigned long long* top, float* cand_val, int* cand_idx, float* prob, int* n_support,
+    const std::int32_t* overlay = nullptr, int overlay_len = 0) {
+    const int tid = threadIdx.x;
+    const int cap = sampling_candidate_cap<Cap>(cfg, vocab);
+    if (tid < cap) { run[tid] = 0ull; }
+    __syncthreads();
+    for (int tile_start = 0; tile_start < vocab; tile_start += kSamplerPartialTileItems) {
+        unsigned long long keys[kSamplerItemsPerThread];
+#pragma unroll
+        for (int item = 0; item < kSamplerItemsPerThread; ++item) {
+            const int v = tile_start + item * kSamplerBlock + tid;
+            keys[item]  = v < vocab ? sampling_sort_key(
+                                          sampling_adjusted_logit(sampling_logit(logits[base + v]), v,
+                                                                  cfg, overlay, overlay_len),
+                                          v)
+                                    : 0ull;
+        }
+        SamplingPartialSort(sort_storage).Sort(keys, SamplingKeyGreater{});
+#pragma unroll
+        for (int item = 0; item < kSamplerItemsPerThread; ++item) {
+            const int rank = tid * kSamplerItemsPerThread + item;
+            if (rank < cap) { top[rank] = keys[item]; }
+        }
+        __syncthreads();
+
+        unsigned long long mine = 0ull;
+        unsigned long long tile = 0ull;
+        int rank_mine           = cap;
+        int rank_tile           = cap;
+        if (tid < cap) {
+            mine = run[tid];
+            tile = top[tid];
+            // Tile keys strictly above `mine` rank ahead of it; run keys at or above `tile`
+            // rank ahead of that tile key, so equal sentinels keep the run first.
+            int lo = 0;
+            int hi = cap;
+            while (lo < hi) {
+                const int mid = (lo + hi) >> 1;
+                if (top[mid] > mine) { lo = mid + 1; } else { hi = mid; }
+            }
+            rank_mine = tid + lo;
+            lo        = 0;
+            hi        = cap;
+            while (lo < hi) {
+                const int mid = (lo + hi) >> 1;
+                if (run[mid] >= tile) { lo = mid + 1; } else { hi = mid; }
+            }
+            rank_tile = tid + lo;
+        }
+        __syncthreads();
+        if (tid < cap) {
+            if (rank_mine < cap) { run[rank_mine] = mine; }
+            if (rank_tile < cap) { run[rank_tile] = tile; }
+        }
+        __syncthreads();
+    }
+    if (tid < cap) {
+        cand_val[tid] = sampling_key_float(run[tid]);
+        cand_idx[tid] = sampling_key_index(run[tid]);
+    }
+    __syncthreads();
+    sampling_normalize_support(cfg, cand_val, cand_idx, prob, n_support, cap);
+}
+
+// Shared-memory scratch of the single-block large-column fallback, per capacity.
+template <int Cap>
+struct SamplingFallbackScratch;
+
+template <>
+struct SamplingFallbackScratch<kSamplerFastCandidates> {
+    float merge_val[kSamplerBlock * kSamplerFastCandidates];
+    int merge_idx[kSamplerBlock * kSamplerFastCandidates];
+};
+
+template <>
+struct SamplingFallbackScratch<kSamplerWideCandidates> {
+    typename SamplingPartialSort::TempStorage sort;
+    unsigned long long run[kSamplerWideCandidates];
+    unsigned long long top[kSamplerWideCandidates];
+};
+
+template <int Cap, class Logit>
+__device__ inline void sampling_build_truncated_large(
+    const Logit* logits, std::int64_t base, std::int32_t vocab, const SamplingConfig& cfg,
+    SamplingFallbackScratch<Cap>& scratch, float* cand_val, int* cand_idx, float* prob,
+    int* n_support, const std::int32_t* overlay = nullptr, int overlay_len = 0) {
+    if constexpr (Cap == kSamplerFastCandidates) {
+        sampling_build_truncated_block_fast(logits, base, vocab, cfg, scratch.merge_val,
+                                            scratch.merge_idx, cand_val, cand_idx, prob, n_support,
+                                            overlay, overlay_len);
+    } else {
+        sampling_build_truncated_block_stream<Cap>(logits, base, vocab, cfg, scratch.sort,
+                                                   scratch.run, scratch.top, cand_val, cand_idx,
+                                                   prob, n_support, overlay, overlay_len);
+    }
 }
 
 // Gumbel-max (SamplingConfig::gumbel_max): a support entry's score log p + g, g = -log(-log u) with u

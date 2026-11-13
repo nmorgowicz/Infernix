@@ -100,6 +100,7 @@ struct ServeOptions {
     // then refused. Values below the admission requirement are raised to it at startup.
     std::uint32_t max_http_clients = 64;
     std::uint32_t prefill_chunk        = 0; // 0: the model's default (EngineOptions)
+    bool prefill_chunk_auto = false; // Gemma4 only; 0 remains the model's default
     bool original_int8_prefill_kernel  = false;
     std::uint32_t prefill_split_workspace_mib = kDefaultPrefillSplitWorkspaceMiB;
     bool original_nvfp4_prefill_kernel = false;

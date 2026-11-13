@@ -378,6 +378,7 @@ infernix::EngineOptions make_engine_options(const ServeOptions& options, Startup
     engine_options.max_pending_requests     = options.max_pending_requests;
     engine_options.pending_timeout_ms       = options.pending_timeout_ms;
     engine_options.prefill_chunk            = options.prefill_chunk;
+    engine_options.prefill_chunk_auto       = options.prefill_chunk_auto;
     engine_options.original_int8_prefill_kernel = options.original_int8_prefill_kernel;
     engine_options.prefill_split_workspace_mib  = options.prefill_split_workspace_mib;
     engine_options.original_nvfp4_prefill_kernel = options.original_nvfp4_prefill_kernel;

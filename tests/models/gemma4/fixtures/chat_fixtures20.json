@@ -1,0 +1,2765 @@
+[
+ {
+  "name": "case00",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hello"
+   }
+  ],
+  "text": "<bos><|turn>user\nHello<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+  "ids": [
+   2,
+   105,
+   2364,
+   107,
+   9259,
+   106,
+   107,
+   105,
+   4368,
+   107,
+   100,
+   45518,
+   107,
+   101
+  ]
+ },
+ {
+  "name": "case01",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Be brief."
+   },
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "text": "<bos><|turn>system\nBe brief.<turn|>\n<|turn>user\nHi<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+  "ids": [
+   2,
+   105,
+   9731,
+   107,
+   3912,
+   8652,
+   236761,
+   106,
+   107,
+   105,
+   2364,
+   107,
+   10979,
+   106,
+   107,
+   105,
+   4368,
+   107,
+   100,
+   45518,
+   107,
+   101
+  ]
+ },
+ {
+  "name": "case02",
+  "messages": [
+   {
+    "role": "user",
+    "content": "2+2"
+   }
+  ],
+  "enable_thinking": true,
+  "text": "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\n2+2<turn|>\n<|turn>model\n",
+  "ids": [
+   2,
+   105,
+   9731,
+   107,
+   98,
+   107,
+   106,
+   107,
+   105,
+   2364,
+   107,
+   236778,
+   236862,
+   236778,
+   106,
+   107,
+   105,
+   4368,
+   107
+  ]
+ },
+ {
+  "name": "case03",
+  "messages": [
+   {
+    "role": "user",
+    "content": "One"
+   },
+   {
+    "role": "assistant",
+    "content": "Two"
+   },
+   {
+    "role": "user",
+    "content": "Three"
+   }
+  ],
+  "text": "<bos><|turn>user\nOne<turn|>\n<|turn>model\nTwo<turn|>\n<|turn>user\nThree<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+  "ids": [
+   2,
+   105,
+   2364,
+   107,
+   4906,
+   106,
+   107,
+   105,
+   4368,
+   107,
+   11634,
+   106,
+   107,
+   105,
+   2364,
+   107,
+   19765,
+   106,
+   107,
+   105,
+   4368,
+   107,
+   100,
+   45518,
+   107,
+   101
+  ]
+ },
+ {
+  "name": "case04",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Look up weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       },
+       "days": {
+        "type": "integer",
+        "description": "Days ahead"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "text": "<bos><|turn>system\n<|tool>declaration:get_weather{description:<|\"|>Look up weather<|\"|>,parameters:{properties:{city:{description:<|\"|>City<|\"|>,type:<|\"|>STRING<|\"|>},days:{description:<|\"|>Days ahead<|\"|>,type:<|\"|>INTEGER<|\"|>},unit:{enum:[<|\"|>c<|\"|>,<|\"|>f<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nWhat is the weather in Paris?<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+  "ids": [
+   2,
+   105,
+   9731,
+   107,
+   46,
+   163688,
+   236787,
+   828,
+   236779,
+   19323,
+   236782,
+   7777,
+   236787,
+   52,
+   13908,
+   872,
+   7606,
+   52,
+   236764,
+   19031,
+   29616,
+   15921,
+   29616,
+   13319,
+   29616,
+   7777,
+   236787,
+   52,
+   17698,
+   52,
+   236764,
+   2084,
+   236787,
+   52,
+   35410,
+   52,
+   1263,
+   14356,
+   29616,
+   7777,
+   236787,
+   52,
+   34826,
+   7531,
+   52,
+   236764,
+   2084,
+   236787,
+   52,
+   86752,
+   52,
+   1263,
+   6805,
+   29616,
+   24626,
+   24845,
+   52,
+   236755,
+   52,
+   236764,
+   52,
+   236760,
+   52,
+   1604,
+   2084,
+   236787,
+   52,
+   35410,
+   52,
+   5237,
+   15979,
+   24845,
+   52,
+   13319,
+   52,
+   1604,
+   2084,
+   236787,
+   52,
+   60688,
+   52,
+   1807,
+   47,
+   106,
+   107,
+   105,
+   2364,
+   107,
+   3689,
+   563,
+   506,
+   7606,
+   528,
+   9079,
+   236881,
+   106,
+   107,
+   105,
+   4368,
+   107,
+   100,
+   45518,
+   107,
+   101
+  ]
+ },
+ {
+  "name": "case05",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Look up weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       },
+       "days": {
+        "type": "integer",
+        "description": "Days ahead"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "edit",
+     "description": "Replace text in a file",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string",
+        "description": "File path"
+       },
+       "edits": {
+        "type": "array",
+        "description": "Edits",
+        "items": {
+         "type": "object",
+         "properties": {
+          "old": {
+           "type": "string"
+          },
+          "new": {
+           "type": "string"
+          }
+         },
+         "required": [
+          "old",
+          "new"
+         ]
+        }
+       },
+       "dry_run": {
+        "type": "boolean",
+        "nullable": true
+       }
+      },
+      "required": [
+       "path",
+       "edits"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "bash",
+     "description": "Run a shell command",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout": {
+        "type": "number"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   }
+  ],
+  "enable_thinking": true,
+  "text": "<bos><|turn>system\n<|think|>\n<|tool>declaration:get_weather{description:<|\"|>Look up weather<|\"|>,parameters:{properties:{city:{description:<|\"|>City<|\"|>,type:<|\"|>STRING<|\"|>},days:{description:<|\"|>Days ahead<|\"|>,type:<|\"|>INTEGER<|\"|>},unit:{enum:[<|\"|>c<|\"|>,<|\"|>f<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><|tool>declaration:edit{description:<|\"|>Replace text in a file<|\"|>,parameters:{properties:{dry_run:{nullable:true,type:<|\"|>BOOLEAN<|\"|>},edits:{description:<|\"|>Edits<|\"|>,items:{properties:{new:{type:<|\"|>STRING<|\"|>},old:{type:<|\"|>STRING<|\"|>}},required:[<|\"|>old<|\"|>,<|\"|>new<|\"|>],type:<|\"|>OBJECT<|\"|>},type:<|\"|>ARRAY<|\"|>},path:{description:<|\"|>File path<|\"|>,type:<|\"|>STRING<|\"|>}},required:[<|\"|>path<|\"|>,<|\"|>edits<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><|tool>declaration:bash{description:<|\"|>Run a shell command<|\"|>,parameters:{properties:{command:{type:<|\"|>STRING<|\"|>},timeout:{type:<|\"|>NUMBER<|\"|>}},required:[<|\"|>command<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nWhat is the weather in Paris?<turn|>\n<|turn>model\n",
+  "ids": [
+   2,
+   105,
+   9731,
+   107,
+   98,
+   107,
+   46,
+   163688,
+   236787,
+   828,
+   236779,
+   19323,
+   236782,
+   7777,
+   236787,
+   52,
+   13908,
+   872,
+   7606,
+   52,
+   236764,
+   19031,
+   29616,
+   15921,
+   29616,
+   13319,
+   29616,
+   7777,
+   236787,
+   52,
+   17698,
+   52,
+   236764,
+   2084,
+   236787,
+   52,
+   35410,
+   52,
+   1263,
+   14356,
+   29616,
+   7777,
+   236787,
+   52,
+   34826,
+   7531,
+   52,
+   236764,
+   2084,
+   236787,
+   52,
+   86752,
+   52,
+   1263,
+   6805,
+   29616,
+   24626,
+   24845,
+   52,
+   236755,
+   52,
+   236764,
+   52,
+   236760,
+   52,
+   1604,
+   2084,
+   236787,
+   52,
+   35410,
+   52,
+   5237,
+   15979,
+   24845,
+   52,
+   13319,
+   52,
+   1604,
+   2084,
+   236787,
+   52,
+   60688,
+   52,
+   1807,
+   47,
+   46,
+   163688,
+   236787,
+   8982,
+   236782,
+   7777,
+   236787,
+   52,
+   42762,
+   1816,
+   528,
+   496,
+   2129,
+   52,
+   236764,
+   19031,
+   29616,
+   15921,
+   29616,
+   51686,
+   236779,
+   4503,
+   29616,
+   35951,
+   236787,
+   3397,
+   236764,
+   2084,
+   236787,
+   52,
+   166264,
+   1536,
+   52,
+   1263,
+   524,
+   1258,
+   29616,
+   7777,
+   236787,
+   52,
+   4675,
+   1258,
+   52,
+   236764,
+   7633,
+   29616,
+   15921,
+   29616,
+   1951,
+   29616,
+   2084,
+   236787,
+   52,
+   35410,
+   52,
+   1263,
+   947,
+   29616,
+   2084,
+   236787,
+   52,
+   35410,
+   52,
+   5237,
+   15979,
+   24845,
+   52,
+   947,
+   52,
+   236764,
+   52,
+   1951,
+   52,
+   1604,
+   2084,
+   236787,
+   52,
+   60688,
+   52,
+   1263,
+   2084,
+   236787,
+   52,
+   48832,
+   52,
+   1263,
+   2337,
+   29616,
+   7777,
+   236787,
+   52,
+   3202,
+   2479,
+   52,
+   236764,
+   2084,
+   236787,
+   52,
+   35410,
+   52,
+   5237,
+   15979,
+   24845,
+   52,
+   2337,
+   52,
+   236764,
+   52,
+   524,
+   1258,
+   52,
+   1604,
+   2084,
+   236787,
+   52,
+   60688,
+   52,
+   1807,
+   47,
+   46,
+   163688,
+   236787,
+   42422,
+   236782,
+   7777,
+   236787,
+   52,
+   7306,
+   496,
+   11411,
+   4991,
+   52,
+   236764,
+   19031,
+   29616,
+   15921,
+   29616,
+   7674,
+   29616,
+   2084,
+   236787,
+   52,
+   35410,
+   52,
+   1263,
+   30447,
+   29616,
+   2084,
+   236787,
+   52,
+   38631,
+   52,
+   5237,
+   15979,
+   24845,
+   52,
+   7674,
+   52,
+   1604,
+   2084,
+   236787,
+   52,
+   60688,
+   52,
+   1807,
+   47,
+   106,
+   107,
+   105,
+   2364,
+   107,
+   3689,
+   563,
+   506,
+   7606,
+   528,
+   9079,
+   236881,
+   106,
+   107,
+   105,
+   4368,
+   107
+  ]
+ },
+ {
+  "name": "case06",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Paris",
+        "unit": "c"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "{\"temp\": 18, \"sky\": \"clear\"}"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Look up weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       },
+       "days": {
+        "type": "integer",
+        "description": "Days ahead"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "text": "<bos><|turn>system\n<|tool>declaration:get_weather{description:<|\"|>Look up weather<|\"|>,parameters:{properties:{city:{description:<|\"|>City<|\"|>,type:<|\"|>STRING<|\"|>},days:{description:<|\"|>Days ahead<|\"|>,type:<|\"|>INTEGER<|\"|>},unit:{enum:[<|\"|>c<|\"|>,<|\"|>f<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nWhat is the weather in Paris?<turn|>\n<|turn>model\n<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,unit:<|\"|>c<|\"|>}<tool_call|><|tool_response>response:get_weather{value:<|\"|>{\"temp\": 18, \"sky\": \"clear\"}<|\"|>}<tool_response|>",
+  "ids": [
+   2,
+   105,
+   9731,
+   107,
+   46,
+   163688,
+   236787,
+   828,
+   236779,
+   19323,
+   236782,
+   7777,
+   236787,
+   52,
+   13908,
+   872,
+   7606,
+   52,
+   236764,
+   19031,
+   29616,
+   15921,
+   29616,
+   13319,
+   29616,
+   7777,
+   236787,
+   52,
+   17698,
+   52,
+   236764,
+   2084,
+   236787,
+   52,
+   35410,
+   52,
+   1263,
+   14356,
+   29616,
+   7777,
+   236787,
+   52,
+   34826,
+   7531,
+   52,
+   236764,
+   2084,
+   236787,
+   52,
+   86752,
+   52,
+   1263,
+   6805,
+   29616,
+   24626,
+   24845,
+   52,
+   236755,
+   52,
+   236764,
+   52,
+   236760,
+   52,
+   1604,
+   2084,
+   236787,
+   52,
+   35410,
+   52,
+   5237,
+   15979,
+   24845,
+   52,
+   13319,
+   52,
+   1604,
+   2084,
+   236787,
+   52,
+   60688,
+   52,
+   1807,
+   47,
+   106,
+   107,
+   105,
+   2364,
+   107,
+   3689,
+   563,
+   506,
+   7606,
+   528,
+   9079,
+   236881,
+   106,
+   107,
+   105,
+   4368,
+   107,
+   48,
+   6639,
+   236787,
+   828,
+   236779,
+   19323,
+   236782,
+   13319,
+   236787,
+   52,
+   50429,
+   52,
+   236764,
+   6805,
+   236787,
+   52,
+   236755,
+   52,
+   236783,
+   49,
+   50,
+   6275,
+   236787,
+   828,
+   236779,
+   19323,
+   236782,
+   2394,
+   236787,
+   52,
+   14937,
+   7617,
+   1083,
+   236743,
+   236770,
+   236828,
+   236764,
+   623,
+   16012,
+   1083,
+   623,
+   9347,
+   25938,
+   52,
+   236783,
+   51
+  ]
+ },
+ {
+  "name": "case07",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Paris",
+        "unit": "c"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "{\"temp\": 18, \"sky\": \"clear\"}"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Look up weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       },
+       "days": {
+        "type": "integer",
+        "description": "Days ahead"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "enable_thinking": true,
+  "text": "<bos><|turn>system\n<|think|>\n<|tool>declaration:get_weather{description:<|\"|>Look up weather<|\"|>,parameters:{properties:{city:{description:<|\"|>City<|\"|>,type:<|\"|>STRING<|\"|>},days:{description:<|\"|>Days ahead<|\"|>,type:<|\"|>INTEGER<|\"|>},unit:{enum:[<|\"|>c<|\"|>,<|\"|>f<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nWhat is the weather in Paris?<turn|>\n<|turn>model\n<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,unit:<|\"|>c<|\"|>}<tool_call|><|tool_response>response:get_weather{value:<|\"|>{\"temp\": 18, \"sky\": \"clear\"}<|\"|>}<tool_response|><|channel>thought\n",
+  "ids": [
+   2,
+   105,
+   9731,
+   107,
+   98,
+   107,
+   46,
+   163688,
+   236787,
+   828,
+   236779,
+   19323,
+   236782,
+   7777,
+   236787,
+   52,
+   13908,
+   872,
+   7606,
+   52,
+   236764,
+   19031,
+   29616,
+   15921,
+   29616,
+   13319,
+   29616,
+   7777,
+   236787,
+   52,
+   17698,
+   52,
+   236764,
+   2084,
+   236787,
+   52,
+   35410,
+   52,
+   1263,
+   14356,
+   29616,
+   7777,
+   236787,
+   52,
+   34826,
+   7531,
+   52,
+   236764,
+   2084,
+   236787,
+   52,
+   86752,
+   52,
+   1263,
+   6805,
+   29616,
+   24626,
+   24845,
+   52,
+   236755,
+   52,
+   236764,
+   52,
+   236760,
+   52,
+   1604,
+   2084,
+   236787,
+   52,
+   35410,
+   52,
+   5237,
+   15979,
+   24845,
+   52,
+   13319,
+   52,
+   1604,
+   2084,
+   236787,
+   52,
+   60688,
+   52,
+   1807,
+   47,
+   106,
+   107,
+   105,
+   2364,
+   107,
+   3689,
+   563,
+   506,
+   7606,
+   528,
+   9079,
+   236881,
+   106,
+   107,
+   105,
+   4368,
+   107,
+   48,
+   6639,
+   236787,
+   828,
+   236779,
+   19323,
+   236782,
+   13319,
+   236787,
+   52,
+   50429,
+   52,
+   236764,
+   6805,
+   236787,
+   52,
+   236755,
+   52,
+   236783,
+   49,
+   50,
+   6275,
+   236787,
+   828,
+   236779,
+   19323,
+   236782,
+   2394,
+   236787,
+   52,
+   14937,
+   7617,
+   1083,
+   236743,
+   236770,
+   236828,
+   236764,
+   623,
+   16012,
+   1083,
+   623,
+   9347,
+   25938,
+   52,
+   236783,
+   51,
+   100,
+   45518,
+   107
+  ]
+ },
+ {
+  "name": "case08",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Paris",
+        "unit": "c"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "{\"temp\": 18, \"sky\": \"clear\"}"
+   },
+   {
+    "role": "assistant",
+    "content": "It is 18 C and clear."
+   },
+   {
+    "role": "user",
+    "content": "And tomorrow?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Look up weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       },
+       "days": {
+        "type": "integer",
+        "description": "Days ahead"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "text": "<bos><|turn>system\n<|tool>declaration:get_weather{description:<|\"|>Look up weather<|\"|>,parameters:{properties:{city:{description:<|\"|>City<|\"|>,type:<|\"|>STRING<|\"|>},days:{description:<|\"|>Days ahead<|\"|>,type:<|\"|>INTEGER<|\"|>},unit:{enum:[<|\"|>c<|\"|>,<|\"|>f<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nWhat is the weather in Paris?<turn|>\n<|turn>model\n<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,unit:<|\"|>c<|\"|>}<tool_call|><|tool_response>response:get_weather{value:<|\"|>{\"temp\": 18, \"sky\": \"clear\"}<|\"|>}<tool_response|>It is 18 C and clear.<turn|>\n<|turn>user\nAnd tomorrow?<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+  "ids": [
+   2,
+   105,
+   9731,
+   107,
+   46,
+   163688,
+   236787,
+   828,
+   236779,
+   19323,
+   236782,
+   7777,
+   236787,
+   52,
+   13908,
+   872,
+   7606,
+   52,
+   236764,
+   19031,
+   29616,
+   15921,
+   29616,
+   13319,
+   29616,
+   7777,
+   236787,
+   52,
+   17698,
+   52,
+   236764,
+   2084,
+   236787,
+   52,
+   35410,
+   52,
+   1263,
+   14356,
+   29616,
+   7777,
+   236787,
+   52,
+   34826,
+   7531,
+   52,
+   236764,
+   2084,
+   236787,
+   52,
+   86752,
+   52,
+   1263,
+   6805,
+   29616,
+   24626,
+   24845,
+   52,
+   236755,
+   52,
+   236764,
+   52,
+   236760,
+   52,
+   1604,
+   2084,
+   236787,
+   52,
+   35410,
+   52,
+   5237,
+   15979,
+   24845,
+   52,
+   13319,
+   52,
+   1604,
+   2084,
+   236787,
+   52,
+   60688,
+   52,
+   1807,
+   47,
+   106,
+   107,
+   105,
+   2364,
+   107,
+   3689,
+   563,
+   506,
+   7606,
+   528,
+   9079,
+   236881,
+   106,
+   107,
+   105,
+   4368,
+   107,
+   48,
+   6639,
+   236787,
+   828,
+   236779,
+   19323,
+   236782,
+   13319,
+   236787,
+   52,
+   50429,
+   52,
+   236764,
+   6805,
+   236787,
+   52,
+   236755,
+   52,
+   236783,
+   49,
+   50,
+   6275,
+   236787,
+   828,
+   236779,
+   19323,
+   236782,
+   2394,
+   236787,
+   52,
+   14937,
+   7617,
+   1083,
+   236743,
+   236770,
+   236828,
+   236764,
+   623,
+   16012,
+   1083,
+   623,
+   9347,
+   25938,
+   52,
+   236783,
+   51,
+   1509,
+   563,
+   236743,
+   236770,
+   236828,
+   565,
+   532,
+   3582,
+   236761,
+   106,
+   107,
+   105,
+   2364,
+   107,
+   3133,
+   16922,
+   236881,
+   106,
+   107,
+   105,
+   4368,
+   107,
+   100,
+   45518,
+   107,
+   101
+  ]
+ },
+ {
+  "name": "case09",
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are Pi."
+   },
+   {
+    "role": "user",
+    "content": "Fix it"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "e1",
+      "type": "function",
+      "function": {
+       "name": "edit",
+       "arguments": {
+        "path": "a.py",
+        "edits": [
+         {
+          "old": "x = 1",
+          "new": "x = 2\n"
+         }
+        ],
+        "dry_run": false
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "e1",
+    "content": "ok"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "edit",
+     "description": "Replace text in a file",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string",
+        "description": "File path"
+       },
+       "edits": {
+        "type": "array",
+        "description": "Edits",
+        "items": {
+         "type": "object",
+         "properties": {
+          "old": {
+           "type": "string"
+          },
+          "new": {
+           "type": "string"
+          }
+         },
+         "required": [
+          "old",
+          "new"
+         ]
+        }
+       },
+       "dry_run": {
+        "type": "boolean",
+        "nullable": true
+       }
+      },
+      "required": [
+       "path",
+       "edits"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "bash",
+     "description": "Run a shell command",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout": {
+        "type": "number"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   }
+  ],
+  "text": "<bos><|turn>system\nYou are Pi.<|tool>declaration:edit{description:<|\"|>Replace text in a file<|\"|>,parameters:{properties:{dry_run:{nullable:true,type:<|\"|>BOOLEAN<|\"|>},edits:{description:<|\"|>Edits<|\"|>,items:{properties:{new:{type:<|\"|>STRING<|\"|>},old:{type:<|\"|>STRING<|\"|>}},required:[<|\"|>old<|\"|>,<|\"|>new<|\"|>],type:<|\"|>OBJECT<|\"|>},type:<|\"|>ARRAY<|\"|>},path:{description:<|\"|>File path<|\"|>,type:<|\"|>STRING<|\"|>}},required:[<|\"|>path<|\"|>,<|\"|>edits<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><|tool>declaration:bash{description:<|\"|>Run a shell command<|\"|>,parameters:{properties:{command:{type:<|\"|>STRING<|\"|>},timeout:{type:<|\"|>NUMBER<|\"|>}},required:[<|\"|>command<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nFix it<turn|>\n<|turn>model\n<|tool_call>call:edit{dry_run:false,edits:[{new:<|\"|>x = 2\n<|\"|>,old:<|\"|>x = 1<|\"|>}],path:<|\"|>a.py<|\"|>}<tool_call|><|tool_response>response:edit{value:<|\"|>ok<|\"|>}<tool_response|>",
+  "ids": [
+   2,
+   105,
+   9731,
+   107,
+   3048,
+   659,
+   18048,
+   236761,
+   46,
+   163688,
+   236787,
+   8982,
+   236782,
+   7777,
+   236787,
+   52,
+   42762,
+   1816,
+   528,
+   496,
+   2129,
+   52,
+   236764,
+   19031,
+   29616,
+   15921,
+   29616,
+   51686,
+   236779,
+   4503,
+   29616,
+   35951,
+   236787,
+   3397,
+   236764,
+   2084,
+   236787,
+   52,
+   166264,
+   1536,
+   52,
+   1263,
+   524,
+   1258,
+   29616,
+   7777,
+   236787,
+   52,
+   4675,
+   1258,
+   52,
+   236764,
+   7633,
+   29616,
+   15921,
+   29616,
+   1951,
+   29616,
+   2084,
+   236787,
+   52,
+   35410,
+   52,
+   1263,
+   947,
+   29616,
+   2084,
+   236787,
+   52,
+   35410,
+   52,
+   5237,
+   15979,
+   24845,
+   52,
+   947,
+   52,
+   236764,
+   52,
+   1951,
+   52,
+   1604,
+   2084,
+   236787,
+   52,
+   60688,
+   52,
+   1263,
+   2084,
+   236787,
+   52,
+   48832,
+   52,
+   1263,
+   2337,
+   29616,
+   7777,
+   236787,
+   52,
+   3202,
+   2479,
+   52,
+   236764,
+   2084,
+   236787,
+   52,
+   35410,
+   52,
+   5237,
+   15979,
+   24845,
+   52,
+   2337,
+   52,
+   236764,
+   52,
+   524,
+   1258,
+   52,
+   1604,
+   2084,
+   236787,
+   52,
+   60688,
+   52,
+   1807,
+   47,
+   46,
+   163688,
+   236787,
+   42422,
+   236782,
+   7777,
+   236787,
+   52,
+   7306,
+   496,
+   11411,
+   4991,
+   52,
+   236764,
+   19031,
+   29616,
+   15921,
+   29616,
+   7674,
+   29616,
+   2084,
+   236787,
+   52,
+   35410,
+   52,
+   1263,
+   30447,
+   29616,
+   2084,
+   236787,
+   52,
+   38631,
+   52,
+   5237,
+   15979,
+   24845,
+   52,
+   7674,
+   52,
+   1604,
+   2084,
+   236787,
+   52,
+   60688,
+   52,
+   1807,
+   47,
+   106,
+   107,
+   105,
+   2364,
+   107,
+   36819,
+   625,
+   106,
+   107,
+   105,
+   4368,
+   107,
+   48,
+   6639,
+   236787,
+   8982,
+   236782,
+   51686,
+   236779,
+   4503,
+   236787,
+   4530,
+   236764,
+   524,
+   1258,
+   24845,
+   236782,
+   1951,
+   236787,
+   52,
+   236781,
+   578,
+   236743,
+   236778,
+   107,
+   52,
+   236764,
+   947,
+   236787,
+   52,
+   236781,
+   578,
+   236743,
+   236770,
+   52,
+   104960,
+   2337,
+   236787,
+   52,
+   236746,
+   236761,
+   2551,
+   52,
+   236783,
+   49,
+   50,
+   6275,
+   236787,
+   8982,
+   236782,
+   2394,
+   236787,
+   52,
+   680,
+   52,
+   236783,
+   51
+  ]
+ },
+ {
+  "name": "case10",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Run ls and pwd"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "b1",
+      "type": "function",
+      "function": {
+       "name": "bash",
+       "arguments": {
+        "command": "ls -la"
+       }
+      }
+     },
+     {
+      "id": "b2",
+      "type": "function",
+      "function": {
+       "name": "bash",
+       "arguments": {
+        "command": "pwd"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "b1",
+    "content": "a.txt\nb.txt"
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "b2",
+    "content": "/home"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "bash",
+     "description": "Run a shell command",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout": {
+        "type": "number"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   }
+  ],
+  "text": "<bos><|turn>system\n<|tool>declaration:bash{description:<|\"|>Run a shell command<|\"|>,parameters:{properties:{command:{type:<|\"|>STRING<|\"|>},timeout:{type:<|\"|>NUMBER<|\"|>}},required:[<|\"|>command<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nRun ls and pwd<turn|>\n<|turn>model\n<|tool_call>call:bash{command:<|\"|>ls -la<|\"|>}<tool_call|><|tool_call>call:bash{command:<|\"|>pwd<|\"|>}<tool_call|><|tool_response>response:bash{value:<|\"|>a.txt\nb.txt<|\"|>}<tool_response|><|tool_response>response:bash{value:<|\"|>/home<|\"|>}<tool_response|>",
+  "ids": [
+   2,
+   105,
+   9731,
+   107,
+   46,
+   163688,
+   236787,
+   42422,
+   236782,
+   7777,
+   236787,
+   52,
+   7306,
+   496,
+   11411,
+   4991,
+   52,
+   236764,
+   19031,
+   29616,
+   15921,
+   29616,
+   7674,
+   29616,
+   2084,
+   236787,
+   52,
+   35410,
+   52,
+   1263,
+   30447,
+   29616,
+   2084,
+   236787,
+   52,
+   38631,
+   52,
+   5237,
+   15979,
+   24845,
+   52,
+   7674,
+   52,
+   1604,
+   2084,
+   236787,
+   52,
+   60688,
+   52,
+   1807,
+   47,
+   106,
+   107,
+   105,
+   2364,
+   107,
+   7306,
+   60068,
+   532,
+   160783,
+   106,
+   107,
+   105,
+   4368,
+   107,
+   48,
+   6639,
+   236787,
+   42422,
+   236782,
+   7674,
+   236787,
+   52,
+   5629,
+   753,
+   2149,
+   52,
+   236783,
+   49,
+   48,
+   6639,
+   236787,
+   42422,
+   236782,
+   7674,
+   236787,
+   52,
+   85971,
+   52,
+   236783,
+   49,
+   50,
+   6275,
+   236787,
+   42422,
+   236782,
+   2394,
+   236787,
+   52,
+   236746,
+   236761,
+   7090,
+   107,
+   236763,
+   236761,
+   7090,
+   52,
+   236783,
+   51,
+   50,
+   6275,
+   236787,
+   42422,
+   236782,
+   2394,
+   236787,
+   52,
+   236786,
+   8147,
+   52,
+   236783,
+   51
+  ]
+ },
+ {
+  "name": "case11",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Think about 7*8"
+   },
+   {
+    "role": "assistant",
+    "content": "56",
+    "reasoning_content": "7*8 is 56."
+   },
+   {
+    "role": "user",
+    "content": "Now 9*9"
+   }
+  ],
+  "enable_thinking": true,
+  "text": "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nThink about 7*8<turn|>\n<|turn>model\n56<turn|>\n<|turn>user\nNow 9*9<turn|>\n<|turn>model\n",
+  "ids": [
+   2,
+   105,
+   9731,
+   107,
+   98,
+   107,
+   106,
+   107,
+   105,
+   2364,
+   107,
+   51836,
+   1003,
+   236743,
+   236832,
+   236829,
+   236828,
+   106,
+   107,
+   105,
+   4368,
+   107,
+   236810,
+   236825,
+   106,
+   107,
+   105,
+   2364,
+   107,
+   6445,
+   236743,
+   236819,
+   236829,
+   236819,
+   106,
+   107,
+   105,
+   4368,
+   107
+  ]
+ },
+ {
+  "name": "case12",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Think about 7*8"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "reasoning_content": "Use the tool.",
+    "tool_calls": [
+     {
+      "id": "b1",
+      "type": "function",
+      "function": {
+       "name": "bash",
+       "arguments": {
+        "command": "echo $((7*8))"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "b1",
+    "content": "56"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "bash",
+     "description": "Run a shell command",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout": {
+        "type": "number"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   }
+  ],
+  "enable_thinking": true,
+  "text": "<bos><|turn>system\n<|think|>\n<|tool>declaration:bash{description:<|\"|>Run a shell command<|\"|>,parameters:{properties:{command:{type:<|\"|>STRING<|\"|>},timeout:{type:<|\"|>NUMBER<|\"|>}},required:[<|\"|>command<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nThink about 7*8<turn|>\n<|turn>model\n<|channel>thought\nUse the tool.\n<channel|><|tool_call>call:bash{command:<|\"|>echo $((7*8))<|\"|>}<tool_call|><|tool_response>response:bash{value:<|\"|>56<|\"|>}<tool_response|><|channel>thought\n",
+  "ids": [
+   2,
+   105,
+   9731,
+   107,
+   98,
+   107,
+   46,
+   163688,
+   236787,
+   42422,
+   236782,
+   7777,
+   236787,
+   52,
+   7306,
+   496,
+   11411,
+   4991,
+   52,
+   236764,
+   19031,
+   29616,
+   15921,
+   29616,
+   7674,
+   29616,
+   2084,
+   236787,
+   52,
+   35410,
+   52,
+   1263,
+   30447,
+   29616,
+   2084,
+   236787,
+   52,
+   38631,
+   52,
+   5237,
+   15979,
+   24845,
+   52,
+   7674,
+   52,
+   1604,
+   2084,
+   236787,
+   52,
+   60688,
+   52,
+   1807,
+   47,
+   106,
+   107,
+   105,
+   2364,
+   107,
+   51836,
+   1003,
+   236743,
+   236832,
+   236829,
+   236828,
+   106,
+   107,
+   105,
+   4368,
+   107,
+   100,
+   45518,
+   107,
+   10896,
+   506,
+   5904,
+   236761,
+   107,
+   101,
+   48,
+   6639,
+   236787,
+   42422,
+   236782,
+   7674,
+   236787,
+   52,
+   17454,
+   210462,
+   236832,
+   236829,
+   236828,
+   1223,
+   52,
+   236783,
+   49,
+   50,
+   6275,
+   236787,
+   42422,
+   236782,
+   2394,
+   236787,
+   52,
+   236810,
+   236825,
+   52,
+   236783,
+   51,
+   100,
+   45518,
+   107
+  ]
+ },
+ {
+  "name": "case13",
+  "messages": [
+   {
+    "role": "developer",
+    "content": "Answer in French."
+   },
+   {
+    "role": "user",
+    "content": "Good morning"
+   }
+  ],
+  "text": "<bos><|turn>system\nAnswer in French.<turn|>\n<|turn>user\nGood morning<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+  "ids": [
+   2,
+   105,
+   9731,
+   107,
+   7925,
+   528,
+   7830,
+   236761,
+   106,
+   107,
+   105,
+   2364,
+   107,
+   11947,
+   5597,
+   106,
+   107,
+   105,
+   4368,
+   107,
+   100,
+   45518,
+   107,
+   101
+  ]
+ },
+ {
+  "name": "case14",
+  "messages": [
+   {
+    "role": "user",
+    "content": "  spaced  \n\nlines\t"
+   },
+   {
+    "role": "assistant",
+    "content": "<|channel>thought\nhidden<channel|>Visible"
+   },
+   {
+    "role": "user",
+    "content": "ok"
+   }
+  ],
+  "text": "<bos><|turn>user\nspaced  \n\nlines<turn|>\n<|turn>model\nVisible<turn|>\n<|turn>user\nok<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+  "ids": [
+   2,
+   105,
+   2364,
+   107,
+   169862,
+   138,
+   108,
+   8721,
+   106,
+   107,
+   105,
+   4368,
+   107,
+   21626,
+   106,
+   107,
+   105,
+   2364,
+   107,
+   680,
+   106,
+   107,
+   105,
+   4368,
+   107,
+   100,
+   45518,
+   107,
+   101
+  ]
+ },
+ {
+  "name": "case15",
+  "messages": [
+   {
+    "role": "user",
+    "content": "中文和 emoji 😀 and <b>html</b>"
+   }
+  ],
+  "text": "<bos><|turn>user\n中文和 emoji 😀 and <b>html</b><turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+  "ids": [
+   2,
+   105,
+   2364,
+   107,
+   55041,
+   237206,
+   64334,
+   163543,
+   532,
+   655,
+   236763,
+   236813,
+   3185,
+   954,
+   236763,
+   236813,
+   106,
+   107,
+   105,
+   4368,
+   107,
+   100,
+   45518,
+   107,
+   101
+  ]
+ },
+ {
+  "name": "case16",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Quote \"this\" and 'that' {braces} [list]"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "edit",
+     "description": "Replace text in a file",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string",
+        "description": "File path"
+       },
+       "edits": {
+        "type": "array",
+        "description": "Edits",
+        "items": {
+         "type": "object",
+         "properties": {
+          "old": {
+           "type": "string"
+          },
+          "new": {
+           "type": "string"
+          }
+         },
+         "required": [
+          "old",
+          "new"
+         ]
+        }
+       },
+       "dry_run": {
+        "type": "boolean",
+        "nullable": true
+       }
+      },
+      "required": [
+       "path",
+       "edits"
+      ]
+     }
+    }
+   }
+  ],
+  "text": "<bos><|turn>system\n<|tool>declaration:edit{description:<|\"|>Replace text in a file<|\"|>,parameters:{properties:{dry_run:{nullable:true,type:<|\"|>BOOLEAN<|\"|>},edits:{description:<|\"|>Edits<|\"|>,items:{properties:{new:{type:<|\"|>STRING<|\"|>},old:{type:<|\"|>STRING<|\"|>}},required:[<|\"|>old<|\"|>,<|\"|>new<|\"|>],type:<|\"|>OBJECT<|\"|>},type:<|\"|>ARRAY<|\"|>},path:{description:<|\"|>File path<|\"|>,type:<|\"|>STRING<|\"|>}},required:[<|\"|>path<|\"|>,<|\"|>edits<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nQuote \"this\" and 'that' {braces} [list]<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+  "ids": [
+   2,
+   105,
+   9731,
+   107,
+   46,
+   163688,
+   236787,
+   8982,
+   236782,
+   7777,
+   236787,
+   52,
+   42762,
+   1816,
+   528,
+   496,
+   2129,
+   52,
+   236764,
+   19031,
+   29616,
+   15921,
+   29616,
+   51686,
+   236779,
+   4503,
+   29616,
+   35951,
+   236787,
+   3397,
+   236764,
+   2084,
+   236787,
+   52,
+   166264,
+   1536,
+   52,
+   1263,
+   524,
+   1258,
+   29616,
+   7777,
+   236787,
+   52,
+   4675,
+   1258,
+   52,
+   236764,
+   7633,
+   29616,
+   15921,
+   29616,
+   1951,
+   29616,
+   2084,
+   236787,
+   52,
+   35410,
+   52,
+   1263,
+   947,
+   29616,
+   2084,
+   236787,
+   52,
+   35410,
+   52,
+   5237,
+   15979,
+   24845,
+   52,
+   947,
+   52,
+   236764,
+   52,
+   1951,
+   52,
+   1604,
+   2084,
+   236787,
+   52,
+   60688,
+   52,
+   1263,
+   2084,
+   236787,
+   52,
+   48832,
+   52,
+   1263,
+   2337,
+   29616,
+   7777,
+   236787,
+   52,
+   3202,
+   2479,
+   52,
+   236764,
+   2084,
+   236787,
+   52,
+   35410,
+   52,
+   5237,
+   15979,
+   24845,
+   52,
+   2337,
+   52,
+   236764,
+   52,
+   524,
+   1258,
+   52,
+   1604,
+   2084,
+   236787,
+   52,
+   60688,
+   52,
+   1807,
+   47,
+   106,
+   107,
+   105,
+   2364,
+   107,
+   40943,
+   623,
+   1580,
+   236775,
+   532,
+   756,
+   7705,
+   236789,
+   642,
+   1457,
+   2620,
+   236783,
+   870,
+   2234,
+   236842,
+   106,
+   107,
+   105,
+   4368,
+   107,
+   100,
+   45518,
+   107,
+   101
+  ]
+ },
+ {
+  "name": "case17",
+  "messages": [
+   {
+    "role": "system",
+    "content": "sys"
+   },
+   {
+    "role": "user",
+    "content": "a"
+   },
+   {
+    "role": "assistant",
+    "content": "b"
+   },
+   {
+    "role": "user",
+    "content": "c"
+   },
+   {
+    "role": "assistant",
+    "content": "d"
+   },
+   {
+    "role": "user",
+    "content": "e"
+   }
+  ],
+  "enable_thinking": true,
+  "text": "<bos><|turn>system\n<|think|>\nsys<turn|>\n<|turn>user\na<turn|>\n<|turn>model\nb<turn|>\n<|turn>user\nc<turn|>\n<|turn>model\nd<turn|>\n<|turn>user\ne<turn|>\n<|turn>model\n",
+  "ids": [
+   2,
+   105,
+   9731,
+   107,
+   98,
+   107,
+   16648,
+   106,
+   107,
+   105,
+   2364,
+   107,
+   236746,
+   106,
+   107,
+   105,
+   4368,
+   107,
+   236763,
+   106,
+   107,
+   105,
+   2364,
+   107,
+   236755,
+   106,
+   107,
+   105,
+   4368,
+   107,
+   236753,
+   106,
+   107,
+   105,
+   2364,
+   107,
+   236744,
+   106,
+   107,
+   105,
+   4368,
+   107
+  ]
+ },
+ {
+  "name": "case18",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "content": "Let me check.",
+    "tool_calls": [
+     {
+      "id": "c9",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Paris",
+        "days": 2
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c9",
+    "content": "rain"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Look up weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       },
+       "days": {
+        "type": "integer",
+        "description": "Days ahead"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "text": "<bos><|turn>system\n<|tool>declaration:get_weather{description:<|\"|>Look up weather<|\"|>,parameters:{properties:{city:{description:<|\"|>City<|\"|>,type:<|\"|>STRING<|\"|>},days:{description:<|\"|>Days ahead<|\"|>,type:<|\"|>INTEGER<|\"|>},unit:{enum:[<|\"|>c<|\"|>,<|\"|>f<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nWhat is the weather in Paris?<turn|>\n<|turn>model\n<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,days:2}<tool_call|><|tool_response>response:get_weather{value:<|\"|>rain<|\"|>}<tool_response|>Let me check.<turn|>\n",
+  "ids": [
+   2,
+   105,
+   9731,
+   107,
+   46,
+   163688,
+   236787,
+   828,
+   236779,
+   19323,
+   236782,
+   7777,
+   236787,
+   52,
+   13908,
+   872,
+   7606,
+   52,
+   236764,
+   19031,
+   29616,
+   15921,
+   29616,
+   13319,
+   29616,
+   7777,
+   236787,
+   52,
+   17698,
+   52,
+   236764,
+   2084,
+   236787,
+   52,
+   35410,
+   52,
+   1263,
+   14356,
+   29616,
+   7777,
+   236787,
+   52,
+   34826,
+   7531,
+   52,
+   236764,
+   2084,
+   236787,
+   52,
+   86752,
+   52,
+   1263,
+   6805,
+   29616,
+   24626,
+   24845,
+   52,
+   236755,
+   52,
+   236764,
+   52,
+   236760,
+   52,
+   1604,
+   2084,
+   236787,
+   52,
+   35410,
+   52,
+   5237,
+   15979,
+   24845,
+   52,
+   13319,
+   52,
+   1604,
+   2084,
+   236787,
+   52,
+   60688,
+   52,
+   1807,
+   47,
+   106,
+   107,
+   105,
+   2364,
+   107,
+   3689,
+   563,
+   506,
+   7606,
+   528,
+   9079,
+   236881,
+   106,
+   107,
+   105,
+   4368,
+   107,
+   48,
+   6639,
+   236787,
+   828,
+   236779,
+   19323,
+   236782,
+   13319,
+   236787,
+   52,
+   50429,
+   52,
+   236764,
+   14356,
+   236787,
+   236778,
+   236783,
+   49,
+   50,
+   6275,
+   236787,
+   828,
+   236779,
+   19323,
+   236782,
+   2394,
+   236787,
+   52,
+   1256,
+   52,
+   236783,
+   51,
+   6481,
+   786,
+   2426,
+   236761,
+   106,
+   107
+  ]
+ },
+ {
+  "name": "case19",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a haiku"
+   },
+   {
+    "role": "assistant",
+    "content": "Autumn wind"
+   }
+  ],
+  "continue_final": true,
+  "text": "<bos><|turn>user\nWrite a haiku<turn|>\n<|turn>model\nAutumn wind",
+  "ids": [
+   2,
+   105,
+   2364,
+   107,
+   6974,
+   496,
+   678,
+   20517,
+   106,
+   107,
+   105,
+   4368,
+   107,
+   66410,
+   6573
+  ]
+ }
+]

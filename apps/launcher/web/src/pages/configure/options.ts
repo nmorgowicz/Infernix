@@ -27,6 +27,7 @@ import type { Control } from "./controls";
 const offloaded = (model: ModelArtifact) => model.offloaded_experts;
 const flashNext = (model: ModelArtifact) => model.needs_ngram_volume;
 const qwen35 = (model: ModelArtifact) => !model.needs_ngram_volume;
+const gemma4 = (model: ModelArtifact) => model.model_type === "gemma4_text";
 const vision = (model: ModelArtifact) => model.has_vision;
 const fp4Local = (model: ModelArtifact) => /fp4[-_]?local/i.test(`${model.recipe ?? ""} ${model.name} ${model.file_name}`);
 /** Flash-Next conversions whose routed experts are NVIDIA's W4A4 NVFP4 (recipe A and Dense8). */
@@ -119,6 +120,16 @@ const CONTEXT: FormSection = {
       placeholder: "default",
       min: 128,
       step: 128,
+      more: true,
+      when: (model) => !gemma4(model),
+    },
+    {
+      kind: "auto",
+      flag: "--prefill-chunk",
+      label: "Prefill chunk",
+      help: "Gemma 4: auto chooses the largest 2048/1024/512/256/128 chunk fitting the complete requested context and VRAM headroom; never shrinks context. Unset uses 128.",
+      placeholder: "128 (default)",
+      when: gemma4,
       more: true,
     },
     {
@@ -732,7 +743,8 @@ const SAMPLING: FormSection = {
   controls: [
     { kind: "number", flag: "--temperature", label: "Temperature", help: "Process-level override; request fields still win.", placeholder: "model preset", min: 0, step: 0.05 },
     { kind: "number", flag: "--top-p", label: "Top-p", help: "Process-level override.", placeholder: "model preset", min: 0, max: 1, step: 0.01 },
-    { kind: "number", flag: "--top-k", label: "Top-k", help: "Process-level override (0..20; 0 = top-20 cap).", placeholder: "model preset", min: 0, max: 20 },
+    { kind: "number", flag: "--top-k", label: "Top-k", help: "Qwen process-level override (0..20; 0 = top-20 cap).", placeholder: "model preset", min: 0, max: 20, when: (model) => !gemma4(model) },
+    { kind: "number", flag: "--top-k", label: "Top-k", help: "Gemma 4 process-level override (0..64; 0 uses the model's preset width, normally 64).", placeholder: "model preset", min: 0, max: 64, when: gemma4 },
     { kind: "number", flag: "--min-p", label: "Min-p", help: "Process-level override.", placeholder: "model preset", min: 0, max: 1, step: 0.01 },
     { kind: "number", flag: "--presence-penalty", label: "Presence penalty", help: "Process-level override.", placeholder: "model preset", step: 0.1 },
     { kind: "number", flag: "--frequency-penalty", label: "Frequency penalty", help: "Process-level override.", placeholder: "0", step: 0.1 },

@@ -420,6 +420,7 @@ int main(int argc, char** argv) {
         engine_options.a8_activations           = cli.a8_activations;
         engine_options.embedding_host           = cli.embedding_host;
         engine_options.prefill_chunk            = cli.prefill_chunk;
+        engine_options.prefill_chunk_auto       = cli.prefill_chunk_auto;
         engine_options.kv_cache                 = cli.kv_cache;
         engine_options.gemma4_qk                = cli.gemma4_qk;
         engine_options.logits_dtype             = cli.logits_dtype;

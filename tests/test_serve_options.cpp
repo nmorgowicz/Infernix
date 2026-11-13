@@ -54,6 +54,23 @@ std::string write_config(const std::string& text) {
 
 int main() {
     int failures       = 0;
+    const auto auto_chunk = parse({"infernix-serve", "model.ninfer", "--prefill-chunk", "auto"});
+    failures += check(auto_chunk.prefill_chunk_auto && auto_chunk.prefill_chunk == 0 &&
+                          !parse({"infernix-serve", "model.ninfer"}).prefill_chunk_auto,
+                      "prefill auto must be distinct from the unset model default");
+    const auto numeric_chunk = parse({"infernix-serve", "model.ninfer", "--prefill-chunk", "auto",
+                                       "--prefill-chunk", "256"});
+    failures += check(numeric_chunk.prefill_chunk == 256 && !numeric_chunk.prefill_chunk_auto &&
+                          parse({"infernix-serve", "model.ninfer", "--prefill-chunk", "256",
+                                 "--prefill-chunk", "auto"}).prefill_chunk_auto,
+                      "last prefill chunk option must replace both numeric and auto state");
+    failures += check(!parse_error({"infernix-serve", "model.ninfer", "--prefill-chunk", "0"}).empty(),
+                      "explicit prefill chunk zero must not mean auto");
+    for (const char* top_k : {"0", "20", "21", "64"}) {
+        failures += check(parse({"infernix-serve", "model.ninfer", "--top-k", top_k})
+                                  .sampling_overrides.top_k == std::stoi(top_k),
+                          "generic serve top-k parser must accept the full Gemma domain");
+    }
     failures += check(parse({"infernix-serve", "model.ninfer"}).rope_yarn_factor == 1.0F,
                       "serving YaRN must default off");
     for (const auto* host : {"127.0.0.1", "127.1.2.3", "localhost", "::1", "[::1]"}) {
@@ -1095,7 +1112,7 @@ int main() {
                       "server sampling flags did not preserve explicit values and zeros");
     bool oversized_top_k_rejected = false;
     try {
-        (void)parse({"infernix-serve", "model.ninfer", "--top-k", "21"});
+        (void)parse({"infernix-serve", "model.ninfer", "--top-k", "65"});
     } catch (const std::invalid_argument&) { oversized_top_k_rejected = true; }
     failures += check(oversized_top_k_rejected,
                       "server accepted top_k beyond the executable candidate domain");

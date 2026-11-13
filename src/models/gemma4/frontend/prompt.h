@@ -3,6 +3,7 @@
 #include "infernix/types.h"
 #include "models/gemma4/ngram.h"
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -35,9 +36,24 @@ public:
 private:
     PreparedPrompt(std::vector<TokenId> tokens, PromptSummary summary)
         : tokens_(std::move(tokens)), summary_(summary) {}
+
+    // A declared tool's name ("" for none) and the tokens of "call:<name>", which follow
+    // `<|tool_call>` when a tool choice forces the call.
+    struct ToolOpener {
+        std::string name;
+        std::vector<TokenId> tokens;
+    };
+
     std::vector<TokenId> tokens_;
     PromptSummary summary_{};
     PromptPreparationStats stats_{};
+    std::vector<ToolOpener> tool_openers_;
+    std::vector<std::string> tool_jsons_;
+    std::string continuation_content_;
+    TokenId tool_call_open_ = -1;
+    TokenId channel_close_  = -1;
+    // "call:" or "call:<name>" once a tool choice has forced the call into the prompt.
+    std::optional<std::string> forced_call_;
     friend class Frontend;
     friend class Program;
 };

@@ -45,6 +45,26 @@ int check(bool condition, const char* message) {
 
 int run_tests() {
     int failures      = 0;
+    const auto auto_chunk = parse({"infernix-cli", "model.ninfer", "--prompt", "x",
+                                    "--prefill-chunk", "auto"});
+    failures += check(auto_chunk.prefill_chunk_auto && auto_chunk.prefill_chunk == 0 &&
+                          !parse({"infernix-cli", "model.ninfer", "--prompt", "x"}).prefill_chunk_auto,
+                      "CLI prefill auto must not replace the unset model default");
+    const auto numeric_chunk = parse({"infernix-cli", "model.ninfer", "--prompt", "x",
+                                       "--prefill-chunk", "auto", "--prefill-chunk", "256"});
+    failures += check(numeric_chunk.prefill_chunk == 256 && !numeric_chunk.prefill_chunk_auto &&
+                          parse({"infernix-cli", "model.ninfer", "--prompt", "x",
+                                 "--prefill-chunk", "256", "--prefill-chunk", "auto"}).prefill_chunk_auto,
+                      "CLI last prefill chunk flag must replace numeric and auto state");
+    failures += check(rejects([] {
+                          (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x",
+                                       "--prefill-chunk", "0"});
+                      }), "explicit CLI prefill zero must not mean auto");
+    for (const char* top_k : {"0", "20", "21", "64"}) {
+        failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--top-k", top_k})
+                                  .sampling.top_k == std::stoi(top_k),
+                          "generic CLI top-k parser must accept the full Gemma domain");
+    }
     const auto choice = parse({"infernix", "model.ninfer", "--prompt", "hello", "--choice", "",
                                "--choice", "a|b", "--choice", "你好"});
     failures += check(choice.choices == std::vector<std::string>{"", "a|b", "你好"},
@@ -444,7 +464,7 @@ int run_tests() {
                       "CLI accepted an unknown log level");
     failures +=
         check(rejects([] {
-                  (void)parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--top-k", "21"});
+                  (void)parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--top-k", "65"});
               }),
               "CLI accepted top_k beyond the executable candidate domain");
     // --expert-state: absent keeps the default (the artifact path + .expert-state), "off" disables.

@@ -149,6 +149,20 @@ int test_basic_request_and_resolution() {
         parse_openai_responses_create_request(body, limits());
 
     int failures = 0;
+    for (const int top_k : {0, 20, 21, 64}) {
+        GenerationRequest generation;
+        generation.sampling.top_k = top_k;
+        failures += check(to_request_options(generation, {}, {}, true).execution.sampling.top_k == top_k,
+                          "request translation narrowed the Gemma sampling domain");
+    }
+    for (const int top_k : {-1, 65}) {
+        GenerationRequest generation;
+        generation.sampling.top_k = top_k;
+        failures += check(api_error([&] {
+                              (void)to_request_options(generation, {}, {}, true);
+                          }).param == "top_k",
+                          "request translation accepted top-k outside the generic domain");
+    }
     failures += check(request.prompt.model == "qwen3.6-27b", "model parsed");
     failures += check(request.prompt.input_turns.size() == 1 &&
                           request.prompt.input_turns[0].role == infernix::ChatRole::User &&

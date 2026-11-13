@@ -1,4 +1,8 @@
 #include "serve/http_server.h"
+#include "http_loopback_harness.h"
+#include "serve/translate.h"
+
+#include <atomic>
 
 #include <nlohmann/json.hpp>
 
@@ -20,10 +24,98 @@ int check(bool condition, const char* message) {
     return 1;
 }
 
+class AliasBackend final : public infernix::serve::test::LoopbackBackend {
+public:
+    AliasBackend() : LoopbackBackend("artifact-gemma") {}
+
+    infernix::serve::PreparedRequest prepare(
+        const infernix::serve::GenerationRequest& request,
+        infernix::serve::GenerationConsumerMode mode,
+        infernix::GenerationObservationOptions observation,
+        std::function<bool()> cancelled) const override {
+        const auto translated = infernix::serve::to_request_options(request, {}, {}, true);
+        top_k.store(translated.execution.sampling.top_k.value_or(-1));
+        return LoopbackBackend::prepare(request, mode, observation, std::move(cancelled));
+    }
+
+    infernix::serve::GenerationOutcome run(
+        infernix::serve::PreparedRequest& request, const infernix::serve::StreamSink*,
+        std::function<bool()>) override {
+        infernix::serve::GenerationOutcome outcome;
+        outcome.text = "answer";
+        outcome.prompt_tokens = request.prompt_tokens;
+        outcome.completion_tokens = 1;
+        outcome.finish_reason = infernix::FinishReason::StopToken;
+        return outcome;
+    }
+
+    mutable std::atomic<int> top_k{-1};
+};
+
+int test_model_aliases() {
+    int failures = 0;
+    for (const bool any_name : {false, true}) {
+        AliasBackend backend;
+        infernix::serve::ServeOptions options;
+        options.model_id_override = "131k";
+        options.any_model_name = any_name;
+        options.log_stats_interval_ms = 0;
+        options.log_stats_panel = false;
+        httplib::Server probe;
+        options.port = probe.bind_to_any_port("127.0.0.1");
+        probe.stop();
+        auto logger = std::make_shared<spdlog::logger>(
+            "alias-test", std::make_shared<spdlog::sinks::null_sink_mt>());
+        infernix::serve::HttpServer server(options, std::move(logger));
+        if (!server.bind()) { return failures + check(false, "alias server could not bind"); }
+        server.attach(backend);
+        std::thread listener([&] { (void)server.listen(); });
+        httplib::Client client("127.0.0.1", options.port);
+        client.set_read_timeout(5, 0);
+        const auto catalog = client.Get("/v1/models");
+        failures += check(catalog && catalog->status == 200 &&
+                              Json::parse(catalog->body).at("data").size() == 1 &&
+                              Json::parse(catalog->body).at("data")[0].at("id") == "131k",
+                          "model catalog must list only the public alias");
+        const auto private_model = client.Get("/v1/models/artifact-gemma");
+        failures += check(private_model && private_model->status == 404,
+                          "model catalog must not expose the artifact name behind an alias");
+        Json body{{"model", any_name ? "client-hardcoded-name" : "131k"},
+                  {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})},
+                  {"top_k", 64}, {"max_tokens", 1}};
+        const auto chat = client.Post("/v1/chat/completions", body.dump(), "application/json");
+        failures += check(chat && chat->status == 200 &&
+                              Json::parse(chat->body).at("model") == "131k" && backend.top_k == 64,
+                          "Chat must accept top-k 64 and report the served alias, not the requested name");
+        body["top_k"] = 65;
+        const auto wide = client.Post("/v1/chat/completions", body.dump(), "application/json");
+        failures += check(wide && wide->status == 400,
+                          "Chat must refuse top-k outside the generic domain");
+        body["top_k"] = 20;
+        body["model"] = "other-name";
+        const auto other = client.Post("/v1/chat/completions", body.dump(), "application/json");
+        failures += check(other && other->status == (any_name ? 200 : 404),
+                          "--any-model-name must be opt-in");
+        body["model"] = "";
+        const auto empty = client.Post("/v1/chat/completions", body.dump(), "application/json");
+        failures += check(empty && empty->status >= 400,
+                          "--any-model-name must not accept an empty model");
+        Json response{{"model", any_name ? "client-hardcoded-name" : "131k"}, {"input", "hello"}};
+        const auto result = client.Post("/v1/responses", response.dump(), "application/json");
+        failures += check(result && result->status == 200 &&
+                              Json::parse(result->body).at("model") == "131k",
+                          "Responses must also report the served alias");
+        server.stop();
+        listener.join();
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
     int failures = 0;
+    failures += test_model_aliases();
     using infernix::serve::api_route_pattern;
     using infernix::serve::canonical_api_path;
 

@@ -1516,8 +1516,8 @@ void parse_generation_fields(const Json& body, GenerationRequest& request) {
         (*request.sampling.top_p < 0.0 || *request.sampling.top_p > 1.0)) {
         bad_request("top_p must be in [0,1]", "top_p");
     }
-    if (request.sampling.top_k && (*request.sampling.top_k < 0 || *request.sampling.top_k > 20)) {
-        bad_request("top_k must be in [0,20]", "top_k");
+    if (request.sampling.top_k && (*request.sampling.top_k < 0 || *request.sampling.top_k > 64)) {
+        bad_request("top_k must be in [0,64]", "top_k");
     }
 }
 

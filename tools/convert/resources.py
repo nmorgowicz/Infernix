@@ -27,8 +27,9 @@ SAMPLING_FIELDS = (
 )
 
 
-def validate_sampling(value: dict, path: Path) -> None:
-    """The presets src/models/qwen3_5/frontend/frontend.cpp sampling_presets accepts."""
+def validate_sampling(value: dict, path: Path, *, architecture: str) -> None:
+    """Validate presets against the consuming architecture's sampler domain."""
+    max_top_k = 64 if architecture == "Gemma4ForCausalLM" else 20
     unknown = set(value) - {"thinking", "non_thinking", "source"}
     if unknown:
         raise ValueError(f"{path}: unknown sampling members {sorted(unknown)}")
@@ -48,8 +49,8 @@ def validate_sampling(value: dict, path: Path) -> None:
             if isinstance(x, bool) or not isinstance(x, (int, float)) or not low <= x <= high:
                 raise ValueError(f"{path}: {mode}.{field} must be a number in [{low},{high}]")
         top_k = preset.get("top_k")
-        if type(top_k) is not int or not 1 <= top_k <= 20:
-            raise ValueError(f"{path}: {mode}.top_k must be an integer in [1,20]")
+        if type(top_k) is not int or not 1 <= top_k <= max_top_k:
+            raise ValueError(f"{path}: {mode}.top_k must be an integer in [1,{max_top_k}]")
         if preset.get("repetition_penalty", 1) != 1:
             raise ValueError(f"{path}: {mode}.repetition_penalty must be 1 (the sampler has none)")
 
@@ -223,6 +224,7 @@ def load_resources(
     model_dir: Path,
     *,
     vocab_size: int,
+    architecture: str,
     vision_config: Mapping[str, int] | None = None,
     overrides: Mapping[str, str | Path] | None = None,
 ) -> tuple[dict[str, dict[str, str]], dict[str, bytes], int, tuple[int, ...]]:
@@ -252,7 +254,7 @@ def load_resources(
                     raise ValueError(f"{path}: resource must contain a JSON object")
                 parsed[role] = value
                 if role == "sampling.json":
-                    validate_sampling(value, path)
+                    validate_sampling(value, path, architecture=architecture)
                 if component == "vision":
                     for field, config_field in (
                         ("patch_size", "patch_size"),
@@ -271,21 +273,21 @@ def load_resources(
             payloads[object_id] = data
     tokenizer_json = parsed["tokenizer.json"]
     tokenizer_config = parsed["tokenizer_config.json"]
-    if _normalize_qwen_split(tokenizer_json):
+    if architecture != "Gemma4ForCausalLM" and _normalize_qwen_split(tokenizer_json):
         payloads["resource/text/tokenizer.json"] = _dump_json(tokenizer_json)
         print(
             "normalized tokenizer.json split pattern to the standard Qwen pattern",
             flush=True,
         )
     config_changed = False
-    if _normalize_added_decoder(tokenizer_json, tokenizer_config):
+    if architecture != "Gemma4ForCausalLM" and _normalize_added_decoder(tokenizer_json, tokenizer_config):
         print(
             "built tokenizer_config.json added_tokens_decoder "
             f"({len(tokenizer_config['added_tokens_decoder'])} tokens)",
             flush=True,
         )
         config_changed = True
-    if _normalize_prefix_semantics(tokenizer_config):
+    if architecture != "Gemma4ForCausalLM" and _normalize_prefix_semantics(tokenizer_config):
         print(
             "normalized tokenizer_config.json prefix semantics "
             "(add_bos_token/add_prefix_space=false, pad_token=<|endoftext|>)",

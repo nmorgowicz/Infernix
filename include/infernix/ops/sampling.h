@@ -26,6 +26,12 @@ enum SamplePurpose : std::int32_t {
     kSamplePurposeSpeculativeBlockAccept = 7,
 };
 
+// Candidate capacities of the sampling pipeline. kSamplingFastTopK is the original 20-wide
+// pipeline; kSamplingMaxTopK is the wide pipeline that serves top_k 21..64. Each sampling launch
+// and its workspace query select exactly one of the two as `top_k_capacity`.
+inline constexpr std::int32_t kSamplingFastTopK = 20;
+inline constexpr std::int32_t kSamplingMaxTopK  = 64;
+
 // Borrowed round operand. Positions are contiguous packed vocabulary masks; null disables it.
 // Each consumed position must have at least one legal token. The caller carries dead-end status
 // separately and supplies a safe filler for dead/unreachable speculative positions.
@@ -38,7 +44,7 @@ struct SamplingMask {
 // [token_domain] committed generated-token occurrence-count array used by both penalties.
 struct SamplingConfig {
     float temperature          = 0.0f; // <= 0 => greedy argmax over allowed tokens
-    std::int32_t top_k         = 20;   // runtime contract is [1,20]; Op defensively caps otherwise
+    std::int32_t top_k         = 20;   // honored in [1,top_k_capacity]; see sample()
     float top_p                = 1.0f; // >= 1 => disabled
     float min_p                = 0.0f; // <= 0 => disabled
     float presence_penalty     = 0.0f;
@@ -68,10 +74,12 @@ struct SamplingConfig {
 // Caller-owned transient capacity for every parallel sampling-lane count in the inclusive
 // interval. For sample(), one lane is one batch row; speculative acceptance uses the same
 // workspace substrate for its verification columns. token_domain is the fixed route profile.
-// Invalid profiles or intervals throw; a legal single-block route returns zero.
-[[nodiscard]] std::size_t sampling_workspace_capacity_bytes(std::int32_t token_domain,
-                                                            std::int32_t min_lanes,
-                                                            std::int32_t max_lanes);
+// top_k_capacity selects the pipeline (kSamplingFastTopK or kSamplingMaxTopK; anything else
+// throws) and must equal the value later passed to sample(); the wide pipeline needs more
+// workspace. Invalid profiles or intervals throw; a legal single-block route returns zero.
+[[nodiscard]] std::size_t sampling_workspace_capacity_bytes(
+    std::int32_t token_domain, std::int32_t min_lanes, std::int32_t max_lanes,
+    std::int32_t top_k_capacity = kSamplingFastTopK);
 
 /**
  * Produces one token id per independent request row. `logits` is contiguous FP32 or BF16
@@ -92,8 +100,11 @@ struct SamplingConfig {
  *
  * A greedy row selects min argmax_v adjusted_v and skips filters and RNG. Candidates for a
  * positive-temperature row are sorted by adjusted_v descending with lower token id breaking
- * ties. Per-row top_k
- * in [1,19] keeps that many candidates; top_k<=0 or top_k>=20 keeps min(20,token_domain).
+ * ties. Per-row top_k in [1,top_k_capacity-1] keeps that many candidates; top_k<=0 or
+ * top_k>=top_k_capacity keeps min(top_k_capacity,token_domain). Truncation is exact: the kept
+ * set is the first top_k entries of that order, so a row whose top_k is at most 20 draws the
+ * same token from the 20-wide and the 64-wide pipeline. `top_k_capacity` is kSamplingFastTopK
+ * or kSamplingMaxTopK and must match the workspace query.
  * Candidate weights are exp(adjusted_v/temperature-max). min_p removes the suffix below
  * min_p*max_weight; top_p keeps the shortest remaining prefix whose cumulative weight reaches
  * top_p times the pre-truncation candidate weight. At least the best candidate remains, the
@@ -120,7 +131,8 @@ struct SamplingConfig {
  */
 void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
             const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,
-            WorkspaceArena& workspace, cudaStream_t stream);
+            WorkspaceArena& workspace, cudaStream_t stream,
+            std::int32_t top_k_capacity = kSamplingFastTopK);
 
 // Adds every id in the contiguous non-empty I32 token_ids vector to the contiguous I32
 // [token_domain] committed count array. IDs must be in [0,token_domain).

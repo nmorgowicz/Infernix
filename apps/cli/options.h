@@ -47,6 +47,7 @@ struct Options {
     bool a8_activations            = false; // EngineOptions::a8_activations
     bool embedding_host            = false; // EngineOptions::embedding_host
     std::uint32_t prefill_chunk  = 0; // 0: the model's default (EngineOptions)
+    bool prefill_chunk_auto = false; // Gemma4 only; 0 remains the model's default
     int device                   = 0;
 
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;

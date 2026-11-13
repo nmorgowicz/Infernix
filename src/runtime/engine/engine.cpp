@@ -112,6 +112,9 @@ EngineOptions normalize_options(EngineOptions engine_options, models::Architectu
         }
         if (engine_options.prefill_chunk == 0) { engine_options.prefill_chunk = 128; }
     }
+    if (engine_options.prefill_chunk_auto && architecture != models::Architecture::Gemma4) {
+        throw std::invalid_argument("--prefill-chunk auto is supported only for Gemma4");
+    }
     runtime::validate_engine_options(engine_options, architecture, offloaded_experts);
     if (drafters) {
         runtime::resolve_auto_speculative_backend(engine_options, architecture, offloaded_experts, *drafters,
@@ -776,6 +779,12 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
     // A token constraint chooses every output step itself, the end of the turn included.
     if (!resolved_options.execution.constraint.empty()) {
         resolved_options.execution.thinking.end_turn_in_thinking = true;
+    }
+
+    // A required or named tool choice is a forced opener appended to the Gemma prompt.
+    if (auto* gemma_prompt = std::get_if<models::gemma4::PreparedPrompt>(&prompt.impl_->value)) {
+        models::gemma4::Frontend::apply_tool_choice(*gemma_prompt, resolved_options.tool_choice);
+        prompt.impl_->summary = gemma_prompt->summary();
     }
 
     const PromptSummary prompt_summary = prompt.impl_->summary;

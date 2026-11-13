@@ -156,7 +156,12 @@ int test_envelope_and_field_policy() {
     failures += check(api_param([&] { (void)parse(body); }) == "temperature",
                       "Anthropic temperature range was not enforced");
     body          = base_request();
-    body["top_k"] = 21;
+    for (const int top_k : {0, 20, 21, 64}) {
+        body["top_k"] = top_k;
+        failures += check(parse(body).generation.sampling.top_k == top_k,
+                          "Anthropic parser must preserve the full Gemma sampling domain");
+    }
+    body["top_k"] = 65;
     failures += check(api_param([&] { (void)parse(body); }) == "top_k",
                       "Engine top_k range was not enforced");
     body                  = base_request();

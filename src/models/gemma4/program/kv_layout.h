@@ -6,6 +6,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
+#include <limits>
 #include <stdexcept>
 
 namespace infernix::models::gemma4 {
@@ -54,6 +56,29 @@ struct KvLayerLayout {
         layout.code_page_bytes = rows * head_dim * sizeof(std::uint16_t);
     }
     return layout;
+}
+
+// The callback plans each chunk independently, including its sliding rings, workspace,
+// I/O and graph allowance, and returns the reservation for the full page-rounded context.
+template <class Reservation>
+[[nodiscard]] std::uint32_t auto_prefill_chunk(std::uint32_t max_context,
+                                               std::size_t available_bytes,
+                                               std::size_t headroom_bytes,
+                                               Reservation&& reservation) {
+    constexpr std::uint32_t page = ops::kGemma4KvPageTokens;
+    if (max_context == 0 || max_context > std::numeric_limits<std::uint32_t>::max() - (page - 1)) {
+        throw std::invalid_argument("Gemma4 auto prefill requires a valid max_context");
+    }
+    const auto capacity = ((max_context + page - 1) / page) * page;
+    if (headroom_bytes <= available_bytes) {
+        const auto budget = available_bytes - headroom_bytes;
+        for (const std::uint32_t chunk : {2048U, 1024U, 512U, 256U, 128U}) {
+            if (reservation(chunk, capacity) <= budget) { return chunk; }
+        }
+    }
+    throw std::runtime_error(
+        "Gemma4 --prefill-chunk auto: no candidate fits the complete page-rounded "
+        "--max-context and VRAM headroom; reduce context or free device memory");
 }
 
 } // namespace infernix::models::gemma4

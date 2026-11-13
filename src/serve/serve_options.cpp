@@ -299,8 +299,8 @@ std::string serve_usage_text(const char* argv0) {
            "MODEL & CONTEXT\n"
            "  --max-context N            max context tokens per request (default 8192)\n"
            "  --max-concurrency N        max concurrent sequences, 1-8 (default 1)\n"
-           "  --prefill-chunk N          prefill chunk size in tokens, multiple of 128\n"
-           "                             (default 16384 with offloaded experts, 1024 otherwise)\n"
+           "  --prefill-chunk N|auto     positive multiple of 128; auto is Gemma4-only\n"
+           "                             (default: Gemma4 128, offloaded Qwen 16384, other Qwen 1024)\n"
            "  --use-original-int8-prefill-kernel\n"
            "                             prefill INT8 KV with the original prompt kernel at\n"
            "                             the requested chunk (default: the fast kernel, chunk\n"
@@ -648,7 +648,7 @@ std::string serve_usage_text(const char* argv0) {
            "and request fields override individual values)\n"
            "  --temperature F            sampling temperature (0-2)\n"
            "  --top-p F                  nucleus probability (0-1)\n"
-           "  --top-k N                  keep the top N tokens (0-20)\n"
+           "  --top-k N                  Gemma4 0..64, Qwen 0..20; 0 uses Gemma preset or Qwen 20\n"
            "  --min-p F                  minimum token probability (0-1)\n"
            "  --presence-penalty F       -2 to 2\n"
            "  --frequency-penalty F      -2 to 2\n"
@@ -860,10 +860,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.max_http_clients = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-http-clients"), "max-http-clients"));
         } else if (arg == "--prefill-chunk") {
-            options.prefill_chunk = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
-            if (options.prefill_chunk == 0) {
-                throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
+            const auto chunk = require_value("--prefill-chunk");
+            options.prefill_chunk_auto = std::string_view(chunk) == "auto";
+            options.prefill_chunk = options.prefill_chunk_auto ? 0U : static_cast<std::uint32_t>(
+                parse_nonnegative_int(chunk, "prefill-chunk"));
+            if (!options.prefill_chunk_auto && options.prefill_chunk == 0) {
+                throw std::invalid_argument("--prefill-chunk must be auto or a positive multiple of 128");
             }
         } else if (arg == "--use-original-int8-prefill-kernel") {
             options.original_int8_prefill_kernel = true;
@@ -1260,7 +1262,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 parse_float_in(require_value("--top-p"), "top-p", 0.0f, 1.0f);
         } else if (arg == "--top-k") {
             const int top_k = parse_nonnegative_int(require_value("--top-k"), "top-k");
-            if (top_k > 20) { throw std::invalid_argument("top-k must be in [0,20]"); }
+            if (top_k > 64) { throw std::invalid_argument("top-k must be in [0,64]"); }
             options.sampling_overrides.top_k = top_k;
         } else if (arg == "--min-p") {
             options.sampling_overrides.min_p =

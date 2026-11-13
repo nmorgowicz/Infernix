@@ -233,7 +233,8 @@ def build_model(
     _metadata_checks(store, config)
     records = {"text": {"config": config}}
     refs, resources, count, special = load_resources(
-        base.root, vocab_size=config["vocab_size"], overrides=resource_overrides)
+        base.root, vocab_size=config["vocab_size"], architecture=config["architectures"][0],
+        overrides=resource_overrides)
     for component, resource_refs in refs.items():
         records[component]["resources"] = resource_refs
     model = Model(records, resources=resources, token_count=count, special_token_ids=special)

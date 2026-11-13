@@ -690,6 +690,7 @@ def build_model(
     refs, resources, count, special = load_resources(
         base.root,
         vocab_size=config["vocab_size"],
+        architecture=config["architectures"][0],
         vision_config=records["vision"]["config"] if "vision" in selected else None,
         overrides=resource_overrides,
     )
@@ -738,7 +739,8 @@ def build_dflash2_companion(base: SafetensorsSource, draft: SafetensorsSource) -
     target = text_config(base.config, mtp=False)
     config = draft_config(draft.config, target, "dflash2")
     config["target_config"] = {key: target[key] for key in DFLASH2_TARGET_FIELDS}
-    _, _, count, special = load_resources(base.root, vocab_size=target["vocab_size"])
+    _, _, count, special = load_resources(
+        base.root, vocab_size=target["vocab_size"], architecture=target["architectures"][0])
     if config["dflash_config"]["selector_top_k"] > count:
         raise ValueError("DFlash2 selector_top_k exceeds public token domain")
     model = Model(

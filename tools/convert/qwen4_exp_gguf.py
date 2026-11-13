@@ -378,6 +378,7 @@ def build_model(
     refs, resources, count, special = load_resources(
         base.root,
         vocab_size=config["vocab_size"],
+        architecture=config["architectures"][0],
         vision_config=records["vision"]["config"] if "vision" in selected else None,
         overrides=resource_overrides,
     )

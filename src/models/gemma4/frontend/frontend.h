@@ -47,7 +47,9 @@ public:
     [[nodiscard]] const StopPolicy& default_stop_policy() const noexcept;
     [[nodiscard]] const ModelSamplingDefaults& sampling_defaults() const noexcept;
     [[nodiscard]] ChatTemplateRoleSupport chat_template_role_support() const noexcept;
-    static void apply_tool_choice(const PreparedPrompt&, const ToolChoice& tool_choice);
+    // A required tool choice opens the call in the prompt (`<|tool_call>call:NAME`), so Engine::submit
+    // applies it to the prepared prompt before the output session is built.
+    static void apply_tool_choice(PreparedPrompt& prompt, const ToolChoice& tool_choice);
 private:
     struct Impl;
     std::shared_ptr<const Impl> impl_;

@@ -1314,12 +1314,14 @@ AcceptExpected accept_state_oracle(const std::vector<std::int32_t>& drafts, std:
     return expected;
 }
 
+// capacity selects the sampling pipeline; live_extent (default K) is the number of live drafts.
 int execute_accept_case(const std::string& label, const std::vector<std::int32_t>& target_tokens,
                         const std::vector<std::uint16_t>& logits_bits, int physical_rows,
                         const std::vector<std::int32_t>& drafts, std::int32_t initial_length,
                         int token_domain, ops::SamplingConfig config,
                         const std::vector<std::int32_t>& initial_token_counts,
-                        const AcceptExpected& expected) {
+                        const AcceptExpected& expected, int capacity = ops::kSamplingFastTopK,
+                        int live_extent = -1) {
     const int k              = static_cast<int>(drafts.size());
     DeviceBuffer d_targets   = to_device(target_tokens);
     DeviceBuffer d_logits    = upload_logits(logits_bits);
@@ -1334,7 +1336,7 @@ int execute_accept_case(const std::string& label, const std::vector<std::int32_t
     GuardedDeviceBuffer d_sampled(static_cast<std::size_t>(k + 1) * sizeof(std::int32_t));
     GuardedDeviceBuffer d_num(sizeof(std::int32_t));
     GuardedDeviceBuffer d_accepted(sizeof(std::int32_t));
-    DeviceBuffer d_extent = to_device<std::int32_t>({k});
+    DeviceBuffer d_extent = to_device<std::int32_t>({live_extent < 0 ? k : live_extent});
     initialize(d_length, std::vector<std::int32_t>{initial_length});
     initialize(d_token, std::vector<std::int32_t>{-1234567});
     d_sampled.fill(0x9d);
@@ -1351,11 +1353,13 @@ int execute_accept_case(const std::string& label, const std::vector<std::int32_t
     Tensor num_sampled(d_num.data(), DType::I32, {1});
     Tensor accepted(d_accepted.data(), DType::I32, {1});
     const std::size_t workspace_bytes =
-        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, 1, 1);
+        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, 1, 1,
+                                                                       capacity);
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
     ops::speculative_accept_greedy_drafts(
         targets, logits, draft_tensor, extent, length, token, sampled, num_sampled, accepted,
-        token_domain, static_cast<const ops::SamplingConfig*>(d_config.p), workspace, nullptr);
+        token_domain, static_cast<const ops::SamplingConfig*>(d_config.p), workspace, nullptr,
+        capacity);
     cuda_synchronize();
 
     int failures = verify_exact((label + " sampled").c_str(), read<std::int32_t>(d_sampled, k + 1),
@@ -1395,6 +1399,230 @@ int execute_accept_case(const std::string& label, const std::vector<std::int32_t
     if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
         std::cerr << label << ": workspace query/execution high-water mismatch\n";
         ++failures;
+    }
+    return failures;
+}
+
+// ---- top_k exactness (20-wide and 64-wide pipelines) ------------------------------------------
+//
+// Every column holds 100 scattered candidate tokens (flat: one shared logit, so top_k keeps the
+// k lowest ids; graded: distinct decreasing logits, rotated per column). The host ranks them by
+// the adjusted logit exactly as sampling.h specifies, and the case is built so the outcome
+// depends on the truncation edge:
+//   A: draft 0 is accepted, draft 1 is the (k+1)-th ranked token (probability zero, always
+//      rejected), and the residual correction lands on the k-th ranked token of column 1.
+//   B: one draft is accepted and the bonus token is the k-th ranked token of column 1.
+//   C: the draft is the (k+1)-th ranked token and the correction is the k-th ranked token.
+// A seed is searched on the host (the RNG is counter based) so each draw falls in the interval
+// that selects that rank. Truncating one candidate too early or too late changes the result.
+
+float topk_host_uniform(std::uint64_t seed, int position, int purpose) {
+    const auto mix = [](std::uint64_t value) {
+        value += 0x9E3779B97F4A7C15ull;
+        value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9ull;
+        value = (value ^ (value >> 27)) * 0x94D049BB133111EBull;
+        return value ^ (value >> 31);
+    };
+    std::uint64_t key = seed;
+    key               = mix(key ^ (static_cast<std::uint64_t>(static_cast<std::uint32_t>(position)) *
+                     0xD1B54A32D192ED03ull));
+    key               = mix(key ^ (static_cast<std::uint64_t>(static_cast<std::uint32_t>(purpose))
+                     << 21));
+    return static_cast<float>(static_cast<std::uint32_t>(key >> 40)) * (1.0f / 16777216.0f);
+}
+
+std::vector<int> topk_scattered_ids(int token_domain, int count) {
+    count            = std::min(count, (token_domain - 2) / 2);
+    const int stride = std::max(2, (token_domain - 2) / count);
+    std::vector<int> ids(static_cast<std::size_t>(count));
+    for (int j = 0; j < count; ++j) {
+        ids[static_cast<std::size_t>(j)] = 1 + j * stride + (j * 37) % (stride / 2 + 1);
+    }
+    return ids;
+}
+
+struct TopKRanking {
+    std::vector<int> order;   // all candidates, best first
+    std::vector<double> prob; // normalized weight of the first `support` entries
+};
+
+TopKRanking topk_rank_column(const std::vector<float>& column, const std::vector<int>& ids,
+                             int top_k, float temperature, float presence,
+                             const std::vector<int>& overlay) {
+    std::vector<std::pair<float, int>> items;
+    for (const int id : ids) {
+        float value = column[static_cast<std::size_t>(id)];
+        if (presence != 0.0f && std::find(overlay.begin(), overlay.end(), id) != overlay.end()) {
+            value -= presence;
+        }
+        items.emplace_back(value, id);
+    }
+    std::sort(items.begin(), items.end(), [](const auto& a, const auto& b) {
+        return a.first != b.first ? a.first > b.first : a.second < b.second;
+    });
+    TopKRanking ranking;
+    for (const auto& item : items) { ranking.order.push_back(item.second); }
+    const int support = std::min<int>(top_k, static_cast<int>(items.size()));
+    double total      = 0.0;
+    for (int r = 0; r < support; ++r) {
+        const double w = std::exp((static_cast<double>(items[static_cast<std::size_t>(r)].first) -
+                                   static_cast<double>(items.front().first)) /
+                                  temperature);
+        ranking.prob.push_back(w);
+        total += w;
+    }
+    for (double& p : ranking.prob) { p /= total; }
+    return ranking;
+}
+
+struct TopKSpecCase {
+    int domain;
+    int physical_rows;
+    int top_k;
+    bool flat;
+    bool penalties;
+    int k_total;   // draft tensor width; k_total+1 columns (17 wide columns leave the multi-block route)
+    char scenario; // 'A', 'B' or 'C'
+    int capacity;
+};
+
+int topk_spec_case(const TopKSpecCase& s) {
+    constexpr float kTemperature = 1.0f;
+    const float presence         = s.penalties ? 0.5f : 0.0f;
+    const int cols               = s.k_total + 1;
+    const int support            = s.top_k;
+    const std::vector<int> ids   = topk_scattered_ids(s.domain, 100);
+
+    std::vector<std::vector<float>> columns(static_cast<std::size_t>(cols));
+    std::vector<std::uint16_t> logits_bits(static_cast<std::size_t>(s.physical_rows) * cols);
+    for (int c = 0; c < cols; ++c) {
+        auto& column = columns[static_cast<std::size_t>(c)];
+        column.assign(static_cast<std::size_t>(s.physical_rows), -20.0f);
+        for (std::size_t j = 0; j < ids.size(); ++j) {
+            column[static_cast<std::size_t>(ids[j])] =
+                s.flat ? 3.0f : 3.0f - 0.0371f * static_cast<float>((j + 7 * static_cast<std::size_t>(c)) % 100);
+        }
+        if (s.physical_rows > s.domain) {
+            column[static_cast<std::size_t>(s.domain)]            = 100.0f;
+            column[static_cast<std::size_t>(s.physical_rows) - 1] = 200.0f;
+        }
+        round_to_bf16(column);
+        for (int row = 0; row < s.physical_rows; ++row) {
+            logits_bits[static_cast<std::size_t>(c) * s.physical_rows + row] =
+                f32_to_bf16(column[static_cast<std::size_t>(row)]);
+        }
+    }
+
+    const TopKRanking col0 = topk_rank_column(columns[0], ids, support, kTemperature, presence, {});
+    const int accepted_rank = s.flat ? support - 1 : 0;
+    const int d0 = s.scenario == 'C' ? col0.order[static_cast<std::size_t>(support)]
+                                     : col0.order[static_cast<std::size_t>(accepted_rank)];
+    const TopKRanking col1 = topk_rank_column(columns[1], ids, support, kTemperature, presence,
+                                              s.scenario == 'C' ? std::vector<int>{}
+                                                                : std::vector<int>{d0});
+    const TopKRanking& edge = s.scenario == 'C' ? col0 : col1;
+    const int terminal      = edge.order[static_cast<std::size_t>(support) - 1];
+    const double last_p     = edge.prob[static_cast<std::size_t>(support) - 1];
+    const float lo          = static_cast<float>(1.0 - 0.9 * last_p);
+    const float hi          = static_cast<float>(1.0 - 0.1 * last_p);
+    const float accept_cap  = static_cast<float>(
+        0.5 * col0.prob[static_cast<std::size_t>(accepted_rank)]);
+
+    const int extent         = s.scenario == 'A' ? 2 : 1;
+    const int accepted       = s.scenario == 'C' ? 0 : 1;
+    const int initial_length = 4093;
+    std::vector<std::int32_t> drafts(static_cast<std::size_t>(s.k_total), col0.order[0]);
+    drafts[0] = d0;
+    if (s.scenario == 'A') { drafts[1] = col1.order[static_cast<std::size_t>(support)]; }
+
+    // Draw positions follow the kernel: accept at L+i+1, correction at L+i+1 for the rejected
+    // column, bonus at L+extent+1.
+    const int terminal_position = initial_length + (s.scenario == 'C' ? 1 : 2);
+    const int terminal_purpose  = s.scenario == 'B' ? ops::kSamplePurposeSpeculativeBonus
+                                                    : ops::kSamplePurposeSpeculativeCorrection;
+    std::uint64_t seed = 0;
+    for (std::uint64_t candidate = 1; candidate < 200000000ull && seed == 0; ++candidate) {
+        const float u_terminal = topk_host_uniform(candidate, terminal_position, terminal_purpose);
+        if (!(u_terminal > lo && u_terminal < hi)) { continue; }
+        if (s.scenario != 'C' &&
+            !(topk_host_uniform(candidate, initial_length + 1,
+                                ops::kSamplePurposeSpeculativeAccept) < accept_cap)) {
+            continue;
+        }
+        seed = candidate;
+    }
+    if (seed == 0) { throw std::runtime_error("top-k speculative case found no seed"); }
+
+    ops::SamplingConfig config{};
+    config.temperature            = kTemperature;
+    config.top_k                  = s.top_k;
+    config.presence_penalty       = presence;
+    config.seed                   = seed;
+    const AcceptExpected expected = accept_state_oracle(drafts, accepted, terminal, initial_length);
+    const std::string label =
+        std::string("speculative top_k=") + std::to_string(s.top_k) + " cap=" +
+        std::to_string(s.capacity) + " " + (s.flat ? "flat" : "graded") +
+        (s.penalties ? " penalty" : "") + " scenario=" + s.scenario +
+        " domain=" + std::to_string(s.domain) + " cols=" + std::to_string(cols);
+    return execute_accept_case(label, std::vector<std::int32_t>(static_cast<std::size_t>(cols), 0),
+                               logits_bits, s.physical_rows, drafts, initial_length, s.domain,
+                               config, std::vector<std::int32_t>(static_cast<std::size_t>(s.domain), 0),
+                               expected, s.capacity, extent);
+}
+
+int topk_spec_contract() {
+    int failures   = 0;
+    const auto run = [&](int domain, int physical, int top_k, int k_total, int capacity) {
+        for (const bool flat : {true, false}) {
+            for (const bool penalties : {false, true}) {
+                for (const char scenario : {'A', 'B', 'C'}) {
+                    failures += topk_spec_case(
+                        {domain, physical, top_k, flat, penalties, k_total, scenario, capacity});
+                }
+            }
+        }
+    };
+    // 21..64 candidates on every route: single block, smallest multi-block, the Qwen-shaped
+    // vocabulary, Gemma's vocabulary, and the 17-column single-block fallback.
+    for (const int top_k : {21, 33, 64}) {
+        run(200, 200, top_k, 3, ops::kSamplingMaxTopK);
+        run(257, 257, top_k, 3, ops::kSamplingMaxTopK);
+        run(248077, 248320, top_k, 3, ops::kSamplingMaxTopK);
+        run(262144, 262144, top_k, 5, ops::kSamplingMaxTopK);
+        run(4097, 4100, top_k, 16, ops::kSamplingMaxTopK);
+    }
+    for (const int top_k : {32, 47, 63}) { run(262144, 262144, top_k, 3, ops::kSamplingMaxTopK); }
+    run(248077, 248320, 40, 16, ops::kSamplingMaxTopK);
+    run(524288, 524288, 64, 3, ops::kSamplingMaxTopK);
+    // top_k <= 20 reaches the same result on the 20-wide and the 64-wide pipeline.
+    for (const int top_k : {5, 13, 20}) {
+        for (const int capacity : {ops::kSamplingFastTopK, ops::kSamplingMaxTopK}) {
+            run(257, 257, top_k, 3, capacity);
+            run(262144, 262144, top_k, 3, capacity);
+            run(4097, 4100, top_k, 16, capacity);
+        }
+    }
+    return failures;
+}
+
+int topk_workspace_query_contract() {
+    int failures           = 0;
+    const std::size_t fast = ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
+        262144, 1, 15, 1, 2);
+    const std::size_t wide = ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
+        262144, 1, 15, 1, 2, ops::kSamplingMaxTopK);
+    if (fast == 0 || wide <= fast ||
+        wide != 2 * ops::sampling_workspace_capacity_bytes(262144, 16, 16, ops::kSamplingMaxTopK)) {
+        std::cerr << "speculative accept wide workspace query is inconsistent\n";
+        ++failures;
+    }
+    for (const int bad : {0, 21, 65}) {
+        try {
+            (void)ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(257, 1, 3, 1, 1,
+                                                                                 bad);
+            std::cerr << "speculative accept workspace accepted capacity " << bad << '\n';
+            ++failures;
+        } catch (const std::invalid_argument&) {}
     }
     return failures;
 }
@@ -2882,6 +3110,8 @@ INFERNIX_OP_TEST(speculative_round) {
     failures += argmax_nan_column_case();
     failures += deterministic_sampling_case();
     failures += batched_sampling_workspace_stride_case();
+    failures += topk_workspace_query_contract();
+    failures += topk_spec_contract();
     failures += sample_sparse_drafts_case();
     std::size_t sparse_peak = 0;
     for (int k = 1; k <= 31; ++k) {

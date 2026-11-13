@@ -81,6 +81,11 @@ Args default_args(const LibraryScan& scan, const ScannedModel& model, const Host
     const bool gemma4 = model.model_type == "gemma4_text";
     add("--max-concurrency", gemma4 ? "1" : "2");
     add("--kv-dtype", gemma4 ? "fp8" : "int8");
+    if (gemma4) {
+        add("--prefill-chunk", "auto");
+        add("--logits-dtype", "bf16");
+        add("--no-prefix-reuse");
+    }
 
     // Speculative decoding: the Engine picks the drafter measured fastest for the artifact.
     const ScannedDrafter* drafter = model.accepts_draft_model ? best_drafter(scan, model) : nullptr;
@@ -103,7 +108,7 @@ Args default_args(const LibraryScan& scan, const ScannedModel& model, const Host
     if (model.family == "qwen3.5-122b-a10b") {
         // The experts take most of the RAM; a 4 GiB Host prefix cache leaves it to them.
         add("--host-context-mib", "4096");
-    } else if (!model.offloaded_experts && host.ram_total_bytes >= (32ull << 30)) {
+    } else if (!gemma4 && !model.offloaded_experts && host.ram_total_bytes >= (32ull << 30)) {
         // Dense models leave RAM free: a larger Host tier keeps more agent sessions cached.
         const double mib = static_cast<double>(host.ram_total_bytes) / (1 << 20) * 0.55;
         const auto rounded = static_cast<std::uint64_t>(std::floor(mib / 1000.0) * 1000.0);

@@ -84,7 +84,7 @@ void speculative_one_hot_proposals_launch(const Tensor& skip_rows, const Tensor&
 
 namespace {
 
-template <class Logit>
+template <int Cap, class Logit>
 void accept_greedy_drafts(const Tensor& target_tokens, const Tensor& logits, const Tensor& drafts,
                           const Tensor& current_extents, Tensor& lengths, Tensor& anchors,
                           Tensor& licensed_tokens, Tensor& licensed_counts, Tensor& accepted,
@@ -93,10 +93,10 @@ void accept_greedy_drafts(const Tensor& target_tokens, const Tensor& logits, con
     const std::int32_t physical_rows = logits.ne[0];
     const std::int32_t cols          = drafts.ne[0] + 1;
     const std::int32_t batch         = drafts.ne[1];
-    const SamplingWorkspaceLayout layout =
-        make_sampling_workspace_layout(token_domain, cols, kSpeculativeSamplerMaxColumns);
+    const SamplingWorkspaceLayout layout = make_sampling_workspace_layout(
+        token_domain, cols, sampler_speculative_max_columns(Cap), Cap);
     if (!layout.multiblock) {
-        speculative_accept_greedy_drafts_kernel<Logit><<<batch, kSamplerBlock, 0, stream>>>(
+        speculative_accept_greedy_drafts_kernel<Logit, Cap><<<batch, kSamplerBlock, 0, stream>>>(
             static_cast<const std::int32_t*>(target_tokens.data), static_cast<const Logit*>(logits.data),
             static_cast<const std::int32_t*>(drafts.data),
             static_cast<const std::int32_t*>(current_extents.data),
@@ -109,13 +109,13 @@ void accept_greedy_drafts(const Tensor& target_tokens, const Tensor& logits, con
         return;
     }
     const std::int32_t partial_blocks = div_up(token_domain, kSamplerPartialTileItems);
-    const std::int32_t groups         = sampler_group_count(partial_blocks);
+    const std::int32_t groups         = sampler_group_count(partial_blocks, Cap);
     const SamplingWorkspace scratch   = layout.bind(workspace);
     const dim3 partial_grid(static_cast<unsigned int>(partial_blocks),
                             static_cast<unsigned int>(cols), static_cast<unsigned int>(batch));
     CUDA_CHECK(pdl::launch_consumer(
         {dim3(partial_grid), dim3(kSamplerBlock), 0, stream},
-        speculative_sampling_partial_topk_kernel<Logit>, static_cast<const Logit*>(logits.data),
+        speculative_sampling_partial_topk_kernel<Logit, Cap>, static_cast<const Logit*>(logits.data),
         static_cast<const std::int32_t*>(drafts.data),
         static_cast<const std::int32_t*>(current_extents.data), configs, token_domain,
         physical_rows, cols, drafts.ne[0], scratch, layout.bytes));
@@ -125,7 +125,7 @@ void accept_greedy_drafts(const Tensor& target_tokens, const Tensor& logits, con
                                   static_cast<unsigned int>(batch));
     CUDA_CHECK(pdl::launch_consumer(
         {dim3(batched_group_grid), dim3(kSamplerGroupBlock), 0, stream},
-        speculative_sampling_group_finalize_kernel<Logit, false>,
+        speculative_sampling_group_finalize_kernel<Logit, false, false, Cap>,
         static_cast<const std::int32_t*>(target_tokens.data),
         static_cast<const std::int32_t*>(drafts.data), nullptr, nullptr,
         static_cast<const std::int32_t*>(current_extents.data),
@@ -197,6 +197,23 @@ void accept_sparse_drafts(const Tensor& target_tokens, const Tensor& logits, con
     CUDA_CHECK(cudaGetLastError());
 }
 
+template <int Cap>
+void accept_greedy_drafts_capacity(const Tensor& target_tokens, const Tensor& logits, const Tensor& drafts,
+                                   const Tensor& current_extents, Tensor& lengths, Tensor& anchors,
+                                   Tensor& licensed_tokens, Tensor& licensed_counts, Tensor& accepted,
+                                   std::int32_t token_domain, const SamplingConfig* configs,
+                                   DeviceSpan workspace, cudaStream_t stream) {
+    if (logits.dtype == DType::FP32) {
+        accept_greedy_drafts<Cap, float>(target_tokens, logits, drafts, current_extents, lengths, anchors,
+                                         licensed_tokens, licensed_counts, accepted, token_domain, configs,
+                                         workspace, stream);
+    } else {
+        accept_greedy_drafts<Cap, __nv_bfloat16>(target_tokens, logits, drafts, current_extents, lengths,
+                                                 anchors, licensed_tokens, licensed_counts, accepted,
+                                                 token_domain, configs, workspace, stream);
+    }
+}
+
 } // namespace
 
 void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const Tensor& logits,
@@ -205,15 +222,15 @@ void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const 
                                              Tensor& licensed_tokens, Tensor& licensed_counts,
                                              Tensor& accepted, std::int32_t token_domain,
                                              const SamplingConfig* configs, DeviceSpan workspace,
-                                             cudaStream_t stream) {
-    if (logits.dtype == DType::FP32) {
-        accept_greedy_drafts<float>(target_tokens, logits, drafts, current_extents, lengths, anchors,
-                                    licensed_tokens, licensed_counts, accepted, token_domain, configs, workspace,
-                                    stream);
+                                             cudaStream_t stream, std::int32_t top_k_capacity) {
+    if (top_k_capacity == kSamplerWideCandidates) {
+        accept_greedy_drafts_capacity<kSamplerWideCandidates>(
+            target_tokens, logits, drafts, current_extents, lengths, anchors, licensed_tokens,
+            licensed_counts, accepted, token_domain, configs, workspace, stream);
     } else {
-        accept_greedy_drafts<__nv_bfloat16>(target_tokens, logits, drafts, current_extents, lengths, anchors,
-                                            licensed_tokens, licensed_counts, accepted, token_domain, configs,
-                                            workspace, stream);
+        accept_greedy_drafts_capacity<kSamplerFastCandidates>(
+            target_tokens, logits, drafts, current_extents, lengths, anchors, licensed_tokens,
+            licensed_counts, accepted, token_domain, configs, workspace, stream);
     }
 }
 

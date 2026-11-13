@@ -1,5 +1,7 @@
 // Engine option combinations the Engine rejects before it reads any artifact.
 #include "infernix/engine.h"
+#include "models/gemma4/program/kv_layout.h"
+#include "runtime/contract/sampling.h"
 
 #include <cuda_runtime.h>
 
@@ -35,13 +37,65 @@ std::string construction_error(infernix::EngineOptions options, bool& invalid_ar
 } // namespace
 
 int main() {
+    int failures = 0;
+    for (const std::int32_t cap : {20, 64}) {
+        infernix::ModelSamplingDefaults defaults;
+        defaults.max_top_k = cap;
+        defaults.thinking.top_k = cap;
+        defaults.non_thinking.top_k = cap;
+        for (const auto mode : {infernix::SamplingMode::Thinking, infernix::SamplingMode::NonThinking}) {
+            for (const std::int32_t top_k : {0, cap}) {
+                const auto resolved = infernix::runtime::resolve_sampling(
+                    defaults, mode, infernix::SamplingOverrides{.top_k = top_k}, false);
+                failures += check(resolved.top_k == cap, "model-specific top-k cap was not retained");
+            }
+            bool refused = false;
+            try {
+                (void)infernix::runtime::resolve_sampling(
+                    defaults, mode, infernix::SamplingOverrides{.top_k = cap + 1}, false);
+            } catch (const std::invalid_argument&) { refused = true; }
+            failures += check(refused, "runtime accepted top-k above the loaded model's ceiling");
+        }
+    }
+    // CPU-only sizing: every width gets its own reservation for the complete rounded
+    // context, and equality includes headroom. No candidate may trade away context.
+    for (const std::uint32_t expected : {2048U, 1024U, 512U, 256U, 128U}) {
+        std::uint32_t previous = 4096;
+        const auto chunk = infernix::models::gemma4::auto_prefill_chunk(
+            257, 1000 + 320 + expected, 1000,
+            [&](std::uint32_t candidate, std::uint32_t capacity) {
+                failures += check(candidate < previous && capacity == 320,
+                                  "auto prefill must plan descending widths with the whole rounded context");
+                previous = candidate;
+                return static_cast<std::size_t>(capacity + candidate);
+            });
+        failures += check(chunk == expected, "auto prefill did not choose the largest fitting chunk");
+    }
+    for (const std::size_t available : {1447U, 999U}) {
+        bool refused = false;
+        try {
+            (void)infernix::models::gemma4::auto_prefill_chunk(
+                257, available, 1000,
+                [](std::uint32_t chunk, std::uint32_t capacity) {
+                    return static_cast<std::size_t>(capacity + chunk);
+                });
+        } catch (const std::runtime_error&) { refused = true; }
+        failures += check(refused, "auto prefill must refuse rather than shrink context or headroom");
+    }
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
         std::cout << "SKIP: no usable CUDA device\n";
-        return 77;
+        return failures == 0 ? 77 : 1;
     }
-    int failures = 0;
     infernix::EngineOptions options;
+    failures += check(!options.prefill_chunk_auto && options.prefill_chunk == 0,
+                      "unset Engine prefill chunk must not enable auto");
+    options.prefill_chunk_auto = true;
+    bool auto_invalid = false;
+    const auto auto_error = construction_error(options, auto_invalid);
+    failures += check(auto_invalid && auto_error.find("only for Gemma4") != std::string::npos,
+                      "non-Gemma Engine accepted automatic prefill chunks");
+    options.prefill_chunk_auto = false;
     // Both artifact extensions name the same container; any other is rejected before reading.
     for (const char* artifact : {"absent-artifact.infernix", "absent-artifact.ninfer"}) {
         bool invalid_argument  = false;

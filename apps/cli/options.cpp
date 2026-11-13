@@ -184,7 +184,7 @@ ReasoningEffort parse_reasoning_effort(std::string_view text) {
 std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.infernix> (--prompt <text>|--messages <messages.json>)\n"
-           "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
+           "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N|auto] [--max-new N]\n"
            "       [--device N]\n"
            "       [--kv-dtype bf16|bf16p|int8|fp8|nvfp4|k8v4|vq2|k4v2] [--logits-dtype fp32|bf16]\n"
            "       [--gemma4-qk bf16|fp8]\n"
@@ -228,8 +228,8 @@ std::string usage_text(const char* argv0) {
            "  --max-context N          max context tokens (default 2048)\n"
            "  --rope-yarn-factor F     startup-fixed YaRN, finite [1,4] (default 1);\n"
            "                           extends allowed ceiling only, not --max-context\n"
-           "  --prefill-chunk N        prefill chunk size in tokens, multiple of 128\n"
-           "                           (default 16384 with offloaded experts, 1024 otherwise)\n"
+           "  --prefill-chunk N|auto   positive multiple of 128; auto is Gemma4-only\n"
+           "                           (default: Gemma4 128, offloaded Qwen 16384, other Qwen 1024)\n"
            "  --max-new N              cap on generated tokens\n"
            "  --device N               CUDA device ordinal (default 0)\n"
            "  --ram-free-mib N         physical Host RAM in MiB that Infernix's weights,\n"
@@ -398,7 +398,7 @@ std::string usage_text(const char* argv0) {
            "SAMPLING\n"
            "  --temperature F          sampling temperature (0-2)\n"
            "  --top-p F                nucleus probability (0-1)\n"
-           "  --top-k N                keep the top N tokens\n"
+           "  --top-k N                Gemma4 0..64, Qwen 0..20; 0 uses Gemma preset or Qwen 20\n"
            "  --min-p F                minimum token probability (0-1)\n"
            "  --presence-penalty F     -2 to 2\n"
            "  --frequency-penalty F    -2 to 2\n"
@@ -510,9 +510,11 @@ Options parse_options(int argc, char** argv) {
                 options.vram_headroom_bytes = static_cast<std::size_t>(mib) << 20;
             }
         } else if (arg == "--prefill-chunk") {
-            options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
-            if (options.prefill_chunk == 0) {
-                throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
+            const auto chunk = value(arg);
+            options.prefill_chunk_auto = std::string_view(chunk) == "auto";
+            options.prefill_chunk = options.prefill_chunk_auto ? 0U : parse_u32(chunk, "prefill-chunk");
+            if (!options.prefill_chunk_auto && options.prefill_chunk == 0) {
+                throw std::invalid_argument("--prefill-chunk must be auto or a positive multiple of 128");
             }
         } else if (arg == "--device") {
             options.device = parse_device(value(arg));
@@ -676,7 +678,7 @@ Options parse_options(int argc, char** argv) {
             options.sampling.top_p = parse_float(value(arg), "top-p", 0.0F, 1.0F);
         } else if (arg == "--top-k") {
             const std::uint32_t top_k = parse_u32(value(arg), "top-k", true);
-            if (top_k > 20) { throw std::invalid_argument("--top-k must be in [0,20]"); }
+            if (top_k > 64) { throw std::invalid_argument("--top-k must be in [0,64]"); }
             options.sampling.top_k = static_cast<std::int32_t>(top_k);
         } else if (arg == "--min-p") {
             options.sampling.min_p = parse_float(value(arg), "min-p", 0.0F, 1.0F);

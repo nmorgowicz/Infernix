@@ -781,10 +781,12 @@ struct EngineOptions {
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
-    // Prompt tokens per prefill call, a multiple of 128; 0 takes the model's default: 16,384 for
-    // Qwen3.8-Flash-Next (its exact-route prefill measured identical across chunks), 1,024
-    // otherwise.
+    // Prompt tokens per prefill call, a multiple of 128; 0 takes the model's default:
+    // Gemma4 128, Qwen with offloaded experts 16,384, otherwise 1,024.
     std::uint32_t prefill_chunk        = 0;
+    // Gemma4 only: choose the largest 2048/1024/512/256/128 chunk that fits the complete
+    // requested context and VRAM headroom. Separate from 0 (unset), never reduces max_context.
+    bool prefill_chunk_auto = false;
     // INT8 KV prefills with the fast prompt-attention kernel and rounds prefill_chunk down to whole
     // prompt-attention waves. True selects the original INT8 prompt kernel at the requested chunk;
     // it requires the INT8 KV cache.
@@ -945,6 +947,10 @@ struct SamplingPreset {
 struct ModelSamplingDefaults {
     SamplingPreset thinking;
     SamplingPreset non_thinking;
+    // Largest top_k this model's sampling pipeline serves: 20 for the fast pipeline (Qwen), 64 for
+    // the wide one (Gemma 4). An explicit top_k above it is rejected; a request's top_k of 0
+    // resolves to the model's default candidate width (20, or the preset's top_k of a wide model).
+    std::int32_t max_top_k = 20;
 
     [[nodiscard]] constexpr const SamplingPreset& for_mode(SamplingMode mode) const noexcept {
         return mode == SamplingMode::Thinking ? thinking : non_thinking;

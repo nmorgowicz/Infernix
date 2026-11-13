@@ -130,9 +130,30 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& supplied, DeviceContext&
     if (options.max_context > geometry->config().text.max_position_embeddings) {
         throw std::invalid_argument("Gemma4 --max-context exceeds the artifact's native position capacity");
     }
+    const auto available = planned_free_after_weights(before.device_free, weight_bytes);
+    if (options.prefill_chunk_auto) {
+        try {
+            options.prefill_chunk = models::gemma4::auto_prefill_chunk(
+                options.max_context, available, headroom,
+                [&](std::uint32_t chunk, std::uint32_t capacity) {
+                    auto candidate = program_options(options);
+                    candidate.prefill_chunk = chunk;
+                    candidate.kv_capacity_tokens = capacity;
+                    const auto curve = Program::plan_device(
+                        *geometry, candidate, geometry->config().text.vocab_size).capacity_curve();
+                    return curve.reservation_bytes(capacity / curve.main_page_tokens);
+                });
+        } catch (const std::runtime_error& error) {
+            if (!planned) { throw; }
+            planned->architecture = "Gemma4ForCausalLM";
+            plan_readings(*planned, device.props.name, before, host_memory_snapshot(), options);
+            planned->vram.weights_bytes = weight_bytes;
+            plan_refuse(*planned, error.what());
+            return {};
+        }
+    }
     const auto request_plan = Program::plan_device(*geometry, program_options(options), geometry->config().text.vocab_size);
     const auto curve = request_plan.capacity_curve();
-    const auto available = planned_free_after_weights(before.device_free, weight_bytes);
     KvCapacityResolution resolution;
     if (planned) {
         planned->architecture = "Gemma4ForCausalLM";

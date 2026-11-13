@@ -277,7 +277,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--vram-headroom-mib N\|auto` | VRAM in MiB that startup sizing leaves free for the display and other programs (`auto` = 1024 with a display on the GPU or when that is unknown, 256 without). Qwen3.5: after `--kv-capacity auto` sizes the KV pool (requires `auto`). Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B): after the expert cache takes the rest ([details](qwen3_8-flash-next.md#vram)) | `auto` |
 | `--vram-past-budget` | Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B) on Windows: also size the expert cache into the VRAM the Windows per-process budget withholds (~0.6 GiB, ~240 more expert frames on an RTX 5090), measured at startup; that memory may be moved to system memory if another program needs VRAM ([details](qwen3_8-flash-next.md#vram)) | off |
 | `--expert-tail-skip R` | Artifacts with offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B), approximate: trades quality for decode speed. In decode and verification rounds, a routed expert missing from VRAM that every token of the round routes at top-k rank `R` or lower (`1..k-1`, 0-based, with k = 10 on Flash-Next and 8 on the 122B; k-1 skips least) is neither copied nor computed: it adds zero and the other experts keep their router weights. The output changes, is slightly worse, and depends on which experts the cache holds; prefill is unchanged; the reproducible route (`--reproducible`) refuses it. Strata does the same by default at rank 7 (`STRATA_ROUTE_TAIL_SKIP=7`) ([details](qwen3_8-flash-next.md#expert-tail-skip)) | off |
-| `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128; rounded down to whole prompt-attention waves (896 tokens for the 24-head model on RTX 5090) with INT8, NVFP4, FP8, K8V4, VQ2 or K4V2 KV unless an original prompt kernel is selected; with offloaded experts it is fitted down to the widest chunk whose prefill workspace the expert cache can lend (Qwen3.5-122B-A10B: with every lane's context full, at startup, with a warning naming both chunks; Qwen3.8-Flash-Next: [guide](qwen3_8-flash-next.md)) | `16384` with offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B), `1024` otherwise |
+| `--prefill-chunk N\|auto` | positive text-prefill chunk in multiples of 128. Gemma4-only `auto` chooses the largest of `2048`, `1024`, `512`, `256`, `128` whose per-width memory plan fits the complete page-rounded requested context plus VRAM headroom; it refuses if none fits and never shrinks context. Qwen quantized KV rounds chunks down to whole prompt-attention waves unless an original prompt kernel is selected; offloaded Qwen fits down to workspace its expert cache can lend ([Flash-Next guide](qwen3_8-flash-next.md)) | Gemma4 `128`, offloaded Qwen `16384`, other Qwen `1024`; omission is the model default, not auto; explicit `0` is refused |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
 | `--ram-free-mib N` | physical Host RAM in MiB that everything Infernix keeps in RAM (weights, offloaded experts, the n-gram table, the prefix cache) leaves free for other programs; startup refuses a lock that would take it, and Qwen3.8-Flash-Next plans every allocation against it in its RAM ledger | `8192` |
@@ -324,7 +324,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--greedy` | exact argmax decoding | off |
 | `--temperature F` | sampling temperature override | registered model/mode default |
 | `--top-p F` | nucleus-threshold override | registered model/mode default |
-| `--top-k N` | top-k-threshold override (`0..20`; zero selects the top-20 cap) | registered model/mode default |
+| `--top-k N` | top-k-threshold override (`0..64` for Gemma4, `0..20` for Qwen; zero uses Gemma4's preset candidate width, normally `64`, or Qwen's `20`; the loaded model enforces its ceiling) | registered model/mode default |
 | `--min-p F` | min-p-threshold override | registered model/mode default |
 | `--presence-penalty F` | presence-penalty override | registered model/mode default; `0` with an output constraint |
 | `--frequency-penalty F` | frequency-penalty override | registered model/mode default (`0`) |
@@ -344,6 +344,7 @@ and rendered prompt mode. The current official models use:
 | Qwen3.6-35B-A3B | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
 | Qwen3.8-Flash-Next | thinking | `1.0` | `0.95` | `20` | `0` | `0` |
 | Qwen3.8-Flash-Next | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
+| Gemma4 | thinking / non-thinking | `1.0` | `0.95` | `64` | `0` | `0` |
 
 Frequency penalty is `0` in every registered preset. Task-specific profiles such as Qwen's
 precise-coding profile use explicit sampling overrides.

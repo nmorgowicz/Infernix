@@ -33,6 +33,7 @@ def test_final_resources_override_defaults_without_hash_pinning(tmp_path):
     references, payloads, count, special = load_resources(
         tmp_path,
         vocab_size=4,
+        architecture="Qwen3_5ForCausalLM",
         overrides={"tokenizer.json": selected, "chat_template.jinja": template},
     )
     assert count == 3 and special == (2,)
@@ -67,7 +68,8 @@ def test_final_resources_keep_one_chat_template_authority(tmp_path):
     (tmp_path / "chat_template.jinja").write_text("checkpoint {{ messages }}")
 
     references, payloads, _, _ = load_resources(
-        tmp_path, vocab_size=2, overrides={"chat_template.jinja": template}
+        tmp_path, vocab_size=2, architecture="Qwen3_5ForCausalLM",
+        overrides={"chat_template.jinja": template}
     )
 
     stored = json.loads(payloads[references["text"]["tokenizer_config.json"]])
@@ -104,7 +106,8 @@ def test_missing_added_tokens_decoder_is_built_from_added_tokens(tmp_path):
         ],
     }
     _write_text_resources(tmp_path, tokenizer, {"bos_token": "a"})
-    references, payloads, count, special = load_resources(tmp_path, vocab_size=4)
+    references, payloads, count, special = load_resources(
+        tmp_path, vocab_size=4, architecture="Qwen3_5ForCausalLM")
     stored = json.loads(payloads[references["text"]["tokenizer_config.json"]])
     assert stored["added_tokens_decoder"] == {
         "2": {
@@ -140,7 +143,8 @@ def test_drifted_split_pattern_is_normalized_to_standard(tmp_path):
         },
     }
     _write_text_resources(tmp_path, tokenizer, {})
-    references, payloads, _, _ = load_resources(tmp_path, vocab_size=4)
+    references, payloads, _, _ = load_resources(
+        tmp_path, vocab_size=4, architecture="Qwen3_5ForCausalLM")
     stored = json.loads(payloads[references["text"]["tokenizer.json"]])
     assert (
         stored["pre_tokenizer"]["pretokenizers"][0]["pattern"]["Regex"]
@@ -177,7 +181,8 @@ def test_standard_tokenizer_assets_are_not_reserialized(tmp_path):
     (tmp_path / "tokenizer_config.json").write_bytes(cfg_bytes)
     (tmp_path / "chat_template.jinja").write_text("{{ messages }}")
     (tmp_path / "generation_config.json").write_text("{}")
-    references, payloads, _, _ = load_resources(tmp_path, vocab_size=4)
+    references, payloads, _, _ = load_resources(
+        tmp_path, vocab_size=4, architecture="Qwen3_5ForCausalLM")
     assert payloads[references["text"]["tokenizer.json"]] == tok_bytes
     assert payloads[references["text"]["tokenizer_config.json"]] == cfg_bytes
 
@@ -208,7 +213,8 @@ def test_defective_prefix_semantics_are_normalized(tmp_path):
         "tokenizer_class": "Qwen2Tokenizer",
     }
     _write_text_resources(tmp_path, tokenizer, config)
-    references, payloads, _, _ = load_resources(tmp_path, vocab_size=4)
+    references, payloads, _, _ = load_resources(
+        tmp_path, vocab_size=4, architecture="Qwen3_5ForCausalLM")
     stored = json.loads(payloads[references["text"]["tokenizer_config.json"]])
     # Every C++-required invariant now holds.
     assert stored["add_bos_token"] is False
@@ -218,3 +224,32 @@ def test_defective_prefix_semantics_are_normalized(tmp_path):
     # Untouched source fields are preserved, not dropped.
     assert stored["eos_token"] == "<|im_end|>"
     assert stored["tokenizer_class"] == "Qwen2Tokenizer"
+
+
+@pytest.mark.parametrize("architecture,cap", [
+    ("Gemma4ForCausalLM", 64),
+    ("Qwen3_5ForCausalLM", 20),
+    ("Qwen3_5MoeForCausalLM", 20),
+    ("Qwen4ExpForCausalLM", 20),
+])
+def test_sampling_resource_uses_architecture_ceiling(tmp_path, architecture, cap):
+    tokenizer = {"model": {"type": "BPE", "vocab": {"a": 0}}}
+    config = {"add_bos_token": True, "pad_token": "<pad>"}
+    _write_text_resources(tmp_path, tokenizer, config)
+    preset = dict(temperature=1.0, top_k=cap, top_p=0.95, min_p=0.0,
+                  presence_penalty=0.0, frequency_penalty=0.0)
+    sampling = tmp_path / "sampling.json"
+    sampling.write_text(json.dumps({"thinking": preset, "non_thinking": preset}))
+    refs, payloads, _, _ = load_resources(
+        tmp_path, vocab_size=1, architecture=architecture,
+        overrides={"sampling.json": sampling})
+    assert json.loads(payloads[refs["text"]["sampling.json"]])["thinking"]["top_k"] == cap
+    if architecture == "Gemma4ForCausalLM":
+        # Gemma's BOS/padding semantics must not be rewritten as Qwen's.
+        assert json.loads(payloads[refs["text"]["tokenizer_config.json"]]) == config
+    for invalid in (0, cap + 1, True):
+        preset["top_k"] = invalid
+        sampling.write_text(json.dumps({"thinking": preset, "non_thinking": preset}))
+        with pytest.raises(ValueError, match=rf"top_k must be an integer in \[1,{cap}\]"):
+            load_resources(tmp_path, vocab_size=1, architecture=architecture,
+                           overrides={"sampling.json": sampling})
