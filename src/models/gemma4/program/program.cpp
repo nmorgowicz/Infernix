@@ -886,6 +886,30 @@ MemorySummary Program::memory_summary() const noexcept {
     result.kv_capacity_increment_bytes = p.plan.curve.bytes_per_additional_main_page_group;
     return result;
 }
+MemoryUsage Program::memory_usage() const noexcept {
+    const auto& p = *impl_; MemoryUsage out;
+    const auto& storage = p.parameters.model.storage_stats();
+    // The materialized arena plus the row scales Parameters prepared from the FP8 projections.
+    out.device.weights = storage.device_capacity_bytes + p.parameters.derived_device_bytes();
+    // KV: every global and ring payload (codes and FP16 scales) and both page tables, all reserved at construction.
+    out.device.kv = p.plan.kv;
+    if (p.occupied) {
+        // The live request's tokens: global pages up to its frontier and the rings' filled share.
+        const std::uint32_t pages = p.plan.kv_pages;
+        const std::uint32_t used = std::min(pages, pages_for(std::max(p.fed, p.physical_written)));
+        const std::uint32_t rings = std::min(pages, ring_pages(p.options.prefill_chunk, p.config().sliding_window));
+        std::uint64_t bytes = 8ULL * used;
+        if (pages != 0) { bytes += p.global_payload_bytes * used / pages; }
+        if (rings != 0) { bytes += p.sliding_payload_bytes * std::min(rings, used) / rings; }
+        out.device.kv_used = std::min<std::uint64_t>(bytes, out.device.kv);
+    }
+    out.device.state = p.plan.io; // call inputs and outputs (hidden, head, sampler and distribution buffers)
+    out.device.workspace = p.workspace.capacity();
+    out.device.cuda_graphs = p.graph_measured_bytes;
+    out.host.weights = storage.pinned_bytes + storage.retained_host_bytes;
+    out.host.staging = kUploadStagingRingBytes + p.host_step.size();
+    return out;
+}
 void Program::reset_memory_peaks() noexcept { impl_->workspace.reset_peak(); }
 
 ScoreResult Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_target, const ScoreOptions& options) {

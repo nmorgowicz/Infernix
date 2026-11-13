@@ -276,6 +276,9 @@ public:
     [[nodiscard]] ScoreResult causal_score(PreparedPrompt&&, std::uint32_t, const ScoreOptions&);
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
+    // What the device and host hold now, by use (RuntimeStats::memory; the prefix cache's Host and SSD tiers and the
+    // headroom are the Engine's to fill). Read from the plan and arena sizes already known; engine thread, O(1).
+    [[nodiscard]] MemoryUsage memory_usage() const noexcept;
     void reset_memory_peaks() noexcept;
 private:
     std::unique_ptr<detail::ProgramImpl> impl_;
