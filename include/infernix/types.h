@@ -1326,6 +1326,11 @@ struct PromptOptions {
     // Claude Code does with its MCP tools): a well-formed call to an undeclared name stays a call for
     // the client to judge instead of turning into text. The prompt does not change.
     bool open_tool_names = false;
+    // On the constrained tool route, a non-strict tool that declares parameters may name only those
+    // (each once, in any order), and a value keeps a quoted `\n</parameter>\n<parameter=NAME>` whose
+    // NAME the call cannot take as its text (infernix-serve --tool-parameter-names declared). Off: names
+    // stay open. The prompt does not change.
+    bool declared_parameter_names = false;
 };
 
 enum class PromptCacheMarkerKind : std::uint8_t {
@@ -2243,6 +2248,9 @@ struct RuntimeStats {
     double no_progress_seconds              = 0.0;
     // Stalls the Engine healed after two minutes by failing the running and paused requests (cumulative).
     std::uint64_t no_progress_recoveries = 0;
+    // Units that ran out of device memory, recovered by failing the running and paused requests while the
+    // Engine kept serving (cumulative).
+    std::uint64_t device_memory_recoveries = 0;
     std::uint64_t preemptions               = 0;
     std::uint64_t snapshot_restores         = 0;
     std::uint64_t replay_restores           = 0;

@@ -1126,7 +1126,6 @@ public:
             diagnostic("sampled MTP drafts need the sparse acceptance's token domain; drafts stay one-hot",
                        DiagnosticLevel::Warning);
         }
-        walk_step_tokens_ = walk_step_tokens_from_environment();
         dflash_process_calibration_.reset();
         screened_head_ = options_.screened_lm_head;
         if (screened_head_ && !parameters_.output_head_screen) {
@@ -1850,6 +1849,42 @@ public:
         return out;
     }
 
+    // How far a binding (start_binding, bind_replay) got: what a failure part-way must give back.
+    enum class BindingStage : std::uint8_t { Taking, Pinned, Activating, Activated };
+
+    // Gives back a binding that failed part-way on lane `index` (out of device memory at a slot reset or a
+    // restore copy, fix sweep FS-01): the selection's own pins before its activation, the lane and what it
+    // took (release), and, after a failed activation, whose pins lie split between the selection and the
+    // lane, the cache, emptied once no lane maps it. The lane is free again, so the Engine's recovery finds
+    // nothing half bound.
+    void abandon_binding(std::uint32_t index, const std::optional<PrefixSelection>& selection,
+                         BindingStage stage) noexcept {
+        if (stage == BindingStage::Pinned && selection) { prefix_unpin(*selection); }
+        if (stage == BindingStage::Activating) { clear_prefix_on_release_ = true; }
+        release(index);
+    }
+
+    // Runs abandon_binding when its scope ends by an exception; a normal return (a shortage, a refusal, a
+    // staged binding) gives back what it must itself.
+    class BindingFailureGuard {
+    public:
+        BindingFailureGuard(ProgramImpl& self, std::uint32_t index, const std::optional<PrefixSelection>& selection,
+                            const BindingStage& stage) noexcept
+            : self_(self), index_(index), selection_(selection), stage_(stage) {}
+        ~BindingFailureGuard() {
+            if (std::uncaught_exceptions() > exceptions_) { self_.abandon_binding(index_, selection_, stage_); }
+        }
+        BindingFailureGuard(const BindingFailureGuard&)            = delete;
+        BindingFailureGuard& operator=(const BindingFailureGuard&) = delete;
+
+    private:
+        ProgramImpl& self_;
+        std::uint32_t index_;
+        const std::optional<PrefixSelection>& selection_;
+        const BindingStage& stage_;
+        int exceptions_ = std::uncaught_exceptions();
+    };
+
     // Stages the binding of `source` on `lane`: re-selects against the cache as it is now (crediting
     // a lane-resident snapshot), reserves the prompt plus one round, lends the Vision window
     // (vision_lend) and maps the cached blocks. The Begin the Engine published names the source's
@@ -1873,6 +1908,8 @@ public:
         const BasePlanImpl& b = *base.impl_;
         const auto& data      = qwen3_5::PreparedPromptAccess::view(*b.prompt);
         std::optional<PrefixSelection> selection;
+        BindingStage stage = BindingStage::Taking;
+        const BindingFailureGuard guard(*this, index, selection, stage);
         if (prefix_) {
             if (q.prefix && q.prefix->snapshot) {
                 selection = prefix_select(data, b, index, resume != nullptr);
@@ -1883,6 +1920,7 @@ public:
                 selection = prefix_root(data, b);
             }
             prefix_pin(*selection);
+            stage = BindingStage::Pinned;
         }
         lane.history.assign(data.token_ids.begin(), data.token_ids.end());
         lane.history.reserve(lane.history.size() + q.summary.effective_output_tokens + 1);
@@ -1938,7 +1976,9 @@ public:
                 }
             }
             const std::uint64_t restored = prefix_->counters().host_restore_bytes;
+            stage = BindingStage::Activating;
             prefix_activate(lane, index, *selection, *reservation, q.pages);
+            stage = BindingStage::Activated;
             lane.prefix.cached_tokens  = selection->cached_tokens;
             lane.prefix.restored_bytes = prefix_->counters().host_restore_bytes - restored;
             lane.reservation    = std::move(*reservation);
@@ -2115,6 +2155,8 @@ public:
         const qwen3_5::PreparedPromptData ledger = ledger_prompt(prompt, r);
         const std::uint32_t pages = binding_pages(b, r.target + 1U);
         std::optional<PrefixSelection> selection;
+        BindingStage stage = BindingStage::Taking;
+        const BindingFailureGuard guard(*this, index, selection, stage);
         if (prefix_) {
             // The pause's capture lands first, so the selection can see it.
             prefix_->drain();
@@ -2130,6 +2172,7 @@ public:
                                                        call_cost())
                                   : prefix::CallPlan{};
             prefix_pin(*selection);
+            stage = BindingStage::Pinned;
         }
         lane.history       = r.history;
         lane.prompt_tokens = r.prompt_tokens;
@@ -2179,7 +2222,9 @@ public:
                 }
             }
             const std::uint64_t restored = prefix_->counters().host_restore_bytes;
+            stage = BindingStage::Activating;
             prefix_activate(lane, index, *selection, *reservation, pages);
+            stage = BindingStage::Activated;
             lane.prefix.cached_tokens  = selection->cached_tokens;
             lane.prefix.restored_bytes = prefix_->counters().host_restore_bytes - restored;
             lane.prefix.taps.clear();
@@ -7369,12 +7414,15 @@ private:
     [[nodiscard]] std::uint64_t window_key() const noexcept;
     std::uint64_t walk_spans_ = 0, walk_calls_ = 0;
     std::uint64_t walk_prefetched_chunks_ = 0, prefetched_at_lease_ = 0; // chunks whose rows were prefetched
-    // Temporary switch INFERNIX_TMP_DECODE_SHARE_WALK_TOKENS (0, unset: off): while another lane
-    // decodes, a walk step enqueues about this many tokens of one-call work (layers * span tokens /
-    // L, at least one layer) instead of one call's, so the Engine's decode share interleaves with the
-    // span at finer steps. Step boundaries change only when work is enqueued, never a bit.
-    std::uint32_t walk_step_tokens_ = 0;
-    [[nodiscard]] static std::uint32_t walk_step_tokens_from_environment();
+    // While another lane decodes, a walk step enqueues about this many tokens of one-call work (layers *
+    // span tokens / L, at least one layer) instead of one call's, so decode rounds run between the steps
+    // of a long span (candidates TX-12, by the owner's rule of 2026-11-12: the fastest overall first, then
+    // the fairest). FP4-Local served, three lanes, two requests decoding 1,500 tokens beside a fresh
+    // 21K-token prompt, ABBA with three repeats a pass: the whole set's time -1.6..-2.1 % against one call's
+    // work a step (-0.1..+1.3 % against the later baseline pass alone), the prompt's TTFT level (2.90 vs
+    // 2.92 s), the decoding lanes' longest pause 1.63 -> 0.74 s. Step boundaries change only when work is
+    // enqueued, never a bit.
+    static constexpr std::uint32_t kWalkStepTokensBesideDecode = 4096;
     [[nodiscard]] std::uint32_t walk_step_layers(std::uint32_t index) const noexcept;
     static constexpr std::uint32_t kWalkMaxTokens = 65536;
     // A walk's MoE calls take up to this many columns (several chunks'): at 16,384 tokens the

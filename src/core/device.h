@@ -5,10 +5,38 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 
 namespace infernix {
 
+// A CUDA call found no device memory (cudaErrorMemoryAllocation: an allocation, a kernel's first launch,
+// which loads its module lazily, or WDDM paging an allocation back in for a stream's work). The error is
+// not sticky: once the work already enqueued has drained (settle_after_memory_exhausted) the device is
+// usable, so the caller gives up the unit of work that needed the memory and carries on. CUDA_CHECK
+// throws it; every other CUDA error aborts the process, as a lost context cannot be recovered.
+class DeviceMemoryExhausted : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+// cudaSuccess returns; cudaErrorMemoryAllocation is reported, cleared from the thread's last error and
+// thrown as DeviceMemoryExhausted; any other error is reported and aborts.
 void cuda_check(cudaError_t err, const char* expr, const char* file, int line);
+
+// After a DeviceMemoryExhausted: waits for every stream's enqueued work and clears an out-of-memory
+// error that work reports (the failed call's own, or an asynchronous one). True when the device is
+// usable again; false (reported) when it reports any other error, or keeps reporting no memory.
+[[nodiscard]] bool settle_after_memory_exhausted() noexcept;
+
+namespace testing {
+// Fault injection for recovery tests: on the calling thread only, the `after`-th later CUDA_CHECK of a
+// call that succeeded throws DeviceMemoryExhausted as if the call had found no device memory (the
+// call's work stays enqueued, as a failed launch's neighbours do). 0 disarms. Other threads are never
+// affected, so a test arms the thread that runs the work it targets.
+void arm_memory_exhausted_here(std::uint64_t after) noexcept;
+// DeviceMemoryExhausted thrown by that injection so far (all threads).
+[[nodiscard]] std::uint64_t memory_exhausted_injections() noexcept;
+} // namespace testing
 
 // The reporter behind cuda_check and the CUDA cleanup paths: writes the bare line to stderr, then
 // publishes the same text through the observer when one is installed (core/cuda_diagnostics.h).
@@ -65,6 +93,12 @@ struct DeviceContext {
 // through the host mapping (pinned allocations are device-accessible under UVA) rather than by a
 // copy engine. Small per-round inputs then never queue behind bulk host-to-device transfers of
 // other streams (for example expert promotions), which share the copy engine in FIFO order.
+// The bytes are those of the source at the call, as a copy from pageable memory would take them: they are copied into
+// a pinned staging ring (allocated by the first DeviceContext) and the kernel reads that copy, so the caller may
+// rewrite its buffer as soon as this returns, whether or not the stream has reached the upload (a host a boundary
+// ahead of the device restages its tables; ZL-01). An upload larger than 16 MiB is copied from pageable memory on the
+// copy engine instead. A stream being captured records a node that reads `pinned_src` itself at each replay: the
+// caller keeps it valid and current for every replay.
 void upload_pinned(void* device_dst, const void* pinned_src, std::size_t bytes, cudaStream_t stream);
 
 // Where a kernel reports a fault instead of trapping (a bounded wait that passed its bound, an input

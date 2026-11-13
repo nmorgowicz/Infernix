@@ -202,9 +202,16 @@ saturation does not make the Engine unavailable. The endpoint remains unauthenti
 
 How failures end:
 
-- An out-of-memory condition or a failed internal check during one unit of work fails the requests
-  that unit involved, logs the error with `: failed N running request(s); the Engine keeps
-  serving`, and the Engine carries on with its queue.
+- A unit of work that runs out of GPU memory, or fails an internal check (an unreadable expert
+  record), fails the running and paused requests and a request being bound, logs the error with
+  `: failed N running request(s); the Engine keeps serving`, and the Engine carries on with its
+  queue. GPU memory runs out when another program takes the VRAM the server's automatic sizing left
+  free: a kernel's first launch (CUDA loads kernels when they first run), an allocation, or the
+  driver paging the server's memory back in then finds none. Those requests end with HTTP 503
+  `service_unavailable` (an error event once their stream has started) and the message `out of
+  device memory (...); the request can be retried`; `infernix_device_memory_recoveries_total` and
+  `live.device_memory_recoveries` count these recoveries. The prefix cache keeps what earlier units
+  completed and nothing of the failed one.
 - Logits with no finite value to sample from (NaN or infinity, a numerical failure of the model's
   execution) fail only the request whose row produced them, with an HTTP 500 `internal_error`
   (an error event once its stream has started), and log `the model produced non-finite logits:
@@ -631,7 +638,16 @@ While the model is thinking, the constraint refuses the `<tool_call>` token: a c
 the thinking would never run, and the turn cannot end before the thinking closes, so the model
 closes its thinking first and calls after it.
 
-Non-strict parameter names and order remain open. Their schema supplies the existing value
+With `--tool-parameter-names declared`, a non-strict tool that declares parameters names only those,
+each at most once and in any order (a tool that declares none keeps open names, and the prompt is
+unchanged). A value then also keeps a `\n</parameter>\n<parameter=NAME>` line whose NAME its call
+cannot take, one the tool does not declare or the call has already given, as its own text: an edit to
+a file that quotes a tool call keeps that quote in its value instead of ending there, while a declared
+name not given yet opens that parameter (candidates ZA-01). The grammar keeps both readings and the
+decoder applies that rule, streamed or whole. A quoted line naming a declared parameter not given yet
+still ends the value. The unconstrained routes parse as before.
+
+Without it, non-strict parameter names and order remain open. Their schema supplies the existing value
 normalization hints; it is not compiled as a strict constraint. Open objects, root unions, and
 unsupported schema assertions therefore remain usable. A root `oneOf` / `anyOf` of object variants
 (a zod or Pydantic discriminated union) supplies its variants' properties as hints too: a name takes
@@ -1944,6 +1960,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--tolerant-tool-calls` | recover complete tool calls cut by a malformed wrapper, a trailing suffix or the output budget instead of demoting them to text, and (with `--end-in-thinking allow`) complete calls stranded in thinking the model never closed | off |
+| `--tool-parameter-names open\|declared` | on the constrained tool route, `declared` lets a call to a non-strict tool that declares parameters name only those (each once, in any order), and a value keeps a quoted `<parameter=NAME>` line its call cannot take as its text (see the constrained route) | `open` |
 | `--restore-reasoning` | give a Chat Completions assistant message sent back without reasoning the reasoning this server generated for it: a tool-call message by its call ids, an answer by its text and the conversation before it. Changes the prompt the model sees from the history the client sent (see Chat Completions) | off |
 | `--cors` | permissive browser CORS headers | off |
 | `--usage-chunk-choice` | give the streamed usage chunk a zero-delta choice, for strict client parsers that reject the OpenAI-conformant empty `choices` array | off |
@@ -2124,6 +2141,7 @@ curl http://127.0.0.1:8080/metrics
 | `infernix_requests_running`, `waiting`, `paused`, `prefilling`, `decode_ready`, `replaying`, `materializing` | Current Engine gauges; prefill/decode/replay are subsets of resident requests |
 | `infernix_no_progress_seconds` | How long the Engine has held requests without completing any unit, control row or context transaction; 0 while it progresses or is idle |
 | `infernix_no_progress_recoveries_total` | Stalls healed after two minutes by failing the running and paused requests (see How failures end) |
+| `infernix_device_memory_recoveries_total` | Units that ran out of GPU memory, recovered by failing the running and paused requests (see How failures end) |
 | `infernix_prompt_tokens_total`, `infernix_prompt_tokens_cached_total` | Full input and reused tokens counted once on initial binding |
 | `infernix_prefill_tokens_total`, `infernix_replayed_tokens_total` | Actual initial prefill and separate recovery recomputation |
 | `infernix_generation_tokens_total`, `infernix_decode_tokens_total` | All committed outputs, or decode/control outputs excluding the first token; include thinking and injected control tokens |
@@ -2574,7 +2592,13 @@ The prefix cache retains content-addressed KV blocks and sparse state snapshots;
 placement, Host tier and eviction are defined in the
 [hybrid prefix cache spec](maintainer/hybrid-prefix-cache-spec.md). Completed conversation endpoints
 serve direct continuations, and snapshots at the generation opener and at structural boundaries
-let a later prompt that normalizes or replaces a response recompute only the changed suffix.
+let a later prompt that normalizes or replaces a response recompute only the changed suffix. A
+reply sent back as history is encoded apart from the generation opener before it (the opener this
+request ends with, at the start of every past assistant turn that begins with it), as it was when
+generated: a reply whose reasoning is empty keeps the opener's "\n" and its own "\n" as two ids
+instead of the one "\n\n" a single encoding of the text gives, so its endpoint serves the next turn
+(candidates ZH-03). Only those ids change, never the text; a conversation that switches thinking
+on or off splits only where the opener still matches.
 
 Changing `preserve_thinking` or reasoning effort changes the rendered prompt where applicable;
 already cached exact prefixes remain usable. An appended mid-conversation system message is an

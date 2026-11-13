@@ -135,6 +135,15 @@ set_tests_properties(
   infernix_qwen3_5_resume_cold_real_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
+# Recovery from a unit out of device memory (fix sweep FS-01): an injected shortage at a sweep of CUDA_CHECK
+# counts fails the request in flight, the Engine keeps serving with an intact prefix cache, a queued request
+# completes, and eight failures in a row stop the Engine (tests/memory_exhausted_recovery.h).
+infernix_add_test(infernix_qwen3_5_memory_exhausted_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_memory_exhausted_real.cpp"
+  LIBRARIES infernix_engine infernix_model_runtime)
+set_tests_properties(infernix_qwen3_5_memory_exhausted_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 1800)
+
 infernix_add_test(infernix_qwen3_5_score_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_score_real.cpp"
   LIBRARIES infernix_engine)
@@ -273,8 +282,8 @@ infernix_add_test(infernix_qwen3_5_tokenizer_golden_real_test
   NEEDS_SOURCE_DIR)
 set_tests_properties(infernix_qwen3_5_tokenizer_golden_real_test PROPERTIES SKIP_RETURN_CODE 77)
 
-# A reply with empty reasoning sent back as history against its generated ids (candidates ZH-03): the
-# documented id mismatch, through the real Frontend on the same INFERNIX_TEST_TOKENIZER_DIR; CPU only.
+# A reply sent back as history against its generated ids (candidates ZH-03): empty reasoning keeps 198 198,
+# through the real Frontend on the same INFERNIX_TEST_TOKENIZER_DIR; CPU only.
 infernix_add_test(infernix_qwen3_5_echoed_empty_reasoning_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_echoed_empty_reasoning.cpp"
   LIBRARIES infernix_engine infernix_core

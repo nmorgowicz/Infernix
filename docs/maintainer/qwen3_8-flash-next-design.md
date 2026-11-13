@@ -3824,6 +3824,18 @@ generated token: 11.0 ms wall against 8.5 ms GPU busy, so the GPU was idle 22.5 
   §19.3.27; prefill chunks keep the bulk copy. GPU idle time fell from 22.5 % to 10.9 % of MTP
   decode. Greedy ids are unchanged.
 
+  Its kernel read the host buffer when it ran, not when it was enqueued, and the expert residency rewrites its frame,
+  record and landing tables at every boundary without waiting (the expert stream waits for its own table). With the
+  host a boundary ahead of the device (an ungated layer walk enqueues many layers at once), a queued upload delivered
+  the next boundary's table: about one frame-table upload in 17 on FP4-Local with NVFP4 KV at 1M tokens and four lanes
+  (ZL-01, PR #62's reporter, 2026-11-12). Kernels then saw an expert in neither VRAM nor RAM (an unserved record: a
+  failed round since PR #62, a null dereference before), read frames before their copies landed (a sticky illegal
+  address within 6-9 minutes) or wrote landed records over resident experts (NaN logits until eviction). Since then
+  `upload_pinned` copies the source into a 32 MiB pinned staging ring at the call (allocated with the first
+  DeviceContext; uploads past 16 MiB take a pageable `cudaMemcpyAsync`; a captured node still reads the caller's
+  buffer at each replay), so the bytes are the caller's at the call: the same traffic then ran 557 requests in 35
+  minutes without a failure.
+
   | Workload (same flags) | Before | After |
   |---|---:|---:|
   | tg512 plain | 85.46 | **88.81** |
@@ -4291,7 +4303,7 @@ These defaults were set on 2026-10-04, before any measurement; the user may over
 | Concurrency | Fill-phase landing (S4): every staged miss is cached while frames are free | Keep LFRU promotions within the budget |
 | Concurrency | S5 compacted grids, subject to the C = 1 no-regression gates | Fork at every width without the lists |
 | Concurrency | S4b warm start on by default from the user's own saved state; a shipped fallback profile only if the replay gate passes (§19.3.5) | Start empty, as today |
-| Concurrency | S8 decode share for Qwen4Exp at C ≥ 2, its value chosen by S8's measurement (0.5 proposed); Qwen3.5 keeps 1:1 | Today's 1:1 alternation for both |
+| Concurrency | S8 decode share for Qwen4Exp at C ≥ 2, its value chosen by S8's measurement (0.5 proposed; measured slower overall and removed 2026-11-12, 4,096-token walk steps beside decode kept instead); Qwen3.5 keeps 1:1 | Today's 1:1 alternation for both |
 
 ### 19.3.1 Prefix cache
 
@@ -6844,6 +6856,14 @@ overflow. Bit-neutral: only which CTA computes a job changes. C = 1: if items 2-
 call's launch shape changes; with item 1, n-gram W ≥ 7 rounds start forking.
 
 **S8. Decode share between prefill chunks (2026-10-04, from Strata #465; 0.5-1 day; after S1 + S2).**
+
+- **Outcome (2026-11-12).** Built behind temporary switches, measured and removed: on FP4-Local, two
+  lanes decoding beside a fresh 21K-token prompt, share 1 cost the whole set 1.6-4.0 % and the prompt's
+  TTFT 47 % (2.92 -> 4.27 s), against the owner's rule of the fastest overall first. Its walk-step
+  companion stays as the default instead: 4,096-token walk steps while another lane decodes keep the
+  set's time and the prompt's TTFT and halve the decoders' longest pause
+  ([resource scheduling](resource-scheduling-and-context-cache.md), candidates TX-12). The plan below is
+  the record of the proposal.
 
 - **Today.** `Scheduler::choose_execution` (`scheduler.h:248-255`) alternates one prefill unit with
   one decode round, and Qwen4Exp ignores `PrefillStepWidth` and the `ExecutionTiming*` argument
