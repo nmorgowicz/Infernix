@@ -275,6 +275,64 @@ __device__ __forceinline__ float rmsnorm_generic_inv(float sum, float* scratch, 
     return rsqrtf(scratch[0] / static_cast<float>(d) + eps);
 }
 
+inline constexpr int kRmsGenericBlock = 256;
+
+// rmsnorm_generic_kernel's halving tree over its 256 per-thread partials, with the last five
+// levels as shuffles; every thread gets the total. scratch holds kRmsGenericBlock + 1 floats and
+// may be reused by a following call.
+__device__ __forceinline__ float rmsnorm_generic_order_sum(float sum, float* scratch) {
+    const int tid = static_cast<int>(threadIdx.x);
+    scratch[tid]  = sum;
+    __syncthreads();
+    if (tid < 128) { scratch[tid] += scratch[tid + 128]; }
+    __syncthreads();
+    if (tid < 64) { scratch[tid] += scratch[tid + 64]; }
+    __syncthreads();
+    if (tid < kWarpSize) {
+        float partial = scratch[tid] + scratch[tid + 32];
+        partial       = warp_reduce_sum(partial);
+        if (tid == 0) { scratch[kRmsGenericBlock] = partial; }
+    }
+    __syncthreads();
+    return scratch[kRmsGenericBlock];
+}
+
+// Same arithmetic as rmsnorm_generic_kernel, bit for bit, at d == 256 * PerThread: thread t sums
+// elements t + 256 * k in k order and the partials meet in the same tree. The row stays in
+// registers, so x and the weight are read once.
+template <RmsEpilogue Epilogue, int PerThread>
+__launch_bounds__(kRmsGenericBlock) __global__
+    void rmsnorm_generic_order_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                                      __nv_bfloat16* out, std::int64_t rows, float eps) {
+    pdl::enter();
+    static_assert(!rms_gated(Epilogue));
+    constexpr int kBlock   = kRmsGenericBlock;
+    constexpr int d        = kBlock * PerThread;
+    const std::int64_t row = static_cast<std::int64_t>(blockIdx.x);
+    if (row >= rows) { return; }
+
+    const int tid           = static_cast<int>(threadIdx.x);
+    const std::int64_t base = row * static_cast<std::int64_t>(d);
+    float values[PerThread];
+    float weights[PerThread];
+    float sum = 0.0f;
+#pragma unroll
+    for (int k = 0; k < PerThread; ++k) {
+        values[k]  = __bfloat162float(x[base + tid + k * kBlock]);
+        weights[k] = __bfloat162float(weight[tid + k * kBlock]);
+        sum += values[k] * values[k];
+    }
+
+    __shared__ float scratch[kBlock + 1];
+    const float total = rmsnorm_generic_order_sum(sum, scratch);
+    const float inv   = rsqrtf(total / static_cast<float>(d) + eps);
+#pragma unroll
+    for (int k = 0; k < PerThread; ++k) {
+        out[base + tid + k * kBlock] =
+            __float2bfloat16_rn(rmsnorm_epilogue<Epilogue>(values[k], inv, weights[k], 0.0f));
+    }
+}
+
 // Functional fallback outside the aligned fast domains. It intentionally favors a simple complete
 // implementation over another family of shape-specific paths. Thread i owns elements i, i + 256,
 // ... and sums their squares in that order; the shared tree is fixed.

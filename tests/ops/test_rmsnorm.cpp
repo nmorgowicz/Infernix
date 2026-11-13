@@ -114,6 +114,41 @@ int run_case(const char* label, const Shape& shape, bool unit_offset, std::uint3
     return failures;
 }
 
+// The aligned hidden-5376 route must round exactly as the generic kernel, which the same rows
+// reach through a buffer offset by one element.
+int run_generic_order_case(int tokens, bool unit_offset, std::uint32_t seed, float input_scale) {
+    constexpr int d         = 5376;
+    const std::size_t count = static_cast<std::size_t>(d) * tokens;
+    std::vector<float> input(count), weight(d);
+    fill_uniform(input, seed, -input_scale, input_scale);
+    fill_uniform(weight, seed + 1U, -1.5F, 1.5F);
+    std::vector<std::uint16_t> input_bits(count), weight_bits(d);
+    for (std::size_t i = 0; i < count; ++i) input_bits[i] = f32_to_bf16(input[i]);
+    for (int i = 0; i < d; ++i) weight_bits[static_cast<std::size_t>(i)] = f32_to_bf16(weight[i]);
+
+    DeviceContext device;
+    std::vector<std::vector<std::uint16_t>> results;
+    for (int shift : {0, 1}) {
+        DeviceBuffer x_buf((count + 1) * 2), w_buf((d + 1) * 2), out_buf((count + 1) * 2);
+        x_buf.copy_from_host(input_bits.data(), count * 2, shift * 2);
+        w_buf.copy_from_host(weight_bits.data(), d * 2, shift * 2);
+        Tensor x(static_cast<std::uint16_t*>(x_buf.p) + shift, DType::BF16, {d, tokens});
+        Tensor w(static_cast<std::uint16_t*>(w_buf.p) + shift, DType::BF16, {d});
+        Tensor out(static_cast<std::uint16_t*>(out_buf.p) + shift, DType::BF16, {d, tokens});
+        ops::rmsnorm(x, w, kEps, unit_offset, out, device.stream);
+        cuda_synchronize(device.stream);
+        results.emplace_back(count);
+        out_buf.copy_to_host(results.back().data(), count * 2, shift * 2);
+    }
+    std::size_t mismatches = 0;
+    for (std::size_t i = 0; i < count; ++i) mismatches += results[0][i] != results[1][i];
+    if (mismatches == 0) return 0;
+    std::cout << "FAIL rmsnorm hidden5376 generic order T=" << tokens
+              << (unit_offset ? " offset" : " plain") << ": " << mismatches << " of " << count
+              << " differ\n";
+    return 1;
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(rmsnorm) {
@@ -161,6 +196,19 @@ INFERNIX_OP_TEST(rmsnorm) {
         for (int heads : {4, 24})
             failures +=
                 run_case("rmsnorm QK prefill", {256, heads, t}, true, 1750U + t, 4.f, false, true);
+    // Gemma 4 hidden (5376): the aligned route keeps the generic kernel's summation order.
+    for (int t : {1, 2, 5, 6, 17, 2048})
+        for (bool offset : {false, true}) {
+            const auto label =
+                "rmsnorm hidden5376 T=" + std::to_string(t) + (offset ? " offset" : " plain");
+            failures +=
+                run_case(label.c_str(), {5376, 1, t}, offset, 2100U + t, 4.f, false, t <= 6);
+        }
+    failures += run_case("rmsnorm hidden5376 unaligned", {5376, 1, 3}, false, 2110U, 4.f, true);
+    for (int t : {1, 7, 407})
+        for (bool offset : {false, true})
+            for (float scale : {1.e-3f, 4.f, 300.f})
+                failures += run_generic_order_case(t, offset, 2200U + t, scale);
     for (int width : {2, 3, 8, 9, 15, 16})
         for (int batch : {1, 8}) {
             for (bool offset : {false, true})

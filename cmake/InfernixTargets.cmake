@@ -43,6 +43,17 @@ function(infernix_runtime_dll_list out_var)
     endforeach()
     list(REMOVE_DUPLICATES _list)
   endif()
+  # cuBLAS (the Gemma FP8 row GEMM): the DLLs of the toolkit this tree was configured with, never PATH's.
+  if(WIN32 AND DEFINED CUDAToolkit_BIN_DIR)
+    foreach(_infernix_cublas_dir "${CUDAToolkit_BIN_DIR}/x64" "${CUDAToolkit_BIN_DIR}")
+      file(GLOB _infernix_cublas_dlls
+        "${_infernix_cublas_dir}/cublas64_*.dll" "${_infernix_cublas_dir}/cublasLt64_*.dll")
+      if(_infernix_cublas_dlls)
+        list(APPEND _list ${_infernix_cublas_dlls})
+        break()
+      endif()
+    endforeach()
+  endif()
   set(${out_var} "${_list}" PARENT_SCOPE)
 endfunction()
 

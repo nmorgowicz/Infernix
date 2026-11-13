@@ -362,6 +362,9 @@ include("${CMAKE_CURRENT_LIST_DIR}/linear/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_add/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_pair/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_swiglu/tests.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/gemma4_small_tests.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/gemma4_q4_tests.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/gemma4_fp8_tests.cmake")
 
 foreach(kv_dtype bf16 int8 fp8 nvfp4 k8v4)
   add_test(NAME infernix_softmax_attention_wide_${kv_dtype}_test

@@ -137,6 +137,10 @@ struct Weight {
     // bf16_p12: the parent's escape list (qdata, qhigh and scales address this matrix's first row of
     // their planes; the row words index this list from the parent's first escape).
     const void* escapes = nullptr;
+    // Gemma Q4_G32/G128/G256_FP16: per-row BF16 multipliers (n values) the fused A8 prefill reads. A
+    // Parameters-owned device buffer derived once at load by linear_prepare_a8_rows; null when the
+    // weight has none (the A16 route does not read it).
+    const void* row_scales = nullptr;
 };
 
 } // namespace infernix

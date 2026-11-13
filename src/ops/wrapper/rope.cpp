@@ -93,8 +93,12 @@ void require_model_mode(int axes, int rotary_dim, std::int32_t head_dim) {
         return;
     }
     if (axes == 1 && head_dim == 128 && rotary_dim == 128) { return; }
+    // Gemma 4 global layers, after the proportional-RoPE permutation, are partial neox
+    // RoPE on the first 128 of 512 dims.
+    if (axes == 1 && head_dim == 512 && rotary_dim == 128) { return; }
     if (head_dim != kTextHeadDim || rotary_dim > kTextHeadDim) {
-        throw std::invalid_argument("rope: Text mode requires D256 or one-dimensional D128/R128");
+        throw std::invalid_argument(
+            "rope: Text mode requires D256, one-dimensional D128/R128, or D512/R128");
     }
     if (axes == 3 && rotary_dim != 64) {
         throw std::invalid_argument("rope: 3-D Text MRoPE requires rotary_dim=64");

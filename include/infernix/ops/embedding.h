@@ -30,4 +30,20 @@ namespace infernix::ops {
  */
 void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream, DeviceFault fault = {});
 
+/**
+ * The same gather with every row multiplied by `scale` rounded to BF16:
+ *
+ *   out[d,t] = bf16(bf16(dequantize(table)[ids[t],d]) * bf16(scale)),
+ *
+ * the product of a BF16 table and a BF16 scalar. This lets a model whose embedding is its output
+ * head times a constant (Gemma's sqrt(hidden)) store the table once. `scale` is positive and
+ * finite; a scale other than 1 needs an FP8_E4M3FN_ROW_BF16 or Q4_G32/G128/G256_FP16 table
+ * (RowSplit, scales binary16 per 32/128/256 columns). FP8 tables are [248320,5120] or Gemma's
+ * [262144,5376]; a q4 table's D is a multiple of its group (padded D a multiple of 128). The oracle
+ * is the unscaled one followed by the BF16 product. For a table of any other format a scale of 1 is
+ * the overload above. Out-of-range ids behave as above.
+ */
+void embedding(const Tensor& ids, const Weight& table, float scale, Tensor& out, cudaStream_t stream,
+               DeviceFault fault = {});
+
 } // namespace infernix::ops

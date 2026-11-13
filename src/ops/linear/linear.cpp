@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "core/device.h"
 #include "infernix/ops/linear.h"
 #include "infernix/ops/rg16_linear.h"
 
@@ -14,6 +15,11 @@
 #include "ops/linear/q5/q5_dispatch.h"
 #include "ops/linear/q6/q6_dispatch.h"
 #include "ops/linear/q8/q8_dispatch.h"
+#include "ops/common/q4_scale_mode.h"
+#include "ops/linear/fp8/shapes/gemma4_a8.h"
+#include "ops/linear/q4/q4_g32_gemv.cuh"
+#include "ops/linear/q4/q4_g32_route.h"
+#include "ops/linear/q4/q4_g32_w4a8.cuh"
 #include "ops/linear/qsa_group.h"
 
 #include <cstdint>
@@ -92,6 +98,11 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
     switch (w.qtype) {
     case QType::Q4_G64_FP16:
         detail::q4_dispatch(x, w, out, policy, stream);
+        return;
+    case QType::Q4_G32_FP16:
+    case QType::Q4_G128_FP16:
+    case QType::Q4_G256_FP16:
+        detail::q4_g32_dispatch(x, w, out, policy, workspace, stream);
         return;
     case QType::Q5_G64_FP16:
         detail::q5_dispatch(x, w, out, policy, stream);
@@ -179,6 +190,11 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
         (void)detail::select_q4_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_q4_launch(output_rows, input_rows, max_tokens, policy);
         return 0;
+    case QType::Q4_G32_FP16:
+    case QType::Q4_G128_FP16:
+    case QType::Q4_G256_FP16:
+        if (policy == LinearPolicy::A16Only) { return 0; }
+        return detail::q4_g32_w4a8_workspace_bytes(output_rows, input_rows, max_tokens);
     case QType::Q5_G64_FP16:
         (void)detail::select_q5_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_q5_launch(output_rows, input_rows, max_tokens, policy);
@@ -275,6 +291,46 @@ void linear_qsa_group(const Tensor& x, const Weight& w, Tensor* const* parts, Li
 void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     validate_linear_semantics(x, w, out, LinearPolicy::A16Only);
     dispatch_linear(x, w, out, LinearPolicy::A16Only, LinearRoutes::Exact, nullptr, stream);
+}
+
+void linear_a8_ready(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
+                     std::uint8_t* codes, float* scales, WorkspaceArena& workspace,
+                     cudaStream_t stream) {
+    validate_linear_semantics(x, w, out, policy);
+    if (detail::is_q4_fp16_family(w.qtype)) {
+        if (!allows_a8(policy) || codes == nullptr || scales == nullptr) {
+            throw std::invalid_argument("linear: a Q4 ready-codes projection needs the A8 policy, codes and scales");
+        }
+        const detail::Q4LinearOperands operands = detail::q4_linear_operands(x, w);
+        detail::q4_g32_w4a8_ready(operands, static_cast<__nv_bfloat16*>(out.data), codes, scales, workspace,
+                                  stream);
+        return;
+    }
+    detail::fp8_dispatch_ready(x, w, out, policy, codes, scales, &workspace, stream);
+}
+
+bool linear_takes_a8_ready(const Weight& w, std::int32_t tokens, LinearPolicy policy) {
+    if (!allows_a8(policy)) { return false; }
+    if (w.qtype == QType::FP8_E4M3FN_ROW_BF16) {
+        return w.n == 5376 && w.k == 21504 && detail::gemma4_fp8::uses_a8(tokens, tokens);
+    }
+    if (detail::is_q4_fp16_family(w.qtype)) { return detail::q4_g32_takes_ready_codes(w.n, w.k, tokens); }
+    return false;
+}
+
+void linear_prepare_a8_rows(Weight& w, DeviceBuffer& storage, cudaStream_t stream) {
+    if (!detail::is_q4_fp16_family(w.qtype) || w.layout != QuantLayout::RowSplit || w.scales == nullptr ||
+        w.padded_shape[1] != w.k || !detail::q4_trunk_shape(w.n, w.k)) {
+        return;
+    }
+    const int scale_mode = detail::q4_scale_mode(w.qtype);
+    if (w.k % detail::q4_scale_span(scale_mode) != 0) { return; }
+    DeviceBuffer rows(static_cast<std::size_t>(w.n) * 2);
+    detail::q4_g32_row_multipliers(static_cast<const std::uint8_t*>(w.scales), rows.p, w.n, w.k, scale_mode,
+                                   stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    storage      = std::move(rows);
+    w.row_scales = storage.p;
 }
 
 } // namespace infernix::ops

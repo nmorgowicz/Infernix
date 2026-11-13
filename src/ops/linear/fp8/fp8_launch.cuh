@@ -62,10 +62,12 @@ void launch_fp8_a8(const Tensor& x, const Weight& w, Tensor& out, Fp8A8Workspace
         stream);
 }
 
+// `quantize` false: the caller already wrote scratch.codes and scratch.scales (Gemma's GeGLU writes
+// the down projection's activation codes).
 template <class Geometry, class Schedule>
 void launch_fp8_a8_tma(const Tensor& x, const Weight& w, Tensor& out, Fp8A8Workspace scratch,
-                       cudaStream_t stream) {
-    launch_fp8_a8_quantize(x, w, scratch, stream);
+                       cudaStream_t stream, bool quantize = true) {
+    if (quantize) { launch_fp8_a8_quantize(x, w, scratch, stream); }
     launch_fp8_a8_tma_mma<Fp8ScheduleInstance<Schedule, Geometry::kInputRows>>(
         fp8_a8_operands(w, scratch, x.ne[1]),
         LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), w.n}, LinearIdentityEpilogue{},

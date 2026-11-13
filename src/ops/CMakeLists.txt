@@ -2,7 +2,7 @@
 add_library(infernix_ops STATIC)
 infernix_internal_includes(infernix_ops)
 infernix_cuda_archive(infernix_ops)
-target_link_libraries(infernix_ops PUBLIC infernix_core PRIVATE infernix_nvfp4_non_rdc)
+target_link_libraries(infernix_ops PUBLIC infernix_core PRIVATE infernix_nvfp4_non_rdc infernix_gemma4_ops)
 
 # Warp-specialized SM120 NVFP4 kernels use setmaxnreg to transfer registers from
 # producer to consumer warpgroups. RDC makes ptxas discard that contract. These
@@ -12,6 +12,17 @@ add_library(infernix_nvfp4_non_rdc STATIC)
 infernix_internal_includes(infernix_nvfp4_non_rdc)
 infernix_cuda_non_rdc_archive(infernix_nvfp4_non_rdc)
 target_link_libraries(infernix_nvfp4_non_rdc PRIVATE infernix_core infernix_cuda_runtime CUDA::cuda_driver)
+
+# Gemma-4 ops. A separate non-RDC archive: the CUDA 13.5 device link of infernix_ops needs over 46 GB, and
+# every kernel added there raises it (porting plan §8.5). Every translation unit here is self-contained: its
+# launcher is a host function, and it calls no device code defined in another translation unit.
+add_library(infernix_gemma4_ops STATIC)
+infernix_internal_includes(infernix_gemma4_ops)
+infernix_cuda_non_rdc_archive(infernix_gemma4_ops)
+target_link_libraries(infernix_gemma4_ops PRIVATE infernix_core infernix_cuda_runtime CUDA::cuda_driver)
+include("${CMAKE_CURRENT_LIST_DIR}/gemma4_small_ops.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/gemma4_q4.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/gemma4_fp8.cmake")
 
 include(basic_sources.cmake)
 include("${CMAKE_CURRENT_LIST_DIR}/attn_input_proj/sources.cmake")

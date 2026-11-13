@@ -35,22 +35,28 @@ std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment, const char*
 
 } // namespace
 
-Fp8WeightGeometry validate_fp8_weight(const Weight& weight, const char* operation) {
-    if (weight.n <= 0 || weight.k <= 0) {
+// Plane geometry of an [n, k] row-scaled matrix: the code plane, then (256-aligned) the row words.
+Fp8WeightGeometry fp8_row_geometry(std::int32_t n, std::int32_t k, const char* operation,
+                                   std::int64_t scale_word_bytes) {
+    if (n <= 0 || k <= 0) {
         throw std::invalid_argument(std::string(operation) + ": FP8 shape must be positive");
     }
+    Fp8WeightGeometry geometry{};
+    geometry.code_plane_bytes   = checked_mul(static_cast<std::uint64_t>(n),
+                                              static_cast<std::uint64_t>(k), operation);
+    geometry.scale_plane_offset = align_up(geometry.code_plane_bytes, 256, operation);
+    geometry.scale_plane_bytes  = checked_mul(static_cast<std::uint64_t>(n),
+                                              static_cast<std::uint64_t>(scale_word_bytes), operation);
+    geometry.required_payload_bytes =
+        checked_add(geometry.scale_plane_offset, geometry.scale_plane_bytes, operation);
+    return geometry;
+}
 
+Fp8WeightGeometry validate_fp8_weight(const Weight& weight, const char* operation) {
     // fp8_e4m3fn_row_bf16 multiplies each row by a BF16 word, fp8_e4m3fn_row_f32 by an FP32 word.
     const bool f32          = weight.qtype == QType::FP8_E4M3FN_ROW_F32;
     const std::int64_t word = f32 ? 4 : 2;
-    Fp8WeightGeometry geometry{};
-    geometry.code_plane_bytes   = checked_mul(static_cast<std::uint64_t>(weight.n),
-                                              static_cast<std::uint64_t>(weight.k), operation);
-    geometry.scale_plane_offset = align_up(geometry.code_plane_bytes, 256, operation);
-    geometry.scale_plane_bytes  = checked_mul(static_cast<std::uint64_t>(weight.n),
-                                              static_cast<std::uint64_t>(word), operation);
-    geometry.required_payload_bytes =
-        checked_add(geometry.scale_plane_offset, geometry.scale_plane_bytes, operation);
+    const Fp8WeightGeometry geometry = fp8_row_geometry(weight.n, weight.k, operation, word);
 
     const std::int64_t scale_stride = static_cast<std::int64_t>(weight.n) * word;
     if (!is_fp8_row(weight.qtype) || weight.layout != QuantLayout::RowScale ||

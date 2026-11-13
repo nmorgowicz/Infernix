@@ -5,8 +5,11 @@
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/launcher/embed_gather.h" // detail::embed_gather_*_launch
 #include "core/weight_view.h"
+#include "ops/common/q4_scale_mode.h"
+#include "ops/launcher/gemma4_embed_gather.h" // detail::embed_gather_scaled_fp8_launch, embed_gather_q4_launch
 
 #include <cstdint>
+#include <cmath>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -181,6 +184,67 @@ void require_fp8_metadata(const Weight& table, const Tensor& out) {
     (void)detail::validate_fp8_weight(table, "embedding");
 }
 
+// The scaled gather also serves the Gemma 4 table [262144,5376].
+void require_scaled_fp8_metadata(const Weight& table, const Tensor& out) {
+    const bool qwen4  = table.n == 248320 && table.k == 5120;
+    const bool gemma4 = table.n == 262144 && table.k == 5376;
+    if (!(qwen4 || gemma4) || out.ne[0] != table.k) {
+        throw std::invalid_argument("embedding: unsupported FP8 table shape");
+    }
+    if ((reinterpret_cast<std::uintptr_t>(out.data) &
+         (static_cast<std::uintptr_t>(alignof(std::uint32_t)) - 1)) != 0) {
+        throw std::invalid_argument("embedding: FP8 output must be 4-byte aligned");
+    }
+    (void)detail::validate_fp8_weight(table, "embedding");
+}
+
+void require_q4_metadata(const Weight& table, const Tensor& out) {
+    const int mode = detail::q4_scale_mode(table.qtype);
+    if (!detail::q4_scale_mode_valid(mode)) { throw std::invalid_argument("embedding: not a q4 fp16 table"); }
+    const std::uint32_t group = 32u << mode;
+    const char* name = table.qtype == QType::Q4_G32_FP16    ? "Q4_G32_FP16"
+                       : table.qtype == QType::Q4_G128_FP16 ? "Q4_G128_FP16"
+                                                            : "Q4_G256_FP16";
+    const std::string prefix = std::string("embedding: ") + name;
+    if (table.layout != QuantLayout::RowSplit) {
+        throw std::invalid_argument(prefix + " table must be RowSplit");
+    }
+    require_weight_2d(table);
+    if (table.group_size != group || table.group != static_cast<std::int32_t>(group)) {
+        throw std::invalid_argument(prefix + " table group must be " + std::to_string(group));
+    }
+    if (table.scale_dtype != DType::FP16) {
+        throw std::invalid_argument(prefix + " table scale dtype must be FP16");
+    }
+    if (table.padded_shape[0] != table.shape[0] ||
+        table.padded_shape[1] != align_up_i32(table.shape[1], 128)) {
+        throw std::invalid_argument(prefix + " padded shape is invalid");
+    }
+    if (mode != 0 && table.shape[1] % static_cast<std::int32_t>(group) != 0) {
+        throw std::invalid_argument(prefix + " table d must be divisible by its group size");
+    }
+    if (table.shape[1] != out.ne[0]) {
+        throw std::invalid_argument(prefix + " table d must match out.ne[0]");
+    }
+    const std::uint64_t rows = static_cast<std::uint64_t>(table.shape[0]);
+    const std::uint64_t code_plane_bytes =
+        checked_mul_u64(rows, static_cast<std::uint64_t>(table.padded_shape[1])) / 2;
+    // Bytes of one row's scale plane for the padded width: two per scale.
+    const std::uint64_t scale_row_bytes = static_cast<std::uint64_t>(
+        detail::q4_scale_row_bytes(mode, table.padded_shape[1]));
+    const std::uint64_t scale_plane_bytes = checked_mul_u64(rows, scale_row_bytes);
+    const std::uint64_t scale_plane_off = ((code_plane_bytes + 255u) / 256u) * 256u;
+    if (table.payload_bytes != 0 && table.payload_bytes < scale_plane_off + scale_plane_bytes) {
+        throw std::invalid_argument(prefix + " payload is too small");
+    }
+    if (table.qdata == nullptr || table.scales == nullptr) {
+        throw std::invalid_argument(prefix + " planes must be non-null");
+    }
+    if (table.qhigh != nullptr || table.high_plane_bytes != 0) {
+        throw std::invalid_argument(prefix + " high plane must be empty");
+    }
+}
+
 bool is_empty_T(const Tensor& ids, const Tensor& out) { return ids.ne[0] == 0 || out.ne[1] == 0; }
 
 void require_non_empty_tensors(const Tensor& ids, const Tensor& out) {
@@ -247,6 +311,41 @@ void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t
         break;
     default:
         throw std::invalid_argument("embedding: unsupported table qtype");
+    }
+}
+
+void embedding(const Tensor& ids, const Weight& table, float scale, Tensor& out, cudaStream_t stream,
+               DeviceFault fault) {
+    if (!(scale > 0.0f) || !std::isfinite(scale)) {
+        throw std::invalid_argument("embedding: scale must be positive and finite");
+    }
+    const bool scaled_table = table.qtype == QType::FP8_E4M3FN_ROW_BF16 || detail::is_q4_fp16_family(table.qtype);
+    if (!scaled_table) {
+        if (scale != 1.0f) {
+            throw std::invalid_argument("embedding: only FP8 and q4 fp16 tables take a scale");
+        }
+        embedding(ids, table, out, stream, fault);
+        return;
+    }
+    if (ids.dtype != DType::I32) { throw std::invalid_argument("embedding: ids must be I32"); }
+    if (out.dtype != DType::BF16) { throw std::invalid_argument("embedding: out must be BF16"); }
+
+    (void)numel_allow_zero(ids, "ids");
+    (void)numel_allow_zero(out, "out");
+    require_ids_shape(ids);
+    require_out_shape(ids, out);
+
+    if (table.qtype == QType::FP8_E4M3FN_ROW_BF16) {
+        require_scaled_fp8_metadata(table, out);
+    } else {
+        require_q4_metadata(table, out);
+    }
+    if (is_empty_T(ids, out)) { return; }
+    require_non_empty_tensors(ids, out);
+    if (table.qtype == QType::FP8_E4M3FN_ROW_BF16) {
+        detail::embed_gather_scaled_fp8_launch(ids, table, scale, out, stream, fault);
+    } else {
+        detail::embed_gather_q4_launch(ids, table, scale, out, stream, fault);
     }
 }
 

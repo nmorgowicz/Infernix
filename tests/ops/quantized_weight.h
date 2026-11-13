@@ -155,6 +155,12 @@ inline QuantSpec quant_spec(QType qtype) {
         return {2, 64, 1, -2};
     case QType::Q4_G64_FP16:
         return {4, 64, 7, -8};
+    case QType::Q4_G32_FP16:
+        return {4, 32, 7, -8};
+    case QType::Q4_G128_FP16:
+        return {4, 128, 7, -8};
+    case QType::Q4_G256_FP16:
+        return {4, 256, 7, -8};
     case QType::Q5_G64_FP16:
         return {5, 64, 15, -16};
     case QType::Q6_G64_FP16:
@@ -580,6 +586,9 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
             "quantized-weight fixture: divisors are defined only for NVFP4");
     }
     const detail::QuantSpec spec      = detail::quant_spec(qtype);
+    if (spec.group_size > 64 && k % spec.group_size != 0) {
+        throw std::invalid_argument("quantized-weight fixture: coarse group requires K % G == 0");
+    }
     const std::int32_t padded_k       = detail::align_up(k, 128);
     const std::int32_t kg             = padded_k / spec.group_size;
     const std::int32_t logical_groups = (k + spec.group_size - 1) / spec.group_size;
@@ -624,7 +633,7 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
             }
         }
     } else {
-        std::uint8_t code_patterns[256][32]{};
+        std::uint8_t code_patterns[256][128]{};
         std::uint8_t high_patterns[256][16]{};
         for (std::size_t pattern = 0; pattern < 256; ++pattern) {
             std::uint64_t state = detail::mix64(static_cast<std::uint64_t>(seed) << 32 | pattern);
@@ -655,6 +664,9 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
         }
     }
     const std::int32_t partial_group_lanes = k % spec.group_size;
+    if (partial_group_lanes != 0 && spec.group_size > 64) {
+        throw std::invalid_argument("quantized-weight fixture: coarse group requires K % G == 0");
+    }
     if (partial_group_lanes != 0) {
         std::int8_t codes[64]{};
         const std::int32_t group = logical_groups - 1;
@@ -726,6 +738,50 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
     packed.weight.n               = n;
     packed.weight.k               = k;
     return packed;
+}
+
+// The q4_g32_fp16 tensor that decodes to exactly the same weights as a q4_g128/q4_g256 `coarse`
+// one (what the converter's virtual-group emulation writes): the code plane is shared byte for
+// byte, every coarse scale is repeated G / 32 times. Outputs of the g32 kernels on the result
+// must equal the coarse kernels' on `coarse` bit for bit.
+inline PackedWeight emulate_q4_g32_from_coarse(const PackedWeight& coarse) {
+    const Weight& cw = coarse.weight;
+    if ((cw.qtype != QType::Q4_G128_FP16 && cw.qtype != QType::Q4_G256_FP16) ||
+        coarse.high_plane_bytes != 0) {
+        throw std::invalid_argument("quantized-weight fixture: expected a coarse q4 weight");
+    }
+    const std::size_t repeat         = static_cast<std::size_t>(cw.group / 32);
+    const std::size_t rows           = static_cast<std::size_t>(cw.n);
+    const std::size_t coarse_per_row = static_cast<std::size_t>(cw.padded_shape[1] / cw.group);
+    const std::size_t g32_per_row    = static_cast<std::size_t>(cw.padded_shape[1] / 32);
+    PackedWeight out;
+    out.code_plane_bytes   = coarse.code_plane_bytes;
+    out.high_plane_offset  = coarse.high_plane_offset;
+    out.high_plane_bytes   = 0;
+    out.scale_plane_offset = coarse.scale_plane_offset;
+    out.scale_plane_bytes  = rows * g32_per_row * 2;
+    out.payload.assign(static_cast<std::size_t>(out.scale_plane_offset + out.scale_plane_bytes), 0);
+    std::copy(coarse.payload.begin(),
+              coarse.payload.begin() + static_cast<std::ptrdiff_t>(coarse.scale_plane_offset),
+              out.payload.begin());
+    for (std::size_t row = 0; row < rows; ++row) {
+        for (std::size_t g = 0; g < g32_per_row; ++g) {
+            const std::size_t source =
+                coarse.scale_plane_offset + (row * coarse_per_row + g / repeat) * 2;
+            const std::size_t target = out.scale_plane_offset + (row * g32_per_row + g) * 2;
+            out.payload[target]      = coarse.payload[source];
+            out.payload[target + 1]  = coarse.payload[source + 1];
+        }
+    }
+    out.weight               = cw;
+    out.weight.qtype         = QType::Q4_G32_FP16;
+    out.weight.group_size    = 32;
+    out.weight.group         = 32;
+    out.weight.payload       = out.payload.data();
+    out.weight.payload_bytes = out.payload.size();
+    out.weight.qdata         = out.payload.data();
+    out.weight.scales        = out.payload.data() + out.scale_plane_offset;
+    return out;
 }
 
 // Independent logical decode for numerical oracles. The packed representation is materialized as
@@ -913,6 +969,9 @@ inline PackedWeight pack_row_split_lowbit(const std::vector<float>& source, std:
     const detail::QuantSpec spec = detail::quant_spec(qtype);
     const std::int32_t padded_k  = detail::align_up(k, 128);
     const std::int32_t kg        = padded_k / spec.group_size;
+    if (spec.group_size > 64 && k % spec.group_size != 0) {
+        throw std::invalid_argument("row-split test packer: coarse group requires K % G == 0");
+    }
     const int nib                = detail::nibble_bytes_per_group(spec);
     const int high_bpr           = detail::high_bytes_per_group(spec);
 
@@ -929,8 +988,8 @@ inline PackedWeight pack_row_split_lowbit(const std::vector<float>& source, std:
     out.scale_plane_bytes = static_cast<std::uint64_t>(n) * static_cast<std::uint64_t>(kg) * 2ULL;
     out.payload.assign(static_cast<std::size_t>(out.scale_plane_offset + out.scale_plane_bytes), 0);
 
-    std::int8_t codes[64];
-    float vals[64];
+    std::int8_t codes[256];
+    float vals[256];
     for (std::int32_t row = 0; row < n; ++row) {
         for (std::int32_t g = 0; g < kg; ++g) {
             float maxabs = 0.0f;

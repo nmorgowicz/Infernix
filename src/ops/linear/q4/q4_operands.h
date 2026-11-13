@@ -2,6 +2,7 @@
 
 #include "core/tensor.h"
 #include "core/weight.h"
+#include "ops/common/q4_scale_mode.h"
 
 #include <cuda_bf16.h>
 
@@ -18,6 +19,11 @@ struct Q4LinearOperands {
     std::int32_t k;
     std::int32_t tokens;
     std::int32_t padded_k;
+    // Row multipliers of the weight (Weight::row_scales), or null: the Gemma W4A8 route derives them
+    // into the workspace then.
+    const __nv_bfloat16* row_scales = nullptr;
+    // Scale mode of the weight (q4_scale_mode.h): log2(G / 32) for q4_g32/g128/g256.
+    std::int32_t scale_mode = 0;
 };
 
 inline Q4LinearOperands q4_linear_operands(const Tensor& x, const Weight& weight) {
@@ -27,7 +33,9 @@ inline Q4LinearOperands q4_linear_operands(const Tensor& x, const Weight& weight
             weight.n,
             weight.k,
             x.ne[1],
-            weight.padded_shape[1]};
+            weight.padded_shape[1],
+            static_cast<const __nv_bfloat16*>(weight.row_scales),
+            q4_scale_mode(weight.qtype) > 0 ? q4_scale_mode(weight.qtype) : 0};
 }
 
 // Private template domain. Public shape admission remains in q4_dispatch.

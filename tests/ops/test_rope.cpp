@@ -587,6 +587,14 @@ INFERNIX_OP_TEST(rope) {
         }
     }
     failures += run_pair_case(execution, {"27b text decode", 256, 64, 1, 1, kTextTheta}, 24, 4, 31);
+    // Gemma 4 sliding layers rotate the full 256 dims. Global layers, after the converter
+    // permutation, rotate the first 128 of 512.
+    constexpr float kGemmaSlidingTheta = 10'000.0F;
+    constexpr float kGemmaGlobalTheta  = 31.622776F;
+    failures += run_pair_case(
+        execution, {"gemma4 sliding full head", 256, 256, 1, 4, kGemmaSlidingTheta}, 32, 16, 7);
+    failures += run_pair_case(
+        execution, {"gemma4 global partial", 512, 128, 1, 3, kGemmaGlobalTheta}, 32, 4, 1024);
     failures += run_pair_case(execution, {"27b text mrope prefill", 256, 64, 3, 128, kTextTheta},
                               24, 4, 4096);
     failures += run_pair_case(

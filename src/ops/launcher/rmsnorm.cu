@@ -1,6 +1,7 @@
 // infernix::ops - RMSNorm launcher: finite semantic dispatch over general row geometries.
 #include "ops/launcher/rmsnorm.h"
 
+#include "ops/launcher/gemma4_rmsnorm.h"
 #include "ops/kernel/rmsnorm.cuh"
 #include "core/device.h"
 #include "core/pdl.cuh"
@@ -40,6 +41,12 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
                                      reinterpret_cast<const __nv_bfloat162*>(x_bf16),
                                      reinterpret_cast<const __nv_bfloat162*>(w_bf16), nullptr,
                                      reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps));
+            return;
+        }
+        if (aligned2 && d == 5376) {
+            // Gemma 4 hidden: the order-preserving single-pass kernel (non-RDC Gemma archive).
+            rmsnorm_gemma4_hidden_launch(x, weight, Epilogue == RmsEpilogue::Offset, out, rows, eps,
+                                         stream);
             return;
         }
     }

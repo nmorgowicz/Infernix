@@ -317,4 +317,23 @@ inline constexpr std::int32_t kQsaGroupSegments = 6;
 void linear_qsa_group(const Tensor& x, const Weight& w, Tensor* const* parts, LinearPolicy policy,
                       WorkspaceArena& workspace, cudaStream_t stream, LinearRoutes routes = LinearRoutes::Exact);
 
+/**
+ * Gemma-4 A8 prefill with a ready activation. The producer (the GeGLU that writes FP8 codes and
+ * per-column scales) already quantized `x`; `codes` is `[K,T]` E4M3 and `scales` holds one FP32 scale
+ * per column. Admits a Q4_G32/G128/G256_FP16 trunk weight on a fused-A8 shape, or the
+ * FP8_E4M3FN_ROW_BF16 5376x21504 down projection, under an A8 policy; linear_takes_a8_ready() says
+ * whether a weight and token count has this route (else the caller runs linear() on BF16 `x`).
+ */
+void linear_a8_ready(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
+                     std::uint8_t* codes, float* scales, WorkspaceArena& workspace,
+                     cudaStream_t stream);
+[[nodiscard]] bool linear_takes_a8_ready(const Weight& w, std::int32_t tokens, LinearPolicy policy);
+
+/**
+ * For a Q4_G32/G128/G256_FP16 weight the fused A8 prefill serves, derive its BF16 row multipliers once
+ * into `storage` and point w.row_scales at them; every other weight is left unchanged. `storage` must
+ * outlive `w`. Finishes before return (it synchronizes `stream`); a load-time call, never a request-time one.
+ */
+void linear_prepare_a8_rows(Weight& w, DeviceBuffer& storage, cudaStream_t stream);
+
 } // namespace infernix::ops

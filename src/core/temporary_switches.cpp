@@ -71,6 +71,10 @@ constexpr Registration kSwitches[] = {
     // Diagnostic (2026-10-29): =<MB/s>; the artifact read queues (core/direct_read_queue.cpp) hold each finished read
     // until a device of that rate would have delivered it, to measure the SSD tier on a slower drive. Same bits.
     {"INFERNIX_TMP_SSD_MBPS", Scope::All, Kind::Value},
+    // Gemma q4_g32/g128/g256 W4A8 prefill (ops/linear/q4/q4_g32_route.h, q4_exact_prefill): =1 sends the
+    // Gemma trunk shapes to the exact route (E4M3 codes, FP32 group scales; deterministic) from 128 tokens
+    // instead of the fused/baked row-scaled routes. The scoring A/B arm; the default is unchanged.
+    {"INFERNIX_TMP_Q4_EXACT", Scope::Gemma4, Kind::Flag},
 };
 constexpr std::size_t kCount = std::size(kSwitches);
 

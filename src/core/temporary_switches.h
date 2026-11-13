@@ -23,7 +23,8 @@ namespace infernix::temporary_switches {
 enum class Scope : std::uint8_t {
     Qwen3_5  = 1, // Qwen3_5ForCausalLM / Qwen3_5MoeForCausalLM Programs (and their kernels)
     Qwen4Exp = 2, // Qwen3.8-Flash-Next
-    All      = 3, // both (the Engine core, the shared expert offload stack)
+    Gemma4   = 4, // Gemma4ForCausalLM Programs (and their kernels)
+    All      = 7, // every model (the Engine core, the shared expert offload stack)
 };
 
 // The raw value, or nullopt when unset or empty.

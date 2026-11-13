@@ -23,6 +23,13 @@ namespace infernix::ops::detail {
 void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
                   LinearRoutes routes, WorkspaceArena* workspace, cudaStream_t stream);
 
+// `codes` and `scales` already hold the A8 activation (per-token E4M3 codes and FP32 scales, as
+// fp8_a8_quantize writes them); the workspace holds only the split-K partials. Gemma's 5376x21504
+// down projection after the GeGLU that writes the codes, on the A8 route only.
+void fp8_dispatch_ready(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
+                        std::uint8_t* codes, float* scales, WorkspaceArena* workspace,
+                        cudaStream_t stream);
+
 // Whether the problem (fp8_e4m3fn_row_bf16 or fp8_e4m3fn_row_f32) registers a dedicated
 // column-invariant route.
 [[nodiscard]] bool fp8_linear_column_invariant_route(QType qtype, std::int32_t output_rows,

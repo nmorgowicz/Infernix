@@ -53,4 +53,21 @@ extern const Fp8LinearShape kFp8N2560K640;
 // the shared expert's down projection and the vocabulary head.
 extern const Fp8LinearShape kFp8F32N3072K1024;
 extern const Fp8LinearShape kFp8F32N248320K3072;
+// Gemma 4 31B (shapes/gemma4.cu, in infernix_gemma4_ops): the trunk projections, the shared FP8
+// vocabulary table and head, and the assistant (draft) projections. The draft's are T=1 only on the
+// serving path.
+extern const Fp8LinearShape kFp8N16384K5376;
+extern const Fp8LinearShape kFp8N18432K5376;
+extern const Fp8LinearShape kFp8N43008K5376;
+extern const Fp8LinearShape kFp8N5376K8192;
+extern const Fp8LinearShape kFp8N5376K16384;
+extern const Fp8LinearShape kFp8N5376K21504;
+extern const Fp8LinearShape kFp8N262144K5376;
+extern const Fp8LinearShape kFp8N262144K1024;
+extern const Fp8LinearShape kFp8N1024K10752;
+extern const Fp8LinearShape kFp8N5376K1024;
+extern const Fp8LinearShape kFp8N8192K1024;
+extern const Fp8LinearShape kFp8N16384K1024;
+extern const Fp8LinearShape kFp8N1024K8192;
+extern const Fp8LinearShape kFp8N1024K16384;
 } // namespace infernix::ops::detail
