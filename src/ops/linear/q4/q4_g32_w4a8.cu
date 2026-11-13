@@ -550,6 +550,8 @@ __global__ void __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm)
         q4_mma_scaled_stage<Schedule>(activation + stage * BT * BK, weight + stage * BR * BK,
                                       tile_scale + (kt & 1) * kScaleTile, accumulators, warp, lane);
         if (kt + 1 < tiles_k) { issue_scales(kt + 1, (kt + 1) & 1); }
+        // The ldmatrix reads of the stage must be ordered before the TMA refill the empty arrive releases.
+        fence_reads_before_async_refill();
         __syncwarp();
         if (lane == 0) { cta_mbarrier_arrive(empty + stage); }
     }

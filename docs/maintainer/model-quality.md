@@ -856,7 +856,9 @@ shared-memory stages with TMA, and its consumer warps released a stage after `ld
 refill could overwrite a stage still being read; `infernix_fp8_moe_overlap_test` reproduces it
 (recipe C's FP8 [1280,2560] and [2560,640] beside staged W4A16 and W4A4 calls: the old kernel
 fails, so does the TMA producer without the fence, the fenced one and a cp.async producer pass),
-and every other TMA-fed route (BF16 A16, FP8 A8, FP8 A8 pair, NVFP4 A4) now fences: in the same
+and every other TMA-fed route (BF16 A16, FP8 A8, FP8 A8 pair, NVFP4 A4, and since 2026-11-14 the Q4 fused
+and exact W4A8 kernels, which Gemma 4 31B's 128-token scoring chunks exposed: unfenced, two identical
+scorings of the same 257 tokens differed by O(1) nats at random; `infernix_gemma4_program_real_test`) now fences: in the same
 harness the unfenced FP8 A8 route differed in 7-147 of 200 overlapped calls and the fenced one in
 none (`infernix_tma_moe_overlap_test`), while the unfenced BF16 A16, pair and NVFP4 A4 routes never
 differed there. The producer now stages with

@@ -10,6 +10,8 @@
 // and NVFP4 A4 ([5120,6144] at T = 1024) never failed here unfenced (0 of 200 each), so they are not
 // victims; they fence for the same proxy rule. fp8-a8-pair-block32 ([2560,6144] at T = 1024,
 // [16384,2560] at T = 200), whose first, unfenced form was nondeterministic even in isolation, is one.
+// The Gemma Q4 W4A8 prefill (fused route, q4_g32_fused_a8.cuh; exact route, q4_w4a8_tma_kernel) refills its
+// stages with TMA too and fences by the same rule; its victims are the Q4 g256 trunk shapes at T = 128.
 //
 // Every victim and routed output must equal a serialized run's bits, over many repeats, eager and
 // graph-replayed, beside W4A16 and W4A4 banks. The serialized outputs' hashes are printed so that
@@ -330,6 +332,15 @@ INFERNIX_OP_TEST(tma_moe_overlap) {
         victims.push_back(make_victim(keep, "FP8 pair-block32 [16384,2560] T=200",
                                       linear_test::make_fp8_weight(16384, 2560, 9109U), 200, true,
                                       LinearPolicy::A16Only, LinearRoutes::Fp8A8PairBlock32));
+        // The Gemma Q4 W4A8 prefill (q4_g32_fused_a8.cuh): code stages refilled by TMA beside the converters'
+        // shared-memory traffic. [5376,8192] is 84 tiles, all split over K; [16384,5376] a full wave of 188
+        // tiles plus a split tail of 68.
+        victims.push_back(make_victim(keep, "Q4 g256 fused [5376,8192] T=128",
+                                      linear_test::make_q4_g256_fp16_weight(5376, 8192, 9111U), 128, true,
+                                      LinearPolicy::AllowA8, LinearRoutes::Exact));
+        victims.push_back(make_victim(keep, "Q4 g256 fused [16384,5376] T=128",
+                                      linear_test::make_q4_g256_fp16_weight(16384, 5376, 9113U), 128, true,
+                                      LinearPolicy::AllowA8, LinearRoutes::Exact));
         int failures       = 0;
         std::uint32_t seed = 911U;
         for (const auto activation : {moe::ExpertActivation::kA16, moe::ExpertActivation::kA4}) {

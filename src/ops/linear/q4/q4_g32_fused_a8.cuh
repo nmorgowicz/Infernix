@@ -302,6 +302,9 @@ __global__ void __launch_bounds__(Q4FusedLayout<Schedule, LoadStages, RoundStage
                 *reinterpret_cast<uint4*>(tile + r * BK + (((2 * group) ^ swizzle) << 4))     = first;
                 *reinterpret_cast<uint4*>(tile + r * BK + (((2 * group + 1) ^ swizzle) << 4)) = second;
             }
+            // The converter's ld.shared reads of the code stage must be ordered before the TMA refill that
+            // the empty arrive releases (mbarrier orders generic-proxy accesses only).
+            fence_reads_before_async_refill();
             __syncwarp();
             if (lane == 0) {
                 cta_mbarrier_arrive(rounded + slot);
@@ -320,6 +323,8 @@ __global__ void __launch_bounds__(Q4FusedLayout<Schedule, LoadStages, RoundStage
         cta_mbarrier_wait(rounded + slot, (kt / R) & 1U);
         fp8_mma_compute_stage<Schedule>(activation + stage * Layout::kActivationBytes,
                                         weight + slot * Layout::kWeightBytes, accumulators, warp, lane);
+        // The ldmatrix reads of the activation stage, likewise, before the TMA refill.
+        fence_reads_before_async_refill();
         __syncwarp();
         if (lane == 0) {
             cta_mbarrier_arrive(empty + stage);
