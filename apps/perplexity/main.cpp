@@ -60,6 +60,7 @@ struct Options {
     std::optional<std::uint32_t> prefill_chunk;
     int device                          = 0;
     infernix::KvCacheStorage kv           = infernix::KvCacheStorage::Fp8E4M3Row256;
+    infernix::ops::Gemma4QkMode gemma4_qk = infernix::ops::Gemma4QkMode::BFloat16;
     infernix::LogitsDtype logits_dtype    = infernix::LogitsDtype::FP32;
     bool quick                          = false;
     bool original_int8_prefill_kernel   = false;
@@ -83,6 +84,7 @@ std::string usage_text() {
            "        default the Engine's 1024)\n"
            "       [--rope-yarn-factor F] (startup-fixed, finite [1,4], default 1; ceiling only)\n"
            "       [--kv-dtype bf16|bf16p|int8|fp8|nvfp4|k8v4|vq2|k4v2] (default fp8)\n"
+           "       [--gemma4-qk bf16|fp8] (Gemma4 global-layer QK precision; fp8 needs --kv-dtype fp8)\n"
            "       [--logits-dtype fp32|bf16] (the head's logits scoring reads; default fp32, bf16\n"
            "        rounds each once, as Transformers returns them, for comparisons)\n"
            "       [--use-original-int8-prefill-kernel (int8 only; default fast kernel)]\n"
@@ -210,6 +212,12 @@ Options parse_options(int argc, char** argv) {
             } else {
                 usage_error("--kv-dtype must be bf16, bf16p, int8, fp8, nvfp4, k8v4, vq2, or k4v2");
             }
+        } else if (option == "--gemma4-qk") {
+            try {
+                out.gemma4_qk = infernix::parse_gemma4_qk(value("--gemma4-qk"));
+            } catch (const std::invalid_argument& error) {
+                usage_error(error.what());
+            }
         } else if (option == "--logits-dtype") {
             try {
                 out.logits_dtype = infernix::product::parse_logits_dtype(value("--logits-dtype"));
@@ -333,6 +341,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.rope_yarn_factor  = options.rope_yarn_factor;
     if (options.prefill_chunk) { engine_options.prefill_chunk = *options.prefill_chunk; }
     engine_options.kv_cache         = options.kv;
+    engine_options.gemma4_qk        = options.gemma4_qk;
     engine_options.logits_dtype     = options.logits_dtype;
     engine_options.original_int8_prefill_kernel = options.original_int8_prefill_kernel;
     engine_options.original_nvfp4_prefill_kernel = options.original_nvfp4_prefill_kernel;
@@ -637,6 +646,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"prefill_chunk_tokens", engine.options().prefill_chunk},
           {"score_tile_tokens", 1024},
           {"kv_dtype", kv_name(options.kv)},
+          {"gemma4_qk", infernix::gemma4_qk_name(options.gemma4_qk)},
           {"logits_dtype", infernix::product::logits_dtype_name(options.logits_dtype)}}},
         {"timing",
          {{"load_seconds", load.load_seconds},

@@ -598,6 +598,16 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
     logger_->info("capacity | {} tokens of context across all requests ({} KV)",
                   product::format_pretty_count(memory.kv_capacity),
                   infernix::kv_cache_cli_name(memory.kv_cache));
+    if (memory.gemma4_kv) {
+        const infernix::Gemma4KvMemorySummary& kv = *memory.gemma4_kv;
+        logger_->info("Gemma QK | requested {} | resolved {} | {}", infernix::gemma4_qk_name(engine.gemma4_qk),
+                      infernix::gemma4_qk_name(kv.qk_mode), infernix::gemma4_qk_scope(kv.qk_mode));
+        logger_->info("Gemma KV | requested {} | global {} ({}) | sliding {} ({})",
+                      infernix::kv_cache_cli_name(kv.requested), infernix::kv_cache_cli_name(kv.global),
+                      product::format_pretty_bytes(kv.global_payload_bytes),
+                      infernix::kv_cache_cli_name(kv.sliding),
+                      product::format_pretty_bytes(kv.sliding_payload_bytes));
+    }
     logger_->debug("capacity | KV {} tokens, {}, {} | pages {}/{} | runtime {} | free {}",
                    product::format_pretty_count(memory.kv_capacity),
                    infernix::kv_cache_cli_name(memory.kv_cache),

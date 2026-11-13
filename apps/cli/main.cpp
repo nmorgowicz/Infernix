@@ -233,6 +233,16 @@ void print_generation_summary(const infernix::GenerationResult& result,
     print_metric("gpu sequence used", format_arena_used(memory.sequence));
     print_metric("kv cache dtype", format_kv_cache(memory.kv_cache));
     print_metric("kv cache payload", format_bytes(memory.kv_payload_bytes));
+    if (memory.gemma4_kv) {
+        const auto& kv = *memory.gemma4_kv;
+        print_metric("requested kv dtype", format_kv_cache(kv.requested));
+        print_metric("global kv dtype", format_kv_cache(kv.global) + ", " +
+                                            format_bytes(kv.global_payload_bytes));
+        print_metric("sliding kv dtype", format_kv_cache(kv.sliding) + ", " +
+                                             format_bytes(kv.sliding_payload_bytes));
+        print_metric("gemma4 qk", infernix::gemma4_qk_name(kv.qk_mode));
+        print_metric("gemma4 qk scope", infernix::gemma4_qk_scope(kv.qk_mode));
+    }
     print_metric("gpu workspace peak", format_arena_peak(memory.workspace));
     print_metric("runtime reservation", format_bytes(memory.runtime_reservation_bytes));
     print_metric("free after weights", format_bytes(memory.available_after_weights_bytes));
@@ -411,6 +421,7 @@ int main(int argc, char** argv) {
         engine_options.embedding_host           = cli.embedding_host;
         engine_options.prefill_chunk            = cli.prefill_chunk;
         engine_options.kv_cache                 = cli.kv_cache;
+        engine_options.gemma4_qk                = cli.gemma4_qk;
         engine_options.logits_dtype             = cli.logits_dtype;
         engine_options.original_int8_prefill_kernel = cli.original_int8_prefill_kernel;
         engine_options.prefill_split_workspace_mib  = cli.prefill_split_workspace_mib;

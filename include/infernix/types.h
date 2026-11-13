@@ -1,6 +1,7 @@
 #pragma once
 
 #include "infernix/kv_format.h"
+#include "infernix/ops/gemma4_cache.h"
 
 #include <array>
 #include <chrono>
@@ -26,6 +27,34 @@ inline constexpr std::size_t kMaximumExplicitPromptCacheMarkers  = 4;
 inline constexpr std::size_t kMaximumPromptMediaBytes = 256ULL << 20;
 inline constexpr std::size_t kDefaultMediaCacheBytes  = 1ULL << 30;
 inline constexpr std::size_t kDefaultMediaLiveBytes   = 2ULL << 30;
+
+[[nodiscard]] inline ops::Gemma4QkMode parse_gemma4_qk(std::string_view value) {
+    if (value == "bf16") { return ops::Gemma4QkMode::BFloat16; }
+    if (value == "fp8") { return ops::Gemma4QkMode::Fp8; }
+    throw std::invalid_argument("--gemma4-qk must be bf16 or fp8");
+}
+
+[[nodiscard]] inline const char* gemma4_qk_name(ops::Gemma4QkMode mode) {
+    return mode == ops::Gemma4QkMode::Fp8 ? "fp8" : "bf16";
+}
+
+[[nodiscard]] inline const char* gemma4_qk_scope(ops::Gemma4QkMode mode) {
+    return mode == ops::Gemma4QkMode::Fp8
+        ? "global D512 MMA tokens>=64: fp8 QK; tokens<64: unchanged BF16 SIMT; sliding D256 unchanged; V BF16-expanded, P hi+lo"
+        : "BF16 QK including FP8-cache expansion; small SIMT and sliding D256 unchanged";
+}
+
+inline void validate_gemma4_qk(ops::Gemma4QkMode mode, bool gemma4, KvCacheStorage storage) {
+    if (mode != ops::Gemma4QkMode::BFloat16 && mode != ops::Gemma4QkMode::Fp8) {
+        throw std::invalid_argument("invalid Gemma4 QK mode");
+    }
+    if (mode == ops::Gemma4QkMode::Fp8 && (!gemma4 || storage != KvCacheStorage::Fp8E4M3Row256)) {
+        throw std::invalid_argument(
+            "--gemma4-qk fp8 requires a Gemma4 artifact with --kv-dtype fp8; it is not supported with "
+            "other KV formats (bf16 QK is the default) or other model families");
+    }
+}
+
 // Physical Host memory Infernix leaves free for the OS and other programs after its weights, experts,
 // n-gram table and caches, when --ram-free-mib is not given (8 GiB since 2026-10-26: with 2 GiB a desktop paged
 // once Qwen3.8-Flash-Next's experts and n-gram table took the rest; Basalt's RAM-low guard sits at ~8.3 GiB).
@@ -845,6 +874,8 @@ struct EngineOptions {
     // them.
     std::vector<FastPath> fast_path_exclusions;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
+    // Gemma4 global-layer QK precision (--gemma4-qk); fp8 needs --kv-dtype fp8. Other families refuse fp8.
+    ops::Gemma4QkMode gemma4_qk        = ops::Gemma4QkMode::BFloat16;
     // The head's logits on every route (--logits-dtype): FP32, or BF16 for comparisons with engines and
     // references that round them; a startup choice (the round buffers and CUDA Graphs are planned for it).
     LogitsDtype logits_dtype           = LogitsDtype::FP32;
@@ -2042,6 +2073,17 @@ struct ExpertCacheMemorySummary {
     std::uint64_t kv_backed_bytes   = 0;
 };
 
+// Present only for Gemma4's mixed global/sliding cache. Payloads include scale planes and all
+// allocated pool pages, but exclude ring checkpoint snapshots and workspace.
+struct Gemma4KvMemorySummary {
+    KvCacheStorage requested          = KvCacheStorage::BFloat16;
+    KvCacheStorage global             = KvCacheStorage::BFloat16;
+    KvCacheStorage sliding            = KvCacheStorage::BFloat16;
+    ops::Gemma4QkMode qk_mode         = ops::Gemma4QkMode::BFloat16;
+    std::uint64_t global_payload_bytes  = 0;
+    std::uint64_t sliding_payload_bytes = 0;
+};
+
 struct MemorySummary {
     int device                                = 0;
     std::uint32_t max_context                 = 0;
@@ -2050,6 +2092,8 @@ struct MemorySummary {
     std::uint32_t kv_capacity_page_groups     = 0;
     std::uint32_t kv_capacity_max_page_groups = 0;
     KvCacheStorage kv_cache                   = KvCacheStorage::BFloat16;
+    // Present only for Gemma4's mixed global/sliding cache.
+    std::optional<Gemma4KvMemorySummary> gemma4_kv;
     ArenaMemorySummary weights;
     ArenaMemorySummary sequence;
     ArenaMemorySummary workspace;

@@ -107,6 +107,7 @@ constexpr std::array kCliOptions{
     CliOption{"--expert-pin-mib"},
     CliOption{"--expert-csf", false},
     CliOption{"--kv-dtype"},
+    CliOption{"--gemma4-qk"},
     CliOption{"--logits-dtype"},
     CliOption{"--spec"},
     CliOption{"--draft-tokens"},
@@ -186,6 +187,7 @@ std::string usage_text(const char* argv0) {
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N]\n"
            "       [--kv-dtype bf16|bf16p|int8|fp8|nvfp4|k8v4|vq2|k4v2] [--logits-dtype fp32|bf16]\n"
+           "       [--gemma4-qk bf16|fp8]\n"
            "       [--spec auto|off|mtp|dflash|dflash2 --draft-tokens "
            "N|auto]\n"
            "       [--draft-model FILE]\n"
@@ -283,6 +285,9 @@ std::string usage_text(const char* argv0) {
            "                           stores bf16's values in 23 % fewer bytes (12 bits a\n"
            "                           value; same output as bf16; a request with a KV row it\n"
            "                           cannot pack fails)\n"
+           "  --gemma4-qk M            bf16 (default) | fp8: Gemma4 global-layer attention QK\n"
+           "                           precision; fp8 needs --kv-dtype fp8 on a Gemma4 artifact\n"
+           "                           and is refused for other model families\n"
            "  --logits-dtype T         fp32 (default) | bf16: the head's logits the sampler,\n"
            "                           greedy choice, draft acceptance and scoring read;\n"
            "                           bf16 rounds each once, as Transformers returns them\n"
@@ -545,6 +550,8 @@ Options parse_options(int argc, char** argv) {
             }
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value(arg));
+        } else if (arg == "--gemma4-qk") {
+            options.gemma4_qk = parse_gemma4_qk(value(arg));
         } else if (arg == "--logits-dtype") {
             options.logits_dtype = product::parse_logits_dtype(value(arg));
         } else if (arg == "--spec") {

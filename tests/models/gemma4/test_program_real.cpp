@@ -1,10 +1,11 @@
-// Real BF16-KV Gemma transactions, including damage after a sliding-ring wrap. No downloads.
+// Real BF16- and FP8-KV Gemma transactions, including damage after a sliding-ring wrap. No downloads.
 // INFERNIX_GEMMA4_ARTIFACT selects an operator-owned artifact; absent means skip (77).
 #include "core/device.h"
 #include "infernix/engine.h"
 #include "models/gemma4/execution/parameters.h"
 #include "models/gemma4/frontend/frontend.h"
 #include "models/gemma4/load.h"
+#include "models/gemma4/program/kv_layout.h"
 #include "models/gemma4/program/program.h"
 
 #include <array>
@@ -201,6 +202,115 @@ void public_recovery(const char* artifact) {
             "a failed decode contaminated the next request");
     std::puts("PASS public Engine queued OOM recovery and failed-decode withdrawal");
 }
+runtime::ResolvedExecutionOptions greedy_execution() {
+    runtime::ResolvedExecutionOptions options;
+    options.requested_output_tokens = 8;
+    options.sampling.temperature = 0;
+    options.sampling.top_k = 20;
+    options.sampling.top_p = 1;
+    options.sampling.min_p = 0;
+    options.sampling.seed = 7;
+    options.allow_prefix_reuse = false;
+    return options;
+}
+bool refused(const g4::Model& model, const g4::ProgramOptions& options) {
+    try { (void)g4::Program::plan_device(model, options, model.config().text.vocab_size); }
+    catch (const std::invalid_argument&) { return true; }
+    return false;
+}
+std::uint64_t expected_global_payload(const g4::execution::Parameters& parameters, KvCacheStorage storage,
+                                      std::uint32_t pages) {
+    std::uint64_t bytes = 0;
+    for (const auto& layer : parameters.layers) {
+        if (layer.global_layer) {
+            bytes += g4::kv_layer_layout(storage, true, layer.head_dim, layer.kv_heads).page_bytes() * pages;
+        }
+    }
+    return bytes;
+}
+// One FP8-KV Program: accounting must match the real allocation, and an eager forward that dies
+// midway must leave no NaN/stale state that changes the next request (unwritten rows are zero).
+Tokens fp8_run(const g4::execution::Parameters& parameters, DeviceContext& device, g4::Frontend& frontend,
+               ops::Gemma4QkMode qk, bool graphs) {
+    constexpr auto fp8 = KvCacheStorage::Fp8E4M3Row256;
+    g4::Program program(parameters, device,
+        {.max_context = 2048, .prefill_chunk = 128, .kv_cache = fp8, .qk_mode = qk, .use_cuda_graph = graphs});
+    const auto memory = program.memory_summary();
+    require(memory.kv_cache == fp8 && memory.gemma4_kv.has_value(), "FP8 memory summary lost the KV format");
+    const auto& kv = *memory.gemma4_kv;
+    require(kv.requested == fp8 && kv.global == fp8 && kv.sliding == KvCacheStorage::BFloat16 && kv.qk_mode == qk,
+            "FP8 memory summary misreports the global/sliding formats or QK mode");
+    const auto pages = program.device_plan().kv_pages;
+    require(kv.global_payload_bytes == expected_global_payload(parameters, fp8, pages),
+            "global FP8 payload does not include the code and scale planes");
+    require(memory.kv_payload_bytes == kv.global_payload_bytes + kv.sliding_payload_bytes,
+            "kv_payload_bytes disagrees with the Gemma payload split");
+    require(memory.kv_payload_bytes + 8ULL * pages == program.device_plan().kv,
+            "planner and constructor disagree on FP8 KV bytes");
+    require(memory.cuda_graph_measured_bytes <= memory.cuda_graph_allowance_bytes,
+            "CUDA graph preparation exceeded its allowance");
+    auto plan = program.plan_request(frontend.prepare_tokens(tokens(1537, 17)), greedy_execution());
+    const auto reference = complete(program, bind(program, plan), 8);
+    if (!graphs) {
+        auto sequence = bind(program, plan);
+        for (int i = 0; i < 9; ++i) { (void)program.advance_prefill(sequence); }
+        testing::arm_memory_exhausted_here(100);
+        bool failed = false;
+        try { (void)program.advance_prefill(sequence); }
+        catch (const DeviceMemoryExhausted&) { failed = true; }
+        testing::arm_memory_exhausted_here(0);
+        require(failed, "the FP8 partial-forward memory fault did not fire");
+        require(program.recover_after_failure(), "the device did not recover after a partial FP8 forward");
+        require(complete(program, bind(program, plan), 8) == reference,
+                "a partially written FP8 cache changed a fresh request after recovery");
+    }
+    return reference;
+}
+void fp8_kv_program(const char* artifact) {
+    DeviceContext device(0);
+    auto model = g4::load_model(artifact, {}, device);
+    const g4::execution::Parameters parameters(*model, device.stream);
+    g4::Frontend frontend(model->resources(), {.max_context = 2048});
+    g4::ProgramOptions options{.max_context = 2048, .prefill_chunk = 128};
+    options.qk_mode = ops::Gemma4QkMode::Fp8;
+    require(refused(*model, options), "FP8 QK with BF16 KV was accepted");
+    options.kv_cache = KvCacheStorage::Int8Group64;
+    options.qk_mode = ops::Gemma4QkMode::BFloat16;
+    require(refused(*model, options), "INT8 KV was accepted by Gemma4");
+    for (const auto qk : {ops::Gemma4QkMode::BFloat16, ops::Gemma4QkMode::Fp8}) {
+        const auto eager = fp8_run(parameters, device, frontend, qk, false);
+        require(fp8_run(parameters, device, frontend, qk, true) == eager,
+                "CUDA graphs changed the FP8 KV continuation");
+    }
+    std::puts("PASS FP8 KV Program (BF16-QK and FP8-QK, graphs on/off, accounting, refusals, recovery)");
+}
+void public_fp8(const char* artifact) {
+    EngineOptions options;
+    options.artifact_path = artifact;
+    options.max_context = 2048;
+    options.prefill_chunk = 128;
+    options.max_concurrency = 1;
+    options.context_cache.enabled = false;
+    options.kv_cache = KvCacheStorage::BFloat16;
+    options.gemma4_qk = ops::Gemma4QkMode::Fp8;
+    options.logits_dtype = LogitsDtype::BF16;
+    options.speculative.backend_auto = false;
+    options.speculative.backend = SpeculativeBackend::None;
+    bool refused_qk = false;
+    try { Engine engine(options); }
+    catch (const std::invalid_argument&) { refused_qk = true; }
+    require(refused_qk, "the public Engine accepted FP8 QK with BF16 KV");
+    options.kv_cache = KvCacheStorage::Fp8E4M3Row256;
+    Engine engine(options);
+    require(!engine.generate(engine.prepare_tokens(tokens(257, 21)), request()).generated_token_ids.empty(),
+            "the FP8 public Engine generated nothing");
+    const auto memory = engine.memory_summary();
+    require(memory.kv_cache == KvCacheStorage::Fp8E4M3Row256 && memory.gemma4_kv.has_value() &&
+            memory.gemma4_kv->qk_mode == ops::Gemma4QkMode::Fp8, "the Engine memory summary lost the FP8 settings");
+    require(engine.load_summary().prefill_signature.find("fp8-kv/qk=fp8") != std::string::npos,
+            "the load summary does not identify the FP8 KV and QK route");
+    std::puts("PASS public FP8 KV/FP8-QK Engine and QK refusal");
+}
 } // namespace
 int main() {
     const char* artifact = std::getenv("INFERNIX_GEMMA4_ARTIFACT");
@@ -211,6 +321,8 @@ int main() {
     try {
         native_transactions(artifact);
         public_recovery(artifact);
+        fp8_kv_program(artifact);
+        public_fp8(artifact);
         return 0;
     } catch (const std::exception& error) {
         testing::arm_memory_exhausted_here(0);

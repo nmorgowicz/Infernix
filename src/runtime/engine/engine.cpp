@@ -121,6 +121,7 @@ EngineOptions normalize_options(EngineOptions engine_options, models::Architectu
         std::rethrow_exception(unreadable);
     }
     auto normalized = runtime::normalize_engine_options(std::move(engine_options), architecture, offloaded_experts);
+    validate_gemma4_qk(normalized.gemma4_qk, architecture == models::Architecture::Gemma4, normalized.kv_cache);
     if (architecture == models::Architecture::Gemma4) { runtime::validate_gemma4_options(normalized); }
     return normalized;
 }

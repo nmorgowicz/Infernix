@@ -38,7 +38,7 @@ struct ConstructedGemma4 {
     EngineOptions options;
 };
 
-// P4 is a real cold-cache, single-lane BF16 route. Other routes must fail before loading.
+// P5 is a real cold-cache, single-lane route with BF16 or FP8 global KV. Other routes must fail before loading.
 void validate_gemma4_options(const EngineOptions& options);
 
 // Planning uses the same model-aware reservation curve without uploading weights or

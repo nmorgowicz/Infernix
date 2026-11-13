@@ -400,6 +400,11 @@ int main() {
     failures += check(parse({"infernix-serve", "model.ninfer", "--kv-dtype", "bf16p"}).kv_cache ==
                           infernix::KvCacheStorage::Bf16Packed,
                       "--kv-dtype bf16p did not select packed BF16 KV");
+    failures += check(parse({"infernix-serve", "model.ninfer"}).gemma4_qk == infernix::ops::Gemma4QkMode::BFloat16,
+                      "--gemma4-qk must default to bf16");
+    failures += check(parse({"infernix-serve", "model.ninfer", "--gemma4-qk", "fp8"}).gemma4_qk ==
+                          infernix::ops::Gemma4QkMode::Fp8,
+                      "--gemma4-qk fp8 was not parsed");
     const std::string kv_help = serve_usage_text("infernix-serve");
     failures += check(kv_help.find("nvfp4") != std::string::npos &&
                           kv_help.find("k8v4") != std::string::npos &&

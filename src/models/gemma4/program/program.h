@@ -3,6 +3,7 @@
 // Native cold-cache, single-lane Gemma 4 execution. Prefix-cache absence is intentional:
 // no state produced by this Program is published or persisted.
 #include "models/gemma4/config.h"
+#include "infernix/ops/gemma4_cache.h"
 #include "models/gemma4/model.h"
 #include "models/gemma4/frontend/frontend.h"
 #include "models/gemma4/frontend/output_session.h"
@@ -185,7 +186,7 @@ struct ContextProgress {
 };
 struct ProgramDevicePlan {
     std::uint32_t kv_pages = 0;
-    // KV includes both BF16 planes of global pools and sliding rings, plus both page tables.
+    // KV includes global pools (BF16, or FP8 codes plus FP16 scales) and BF16 sliding rings, plus both page tables.
     std::uint64_t kv = 0, kv_max = 0, workspace = 0, state = 0, io = 0;
     std::uint64_t prepared_row_scales = 0, graph_allowance = 0;
     std::uint32_t graph_bound = 0;
@@ -201,6 +202,7 @@ struct ProgramOptions {
     std::uint32_t prefill_chunk = 1024;
     std::uint32_t kv_capacity_tokens = 0;
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
+    ops::Gemma4QkMode qk_mode = ops::Gemma4QkMode::BFloat16;
     bool causal_scoring = false;
     bool prefix_cache = false;
     bool reproducible = false;

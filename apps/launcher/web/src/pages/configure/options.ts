@@ -77,6 +77,18 @@ const CONTEXT: FormSection = {
       unsetLabel: "BF16 (default)",
     },
     {
+      kind: "select",
+      flag: "--gemma4-qk",
+      label: "Gemma 4 attention QK precision",
+      help: "Gemma 4 global-layer attention QK: BF16 (default) or FP8 tensor cores, faster on long prompts and measurably less faithful. FP8 needs the FP8 KV cache format on a Gemma 4 model; other models refuse it.",
+      options: [
+        { value: "bf16", label: "BF16" },
+        { value: "fp8", label: "FP8 (needs FP8 KV)" },
+      ],
+      unsetLabel: "BF16 (default)",
+      more: true,
+    },
+    {
       kind: "auto",
       flag: "--vram-headroom-mib",
       label: "VRAM headroom (MiB)",

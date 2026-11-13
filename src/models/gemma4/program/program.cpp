@@ -4,6 +4,8 @@
 #include "core/decode_graph.h"
 #include "core/startup.h"
 #include "models/gemma4/execution/parameters.h"
+#include "models/gemma4/program/kv_layout.h"
+#include "infernix/types.h"
 #include "models/gemma4/execution/text_forward.h"
 #include "infernix/ops/fp8_row_cublas.h"
 #include "infernix/ops/sampling.h"
@@ -48,9 +50,8 @@ void validate_options(const Model& model, const ProgramOptions& o, std::uint32_t
     if (o.max_concurrency != 1) { throw std::invalid_argument("Gemma4 P4 requires max_concurrency=1"); }
     if (o.reproducible) { throw std::invalid_argument("Gemma4 P4 does not support --reproducible"); }
     if (o.prefix_cache) { throw std::invalid_argument("Gemma4 P4 requires prefix_cache=false"); }
-    if (o.kv_cache != KvCacheStorage::BFloat16) {
-        throw std::invalid_argument("Gemma4 P4 requires BF16 K and V storage");
-    }
+    (void)gemma4_kv_format(o.kv_cache);
+    validate_gemma4_qk(o.qk_mode, true, o.kv_cache);
     if (model.config().mtp) { throw std::invalid_argument("Gemma4 P4 does not execute MTP"); }
     if (o.prefill_chunk < 16 || o.prefill_chunk > 16384) {
         throw std::invalid_argument("Gemma4 prefill_chunk must be in [16,16384]");
@@ -74,7 +75,9 @@ ProgramDevicePlan Program::plan_device(const Model& model, const ProgramOptions&
     std::uint64_t global_page_bytes = 0;
     std::uint64_t sliding_page_bytes = 0;
     for (const auto& layer : geometry.layers) {
-        const std::uint64_t bytes = 4ULL * layer.head_dim * layer.kv_heads * kPage;
+        // Global layers follow the requested format (FP8 codes plus FP16 scales); rings stay BF16.
+        const std::uint64_t bytes =
+            kv_layer_layout(options.kv_cache, layer.global_layer, layer.head_dim, layer.kv_heads).page_bytes();
         (layer.global_layer ? global_page_bytes : sliding_page_bytes) += bytes;
         plan.workspace = std::max<std::uint64_t>(plan.workspace,
             gemma4_layer_workspace_bytes(layer, static_cast<int>(options.prefill_chunk)));
@@ -144,8 +147,9 @@ struct ProgramImpl {
     DeviceArena io;
     DeviceBuffer global_table_storage, ring_table_storage;
     Tensor global_table, ring_table;
-    std::vector<DeviceBuffer> keys, values;
-    std::vector<Tensor> key_views, value_views;
+    std::vector<DeviceBuffer> keys, values, key_scales, value_scales;
+    std::vector<Tensor> key_views, value_views, key_scale_views, value_scale_views;
+    std::uint64_t global_payload_bytes = 0, sliding_payload_bytes = 0;
     std::vector<Gemma4CacheLayer> caches;
     Tensor ids, positions, hidden, head, counts, mask, step, distribution_ids, distribution_values;
     ops::SamplingConfig* sampling_device = nullptr;
@@ -209,23 +213,44 @@ struct ProgramImpl {
         global_table = Tensor(global_table_storage.p, DType::I32, {static_cast<int>(plan.kv_pages)});
         ring_table = Tensor(ring_table_storage.p, DType::I32, {static_cast<int>(plan.kv_pages)});
         const auto layers = p.layers.size();
-        keys.reserve(layers); values.reserve(layers); key_views.reserve(layers); value_views.reserve(layers);
+        for (auto* storage : {&keys, &values, &key_scales, &value_scales}) { storage->reserve(layers); }
+        for (auto* views : {&key_views, &value_views, &key_scale_views, &value_scale_views}) { views->reserve(layers); }
         caches.reserve(layers);
         for (const auto& layer : p.layers) {
             const auto pages = layer.global_layer ? plan.kv_pages : ring_count;
-            const auto bytes = 2ULL * layer.head_dim * kPage * layer.kv_heads * pages;
-            keys.emplace_back(static_cast<std::size_t>(bytes));
-            values.emplace_back(static_cast<std::size_t>(bytes));
-            key_views.emplace_back(keys.back().p, DType::BF16,
-                std::initializer_list<std::int32_t>{layer.head_dim, static_cast<int>(kPage), layer.kv_heads, static_cast<int>(pages)});
-            value_views.emplace_back(values.back().p, DType::BF16,
-                std::initializer_list<std::int32_t>{layer.head_dim, static_cast<int>(kPage), layer.kv_heads, static_cast<int>(pages)});
+            const auto layout = kv_layer_layout(options.kv_cache, layer.global_layer, layer.head_dim, layer.kv_heads);
+            const auto code_bytes = layout.code_page_bytes * pages;
+            (layer.global_layer ? global_payload_bytes : sliding_payload_bytes) += layout.page_bytes() * pages;
+            // Never-written rows must read as finite zeros (code 0, scale 0), including after recovery.
+            keys.emplace_back(code_bytes); values.emplace_back(code_bytes);
+            keys.back().fill(0); values.back().fill(0);
+            const std::initializer_list<std::int32_t> shape{
+                layer.head_dim, static_cast<int>(kPage), layer.kv_heads, static_cast<int>(pages)};
+            key_views.emplace_back(keys.back().p, layout.code_dtype, shape);
+            value_views.emplace_back(values.back().p, layout.code_dtype, shape);
+            key_scales.emplace_back(); value_scales.emplace_back();
+            key_scale_views.emplace_back(); value_scale_views.emplace_back();
+            if (layout.scale_groups != 0) {
+                const auto scale_bytes = layout.scale_page_bytes * pages;
+                key_scales.back() = DeviceBuffer(scale_bytes); value_scales.back() = DeviceBuffer(scale_bytes);
+                key_scales.back().fill(0); value_scales.back().fill(0);
+                const std::initializer_list<std::int32_t> scale_shape{
+                    layout.scale_groups, static_cast<int>(kPage), layer.kv_heads, static_cast<int>(pages)};
+                key_scale_views.back() = Tensor(key_scales.back().p, DType::FP16, scale_shape);
+                value_scale_views.back() = Tensor(value_scales.back().p, DType::FP16, scale_shape);
+            }
         }
+        // Every reserve() above is complete; the descriptors now point at stable Tensor storage.
         for (std::size_t i = 0; i < layers; ++i) {
-            caches.push_back({.format = ops::Gemma4KvFormat::BFloat16,
+            const bool global = p.layers[i].global_layer;
+            const bool scaled = key_scale_views[i].data != nullptr;
+            caches.push_back({.format = scaled ? ops::Gemma4KvFormat::Fp8E4m3Row256 : ops::Gemma4KvFormat::BFloat16,
                 .k_pages = &key_views[i], .v_pages = &value_views[i],
-                .block_table = p.layers[i].global_layer ? &global_table : &ring_table,
-                .qk_mode = ops::Gemma4QkMode::BFloat16});
+                .k_scales = scaled ? &key_scale_views[i] : nullptr,
+                .v_scales = scaled ? &value_scale_views[i] : nullptr,
+                .block_table = global ? &global_table : &ring_table,
+                // Sliding descriptors retain BF16 QK.
+                .qk_mode = global ? options.qk_mode : ops::Gemma4QkMode::BFloat16});
         }
         if (p.derived_device_bytes() != plan.prepared_row_scales) {
             throw std::logic_error("Gemma4 Parameters and device plan disagree on prepared row scales");
@@ -802,8 +827,13 @@ MemorySummary Program::memory_summary() const noexcept {
     result.weights.peak_used_bytes = result.weights.capacity_bytes;
     result.kv_capacity = p.plan.kv_pages * kPage; result.kv_capacity_page_groups = p.plan.kv_pages;
     result.kv_capacity_max_page_groups = pages_for(p.options.max_context);
-    result.kv_cache = KvCacheStorage::BFloat16;
-    result.kv_payload_bytes = p.plan.kv - 8ULL * p.plan.kv_pages;
+    // kv_cache is the global format; gemma4_kv states the BF16 sliding rings explicitly.
+    result.kv_cache = p.options.kv_cache;
+    result.gemma4_kv = Gemma4KvMemorySummary{
+        .requested = p.options.kv_cache, .global = p.options.kv_cache, .sliding = KvCacheStorage::BFloat16,
+        .qk_mode = p.options.qk_mode, .global_payload_bytes = p.global_payload_bytes,
+        .sliding_payload_bytes = p.sliding_payload_bytes};
+    result.kv_payload_bytes = p.global_payload_bytes + p.sliding_payload_bytes;
     result.sequence.capacity_bytes = static_cast<std::size_t>(p.plan.kv + p.plan.io);
     result.sequence.used_bytes = result.sequence.capacity_bytes;
     result.sequence.peak_used_bytes = result.sequence.capacity_bytes;

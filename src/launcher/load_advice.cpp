@@ -107,10 +107,13 @@ void vram_suggestions(const ScannedModel& model, const Args& args, std::string_v
                        with_flag(args, "--max-concurrency", "1")});
     }
     const std::optional<std::string> kv_dtype = flag_value(args, "--kv-dtype");
+    const bool gemma4 = model.model_type == "gemma4_text";
     if (!kv_dtype || *kv_dtype == "bf16") {
-        out.push_back({"Store the KV cache as INT8",
-                       "Half the size of the default BF16 cache, and the format Infernix recommends (--kv-dtype int8).",
-                       with_flag(args, "--kv-dtype", "int8")});
+        // Gemma4 refuses INT8 KV; its compact format is FP8 on the global layers.
+        out.push_back({gemma4 ? "Store the KV cache as FP8" : "Store the KV cache as INT8",
+                       gemma4 ? "Smaller than the default BF16 global-layer cache (--kv-dtype fp8)."
+                              : "Half the size of the default BF16 cache, and the format Infernix recommends (--kv-dtype int8).",
+                       with_flag(args, "--kv-dtype", gemma4 ? "fp8" : "int8")});
     }
     if (facts.vram_used > (1ull << 30)) {
         out.push_back({"Close other programs using the GPU",

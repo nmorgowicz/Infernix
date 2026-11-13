@@ -7,7 +7,8 @@ infernix_add_test(infernix_gemma4_loading_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_loading_real.cpp"
   LIBRARIES infernix_model_loading)
 
-# Explicit real artifact, no downloads. Exercises real partial-ring writes and public queued recovery.
+# Explicit real artifact, no downloads. Exercises real partial-ring writes, public queued recovery and
+# the FP8 KV / FP8-QK Program (graphs on/off, accounting, refusals).
 infernix_add_test(infernix_gemma4_program_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_program_real.cpp"
   LIBRARIES infernix_engine infernix_model_runtime)

@@ -585,6 +585,7 @@ std::string format_server_start_json(
              {"lossless", engine_options.lossless},
              {"log_stats_interval_ms", options.log_stats_interval_ms},
              {"kv_cache", kv_cache_json_name(engine_options.kv_cache)},
+             {"gemma4_qk", infernix::gemma4_qk_name(engine_options.gemma4_qk)},
              {"logits_dtype", product::logits_dtype_name(engine_options.logits_dtype)},
              {"vision", engine_options.enable_vision},
              {"cuda_graph", engine_options.use_cuda_graph},
@@ -641,6 +642,17 @@ std::string format_server_start_json(
              {"cuda_graph_allowance_bytes", memory.cuda_graph_allowance_bytes},
              {"cuda_graph_measured_bytes", memory.cuda_graph_measured_bytes},
              {"kv_payload_bytes", memory.kv_payload_bytes}};
+    if (memory.gemma4_kv) {
+        const auto& kv = *memory.gemma4_kv;
+        record["memory"]["gemma4_kv"] =
+            Json{{"requested", kv_cache_json_name(kv.requested)},
+                 {"global", kv_cache_json_name(kv.global)},
+                 {"sliding", kv_cache_json_name(kv.sliding)},
+                 {"qk_mode", infernix::gemma4_qk_name(kv.qk_mode)},
+                 {"qk_scope", infernix::gemma4_qk_scope(kv.qk_mode)},
+                 {"global_payload_bytes", kv.global_payload_bytes},
+                 {"sliding_payload_bytes", kv.sliding_payload_bytes}};
+    }
     record["environment"] =
         Json{{"device", environment.device},
              {"gpu_name", environment.gpu_name},

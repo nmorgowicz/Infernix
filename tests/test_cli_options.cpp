@@ -348,6 +348,12 @@ int run_tests() {
     failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "bf16p"})
                               .kv_cache == infernix::KvCacheStorage::Bf16Packed,
                       "--kv-dtype bf16p did not select packed BF16 KV");
+    failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "hello"}).gemma4_qk ==
+                          infernix::ops::Gemma4QkMode::BFloat16,
+                      "--gemma4-qk must default to bf16");
+    failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--gemma4-qk", "fp8"}).gemma4_qk ==
+                          infernix::ops::Gemma4QkMode::Fp8,
+                      "--gemma4-qk fp8 was not parsed");
     const std::string help = infernix::cli::usage_text("infernix-cli");
     failures +=
         check(help.find("nvfp4") != std::string::npos && help.find("k8v4") != std::string::npos &&

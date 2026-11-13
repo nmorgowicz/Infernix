@@ -7,6 +7,7 @@
 #include "core/startup.h"
 #include "core/vram_budget.h"
 #include "models/load_options.h"
+#include "models/gemma4/program/kv_layout.h"
 #include "runtime/engine/engine_plan.h"
 #include "runtime/engine/kv_capacity.h"
 #include "runtime/expert_offload/memory_plan.h"
@@ -32,6 +33,7 @@ ProgramOptions program_options(const EngineOptions& options) {
     out.kv_capacity_tokens = options.kv_capacity.mode == KvCapacityMode::Automatic ? 0U :
         ((options.kv_capacity.explicit_tokens + 63U) / 64U) * 64U;
     out.kv_cache = options.kv_cache;
+    out.qk_mode = options.gemma4_qk;
     out.causal_scoring = options.purpose == EnginePurpose::CausalScoring;
     out.prefix_cache = options.context_cache.enabled;
     out.reproducible = !options.fast_paths;
@@ -78,9 +80,8 @@ void validate_gemma4_options(const EngineOptions& options) {
     if (options.context_cache.enabled) {
         throw std::invalid_argument("Gemma4 cold-cache execution requires --no-prefix-reuse; prefix reuse is not implemented yet");
     }
-    if (options.kv_cache != KvCacheStorage::BFloat16) {
-        throw std::invalid_argument("Gemma4 currently requires --kv-dtype bf16");
-    }
+    (void)models::gemma4::gemma4_kv_format(options.kv_cache);
+    validate_gemma4_qk(options.gemma4_qk, true, options.kv_cache);
     const auto& spec = options.speculative;
     if (spec.backend_auto || spec.backend != SpeculativeBackend::None || spec.ngram_draft_tokens != 0 ||
         spec.ngram_draft_tokens_auto || spec.ngram_archive_bytes != 0 || !spec.draft_model.empty()) {
@@ -192,7 +193,9 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& supplied, DeviceContext&
     LoadSummary summary;
     summary.architecture = "Gemma4ForCausalLM";
     summary.model_name = instance->model->info().name;
-    summary.prefill_signature = "gemma4/bf16-kv/cold/chunk=" + std::to_string(options.prefill_chunk);
+    summary.prefill_signature = std::string("gemma4/") +
+        (options.kv_cache == KvCacheStorage::Fp8E4M3Row256 ? "fp8" : "bf16") + "-kv/qk=" +
+        gemma4_qk_name(options.gemma4_qk) + "/cold/chunk=" + std::to_string(options.prefill_chunk);
     std::set<std::string> formats;
     for (const auto& weight : instance->model->weight_data()) {
         for (const auto& part : weight.view.parts) {

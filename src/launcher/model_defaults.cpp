@@ -77,8 +77,10 @@ Args default_args(const LibraryScan& scan, const ScannedModel& model, const Host
     } else if (model.native_context != 0) {
         add("--max-context", std::to_string(std::min<std::uint64_t>(model.native_context, 262144)));
     }
-    add("--max-concurrency", "2");
-    add("--kv-dtype", "int8");
+    // Gemma4 runs one lane and stores KV as BF16 or FP8 only (INT8 is refused); every other family keeps 2 lanes, INT8.
+    const bool gemma4 = model.model_type == "gemma4_text";
+    add("--max-concurrency", gemma4 ? "1" : "2");
+    add("--kv-dtype", gemma4 ? "fp8" : "int8");
 
     // Speculative decoding: the Engine picks the drafter measured fastest for the artifact.
     const ScannedDrafter* drafter = model.accepts_draft_model ? best_drafter(scan, model) : nullptr;

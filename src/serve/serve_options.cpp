@@ -97,6 +97,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--expert-pin-mib"},
     ServeOptionArity{"--expert-csf", false},
     ServeOptionArity{"--kv-dtype"},
+    ServeOptionArity{"--gemma4-qk"},
     ServeOptionArity{"--logits-dtype"},
     ServeOptionArity{"--spec"},
     ServeOptionArity{"--draft-tokens"},
@@ -486,6 +487,9 @@ std::string serve_usage_text(const char* argv0) {
            "                             BF16; bf16p stores bf16's values in 23 % fewer bytes (12\n"
            "                             bits a value; same output as bf16; a request with a KV\n"
            "                             row it cannot pack fails)\n"
+           "  --gemma4-qk M              bf16 (default) | fp8: Gemma4 global-layer attention QK\n"
+           "                             precision; fp8 needs --kv-dtype fp8 on a Gemma4\n"
+           "                             artifact and is refused for other model families\n"
            "  --logits-dtype T           fp32 (default) | bf16: the head's logits the sampler,\n"
            "                             greedy choice, draft acceptance and constraints read;\n"
            "                             bf16 rounds each once, as Transformers returns them\n"
@@ -1122,6 +1126,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
+        } else if (arg == "--gemma4-qk") {
+            options.gemma4_qk = parse_gemma4_qk(require_value("--gemma4-qk"));
         } else if (arg == "--logits-dtype") {
             options.logits_dtype = product::parse_logits_dtype(require_value("--logits-dtype"));
         } else if (arg == "--spec") {
