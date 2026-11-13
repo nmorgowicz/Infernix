@@ -21,6 +21,12 @@ infernix_add_test(infernix_gemma4_tool_parser_test
           "${PROJECT_SOURCE_DIR}/src/models/gemma4/frontend/tool_parser.cpp"
   LIBRARIES infernix::json)
 
+# P7 C.0: prefix-cache byte geometry (31B-like and 26B-A4B-like descriptors), the cache/restore
+# identity's fingerprint stability and field sensitivity, and the value-only storage flag's carry
+# and refusal. Pure headers, CPU only: no GPU, no artifact, no model.
+infernix_add_test(infernix_gemma4_prefix_geometry_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_prefix_geometry.cpp")
+
 # Original HF-template fixture byte identity, plus fixed-template override behavior, tool calls
 # through the output session, required tool choice, EOS arrays and thinking precedence. CPU only. Skips (77)
 # without INFERNIX_GEMMA4_HF (a Hugging Face Gemma 4 directory with tokenizer.json and chat_template.jinja);

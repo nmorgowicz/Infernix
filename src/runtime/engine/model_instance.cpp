@@ -494,6 +494,9 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     }
     const std::uint32_t concurrency = options.max_concurrency;
     const bool qwen4_exp            = architecture == models::Architecture::Qwen4Exp;
+    // Gemma4's prefix cache is Host-born like Qwen3.8-Flash-Next's: one tier, no Device snapshot
+    // slots, and --host-context-mib 0 as its off switch (a cold lane).
+    const bool gemma4               = architecture == models::Architecture::Gemma4;
     // Offloaded routed experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B) share the offload defaults.
     const bool offloaded            = qwen4_exp || offloaded_experts;
     // --draft-tokens auto where no draft length beats plain decode (the configuration's measurement,
@@ -617,6 +620,25 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
             throw std::invalid_argument(
                 "--cache-host-state fp24 and bf16 are lossy; --reproducible and --lossless require fp32");
         }
+        if (gemma4) {
+            // Gemma's snapshots are born in the Host tier; it has no Device snapshot slots, and
+            // --host-context-mib 0 is its off switch (a cold lane: the too-small and auto sizing
+            // live in construct_gemma4, against the artifact's geometry).
+            if (hybrid.device_snapshot_slots.value_or(0U) != 0) {
+                throw std::invalid_argument("Gemma4's prefix cache has no Device snapshot slots");
+            }
+            hybrid.device_snapshot_slots = 0U;
+            if (host_tier && hybrid.host_state_precision != HybridHostStatePrecision::Fp32) {
+                throw std::invalid_argument("Gemma4's prefix cache keeps snapshot state exact on the Host tier");
+            }
+            if (host_tier && hybrid.tool_call_hold.value_or(std::chrono::milliseconds{0}).count() != 0) {
+                throw std::invalid_argument("Gemma4's prefix cache has no tool-call holds");
+            }
+            if (host_tier && !options.fast_paths &&
+                hybrid.next_turn_prefill_quiet.value_or(std::chrono::milliseconds{0}).count() != 0) {
+                throw std::invalid_argument("Gemma4's idle next-turn prefill is not exact: --reproducible and --lossless refuse it");
+            }
+        }
         if (qwen4_exp) {
             // Qwen3.8-Flash-Next's snapshots are born in the Host tier (design §19.3.1): it needs
             // the tier and has no Device snapshot slots.
@@ -642,7 +664,7 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
             }
         }
         hybrid.tool_call_hold =
-            hybrid.tool_call_hold.value_or(qwen4_exp ? std::chrono::milliseconds{0} : kDefaultToolCallHold);
+            hybrid.tool_call_hold.value_or(qwen4_exp || gemma4 ? std::chrono::milliseconds{0} : kDefaultToolCallHold);
         // Idle-time prefill of finished turns (hybrid-prefix-cache-spec §7.9). Qwen3.8-Flash-Next: off by default
         // (its default route already resumes 94 % of agentic turns at the reply's end), and refused on the
         // reproducible route, where a turn resumed from the pass's grid snapshot inside a cold run's call differed
@@ -652,7 +674,7 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
                 "Qwen3.8-Flash-Next's idle next-turn prefill is not exact: --reproducible and --lossless refuse it");
         }
         hybrid.next_turn_prefill_quiet = hybrid.next_turn_prefill_quiet.value_or(
-            qwen4_exp ? std::chrono::milliseconds{0} : kDefaultNextTurnPrefillQuiet);
+            qwen4_exp || gemma4 ? std::chrono::milliseconds{0} : kDefaultNextTurnPrefillQuiet);
         if (hybrid.next_turn_prefill_quiet->count() < 0 ||
             *hybrid.next_turn_prefill_quiet > std::chrono::milliseconds{3'600'000}) {
             throw std::invalid_argument("idle prefill quiet period must be in [0,3600000] ms");
@@ -661,7 +683,7 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
         // endpoint restorable without PCIe traffic; one more slot stages taps and endpoints while
         // their Host copies are written. Without a Host tier these slots are the only snapshot
         // storage, so one more is kept for shared prefixes.
-        if (!qwen4_exp) {
+        if (!qwen4_exp && !gemma4) {
             // With offloaded experts and a Host tier one slot (candidates §22 VM-03, 2026-10-27): each further slot
             // is 146.5 MiB of the 122B's frames, and the VRAM defaults measured its one-request decode +1.0-1.7 %
             // with one; its conversations' endpoints restore from the Host tier instead. Resident artifacts keep a
@@ -682,7 +704,7 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
             hybrid.tap_ladder_tokens.value_or(std::max<std::uint32_t>(4096U, 2U * chunk));
         hybrid.tap_min_gap_tokens =
             hybrid.tap_min_gap_tokens.value_or(std::max<std::uint32_t>(1024U, chunk));
-        if ((!qwen4_exp && *hybrid.device_snapshot_slots == 0) || *hybrid.device_snapshot_slots > 64) {
+        if ((!qwen4_exp && !gemma4 && *hybrid.device_snapshot_slots == 0) || *hybrid.device_snapshot_slots > 64) {
             throw std::invalid_argument("hybrid device snapshot slots must be in [1,64]");
         }
         if (hybrid.tool_call_hold->count() < 0) {

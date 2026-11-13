@@ -128,6 +128,11 @@ namespace {
 thread_local std::uint64_t t_memory_fault_countdown = 0;
 std::atomic<std::uint64_t> g_memory_fault_injections{0};
 
+// testing::cuda_check_count: this thread's CUDA_CHECKs since its last reset; the total sums every
+// thread, because a generation worker performs the Engine path's checks off the calling thread.
+thread_local std::uint64_t t_cuda_check_count = 0;
+std::atomic<std::uint64_t> g_cuda_check_count{0};
+
 [[noreturn]] void throw_memory_exhausted(const char* expr, const char* file, int line, bool injected) {
     char what[640];
     std::snprintf(what, sizeof(what), "out of device memory (%s:%d: %s%s)", file, line, expr,
@@ -138,6 +143,10 @@ std::atomic<std::uint64_t> g_memory_fault_injections{0};
 } // namespace
 
 void cuda_check(cudaError_t err, const char* expr, const char* file, int line) {
+    // One plain increment per check (plus a relaxed total for cross-thread reads): nothing next
+    // to the wrapped driver call itself.
+    ++t_cuda_check_count;
+    g_cuda_check_count.fetch_add(1, std::memory_order_relaxed);
     if (err == cudaSuccess) {
         if (t_memory_fault_countdown == 0 || --t_memory_fault_countdown != 0) { return; }
         g_memory_fault_injections.fetch_add(1, std::memory_order_relaxed);
@@ -171,6 +180,12 @@ namespace testing {
 void arm_memory_exhausted_here(std::uint64_t after) noexcept { t_memory_fault_countdown = after; }
 std::uint64_t memory_exhausted_injections() noexcept {
     return g_memory_fault_injections.load(std::memory_order_relaxed);
+}
+void cuda_check_count_reset() noexcept { t_cuda_check_count = 0; }
+std::uint64_t cuda_check_count() noexcept { return t_cuda_check_count; }
+void cuda_check_count_total_reset() noexcept { g_cuda_check_count.store(0, std::memory_order_relaxed); }
+std::uint64_t cuda_check_count_total() noexcept {
+    return g_cuda_check_count.load(std::memory_order_relaxed);
 }
 } // namespace testing
 

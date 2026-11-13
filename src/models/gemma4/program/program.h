@@ -1,7 +1,7 @@
 #pragma once
 
-// Native cold-cache, single-lane Gemma 4 execution. Prefix-cache absence is intentional:
-// no state produced by this Program is published or persisted.
+// Native single-lane Gemma 4 execution. The prefix cache reserves its Host tier but binds every
+// request at the root: no cached state is published, reused or persisted yet.
 #include "models/gemma4/config.h"
 #include "infernix/ops/gemma4_cache.h"
 #include "models/gemma4/model.h"
@@ -205,6 +205,8 @@ struct ProgramOptions {
     ops::Gemma4QkMode qk_mode = ops::Gemma4QkMode::BFloat16;
     bool causal_scoring = false;
     bool prefix_cache = false;
+    // The prefix cache's pinned Host tier in bytes; 0 disables its construction (a cold lane).
+    std::uint64_t host_bytes = 0;
     bool reproducible = false;
     bool use_cuda_graph = true;
     DiagnosticObserver diagnostics;
@@ -218,6 +220,8 @@ public:
     Program& operator=(const Program&) = delete;
     [[nodiscard]] static ProgramDevicePlan plan_device(const Model&, const ProgramOptions&, std::uint32_t public_tokens);
     [[nodiscard]] const ProgramDevicePlan& device_plan() const noexcept;
+    // The prefix cache's pinned Host tier the Program was constructed with (0: none constructed).
+    [[nodiscard]] std::uint64_t host_bytes() const noexcept;
     [[nodiscard]] RequestBasePlan plan_request(PreparedPrompt&&, const runtime::ResolvedExecutionOptions&);
     [[nodiscard]] std::vector<SourceCandidate> hybrid_sources(const RequestBasePlan&, std::uint32_t);
     [[nodiscard]] BindingReservation start_binding(const RequestBasePlan&, runtime::LaneId,

@@ -9,12 +9,14 @@
 #include "models/gemma4/program/kv_layout.h"
 #include "models/gemma4/program/program.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -32,6 +34,58 @@ void require_tokens(const Tokens& actual, const Tokens& expected, const char* me
     for (const auto id : actual) { std::fprintf(stderr, " %d", id); }
     std::fputc('\n', stderr);
     throw std::runtime_error(message);
+}
+// FNV-1a over the raw bytes: a short stable summary of one distribution for flake reports.
+std::uint64_t fnv1a64(const void* bytes, std::size_t count) {
+    std::uint64_t hash = 14695981039346656037ULL;
+    const auto* p = static_cast<const unsigned char*>(bytes);
+    for (std::size_t i = 0; i < count; ++i) { hash = (hash ^ p[i]) * 1099511628211ULL; }
+    return hash;
+}
+// On mismatch prints where and how far two distributions differ (count, first index, max abs
+// diff) plus byte hashes of both, and leaves the assertion itself untouched.
+template <class T>
+bool report_distribution(const char* name, const std::vector<T>& reference,
+                         const std::vector<T>& repeat) {
+    if (reference == repeat) { return false; }
+    std::size_t differing = 0;
+    std::size_t first = reference.size();
+    double max_diff = 0.0;
+    const std::size_t common = std::min(reference.size(), repeat.size());
+    for (std::size_t i = 0; i < common; ++i) {
+        if (reference[i] != repeat[i]) {
+            if (differing == 0) { first = i; }
+            ++differing;
+            const double diff =
+                std::abs(static_cast<double>(reference[i]) - static_cast<double>(repeat[i]));
+            if (diff > max_diff) { max_diff = diff; }
+        }
+    }
+    std::fprintf(stderr,
+                 "%s: differing %zu of %zu/%zu, first-diff %zu, max-abs-diff %.9g, "
+                 "fnv1a %016llx vs %016llx\n",
+                 name, differing, reference.size(), repeat.size(), first, max_diff,
+                 static_cast<unsigned long long>(fnv1a64(reference.data(), reference.size() * sizeof(T))),
+                 static_cast<unsigned long long>(fnv1a64(repeat.data(), repeat.size() * sizeof(T))));
+    return true;
+}
+bool same_distributions(const ScoreResult& reference, const ScoreResult& got) {
+    return reference.logprobs == got.logprobs && reference.logits == got.logits &&
+           reference.top_ids == got.top_ids &&
+           reference.candidate_logprobs == got.candidate_logprobs;
+}
+// One scoring call between a CUDA_CHECK counter reset and the 'score-checks N' line (printed even
+// when the call throws), so one failing run shows whether each call's check count is stable.
+template <class Work>
+auto score_with_checks(Work&& work) -> decltype(work()) {
+    struct PrintOnExit {
+        ~PrintOnExit() {
+            std::fprintf(stderr, "score-checks %llu\n",
+                         static_cast<unsigned long long>(testing::cuda_check_count()));
+        }
+    } print_on_exit;
+    testing::cuda_check_count_reset();
+    if constexpr (std::is_void_v<decltype(work())>) { work(); } else { return work(); }
 }
 Tokens tokens(std::size_t count, std::uint32_t seed) {
     Tokens result;
@@ -161,21 +215,53 @@ void native_transactions(const char* artifact) {
         score_options.candidates.push_back(score_tokens[i]);
         score_options.candidates.push_back(7);
     }
-    const auto scored = scorer.causal_score(frontend.prepare_tokens(score_tokens), 129, score_options);
+    const auto scored = score_with_checks([&] {
+        return scorer.causal_score(frontend.prepare_tokens(score_tokens), 129, score_options);
+    });
     for (std::size_t i = 0; i < scored.logprobs.size(); ++i) {
         require(std::abs(scored.logprobs[i] - scored.candidate_logprobs[2 * i]) < 1e-5F,
                 "candidate columns are not aligned with teacher-forced targets");
     }
+    // Control: three clean back-to-back calls on one Program must be bit-identical to the first.
+    const auto score_call = [&] {
+        return scorer.causal_score(frontend.prepare_tokens(score_tokens), 129, score_options);
+    };
+    const auto clean_a = score_call();
+    const auto clean_b = score_call();
+    const auto clean_c = score_call();
+    const bool clean_repeat_equal = same_distributions(clean_a, clean_b) &&
+                                    same_distributions(clean_a, clean_c);
+    if (!clean_repeat_equal) {
+        const auto detail = [](const char* prefix, const ScoreResult& expected, const ScoreResult& got) {
+            std::fprintf(stderr, "%s detail:\n", prefix);
+            report_distribution("logprobs", expected.logprobs, got.logprobs);
+            report_distribution("logits", expected.logits, got.logits);
+            report_distribution("top_ids", expected.top_ids, got.top_ids);
+            report_distribution("candidate_logprobs", expected.candidate_logprobs, got.candidate_logprobs);
+        };
+        detail("clean repeat 1 vs 2", clean_a, clean_b);
+        detail("clean repeat 1 vs 3", clean_a, clean_c);
+    }
+    require(clean_repeat_equal, "repeated clean scoring calls are not bit-identical with no fault injected");
     testing::arm_memory_exhausted_here(100);
     bool scoring_failed = false;
-    try { (void)scorer.causal_score(frontend.prepare_tokens(score_tokens), 129, score_options); }
-    catch (const DeviceMemoryExhausted&) { scoring_failed = true; }
+    try {
+        (void)score_with_checks([&] {
+            return scorer.causal_score(frontend.prepare_tokens(score_tokens), 129, score_options);
+        });
+    } catch (const DeviceMemoryExhausted&) { scoring_failed = true; }
     testing::arm_memory_exhausted_here(0);
     require(scoring_failed, "the scoring memory fault did not fire");
-    const auto after = scorer.causal_score(frontend.prepare_tokens(score_tokens), 129, score_options);
-    require(after.logprobs == scored.logprobs && after.logits == scored.logits &&
-            after.top_ids == scored.top_ids && after.candidate_logprobs == scored.candidate_logprobs,
-            "a failed scoring call contaminated subsequent public distributions");
+    const auto after = score_with_checks([&] {
+        return scorer.causal_score(frontend.prepare_tokens(score_tokens), 129, score_options);
+    });
+    bool contaminated = false;
+    contaminated |= report_distribution("logprobs", scored.logprobs, after.logprobs);
+    contaminated |= report_distribution("logits", scored.logits, after.logits);
+    contaminated |= report_distribution("top_ids", scored.top_ids, after.top_ids);
+    contaminated |= report_distribution("candidate_logprobs", scored.candidate_logprobs,
+                                        after.candidate_logprobs);
+    require(!contaminated, "a failed scoring call contaminated subsequent public distributions");
     std::puts("PASS scoring alignment and partial-forward recovery");
 }
 RequestOptions request() {
@@ -243,8 +329,14 @@ void public_recovery(const char* artifact) {
     const auto other = tokens(129, 22);
     const auto reference = engine.generate(engine.prepare_tokens(prompt), request()).generated_token_ids;
     const auto queued_reference = engine.generate(engine.prepare_tokens(other), request()).generated_token_ids;
-    require_tokens(engine.generate(engine.prepare_tokens(prompt), request()).generated_token_ids, reference,
-        "interleaved clean request changed output before fault injection");
+    // The clean call that flipped once (759->715): the whole Engine round's CUDA_CHECK count over
+    // every thread (the runtime worker performs the device work off this thread).
+    testing::cuda_check_count_total_reset();
+    const auto interleaved = engine.generate(engine.prepare_tokens(prompt), request()).generated_token_ids;
+    std::fprintf(stderr, "interleave-checks %llu\n",
+                 static_cast<unsigned long long>(testing::cuda_check_count_total()));
+    require_tokens(interleaved, reference,
+                   "interleaved clean request changed output before fault injection");
     const auto recoveries = engine.runtime_stats().device_memory_recoveries;
     runtime::testing::hold_units(true);
     auto first = engine.submit(engine.prepare_tokens(prompt), request());

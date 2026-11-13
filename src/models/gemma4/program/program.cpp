@@ -19,6 +19,8 @@
 #include <limits>
 #include <numeric>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace infernix::models::gemma4 {
 namespace {
@@ -47,9 +49,17 @@ void validate_options(const Model& model, const ProgramOptions& o, std::uint32_t
         public_tokens != c.vocab_size || c.hidden_size == 0 || c.layer_types.empty()) {
         throw std::invalid_argument("Gemma4: invalid context or model geometry");
     }
-    if (o.max_concurrency != 1) { throw std::invalid_argument("Gemma4 P4 requires max_concurrency=1"); }
-    if (o.reproducible) { throw std::invalid_argument("Gemma4 P4 does not support --reproducible"); }
-    if (o.prefix_cache) { throw std::invalid_argument("Gemma4 P4 requires prefix_cache=false"); }
+    if (o.max_concurrency != 1) { throw std::invalid_argument("Gemma4 requires max_concurrency=1"); }
+    if (o.reproducible) { throw std::invalid_argument("Gemma4 does not support --reproducible yet"); }
+    if (o.prefix_cache) {
+        if (o.host_bytes == 0) {
+            throw std::invalid_argument(
+                "Gemma4's prefix cache needs a Host tier: --host-context-mib must be positive "
+                "(0 is the off switch)");
+        }
+    } else if (o.host_bytes != 0) {
+        throw std::invalid_argument("Gemma4 host context bytes require the prefix cache to be enabled");
+    }
     (void)gemma4_kv_format(o.kv_cache);
     validate_gemma4_qk(o.qk_mode, true, o.kv_cache);
     if (model.config().mtp) { throw std::invalid_argument("Gemma4 P4 does not execute MTP"); }
@@ -77,7 +87,9 @@ ProgramDevicePlan Program::plan_device(const Model& model, const ProgramOptions&
     for (const auto& layer : geometry.layers) {
         // Global layers follow the requested format (FP8 codes plus FP16 scales); rings stay BF16.
         const std::uint64_t bytes =
-            kv_layer_layout(options.kv_cache, layer.global_layer, layer.head_dim, layer.kv_heads).page_bytes();
+            require_implemented_storage(
+                kv_layer_layout(options.kv_cache, layer.global_layer, layer.head_dim, layer.kv_heads))
+                .page_bytes();
         (layer.global_layer ? global_page_bytes : sliding_page_bytes) += bytes;
         plan.workspace = std::max<std::uint64_t>(plan.workspace,
             gemma4_layer_workspace_bytes(layer, static_cast<int>(options.prefill_chunk)));
@@ -526,6 +538,7 @@ Program::Program(const execution::Parameters& parameters, DeviceContext& device,
     : impl_(std::make_unique<detail::ProgramImpl>(parameters, device, std::move(options))) {}
 Program::~Program() noexcept { shutdown_cleanup(); }
 const ProgramDevicePlan& Program::device_plan() const noexcept { return impl_->plan; }
+std::uint64_t Program::host_bytes() const noexcept { return impl_->options.host_bytes; }
 
 RequestBasePlan Program::plan_request(PreparedPrompt&& prompt, const runtime::ResolvedExecutionOptions& options) {
     const auto& tokens = prompt.tokens();
@@ -829,11 +842,11 @@ void Program::shutdown_cleanup() noexcept {
     impl_->clear();
 }
 void Program::hybrid_hold_continuation(std::chrono::steady_clock::time_point) {
-    throw std::logic_error("Gemma4 P4 prefix cache is disabled; continuation holds are unsupported");
+    throw std::logic_error("Gemma4's prefix cache has no tool-call holds");
 }
 runtime::prefix_cache::PersistResult Program::attach_prefix_cache_file(const std::filesystem::path&,
     std::string, const StartupObserver&) {
-    throw std::invalid_argument("Gemma4 P4 prefix cache is disabled; persistence is unsupported");
+    throw std::invalid_argument("Gemma4 prefix cache persistence is not implemented; --prefix-cache-file is unsupported");
 }
 PhysicalUsageSnapshot Program::physical_usage() const noexcept {
     PhysicalUsageSnapshot result;

@@ -36,6 +36,15 @@ namespace testing {
 void arm_memory_exhausted_here(std::uint64_t after) noexcept;
 // DeviceMemoryExhausted thrown by that injection so far (all threads).
 [[nodiscard]] std::uint64_t memory_exhausted_injections() noexcept;
+// Flake diagnostics: CUDA_CHECKs the calling thread has performed since its last reset —
+// successes, failures and a fault injection's firing alike. Identical work whose count differs
+// between runs exercised a different lazily loaded check site.
+[[nodiscard]] std::uint64_t cuda_check_count() noexcept;
+void cuda_check_count_reset() noexcept;
+// The same count summed over every thread (a generation worker performs the Engine path's
+// checks off the calling thread, so its work is invisible to the per-thread counter).
+[[nodiscard]] std::uint64_t cuda_check_count_total() noexcept;
+void cuda_check_count_total_reset() noexcept;
 } // namespace testing
 
 // The reporter behind cuda_check and the CUDA cleanup paths: writes the bare line to stderr, then

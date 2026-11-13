@@ -9,6 +9,7 @@
 #include "models/load_options.h"
 #include "models/gemma4/program/kv_layout.h"
 #include "runtime/engine/engine_plan.h"
+#include "runtime/engine/expert_memory.h"
 #include "runtime/engine/kv_capacity.h"
 #include "runtime/expert_offload/memory_plan.h"
 
@@ -18,6 +19,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace infernix::runtime {
 namespace {
@@ -25,7 +27,7 @@ using Clock = std::chrono::steady_clock;
 using models::gemma4::Program;
 using models::gemma4::ProgramOptions;
 
-ProgramOptions program_options(const EngineOptions& options) {
+ProgramOptions program_options(const EngineOptions& options, std::uint64_t host_bytes) {
     ProgramOptions out;
     out.max_context = options.max_context;
     out.max_concurrency = options.max_concurrency;
@@ -35,7 +37,10 @@ ProgramOptions program_options(const EngineOptions& options) {
     out.kv_cache = options.kv_cache;
     out.qk_mode = options.gemma4_qk;
     out.causal_scoring = options.purpose == EnginePurpose::CausalScoring;
-    out.prefix_cache = options.context_cache.enabled;
+    // A Host tier is the prefix cache's only capacity on Gemma: 0 (--host-context-mib 0) is the
+    // off switch and leaves a cold lane.
+    out.prefix_cache = options.context_cache.enabled && host_bytes != 0;
+    out.host_bytes = options.context_cache.enabled ? host_bytes : 0;
     out.reproducible = !options.fast_paths;
     out.use_cuda_graph = options.use_cuda_graph;
     out.diagnostics = options.diagnostic_observer;
@@ -77,8 +82,12 @@ void validate_gemma4_options(const EngineOptions& options) {
     if (options.max_concurrency != 1) {
         throw std::invalid_argument("Gemma4 requires --max-concurrency 1");
     }
-    if (options.context_cache.enabled) {
-        throw std::invalid_argument("Gemma4 cold-cache execution requires --no-prefix-reuse; prefix reuse is not implemented yet");
+    if (options.context_cache.enabled &&
+        (options.context_cache.ssd_capacity_bytes != 0 || !options.context_cache.ssd_directory.empty())) {
+        throw std::invalid_argument("Gemma4's prefix cache has no SSD tier; --ssd-context-gib and --ssd-context-dir are unsupported");
+    }
+    if (options.context_cache.enabled && !options.context_cache.hybrid.persistent_file.empty()) {
+        throw std::invalid_argument("Gemma4 prefix cache persistence is not implemented; --prefix-cache-file is unsupported");
     }
     (void)models::gemma4::gemma4_kv_format(options.kv_cache);
     validate_gemma4_qk(options.gemma4_qk, true, options.kv_cache);
@@ -130,13 +139,52 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& supplied, DeviceContext&
     if (options.max_context > geometry->config().text.max_position_embeddings) {
         throw std::invalid_argument("Gemma4 --max-context exceeds the artifact's native position capacity");
     }
+    // The prefix cache's Host tier: explicit --host-context-mib, or auto like Qwen3.8-Flash-Next
+    // (the RAM ledger's share beyond its reserve and plan, at least 1 GiB; expert_memory.h).
+    // 0 (--host-context-mib 0) disables the cache: the lane stays cold.
+    const bool cache_on = options.context_cache.enabled;
+    const bool prefix_auto = cache_on && !options.context_cache.host_capacity_bytes;
+    std::uint64_t prefix_bytes =
+        cache_on && !prefix_auto ? *options.context_cache.host_capacity_bytes : 0;
+    if (prefix_auto) {
+        auto demand = expert_ram_demand(options, {}, 0U, budget->query());
+        demand.pageable = frontend_cache_bytes(options);
+        prefix_bytes = auto_host_context_bytes(expert_offload::plan_host_memory(host_memory_snapshot(), demand));
+    }
+    // HPC-min packing (D1): one image is the ring window alone; the Host tier must hold one live
+    // snapshot, one staging image and a slab of headroom (image_slabs + 2 slabs). The requirement
+    // is computed from the artifact's geometry, never assumed from a model size.
+    if (cache_on && prefix_bytes != 0) {
+        const auto& text = geometry->config().text;
+        std::vector<models::gemma4::KvLayerFact> facts;
+        facts.reserve(text.layer_types.size());
+        for (const auto kind : text.layer_types) {
+            facts.push_back({kind == models::gemma4::LayerKind::Global,
+                             static_cast<int>(text.head_dim_of(kind)),
+                             static_cast<int>(text.kv_heads_of(kind))});
+        }
+        const auto tier = models::gemma4::prefix_cache_geometry(facts, text.sliding_window, options.kv_cache);
+        if (prefix_bytes < tier.host_floor_bytes) {
+            const std::uint64_t mib = (tier.host_floor_bytes + (1ULL << 20) - 1) >> 20;
+            const std::string refusal =
+                "--host-context-mib is too small for the Gemma4 prefix cache: one ring snapshot needs " +
+                std::to_string(mib) + " MiB (" + std::to_string(tier.image_slabs) + "+2 slabs of " +
+                std::to_string(tier.slab_bytes >> 20) + " MiB from this artifact's geometry)";
+            if (!planned) { throw std::invalid_argument(refusal); }
+            planned->architecture = "Gemma4ForCausalLM";
+            plan_readings(*planned, device.props.name, before, host_memory_snapshot(), options);
+            planned->vram.weights_bytes = weight_bytes;
+            plan_refuse(*planned, refusal);
+            return {};
+        }
+    }
     const auto available = planned_free_after_weights(before.device_free, weight_bytes);
     if (options.prefill_chunk_auto) {
         try {
             options.prefill_chunk = models::gemma4::auto_prefill_chunk(
                 options.max_context, available, headroom,
                 [&](std::uint32_t chunk, std::uint32_t capacity) {
-                    auto candidate = program_options(options);
+                    auto candidate = program_options(options, prefix_bytes);
                     candidate.prefill_chunk = chunk;
                     candidate.kv_capacity_tokens = capacity;
                     const auto curve = Program::plan_device(
@@ -152,7 +200,8 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& supplied, DeviceContext&
             return {};
         }
     }
-    const auto request_plan = Program::plan_device(*geometry, program_options(options), geometry->config().text.vocab_size);
+    const auto request_plan = Program::plan_device(*geometry, program_options(options, prefix_bytes),
+                                                   geometry->config().text.vocab_size);
     const auto curve = request_plan.capacity_curve();
     KvCapacityResolution resolution;
     if (planned) {
@@ -168,7 +217,7 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& supplied, DeviceContext&
             plan_refuse(*planned, "Gemma4 KV capacity cannot hold --max-context");
             return {};
         }
-        auto resolved_options = program_options(options);
+        auto resolved_options = program_options(options, prefix_bytes);
         resolved_options.kv_capacity_tokens = resolution.resolved_tokens;
         const auto final_plan = Program::plan_device(*geometry, resolved_options, geometry->config().text.vocab_size);
         planned->vram.kv_bytes = final_plan.kv;
@@ -195,7 +244,7 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& supplied, DeviceContext&
         upload.complete();
     }
     auto instance = std::make_unique<Gemma4Instance>(std::move(model), options, device);
-    const auto resident_plan = Program::plan_device(*instance->model, program_options(options),
+    const auto resident_plan = Program::plan_device(*instance->model, program_options(options, prefix_bytes),
                                                     instance->model->config().text.vocab_size);
     // Parameters already owns these planned bytes. Add them back to the free reading
     // while resolving the curve that includes them, rather than charging them twice.
@@ -204,11 +253,13 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& supplied, DeviceContext&
     instance->kv_capacity_resolution = resolution;
     {
         StartupPhaseScope construct(options.startup_observer, StartupPhase::ProgramInitialize);
-        instance->program = std::make_unique<Program>(instance->parameters, device, program_options(options));
+        instance->program = std::make_unique<Program>(instance->parameters, device, program_options(options, prefix_bytes));
         construct.complete();
     }
     device.synchronize();
     instance->kv_capacity_resolution.available_after_startup_bytes = budget->query().device_free;
+    // The Engine and the request log report the tier actually resolved (--host-context-mib auto).
+    if (prefix_auto) { options.context_cache.host_capacity_bytes = prefix_bytes; }
 
     const auto& stats = instance->model->storage_stats();
     LoadSummary summary;
