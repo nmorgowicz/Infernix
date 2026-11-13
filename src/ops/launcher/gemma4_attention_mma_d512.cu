@@ -172,7 +172,7 @@ __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
 #pragma unroll
         for (int i = 0; i < 4; ++i) { acc[n][i] = 0.0f; }
     }
-    Bf16KvSoftmaxRow state0, state1;
+    Gemma4KvSoftmaxRow state0, state1;
 
     const float scale_l2   = scale * kLog2E;
     const int block_begin  = first_key / kBc;

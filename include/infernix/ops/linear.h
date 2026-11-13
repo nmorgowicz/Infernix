@@ -329,6 +329,9 @@ void linear_a8_ready(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
                      cudaStream_t stream);
 [[nodiscard]] bool linear_takes_a8_ready(const Weight& w, std::int32_t tokens, LinearPolicy policy);
 
+// Exact persistent bytes linear_prepare_a8_rows() allocates for this weight; zero
+// when it leaves the weight unchanged. Reads geometry only, never weight payloads.
+[[nodiscard]] std::size_t linear_a8_rows_bytes(const Weight& w) noexcept;
 /**
  * For a Q4_G32/G128/G256_FP16 weight the fused A8 prefill serves, derive its BF16 row multipliers once
  * into `storage` and point w.row_scales at them; every other weight is left unchanged. `storage` must

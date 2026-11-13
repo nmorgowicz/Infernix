@@ -20,6 +20,7 @@ add_library(infernix_engine STATIC
   engine/expert_memory.cpp
   engine/model_instance.cpp
   engine/qwen4_exp_instance.cpp
+  engine/gemma4_instance.cpp
   contract/sampling.cpp
   engine/engine.cpp
 )

@@ -4,10 +4,44 @@
 #include "ops/kernel/paged_kv_address.cuh"
 #include "ops/kernel/gemma4_fp8_kv.cuh"
 #include "ops/softmax_attention/common/causal_tile_io.cuh"
-
-
+#include "ops/softmax_attention/dense/causal_cache/bf16/softmax.cuh"
 
 namespace infernix::ops::detail {
+
+// Gemma 4's online-softmax row, bit-identical to ninfer.spo b330aaf. The shared Bf16KvSoftmaxRow
+// rescales with causal_rescale (two rounded products, candidates UV-01), which differs from the
+// fork's alpha by an ulp wherever the maximum holds; the qualified Gemma logits use the fork's one
+// FMA of the previous maximum against the new scaled maximum. Keep this copy Gemma-local.
+struct Gemma4KvSoftmaxRow {
+    float maximum;
+    float sum;
+    float scaled_maximum;
+
+    __device__ Gemma4KvSoftmaxRow()
+        : maximum(kBf16KvNegativeInfinity), sum(0.0f), scaled_maximum(0.0f) {}
+
+    template <bool MayBeEmpty = true>
+    __device__ __forceinline__ float update(float tile_maximum, float scale_log2) {
+        const float previous = maximum;
+        maximum              = fmaxf(maximum, tile_maximum);
+        scaled_maximum       = maximum * scale_log2;
+        if constexpr (MayBeEmpty)
+            if (maximum == kBf16KvNegativeInfinity) scaled_maximum = 0.0f;
+        const float alpha = exp2_approx(__fmaf_rn(previous, scale_log2, -scaled_maximum));
+        return alpha;
+    }
+
+    __device__ __forceinline__ void accumulate(float alpha, float tile_sum) {
+        sum = __fmaf_rn(sum, alpha, tile_sum);
+    }
+
+    __device__ __forceinline__ float probability(float score, float scale_log2) const {
+        return exp2_approx(__fmaf_rn(score, scale_log2, -scaled_maximum));
+    }
+
+    __device__ __forceinline__ void finish() { sum = warp_sum<4>(sum, 0xffffffffu); }
+};
+
 
 // One [Bc, Width] tile of keys [k0, k0 + Bc) from columns [column, column + Width) of the
 // [D,64,Hkv,pages] cache into swizzled shared memory. Keys past `last` are zeroed so the

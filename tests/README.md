@@ -119,6 +119,24 @@ The manual benchmark emits CUDA-event samples/medians and kernel-resource diagno
 The 128-token cells also check sampled outputs against every visible key in an FP64
 reference. These are attention-Op measurements, not model-serving throughput or quality.
 
+The real Gemma cold-cache regression is `infernix_gemma4_program_real_test`
+([source](models/gemma4/test_program_real.cpp)). Set `INFERNIX_GEMMA4_ARTIFACT` to an
+existing Gemma 4 text artifact and `INFERNIX_TMP_Q4_EXACT=1`; it skips (77) without
+the artifact variable and downloads nothing. Run it alone:
+
+```bash
+ctest --test-dir build -C Release -R '^infernix_gemma4_program_real_test$' -j1 --output-on-failure
+```
+
+It checks pending-output abort/stale capabilities, pause/root replay, and real
+partial-forward recovery after an 18-page sliding ring wraps. Layer-work fault injection
+uses eager execution: counting CUDA checks on one Graph replay cannot place a fault
+inside its captured layers. Scoring checks candidate/target alignment and recovery of
+full selected logits after a failed forward. The public Engine section retains default
+Graphs and verifies a request queued behind an injected memory shortage plus withdrawal
+of a non-finite decode result; subsequent requests must return their reference tokens.
+This is not prefix-cache, assistant/MTP, grammar, media or long-context qualification.
+
 The lossless route's exact Python oracles (`tests/ops/lossless_cr_oracle.py`, which evaluates on every
 core, and `lossless_ops_oracle.py`) keep their deterministic output in `build/tests/oracle-cache/`, keyed by
 their sources and the Python version, so a tree computes it once per oracle change.

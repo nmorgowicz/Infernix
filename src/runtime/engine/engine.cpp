@@ -15,6 +15,7 @@
 #include "runtime/engine/context_cache/hybrid_resource_manager.h"
 #include "runtime/engine/model_instance.h"
 #include "runtime/engine/qwen4_exp_instance.h"
+#include "runtime/engine/gemma4_instance.h"
 #include "runtime/expert_offload/host_slot_pool.h"
 
 #include <cuda_runtime.h>
@@ -77,7 +78,9 @@ EngineOptions normalize_options(EngineOptions engine_options, models::Architectu
     std::exception_ptr unreadable;
     try {
         const artifact::Reader reader(engine_options.artifact_path);
-        if (runtime::artifact_is_qwen4_exp(reader)) {
+        if (models::gemma4::is_gemma4(reader)) {
+            architecture = models::Architecture::Gemma4;
+        } else if (runtime::artifact_is_qwen4_exp(reader)) {
             architecture = models::Architecture::Qwen4Exp;
             const SpeculativeOptions& speculative = engine_options.speculative;
             if (speculative.backend_auto && speculative.draft_model.empty() && !engine_options.lossless &&
@@ -88,9 +91,26 @@ EngineOptions normalize_options(EngineOptions engine_options, models::Architectu
         } else {
             offloaded_experts = runtime::artifact_offloads_experts(reader);
         }
-        drafters = runtime::artifact_drafters(reader);
+        if (architecture != models::Architecture::Gemma4) {
+            drafters = runtime::artifact_drafters(reader);
+        }
     } catch (const std::exception&) {
         unreadable = std::current_exception();
+    }
+    if (architecture == models::Architecture::Gemma4) {
+        if (engine_options.max_concurrency != 1 || !engine_options.fast_paths) {
+            throw std::invalid_argument("Gemma4 requires --max-concurrency 1 and refuses --reproducible");
+        }
+        if (engine_options.speculative.backend_auto) {
+            engine_options.speculative.backend_auto = false;
+            engine_options.speculative.backend = SpeculativeBackend::None;
+            engine_options.speculative.draft_tokens = 0;
+            engine_options.speculative.draft_tokens_auto = false;
+            engine_options.speculative.proposal_head = ProposalHead::Full;
+            runtime::publish_diagnostic(engine_options.diagnostic_observer, DiagnosticLevel::Info,
+                                        "--spec auto: Gemma4 cold-cache execution uses plain decode");
+        }
+        if (engine_options.prefill_chunk == 0) { engine_options.prefill_chunk = 128; }
     }
     runtime::validate_engine_options(engine_options, architecture, offloaded_experts);
     if (drafters) {
@@ -100,7 +120,9 @@ EngineOptions normalize_options(EngineOptions engine_options, models::Architectu
                engine_options.purpose == EnginePurpose::Generation && unreadable) {
         std::rethrow_exception(unreadable);
     }
-    return runtime::normalize_engine_options(std::move(engine_options), architecture, offloaded_experts);
+    auto normalized = runtime::normalize_engine_options(std::move(engine_options), architecture, offloaded_experts);
+    if (architecture == models::Architecture::Gemma4) { runtime::validate_gemma4_options(normalized); }
+    return normalized;
 }
 
 runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefaults& defaults,
@@ -195,11 +217,15 @@ public:
          models::qwen3_5::PreparedPrompt prepared)
         : summary(std::move(prompt_summary)), prepare(std::move(preparation)), sampling_mode(mode),
           value(std::move(prepared)) {}
+    Impl(PromptSummary prompt_summary, PromptPreparationStats preparation, SamplingMode mode,
+         models::gemma4::PreparedPrompt prepared)
+        : summary(std::move(prompt_summary)), prepare(std::move(preparation)), sampling_mode(mode),
+          value(std::move(prepared)) {}
 
     PromptSummary summary;
     PromptPreparationStats prepare;
     SamplingMode sampling_mode = SamplingMode::Thinking;
-    models::qwen3_5::PreparedPrompt value;
+    std::variant<models::qwen3_5::PreparedPrompt, models::gemma4::PreparedPrompt> value;
 };
 
 PreparedPrompt::PreparedPrompt() noexcept                            = default;
@@ -220,7 +246,9 @@ const PromptPreparationStats& PreparedPrompt::preparation_stats() const noexcept
 }
 
 std::span<const TokenId> PreparedPrompt::token_ids() const noexcept {
-    return impl_ != nullptr ? impl_->value.token_ids() : std::span<const TokenId>{};
+    return impl_ != nullptr
+        ? std::visit([](const auto& value) { return value.token_ids(); }, impl_->value)
+        : std::span<const TokenId>{};
 }
 
 PreparedPrompt::operator bool() const noexcept { return impl_ != nullptr; }
@@ -306,11 +334,20 @@ public:
     // Qwen3.8-Flash-Next: the common cores over its own Program.
     using Qwen4ExpCore        = runtime::EngineCore<runtime::Qwen4ExpInstance>;
     using Qwen4ExpScoringCore = runtime::CausalScoreCore<runtime::Qwen4ExpInstance>;
+    using Gemma4Core = runtime::EngineCore<runtime::Gemma4Instance>;
+    using Gemma4ScoringCore = runtime::CausalScoreCore<runtime::Gemma4Instance>;
     using Core = std::variant<std::monostate, std::unique_ptr<GenerationCore>, std::unique_ptr<ScoringCore>,
-                              std::unique_ptr<Qwen4ExpCore>, std::unique_ptr<Qwen4ExpScoringCore>>;
+                              std::unique_ptr<Qwen4ExpCore>, std::unique_ptr<Qwen4ExpScoringCore>,
+                              std::unique_ptr<Gemma4Core>, std::unique_ptr<Gemma4ScoringCore>>;
     template <class CoreState>
     static constexpr bool kScoring = std::is_same_v<CoreState, std::unique_ptr<ScoringCore>> ||
-                                     std::is_same_v<CoreState, std::unique_ptr<Qwen4ExpScoringCore>>;
+                                     std::is_same_v<CoreState, std::unique_ptr<Qwen4ExpScoringCore>> ||
+                                     std::is_same_v<CoreState, std::unique_ptr<Gemma4ScoringCore>>;
+    template <class CoreState>
+    using NativePrompt = std::conditional_t<
+        std::is_same_v<CoreState, std::unique_ptr<Gemma4Core>> ||
+        std::is_same_v<CoreState, std::unique_ptr<Gemma4ScoringCore>>,
+        models::gemma4::PreparedPrompt, models::qwen3_5::PreparedPrompt>;
 
     explicit Impl(EngineOptions engine_options,
                   std::shared_ptr<runtime::expert_offload::HostSlotPool> slot_pool = nullptr)
@@ -322,6 +359,24 @@ public:
         if (options.lossless) {
             ops::lossless_set_noise(options.lossless_noise_seed, options.lossless_noise_units,
                                     options.lossless_noise_scale);
+        }
+        if (architecture == models::Architecture::Gemma4) {
+            auto constructed = runtime::construct_gemma4(options, device);
+            options = std::move(constructed.options);
+            gemma = std::move(constructed.instance);
+            load = std::move(constructed.load);
+            model_metadata = std::move(constructed.model_metadata);
+            load.cuda_sync_mode = device.sync_mode();
+            load.temporary_switches = temporary_switches::describe(temporary_switches::Scope::Gemma4);
+            sampling_defaults = gemma->frontend.sampling_defaults();
+            StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
+            if (options.purpose == EnginePurpose::CausalScoring) {
+                core = std::make_unique<Gemma4ScoringCore>(*gemma, device);
+            } else {
+                core = std::make_unique<Gemma4Core>(*gemma, device, options);
+            }
+            finalize_phase.complete();
+            return;
         }
         if (architecture == models::Architecture::Qwen4Exp) {
             auto constructed  = runtime::construct_qwen4_exp(options, device, nullptr, std::move(slot_pool));
@@ -439,17 +494,23 @@ public:
         }
     }
 
-    [[nodiscard]] const models::qwen3_5::Frontend& frontend() const {
-        return qwen4 != nullptr ? qwen4->frontend : active->frontend;
+    template <class Function>
+    decltype(auto) with_frontend(Function&& function) const {
+        if (gemma) { return std::forward<Function>(function)(gemma->frontend); }
+        return std::forward<Function>(function)(qwen4 ? qwen4->frontend : active->frontend);
     }
 
-    [[nodiscard]] std::uint32_t capacity() const { return qwen4 != nullptr ? qwen4->capacity : active->capacity; }
+    [[nodiscard]] std::uint32_t capacity() const {
+        if (gemma) { return gemma->capacity; }
+        return qwen4 ? qwen4->capacity : active->capacity;
+    }
 
     models::Architecture architecture = models::Architecture::Qwen3_5; // set by normalize
     EngineOptions options;
     DeviceContext device;
     std::unique_ptr<runtime::ModelInstance> active;
     std::unique_ptr<runtime::Qwen4ExpInstance> qwen4;
+    std::unique_ptr<runtime::Gemma4Instance> gemma;
     LoadSummary load;
     ModelMetadata model_metadata;
     ModelSamplingDefaults sampling_defaults;
@@ -538,7 +599,9 @@ EnginePlan Engine::plan(EngineOptions engine_options) {
     // reads is the free memory a start would read.
     DeviceContext device = initialize_device(options);
     EnginePlan plan;
-    if (architecture == models::Architecture::Qwen4Exp) {
+    if (architecture == models::Architecture::Gemma4) {
+        (void)runtime::construct_gemma4(options, device, &plan);
+    } else if (architecture == models::Architecture::Qwen4Exp) {
         (void)runtime::construct_qwen4_exp(options, device, &plan);
     } else {
         (void)runtime::construct_model(options, device, &plan);
@@ -553,16 +616,18 @@ Engine& Engine::operator=(Engine&&) noexcept = default;
 PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& control) const {
     nvtx::ScopedRange prepare_range(nvtx::Name::FrontendPrepare, nvtx::Category::Runtime);
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    auto prepared      = impl_->frontend().prepare(std::move(input), control);
-    PromptSummary info = prepared.summary();
-    const SamplingMode sampling_mode =
-        info.starts_in_reasoning ? SamplingMode::Thinking : SamplingMode::NonThinking;
-    if (info.prompt_tokens > impl_->capacity()) {
-        throw std::logic_error("target Frontend admitted a prompt beyond Engine capacity");
-    }
-    const PromptPreparationStats preparation = prepared.preparation_stats();
-    return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(info, preparation, sampling_mode,
-                                                                 std::move(prepared)));
+    return impl_->with_frontend([&](const auto& frontend) {
+        auto prepared = frontend.prepare(std::move(input), control);
+        PromptSummary info = prepared.summary();
+        const SamplingMode sampling_mode =
+            info.starts_in_reasoning ? SamplingMode::Thinking : SamplingMode::NonThinking;
+        if (info.prompt_tokens > impl_->capacity()) {
+            throw std::logic_error("target Frontend admitted a prompt beyond Engine capacity");
+        }
+        const auto preparation = prepared.preparation_stats();
+        return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
+            info, preparation, sampling_mode, std::move(prepared)));
+    });
 }
 
 PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
@@ -574,34 +639,36 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
         throw RequestError(ContextLengthDetails{.prompt_tokens = token_ids.size(),
                                                 .max_context   = impl_->capacity()});
     }
-    auto prepared = impl_->frontend().prepare_tokens(std::move(token_ids), allow_prefix_identity);
-    PromptSummary info = prepared.summary();
-    if (info.prompt_tokens > impl_->capacity()) {
-        throw std::logic_error("target Frontend admitted prompt tokens beyond capacity");
-    }
-    const PromptPreparationStats preparation = prepared.preparation_stats();
-    return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
-        info, preparation, SamplingMode::Thinking, std::move(prepared)));
+    return impl_->with_frontend([&](const auto& frontend) {
+        auto prepared = frontend.prepare_tokens(std::move(token_ids), allow_prefix_identity);
+        PromptSummary info = prepared.summary();
+        if (info.prompt_tokens > impl_->capacity()) {
+            throw std::logic_error("target Frontend admitted prompt tokens beyond capacity");
+        }
+        const auto preparation = prepared.preparation_stats();
+        return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
+            info, preparation, SamplingMode::Thinking, std::move(prepared)));
+    });
 }
 
 std::vector<TokenId> Engine::tokenize_text(std::string_view text) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return impl_->frontend().tokenize_text(text);
+    return impl_->with_frontend([&](const auto& frontend) { return frontend.tokenize_text(text); });
 }
 
 std::string Engine::detokenize(std::span<const TokenId> token_ids) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return impl_->frontend().detokenize(token_ids);
+    return impl_->with_frontend([&](const auto& frontend) { return frontend.detokenize(token_ids); });
 }
 
 std::string Engine::detokenize_bytes(std::span<const TokenId> token_ids) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return impl_->frontend().detokenize_bytes(token_ids);
+    return impl_->with_frontend([&](const auto& frontend) { return frontend.detokenize_bytes(token_ids); });
 }
 
 ChatTokens Engine::tokenize_chat(PromptInput input) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return impl_->frontend().tokenize_chat(std::move(input));
+    return impl_->with_frontend([&](const auto& frontend) { return frontend.tokenize_chat(std::move(input)); });
 }
 
 ScoreResult Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t first_target,
@@ -642,8 +709,9 @@ ScoreResult Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t firs
         [&](auto& core) -> ScoreResult {
             using CoreState = std::remove_cvref_t<decltype(core)>;
             if constexpr (Impl::kScoring<CoreState>) {
-                return core->score(std::move(prompt.impl_->value), first_target,
-                                   std::move(options));
+                auto* native = std::get_if<Impl::NativePrompt<CoreState>>(&prompt.impl_->value);
+                if (!native) { throw std::invalid_argument("PreparedPrompt belongs to another model family"); }
+                return core->score(std::move(*native), first_target, std::move(options));
             } else {
                 throw std::logic_error("Engine scoring core is unavailable");
             }
@@ -660,7 +728,7 @@ ScoreResult Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t firs
 
 std::uint32_t Engine::count_tokens(PromptInput input, const PreparationControl& control) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return impl_->frontend().count_tokens(std::move(input), control);
+    return impl_->with_frontend([&](const auto& frontend) { return frontend.count_tokens(std::move(input), control); });
 }
 
 ModelSamplingDefaults Engine::sampling_defaults() const {
@@ -683,6 +751,11 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
         throw std::invalid_argument("live generation observations require a Streaming consumer");
     }
 
+    if (impl_->architecture == models::Architecture::Gemma4 &&
+        (!options.ngram_session.key.empty() || options.ngram_session.reset ||
+         !options.ngram_session.parent.empty() || options.ngram_session.parent_generation != 0)) {
+        throw std::invalid_argument("Gemma4 does not support ngram session hints");
+    }
     runtime::ResolvedRequestOptions resolved_options = resolve_request_options(
         impl_->sampling_defaults, prompt.impl_->sampling_mode, std::move(options));
     const ResolvedSamplingParameters resolved_sampling = resolved_options.execution.sampling;
@@ -747,8 +820,10 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             } else if constexpr (Impl::kScoring<CoreState>) {
                 throw std::logic_error("Engine generation core is unavailable");
             } else {
+                auto* native = std::get_if<Impl::NativePrompt<CoreState>>(&prompt.impl_->value);
+                if (!native) { throw std::invalid_argument("PreparedPrompt belongs to another model family"); }
                 auto submission =
-                    core->submit(std::move(prompt.impl_->value), prompt_summary, prepare_seconds,
+                    core->submit(std::move(*native), prompt_summary, prepare_seconds,
                                  std::move(resolved_options), consumer_mode, std::move(observation),
                                  pending_deadline);
                 return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
@@ -809,12 +884,12 @@ MemorySummary Engine::memory_summary() const {
 
 MediaCacheSummary Engine::media_cache_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return impl_->frontend().media_cache_summary();
+    return impl_->with_frontend([](const auto& frontend) { return frontend.media_cache_summary(); });
 }
 
 ChatTemplateRoleSupport Engine::chat_template_role_support() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return impl_->frontend().chat_template_role_support();
+    return impl_->with_frontend([](const auto& frontend) { return frontend.chat_template_role_support(); });
 }
 
 RuntimeStats Engine::runtime_stats() const {

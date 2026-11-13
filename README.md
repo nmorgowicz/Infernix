@@ -9,9 +9,12 @@
 > written with AI (mostly Claude Opus 5.5 and Qwen3.8-27B running on Infernix). It is likely to be
 > neither complete nor entirely accurate. This is hobby development.
 
-Infernix is a C++/CUDA inference engine that serves Qwen models on one NVIDIA RTX 5090. It began as a fork of [NInfer](https://github.com/Neroued/ninfer) by
+Infernix is a C++/CUDA inference engine that serves Qwen models on one NVIDIA RTX 5090. This branch also has [Gemma 4 31B cold-cache text execution](#gemma-4-31b-cold-cache-text) under qualification. It began as a fork of [NInfer](https://github.com/Neroued/ninfer) by
 [Neroued](https://github.com/Neroued) and reads NInfer's `.ninfer` artifacts as well as its own
 `.infernix` files.
+
+The headline results and general agent features below describe the Qwen routes;
+Gemma's current, narrower scope is listed in its model section.
 
 ## Headline results
 
@@ -646,8 +649,35 @@ Podman takes the same commands, with `--device nvidia.com/gpu=0` in place of `--
 ## Models
 
 Each repository's model card gives its files, requirements, recommended command, quality and speed.
-`python -m tools.convert` converts your own checkpoints of these architectures
-([weight conversion](docs/weight-conversion.md)).
+`python -m tools.convert` converts your own Qwen checkpoints of the architectures below
+([weight conversion](docs/weight-conversion.md)); Gemma conversion remains in the source fork.
+
+### Gemma 4 31B: cold-cache text
+
+Qualification in progress on this branch; not the complete Gemma serving profile.
+Existing `ninfer.spo` text artifacts load unchanged: BF16, row-scaled FP8 and grouped
+Q4 g32/g128/g256 projections. Text generation and public causal scoring use native
+Gemma weights, tokenizer/template, sliding rings and global attention, not a Qwen model cast.
+K **and V** stay BF16. The head's BF16 rounding is preserved, so explicitly select
+`--logits-dtype bf16`; unrounded FP32 head sums are not implemented.
+
+```bat
+set INFERNIX_TMP_Q4_EXACT=1
+infernix.exe model.ninfer --max-context 2048 --prefill-chunk 128 --kv-dtype bf16 --logits-dtype bf16 --spec off --prompt "Hello" --max-new 64 --greedy
+```
+
+The one-shot CLI already disables prefix reuse; it has no `--no-prefix-reuse` option.
+C++ callers set `EngineOptions::context_cache.enabled = false` and concurrency 1.
+Use BF16 KV and logits with `infernix-perplexity` too. Qualification runs use the
+explicit Q4 exact-route environment setting above.
+
+Not enabled here: FP8 KV/QK, MTP or other speculation/ngram sessions, prefix-cache
+reuse/persistence, concurrency >1, reproducible/lossless/reference math, top-k >20,
+tools/grammars, media, reasoning-loop budgets and the HTTP/launcher serving profile.
+Unsupported requests refuse rather than silently selecting a Qwen implementation.
+The startup warning that the constraint vocabulary was not built is expected until
+Gemma grammar support lands. Conversion, existing launchers and published models
+are not rewritten by loading an artifact.
 
 ### Qwen3.8-Flash-Next
 

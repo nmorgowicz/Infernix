@@ -318,14 +318,20 @@ bool linear_takes_a8_ready(const Weight& w, std::int32_t tokens, LinearPolicy po
     return false;
 }
 
-void linear_prepare_a8_rows(Weight& w, DeviceBuffer& storage, cudaStream_t stream) {
-    if (!detail::is_q4_fp16_family(w.qtype) || w.layout != QuantLayout::RowSplit || w.scales == nullptr ||
+std::size_t linear_a8_rows_bytes(const Weight& w) noexcept {
+    if (!detail::is_q4_fp16_family(w.qtype) || w.layout != QuantLayout::RowSplit ||
         w.padded_shape[1] != w.k || !detail::q4_trunk_shape(w.n, w.k)) {
-        return;
+        return 0;
     }
     const int scale_mode = detail::q4_scale_mode(w.qtype);
-    if (w.k % detail::q4_scale_span(scale_mode) != 0) { return; }
-    DeviceBuffer rows(static_cast<std::size_t>(w.n) * 2);
+    return w.k % detail::q4_scale_span(scale_mode) == 0 ? static_cast<std::size_t>(w.n) * 2 : 0;
+}
+
+void linear_prepare_a8_rows(Weight& w, DeviceBuffer& storage, cudaStream_t stream) {
+    const std::size_t bytes = linear_a8_rows_bytes(w);
+    if (bytes == 0 || w.scales == nullptr) { return; }
+    const int scale_mode = detail::q4_scale_mode(w.qtype);
+    DeviceBuffer rows(bytes);
     detail::q4_g32_row_multipliers(static_cast<const std::uint8_t*>(w.scales), rows.p, w.n, w.k, scale_mode,
                                    stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
