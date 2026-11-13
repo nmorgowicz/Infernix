@@ -36,9 +36,10 @@ Configuration rules:
 
 ## Status
 
-The cache configures itself: the only capacity a deployment chooses is `--host-context-mib`
-(default 8192, 0 = Device only; Qwen3.8-Flash-Next: default 4096, must be positive, §17); every
-other value is derived from the rest of the configuration (§14.2).
+The cache configures itself: the only capacity a deployment may choose is `--host-context-mib`
+(default `auto`: all the RAM the model's plan, experts and n-gram table first, leaves beyond
+`--ram-free-mib`, within the page-lock room, at least 1 GiB; 0 = Device only; Qwen3.8-Flash-Next: must
+be positive, §17); every other value is derived from the rest of the configuration (§14.2).
 
 | area | state |
 |---|---|
@@ -376,15 +377,27 @@ struct Snapshot {
   packed byte `o` lives in slab `o / slab_bytes`), and a snapshot with a tail one slab more. The
   free list is a min-heap of slab ids (the lowest goes first, so batches come out consecutive).
   There is no fragmentation and no geometry check: capacity is `free_slabs`. A nonzero budget
-  smaller than one snapshot plus one block is rejected at startup. The pool is pinned in chunks of
-  at most 1 GiB of whole slabs (one very large pinned allocation can fail or stall under WDDM),
-  which is also its resize step; a slab never crosses chunks. Under RAM pressure
-  (`--ram-resize auto`, between requests with every transfer settled) the index retires the slabs
-  past a limit (`PrefixCacheIndex::shrink_host`): it evicts in allocation order (dead KV,
-  superseded, then the GDSF minimum) until the owned and reserved slabs fit below it, moves the
-  owned slabs past it into free ones below (`move_host_slab`, a host copy), and the cache releases
-  the emptied chunks; a pinned, filling or reserved slab keeps the limit above it. `grow_host` pins
-  chunks back and returns their slabs to the free list, up to the startup size. A strided copy run
+  smaller than one snapshot plus one block is rejected at startup. Both Programs' caches keep the
+  pool in `runtime::prefix_cache::HostSlabStore`: chunks of at most 1 GiB of whole slabs (one very
+  large page-locked allocation can fail or stall under WDDM), each committed, zeroed and then
+  registered with the driver (a short driver call), which are also its resize step; a slab never
+  crosses chunks. Under RAM pressure (`--ram-resize auto`, idle or between rounds while requests
+  run) a release retires the slabs from a ceiling on without stopping anything:
+  `PrefixCacheIndex::begin_host_shrink` places the ceiling above every slab a transfer reads or
+  writes now (reservations, filling copies, I/O-pinned entries), so the release never waits for
+  one, evicts in allocation order (dead KV, superseded, then the GDSF minimum of the unheld
+  entries) until what is in use fits below it (nothing when nothing could be retired), and from
+  then on no slab at or past the ceiling is taken (freed ones retire); `plan_host_moves` drops dead
+  KV past it and pairs every other Host-resident entry past it with a free slab below, a pinned one
+  included (a running sequence's mapped path: pins keep entries indexed, and only a restore batch
+  or an SSD job reads a Host slab); the store copies the bytes with streaming stores on the RAM
+  monitor's worker thread (a hybrid CPU's slow cores); `commit_host_moves` switches the entries
+  once the copies have landed and no restore batch is staged or landing (an entry evicted meanwhile
+  gives its destination back; one an SSD job I/O-pins meanwhile waits for it); `finish_host_shrink`
+  ends the shrink once nothing past the ceiling is in use (a counter: only `begin_host_shrink`
+  scans every node), and the worker releases the chunks past it. A growth page-locks chunks on the worker and `grow_host` returns
+  their slabs to the free list at the next step, up to the startup size. A rebuilt index
+  (`clear()`) starts at the slabs page-locked then (`HostSlabStore::limit_index`). A strided copy run
   joins consecutive pages only while their slab records share a chunk and advance by one pitch no
   larger than the device's maximum copy pitch. Any two records form a candidate run, so records in
   different chunks, or gigabytes apart in one, must be split explicitly. A 52 GB Host tier
@@ -411,7 +424,8 @@ directory, or `--host-cache-mib 0`, so an unusable location fails before any cac
   `Program::shutdown_cleanup` releases every lane first, so requests still in flight write their
   committed blocks through, and saves before the cleanup drops the cache. Every Host write
   lands, then every Host-resident snapshot whose anchor path is Host-resident, and exactly those
-  paths, are written parents first with their slab bytes (a temporary file renamed into place).
+  paths, are written parents first with their slab bytes (a temporary file flushed to the drive,
+  then renamed into place, so a power loss leaves the old file or the new one, never a torn one).
   Superseded snapshots (§9.3) are saved too, with their flag, after the retained ones and oldest
   supersession first: a retry, a regenerate or a re-sent prompt resumes from the tap its first
   request resumed from, which that request's endpoint superseded, so leaving them out lost exactly
@@ -1733,7 +1747,7 @@ struct HybridPrefixCacheOptions {
 struct ContextCacheOptions {
     bool enabled;                                           // --no-prefix-reuse disables
     HybridPrefixCacheOptions hybrid;
-    std::optional<std::size_t> host_capacity_bytes;         // --host-context-mib: Host slab pool
+    std::optional<std::size_t> host_capacity_bytes;         // --host-context-mib: Host slab pool (unset: auto)
     std::uint64_t ssd_capacity_bytes;                       // --ssd-context-gib: SSD tier (§5.7), 0 = off
     std::filesystem::path ssd_directory;                    // --ssd-context-dir: its scratch file's place
 };
@@ -2316,7 +2330,7 @@ rules, measurements and the build record are in the
 | Prefill calls | The plan's calls from the resume frontier: without exact taps `F, F + chunk, ...` (for F = 0 the cold grid). Calls of at most 8 columns are CPU-served and promote experts at the decode rate. Without `free-cache-resume` (the reproducible route) every tap, coalescing point and resume frontier lies on the prefill-chunk grid (`ProgramImpl::resume_grid`), so a resumed prefill's calls are the cold prefill's: several prefill routes change their arithmetic with the call's width (model-quality.md §6.7) |
 | Vision | A resume frontier strictly inside an item, or past its start in the block it begins in (rule 3 of §6.1), is never chosen; items ending at or before the frontier are not encoded again (the encode window is planned from the frontier); suffix M-RoPE positions come from the prompt |
 | Statistics | `RuntimeStats::hybrid_*` and the request log's `prefix_cache_hit_tokens` / `prefix_cache_block_tokens` as in Qwen3.5 |
-| Persistence | As §5.5, own format (`prefix/persist.cpp`, `NINFQ4PC` version 2): the block table also stores each block's `mtp_next`, the snapshot table each snapshot's superseded flag; snapshot meta travels inside each image's header slab and is validated by the state-image layout fingerprint, which the file's geometry also records. Saved at the Engine's stop after every lane is released; loaded into the empty cache at startup |
+| Persistence | As §5.5, the shared file (`runtime/prefix_cache/persist_file.cpp`, version 5) under its own magic `NINFQ4PC` and geometry, bound in `prefix/persist.cpp`: the block table also stores each block's `mtp_next`, the snapshot table each snapshot's superseded flag; snapshot meta travels inside each image's header slab and is validated by the state-image layout fingerprint, which the file's geometry also records. Saved at the Engine's stop after every lane is released; loaded into the empty cache at startup |
 | SSD tier | As §5.7 (`prefix_select` promotes the source a quote chooses; a binding skips sources only on the SSD). Snapshot meta and `mtp_next` stay with their index entries, so an SSD copy is the Host slabs' bytes alone, and it leaves out the DFlash2 ring (`ssd_image_slabs`: 136 of 184 FP4-Local image slabs; a promotion zero-fills the rest) |
 | Preemption | A pause publishes the lane's blocks and its state at the frontier to the cache, as a consistent abort does, and releases the lane (design §19.3.13); the resume binds from the deepest snapshot, without replay when it sits at the paused frontier |
 | Failure | A row with non-finite logits withdraws the request's entries (§7.8): its captures are Host-born, so the release first drains the transfer stream and reads each capture's publication (the lane keeps its capture ids until its release). A `RecoverableExecutionError` (an expert record that could not be read) still empties the whole cache, since the failed round's state is unknown for every lane |
