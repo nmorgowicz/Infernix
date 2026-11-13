@@ -1,5 +1,6 @@
 // Real BF16- and FP8-KV Gemma transactions, including damage after a sliding-ring wrap. No downloads.
 // INFERNIX_GEMMA4_ARTIFACT selects an operator-owned artifact; absent means skip (77).
+// INFERNIX_GEMMA4_DEEP=1 adds the G7 near-capacity case (131072 capacity, ~125k-token prompts; minutes).
 #include "core/device.h"
 #include "infernix/engine.h"
 #include "models/gemma4/execution/parameters.h"
@@ -61,6 +62,24 @@ Tokens complete(g4::Program& program, g4::SequenceHandle sequence, std::uint32_t
     }
     require(program.finish(sequence).status == runtime::ConsumeStatus::Consumed, "terminal sequence did not finish");
     return result;
+}
+// Commits one sampled output without licensing a terminal state, leaving the sequence decodable.
+void commit_one(g4::Program& program, g4::PendingBatch&& pending) {
+    require(pending.row_failure(0) == runtime::PendingRowFailure::None, "deep logits failed");
+    runtime::CommitDecision decision;
+    decision.accepted_tokens = 1;
+    const std::array decisions{decision};
+    (void)program.commit(std::move(pending), decisions);
+}
+// Arms the calling thread so the `after`-th later CUDA_CHECK of `work` throws, then disarms.
+template <class Work>
+void expect_memory_fault(std::uint64_t after, Work&& work, const char* message) {
+    testing::arm_memory_exhausted_here(after);
+    bool failed = false;
+    try { work(); }
+    catch (const DeviceMemoryExhausted&) { failed = true; }
+    testing::arm_memory_exhausted_here(0);
+    require(failed, message);
 }
 void native_transactions(const char* artifact) {
     DeviceContext device(0);
@@ -311,6 +330,79 @@ void public_fp8(const char* artifact) {
             "the load summary does not identify the FP8 KV and QK route");
     std::puts("PASS public FP8 KV/FP8-QK Engine and QK refusal");
 }
+// G7: FP8 KV at capacity 131072 with a 124,905-token prompt (61 chunks of 2048), for both QK modes. A
+// partial forward in a late prefill chunk or in the first decode at depth, and an aborted pending decode,
+// must leave the lane idle and a fresh short request and the deep request itself bit-identical to their
+// clean references (a stale or NaN unwritten plane would change either).
+void deep_fp8(const char* artifact) {
+    constexpr std::uint32_t capacity = 131072, chunk = 2048, deep_tokens = 124905;
+    constexpr std::uint32_t chunks = (deep_tokens + chunk - 1) / chunk;
+    DeviceContext device(0);
+    auto model = g4::load_model(artifact, {}, device);
+    const g4::execution::Parameters parameters(*model, device.stream);
+    g4::Frontend frontend(model->resources(), {.max_context = capacity});
+    const auto deep_prompt = tokens(deep_tokens, 4242);
+    for (const auto qk : {ops::Gemma4QkMode::BFloat16, ops::Gemma4QkMode::Fp8}) {
+        // Eager execution lets the fault land inside layers rather than count a single Graph replay.
+        g4::Program program(parameters, device,
+            {.max_context = capacity, .prefill_chunk = chunk, .kv_cache = KvCacheStorage::Fp8E4M3Row256,
+             .qk_mode = qk, .use_cuda_graph = false});
+        const auto pages = program.device_plan().kv_pages;
+        require(pages * 64ULL == capacity, "the deep Program did not allocate the full capacity");
+        const auto short_plan = program.plan_request(frontend.prepare_tokens(tokens(1537, 17)), greedy_execution());
+        const auto deep_plan = program.plan_request(frontend.prepare_tokens(Tokens(deep_prompt)), greedy_execution());
+        const auto reference = complete(program, bind(program, short_plan), 8);
+        const auto deep_reference = complete(program, bind(program, deep_plan), 8);
+        const auto idle = [&] {
+            const auto usage = program.physical_usage();
+            return usage.occupied.main_kv_pages == 0 && usage.occupied.state_slots == 0;
+        };
+        const auto settled = [&](const char* message) {
+            require(idle(), "a failed or aborted deep request left its lane occupied");
+            require(complete(program, bind(program, short_plan), 8) == reference, message);
+        };
+
+        // A late prefill chunk (depth ~120k) dies partway through real layer work.
+        auto sequence = bind(program, deep_plan);
+        for (std::uint32_t i = 0; i + 2 < chunks; ++i) {
+            require(!program.advance_prefill(sequence).complete, "the deep prompt completed too early");
+        }
+        expect_memory_fault(100, [&] { (void)program.advance_prefill(sequence); },
+                            "the late-chunk memory fault did not fire");
+        require(program.recover_after_failure(), "the device did not recover after a late-chunk fault");
+        settled("a late prefill-chunk fault at depth changed a fresh request");
+
+        // The first decode at full depth dies after its first output was committed.
+        sequence = bind(program, deep_plan);
+        commit_one(program, prefill(program, sequence));
+        const std::array sequences{sequence};
+        const std::array budgets{runtime::RoundBudget{7}};
+        expect_memory_fault(50, [&] { (void)program.decode(sequences, budgets); },
+                            "the first-decode memory fault did not fire");
+        require(program.recover_after_failure(), "the device did not recover after a first-decode fault");
+        settled("a first-decode fault at depth changed a fresh request");
+
+        // A sampled-but-unlicensed decode output at depth: ledger, occupancy and the capability are released.
+        sequence = bind(program, deep_plan);
+        commit_one(program, prefill(program, sequence));
+        const std::array live{sequence};
+        auto pending = program.decode(live, budgets);
+        require(program.physical_usage().occupied.main_kv_pages == pages, "a deep sequence does not own its KV");
+        require(program.abort_pending(std::move(pending)).status == runtime::ConsumeStatus::Consumed,
+                "deep pending abort did not consume");
+        require(program.abort_pending(std::move(pending)).status == runtime::ConsumeStatus::InvariantMismatch,
+                "a consumed deep pending capability was reusable");
+        bool stale_rejected = false;
+        try { (void)program.decode(live, budgets); }
+        catch (const std::logic_error&) { stale_rejected = true; }
+        require(stale_rejected, "an aborted deep sequence was still decodable");
+        settled("an aborted deep decode changed a fresh request");
+        require(complete(program, bind(program, deep_plan), 8) == deep_reference,
+                "recovered deep state changed the deep continuation");
+        std::puts(qk == ops::Gemma4QkMode::Fp8 ? "PASS deep FP8 KV/FP8-QK late-chunk, first-decode, abort recovery"
+                                               : "PASS deep FP8 KV/BF16-QK late-chunk, first-decode, abort recovery");
+    }
+}
 } // namespace
 int main() {
     const char* artifact = std::getenv("INFERNIX_GEMMA4_ARTIFACT");
@@ -323,6 +415,8 @@ int main() {
         public_recovery(artifact);
         fp8_kv_program(artifact);
         public_fp8(artifact);
+        const char* deep = std::getenv("INFERNIX_GEMMA4_DEEP");
+        if (deep != nullptr && std::string(deep) == "1") { deep_fp8(artifact); }
         return 0;
     } catch (const std::exception& error) {
         testing::arm_memory_exhausted_here(0);
