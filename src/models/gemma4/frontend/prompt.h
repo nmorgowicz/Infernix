@@ -1,6 +1,8 @@
 #pragma once
 
 #include "infernix/types.h"
+#include "runtime/prefix_cache/block_hash.h"
+#include "runtime/prefix_cache/tap_planner.h"
 #include "models/gemma4/ngram.h"
 #include <memory>
 #include <optional>
@@ -25,6 +27,13 @@ public:
     [[nodiscard]] explicit operator bool() const noexcept { return !tokens_.empty(); }
     [[nodiscard]] const std::vector<TokenId>& tokens() const noexcept { return tokens_; }
     [[nodiscard]] std::span<const TokenId> token_ids() const noexcept { return tokens_; }
+    // Prefix-cache lookup keys over the tokens (docs/maintainer/hybrid-prefix-cache-spec.md §5.1): one
+    // chained hash per full 64-token block, and one extra key per block (empty: a text-only prompt
+    // carries none, so every block's extra is zero). Recomputed whenever the tokens change.
+    [[nodiscard]] const std::vector<std::uint64_t>& block_hashes() const noexcept { return block_hashes_; }
+    [[nodiscard]] const std::vector<std::uint64_t>& block_extras() const noexcept { return block_extras_; }
+    // Prompt boundary facts for tap placement (§7.1): exact token positions.
+    [[nodiscard]] const std::vector<runtime::prefix_cache::TapHint>& tap_hints() const noexcept { return tap_hints_; }
     [[nodiscard]] std::unique_ptr<NgramArchive::Request>
     bind_ngram(NgramArchive&, const NgramSessionHints& hints) {
         if (!hints.key.empty() || hints.reset || !hints.parent.empty() || hints.parent_generation) {
@@ -35,7 +44,11 @@ public:
 
 private:
     PreparedPrompt(std::vector<TokenId> tokens, PromptSummary summary)
-        : tokens_(std::move(tokens)), summary_(summary) {}
+        : tokens_(std::move(tokens)), summary_(summary) { refresh_block_keys(); }
+
+    void refresh_block_keys() {
+        block_hashes_ = runtime::prefix_cache::block_lookup_hashes(tokens_, block_extras_);
+    }
 
     // A declared tool's name ("" for none) and the tokens of "call:<name>", which follow
     // `<|tool_call>` when a tool choice forces the call.
@@ -45,6 +58,9 @@ private:
     };
 
     std::vector<TokenId> tokens_;
+    std::vector<std::uint64_t> block_hashes_;
+    std::vector<std::uint64_t> block_extras_;
+    std::vector<runtime::prefix_cache::TapHint> tap_hints_;
     PromptSummary summary_{};
     PromptPreparationStats stats_{};
     std::vector<ToolOpener> tool_openers_;

@@ -11,11 +11,19 @@
 #include "infernix/ops/sampling.h"
 #include "infernix/ops/target_logprobs.h"
 #include "infernix/ops/top_logprobs.h"
+#include "models/gemma4/program/prefix/layout_identity.h"
+#include "models/gemma4/program/prefix/prefix_cache.h"
+#include "models/gemma4/program/prefix/state_image.h"
+#include "runtime/prefix_cache/block_hash.h"
+#include "runtime/prefix_cache/prefix_index.h"
+#include "runtime/prefix_cache/tap_planner.h"
 
 #include <algorithm>
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
@@ -23,11 +31,18 @@
 #include <vector>
 
 namespace infernix::models::gemma4 {
+namespace pc = runtime::prefix_cache;
 namespace {
 constexpr std::uint32_t kPage = ops::kGemma4KvPageTokens;
 constexpr int kScoreTile = 128;
 constexpr std::array<std::uint32_t, 6> kGraphWidths{32, 64, 128, 256, 512, 1024};
 constexpr std::uint64_t kGraphAllowance = 64ULL << 20;
+// Ranking only (CacheCostModel never decides feasibility): what a prefilled token costs against a
+// restore's copy time when the cache chooses between sources and values snapshots.
+constexpr double kCacheTokenSeconds = 1.0 / 1500.0;
+PrefixReusePath reuse_path_for(pc::SnapshotKind kind) noexcept {
+    return kind == pc::SnapshotKind::Endpoint ? PrefixReusePath::HybridEndpoint : PrefixReusePath::HybridSnapshot;
+}
 std::uint64_t aligned(std::uint64_t bytes) { return (bytes + 255) & ~std::uint64_t{255}; }
 std::uint32_t pages_for(std::uint32_t tokens) { return (tokens + kPage - 1) / kPage; }
 std::uint32_t ring_pages(std::uint32_t chunk, std::uint32_t window) {
@@ -138,6 +153,11 @@ struct RequestPlan {
     std::vector<TokenId> tokens;
     ResolvedSamplingParameters sampling;
     std::vector<TokenId> readout_tokens;
+    // The prefix cache serves this request (the cache exists and the request allows reuse), its
+    // chained block hashes over `tokens` and the Frontend's tap hints.
+    bool reuse = false;
+    std::vector<std::uint64_t> block_hashes;
+    std::vector<pc::TapHint> hints;
 };
 struct ResumeData {
     const void* owner = nullptr;
@@ -147,6 +167,9 @@ struct ResumeData {
     bool prefilled = false;
     bool finishable = false;
     GenerationTimings timings;
+    // The Begin the Engine committed at the request's first admission: it never changes, so a
+    // resumed binding reports it again whatever source the resume restored from.
+    runtime::BeginSummary begin;
 };
 struct ProgramImpl {
     const execution::Parameters& parameters;
@@ -196,6 +219,57 @@ struct ProgramImpl {
     runtime::PendingRowFailure pending_failure = runtime::PendingRowFailure::None;
     bool pending_decode = false;
     GenerationTimings timings;
+    // The Begin the Engine committed for this binding (its prompt, the source it quoted and that
+    // source's path): every prefill progress reports it back unchanged.
+    runtime::BeginSummary begin;
+
+    // ---- prefix cache ---------------------------------------------------------------------------
+    // The snapshot a binding resumes from (its `path` is the k = frontier / 64 full blocks).
+    struct PrefixSelection {
+        std::optional<pc::SnapshotRef> snapshot;
+        pc::SnapshotKind kind = pc::SnapshotKind::Tap;
+        std::uint32_t frontier = 0;
+        std::vector<pc::NodeRef> path;
+    };
+    struct PrefixCandidates {
+        std::vector<PrefixSelection> list;     // preference order, the root excluded
+        std::uint32_t cached_tokens = 0;       // the prompt prefix held as cached blocks
+        std::vector<std::uint32_t> existing;   // frontiers of the usable snapshots on the matched path
+    };
+    // What the live sequence owns in the cache. Every pin a sequence holds is released in
+    // release_prefix, exactly once, whichever way the sequence ends.
+    struct PrefixLane {
+        bool active = false;
+        std::vector<pc::NodeRef> path;                   // pinned: matched blocks, then published or found ones
+        std::vector<std::uint64_t> hashes;               // chained over the ledger, extended as blocks publish
+        std::vector<pc::TapHint> hints;
+        std::vector<pc::PlannedTap> taps;                // not yet realized
+        std::vector<std::uint32_t> call_ends;            // exclusive prefill call ends, ascending
+        std::size_t next_call = 0;
+        std::optional<pc::SnapshotRef> restore_snapshot; // selected at binding, restored by poll_context
+        std::optional<pc::SnapshotRef> pinned_snapshot;  // the selection's pin, until the restore holds its own
+        std::optional<pc::SnapshotRef> resume;           // the snapshot the sequence was restored from
+        std::optional<pc::SnapshotRef> superseded;       // the snapshot its first capture superseded
+        std::uint32_t reused = 0;                        // the resume frontier
+        std::uint32_t deepest = 0;                       // the deepest snapshot frontier of this lineage
+        // The end of the prefix computed only by full, grid-aligned prefill calls ([kC,(k+1)C) for chunk C), from
+        // the root or from a restore at a grid frontier: the arithmetic a cold prefill of any longer prompt
+        // applies to those positions, bit for bit. Only blocks and snapshots below it are published, so a
+        // restore reproduces a cold prefill exactly; a partial final call, decode, forced feeds or an
+        // off-grid replay never reach the cache (plan §8.4, §17.6 grid-aligned policy).
+        std::uint32_t exact_through = 0;
+        std::vector<pc::NodeRef> owned;                  // blocks whose Device copy this sequence inserted
+        std::vector<std::uint64_t> captures;             // every capture it asked for
+        bool captured = false;
+        bool withdraw = false;                           // its state may be wrong: take back what it published
+        bool close_endpoint = true;                      // the next turn may resume at this one's endpoint
+    } pl;
+    pc::Withdrawal prefix_withdrawal;                    // entries a pin kept from an earlier withdrawal
+    std::uint64_t next_capture = 0;
+    bool clear_prefix_after_release = false;
+    std::uint32_t ring_pages_ = 0;
+    // Last: destroyed first, waiting for its copies before the Device buffers it reads are freed.
+    std::unique_ptr<prefix::PrefixCache> prefix_cache;
 
     ProgramImpl(const execution::Parameters& p, DeviceContext& d, ProgramOptions o)
         : parameters(p), device(d), options(std::move(o)),
@@ -222,6 +296,7 @@ struct ProgramImpl {
         if (options.causal_scoring) { host_logits.resize(static_cast<std::size_t>(c.vocab_size)); }
         ledger.reserve(capacity() + 1ULL);
         const auto ring_count = std::min(plan.kv_pages, ring_pages(options.prefill_chunk, c.sliding_window));
+        ring_pages_ = static_cast<std::uint32_t>(ring_count);
         std::vector<std::int32_t> table(plan.kv_pages);
         std::iota(table.begin(), table.end(), 0);
         global_table_storage.copy_from_host(table.data(), table.size() * sizeof(std::int32_t));
@@ -269,6 +344,7 @@ struct ProgramImpl {
                 // Sliding descriptors retain BF16 QK.
                 .qk_mode = global ? options.qk_mode : ops::Gemma4QkMode::BFloat16});
         }
+        if (options.prefix_cache) { create_prefix_cache(); }
         if (p.derived_device_bytes() != plan.prepared_row_scales) {
             throw std::logic_error("Gemma4 Parameters and device plan disagree on prepared row scales");
         }
@@ -302,6 +378,9 @@ struct ProgramImpl {
         if (!owns(sequence) || !state_valid) { throw std::logic_error("Gemma4 stale or invalid sequence"); }
     }
     void clear() noexcept {
+        // A sequence that ends with its state unknown (an exception left it invalid) takes back
+        // what it published; every pin it holds goes back before the request itself is dropped.
+        release_prefix(!state_valid);
         binding = occupied = prefilled = replaying = finishable = pending = false;
         state_valid = true;
         fed = physical_written = replay_target = 0;
@@ -320,9 +399,9 @@ struct ProgramImpl {
         gemma4_layers(input, out, parameters.embedding, parameters.layers, caches, pos,
             gemm, workspace, stream);
     }
-    void head_body(int first, int n) {
+    void head_body(int first, int n, int output_first = 0) {
         workspace.reset();
-        auto out = logits(n);
+        auto out = head.slice(1, output_first, n);
         gemma4_logits(hidden_columns(first, n), out, parameters.final_norm, parameters.output_head,
             config().final_logit_softcapping, config().rms_norm_eps, gemm, workspace, stream);
     }
@@ -418,6 +497,393 @@ struct ProgramImpl {
             timings.decode_share_seconds += seconds; // This Program has one lane.
         } else { timings.prefill_seconds += seconds; }
         return timing;
+    }
+    void diagnostic(const std::string& text, DiagnosticLevel level = DiagnosticLevel::Info) const noexcept {
+        try {
+            if (options.diagnostics.callback) {
+                options.diagnostics.callback(Diagnostic{.level = level, .message = text});
+            } else {
+                std::fprintf(stderr, "[engine] %s\n", text.c_str());
+            }
+        } catch (...) {}
+    }
+
+    // ---- prefix cache: construction -----------------------------------------------------------
+    void create_prefix_cache() {
+        const auto& c = config();
+        std::vector<KvLayerFact> facts;
+        facts.reserve(parameters.layers.size());
+        for (const auto& layer : parameters.layers) {
+            facts.push_back({layer.global_layer, layer.head_dim, layer.kv_heads});
+        }
+        const auto geometry = prefix_cache_geometry(facts, c.sliding_window, options.kv_cache);
+        const auto identity = prefix::make_layout_identity(facts, c.sliding_window, options.prefill_chunk,
+                                                           options.kv_cache, options.qk_mode);
+        std::vector<std::vector<prefix::DevicePlane>> global, sliding;
+        for (std::size_t i = 0; i < parameters.layers.size(); ++i) {
+            const auto& layer = parameters.layers[i];
+            const auto layout = kv_layer_layout(options.kv_cache, layer.global_layer, layer.head_dim, layer.kv_heads);
+            // KvLayerLayout::planes() order: K codes, K scales (when scaled), V codes, V scales.
+            std::vector<prefix::DevicePlane> planes;
+            planes.push_back({static_cast<std::byte*>(keys[i].p), layout.code_page_bytes});
+            if (layout.scale_page_bytes != 0) {
+                planes.push_back({static_cast<std::byte*>(key_scales[i].p), layout.scale_page_bytes});
+            }
+            planes.push_back({static_cast<std::byte*>(values[i].p), layout.code_page_bytes});
+            if (layout.scale_page_bytes != 0) {
+                planes.push_back({static_cast<std::byte*>(value_scales[i].p), layout.scale_page_bytes});
+            }
+            (layer.global_layer ? global : sliding).push_back(std::move(planes));
+        }
+        prefix::PrefixCacheConfig cache;
+        cache.kv_pages = plan.kv_pages;
+        cache.taps = prefix::derive_tap_config(geometry.image_bytes);
+        cache.cost.chunk_tokens = options.prefill_chunk;
+        cache.cost.token_seconds = kCacheTokenSeconds;
+        prefix_cache = std::make_unique<prefix::PrefixCache>(
+            cache, geometry, identity, prefix::plan_block_layout(facts, options.kv_cache),
+            prefix::plan_state_image(facts, c.sliding_window, options.kv_cache), std::move(global),
+            std::move(sliding), ring_pages_, options.host_bytes, stream);
+    }
+
+    // ---- prefix cache: admission --------------------------------------------------------------
+    // The usable snapshots of `tokens` in preference order (the index's choice first; a resumed
+    // request takes its deepest), none deeper than `maximum_frontier`. A candidate is usable when
+    // its blocks are on the Host (none still being written), it is not on an SSD tier and its
+    // image header validates against this process's layout identity.
+    PrefixCandidates prefix_candidates(std::span<const TokenId> tokens, std::span<const std::uint64_t> hashes,
+                                       std::uint32_t maximum_frontier, bool resumed) {
+        PrefixCandidates out;
+        const auto n = static_cast<std::uint32_t>(tokens.size());
+        if (!prefix_cache || n <= 1 || hashes.size() != n / pc::kBlockTokens) { return out; }
+        pc::PrefixCacheIndex& index = prefix_cache->index();
+        prefix_cache->poll();
+        // With no sequence mapping the cache, a Device copy is a leftover (a write refused its
+        // block): none is worth keeping.
+        if (!occupied && !binding) { prefix_cache->sweep_device_copies(); }
+        pc::MatchResult match = index.match(tokens, hashes, {}, n);
+        const auto filling = [](const pc::MatchResult& m) {
+            return std::any_of(m.candidates.begin(), m.candidates.end(),
+                               [](const pc::MatchCandidate& c) { return c.filling_blocks != 0; });
+        };
+        if (prefix_cache->transfers_pending() && filling(match)) {
+            // Blocks being written land within a copy time: a cached source is not given up for them.
+            prefix_cache->drain();
+            match = index.match(tokens, hashes, {}, n);
+        }
+        out.cached_tokens = static_cast<std::uint32_t>(match.path.size()) * pc::kBlockTokens;
+        // Only a grid frontier restores to a cold prefill's state (PrefixLane::exact_through); a snapshot
+        // elsewhere is skipped.
+        std::erase_if(match.candidates, [&](const pc::MatchCandidate& c) {
+            return c.filling_blocks != 0 || c.ssd_only_blocks != 0 || c.image_on_ssd_only || c.tail_on_ssd_only ||
+                   c.frontier > maximum_frontier || c.frontier % options.prefill_chunk != 0 ||
+                   !prefix_cache->image_valid(c.snapshot);
+        });
+        for (const pc::MatchCandidate& c : match.candidates) { out.existing.push_back(c.frontier); }
+        const pc::AdmissionChoice choice = index.choose(match, n);
+        std::vector<std::size_t> order;
+        if (choice.candidate) { order.push_back(*choice.candidate); }
+        for (std::size_t i = 0; i < match.candidates.size(); ++i) {
+            if (!choice.candidate || i != *choice.candidate) { order.push_back(i); }
+        }
+        // A resumed request takes its deepest state: a shallower one would replay the tokens past
+        // it with prefill arithmetic.
+        if (resumed) {
+            std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+                return match.candidates[a].frontier > match.candidates[b].frontier;
+            });
+        }
+        for (const std::size_t i : order) {
+            const pc::MatchCandidate& c = match.candidates[i];
+            PrefixSelection s;
+            s.snapshot = c.snapshot;
+            s.kind = index.snapshot(c.snapshot).kind;
+            s.frontier = c.frontier;
+            s.path.assign(match.path.begin(), match.path.begin() + c.path_blocks);
+            out.list.push_back(std::move(s));
+        }
+        return out;
+    }
+
+    // The prompt's prefill calls from the grid frontier `frontier`: the plain chunk grid, as a cold
+    // prefill runs. The taps the planner places (the generation opener moves forward unless the
+    // lineage echoes its replies) are realized at the first full-call boundary at or past them; none
+    // cuts a call, since a narrower call changes the arithmetic of the positions it covers.
+    void plan_prefill(std::uint32_t frontier, std::span<const std::uint32_t> existing, bool follow_endpoint) {
+        const std::uint32_t n = request->summary.prompt_tokens;
+        pl.taps = pc::plan_taps(n, frontier, pl.hints, existing, {}, prefix_cache->taps(), !follow_endpoint);
+        pl.call_ends = prefix::plan_call_ends(frontier, n, options.prefill_chunk, {});
+        pl.next_call = 0;
+    }
+
+    // Records a prefill or replay call over [first, first + width): a full call on the chunk grid that
+    // continues the exact prefix extends it.
+    void note_grid_call(std::uint32_t first, std::uint32_t width) noexcept {
+        if (first == pl.exact_through && first % options.prefill_chunk == 0 && width == options.prefill_chunk) {
+            pl.exact_through = first + width;
+        }
+    }
+
+    // Exclusive end of the prefill call that starts at `fed`. advance_prefill takes every prefill call's
+    // end from here (a cache-off or non-reusing request has no planned calls and ends at the prompt, then
+    // chunk-capped there).
+    std::uint32_t next_call_end() {
+        const std::uint32_t prompt = request->summary.prompt_tokens;
+        while (pl.next_call < pl.call_ends.size() && pl.call_ends[pl.next_call] <= fed) { ++pl.next_call; }
+        return pl.next_call < pl.call_ends.size() ? pl.call_ends[pl.next_call] : prompt;
+    }
+
+    // ---- prefix cache: publication ------------------------------------------------------------
+    // Publishes the full blocks below `frontier` and below the exact prefix (PrefixLane::exact_through):
+    // positions whose input token is in the committed ledger and whose KV full grid prefill calls wrote.
+    // Nothing past `fed` is ever published, so a rejected or uncommitted write reaches no block and no
+    // snapshot (plan §8.4 invariant 1). Each new block is written through to the Host at once; a block
+    // already cached stays as it is.
+    void publish_blocks(std::uint32_t frontier) {
+        if (!prefix_cache || !pl.active) { return; }
+        frontier = std::min({frontier, pl.exact_through, static_cast<std::uint32_t>(ledger.size())});
+        const std::uint32_t blocks = frontier / pc::kBlockTokens;
+        std::vector<pc::NodeRef> fresh;
+        std::vector<std::uint32_t> pages;
+        while (pl.path.size() < blocks) {
+            const auto b = static_cast<std::uint32_t>(pl.path.size());
+            const std::span<const TokenId> tokens(ledger.data() + static_cast<std::size_t>(b) * pc::kBlockTokens,
+                                                  pc::kBlockTokens);
+            while (pl.hashes.size() <= b) {
+                const std::size_t at = pl.hashes.size();
+                const std::uint64_t previous = at == 0 ? pc::kRootLookupHash : pl.hashes[at - 1];
+                pl.hashes.push_back(pc::block_lookup_hash(
+                    previous, std::span<const TokenId>(ledger.data() + at * pc::kBlockTokens, pc::kBlockTokens), 0));
+            }
+            const pc::NodeRef parent = b == 0 ? pc::NodeRef{} : pl.path.back();
+            const pc::InsertResult result = prefix_cache->insert_block(parent, pl.hashes[b], tokens, b);
+            pl.path.push_back(result.node);
+            if (result.device_attached) {
+                pl.owned.push_back(result.node);
+                fresh.push_back(result.node);
+                pages.push_back(b);
+            }
+        }
+        prefix_cache->write_blocks(fresh, pages);
+    }
+
+    // A snapshot of the sequence's state at its frontier `fed`, Host-born; only at the end of the exact
+    // prefix, the one state a cold prefill reaches too.
+    void prefix_capture(pc::SnapshotKind kind, bool resume_point) {
+        const std::uint32_t F = fed;
+        const std::uint32_t k = F / pc::kBlockTokens;
+        if (F == 0 || F != pl.exact_through || pl.path.size() < k || F > ledger.size()) { return; }
+        pc::PrefixCacheIndex& index = prefix_cache->index();
+        prefix::PrefixCache::Capture c;
+        c.id = ++next_capture;
+        c.anchor = k == 0 ? pc::NodeRef{} : pl.path[k - 1];
+        c.frontier = F;
+        c.tail.assign(ledger.begin() + static_cast<std::ptrdiff_t>(k) * pc::kBlockTokens,
+                      ledger.begin() + static_cast<std::ptrdiff_t>(F));
+        c.tail_page = k;
+        c.kind = kind;
+        // A paused request's frontier is its own resume point: its image is admitted over any
+        // retained snapshot that is not pinned. The claim only admits it.
+        c.claim = resume_point ? std::numeric_limits<double>::infinity()
+                               : index.estimate_priority(pl.deepest, F, !c.tail.empty());
+        c.meta.opener = kind != pc::SnapshotKind::Endpoint &&
+                        std::any_of(pl.hints.begin(), pl.hints.end(), [&](const pc::TapHint& hint) {
+                            return hint.kind == pc::TapHintKind::GenerationOpener && hint.position == F;
+                        });
+        c.meta.lineage_echo = pl.resume && index.valid(*pl.resume) &&
+                              index.snapshot(*pl.resume).kind == pc::SnapshotKind::Endpoint;
+        // The request's first capture supersedes the snapshot it resumed from, which then serves
+        // only requests diverging before this one.
+        const bool supersede = !pl.captured && pl.resume && index.valid(*pl.resume);
+        if (supersede) {
+            c.supersedes = *pl.resume;
+            const std::uint32_t from = index.snapshot(*pl.resume).frontier;
+            if (from < F) { c.continuation.assign(ledger.begin() + from, ledger.begin() + F); }
+        }
+        const std::uint64_t id = c.id;
+        if (prefix_cache->capture(std::move(c))) {
+            pl.captures.push_back(id);
+            pl.captured = true;
+            pl.deepest = F;
+            if (supersede) { pl.superseded = pl.resume; }
+        }
+    }
+
+    // Whether a snapshot at `boundary` still pays given the deepest one of the lineage.
+    [[nodiscard]] bool tap_far_enough(std::uint32_t boundary, bool forward) const noexcept {
+        return boundary >= pl.deepest + pc::kBlockTokens || (forward && boundary > pl.deepest);
+    }
+
+    // The planned taps due at call boundary `boundary`: an exact tap ends a call; a flexible one is
+    // realized at the first boundary at or past it, or at the start of the prompt's final call.
+    bool take_due_taps(std::uint32_t boundary, bool final_next, bool& is_boundary, bool& forward) {
+        bool due = false;
+        std::erase_if(pl.taps, [&](const pc::PlannedTap& tap) {
+            if (tap.position > boundary && !(final_next && tap.placement == pc::TapPlacement::Flexible)) {
+                return false;
+            }
+            due = true;
+            is_boundary = is_boundary || tap.boundary;
+            forward = forward || tap.forward;
+            return true;
+        });
+        return due;
+    }
+
+    // After a prefill call ending at `fed`: publish its blocks and realize the taps due here. The
+    // prompt's deepest grid state is always offered as a tap, so a next turn resumes there and replays
+    // at most one chunk of this prompt: the end of the prompt when it ends on the grid, else the start
+    // of its final (partial) call.
+    void after_prefill_call() {
+        if (!pl.active) { return; }
+        publish_blocks(fed);
+        const std::uint32_t prompt = request->summary.prompt_tokens;
+        bool is_boundary = false, forward = false;
+        if (fed >= prompt) {
+            if (fed == pl.exact_through && tap_far_enough(fed, true)) { prefix_capture(pc::SnapshotKind::Tap, false); }
+            return;
+        }
+        const bool final_next = next_call_end() == prompt;
+        const bool deepest = final_next && prompt % options.prefill_chunk != 0;
+        if (deepest) { forward = true; }
+        if ((take_due_taps(fed, final_next, is_boundary, forward) || deepest) && tap_far_enough(fed, forward)) {
+            prefix_capture(is_boundary ? pc::SnapshotKind::Boundary : pc::SnapshotKind::Tap, false);
+        }
+    }
+
+    // The end of a consistent sequence (finish, abort, pause): its remaining blocks and an endpoint
+    // snapshot at the committed frontier when that is the exact prefix's end (a pausing sequence past it
+    // resumes from its last grid snapshot and replays the rest on the chunk grid).
+    void prefix_finish(bool pausing) noexcept {
+        if (!prefix_cache || !pl.active || !state_valid) { return; }
+        try {
+            publish_blocks(fed);
+            const std::uint32_t F = fed;
+            const bool far_enough = F >= pl.deepest + pc::kBlockTokens || (pausing && F > pl.deepest) ||
+                                    (pl.close_endpoint && F >= pl.deepest + pc::kMinimumForwardTokens);
+            if (far_enough && pl.path.size() >= F / pc::kBlockTokens) {
+                prefix_capture(pc::SnapshotKind::Endpoint, pausing);
+            }
+        } catch (const std::exception& error) {
+            diagnostic(std::string("Gemma4: publishing the prefix cache failed: ") + error.what(),
+                       DiagnosticLevel::Warning);
+            pl.withdraw = true;
+            clear_prefix_after_release = true;
+        } catch (...) {
+            pl.withdraw = true;
+            clear_prefix_after_release = true;
+        }
+    }
+
+    // The prompt tokens past the reused prefix that this request's accepted captures made
+    // reusable for a later request (Anthropic's cache_creation_input_tokens).
+    [[nodiscard]] std::optional<std::uint32_t> prefix_created_tokens() const noexcept {
+        if (!prefix_cache || !pl.active) { return std::nullopt; }
+        const std::uint32_t deepest = std::min(pl.deepest, request->summary.prompt_tokens);
+        return deepest > pl.reused ? deepest - pl.reused : 0U;
+    }
+
+    // ---- prefix cache: release ----------------------------------------------------------------
+    // After a non-finite failure or an invalid state, once the pins are released
+    // (hybrid-prefix-cache-spec §7.8): the sequence's captures land, then its blocks (with what
+    // later requests built on them) and its snapshots leave the cache, so a resend resumes from
+    // what was cached before it. What another pin still holds waits in prefix_withdrawal.
+    void prefix_withdraw() noexcept {
+        try {
+            prefix_cache->drain(); // each capture pins its anchor until it has landed and published
+            for (const std::uint64_t id : pl.captures) {
+                if (const auto result = prefix_cache->capture_result(id); result && result->created) {
+                    prefix_withdrawal.snapshots.push_back(result->snapshot);
+                }
+                prefix_cache->forget_capture(id);
+            }
+            const bool published = !pl.captures.empty() || !pl.owned.empty();
+            prefix_withdrawal.nodes.insert(prefix_withdrawal.nodes.end(), pl.owned.begin(), pl.owned.end());
+            const std::uint32_t removed = prefix_cache->index().withdraw(prefix_withdrawal);
+            // The snapshot its first capture superseded serves again.
+            if (pl.superseded && prefix_cache->index().valid(*pl.superseded)) {
+                prefix_cache->index().unsupersede(*pl.superseded);
+            }
+            if (published) {
+                diagnostic("Gemma4: withdrew " + std::to_string(removed) +
+                               " prefix-cache entries a failed request published",
+                           DiagnosticLevel::Warning);
+            }
+        } catch (...) {
+            // What it published cannot be told apart now: the cache is emptied.
+            clear_prefix_after_release = true;
+        }
+    }
+
+    // Gives back everything the sequence holds in the cache: the selection's pins, the mapped
+    // path, its Device copies (the pages go with the sequence; their bytes are on the Host) and,
+    // for a failed sequence, what it published.
+    void release_prefix(bool invalid) noexcept {
+        if (!prefix_cache) { return; }
+        if (invalid && pl.active) { pl.withdraw = true; }
+        pc::PrefixCacheIndex& index = prefix_cache->index();
+        try {
+            if (pl.pinned_snapshot) { index.unpin_snapshot(*pl.pinned_snapshot); }
+            if (!pl.path.empty()) { index.release_path(pl.path); }
+        } catch (...) { clear_prefix_after_release = true; }
+        try {
+            if (pl.withdraw) {
+                prefix_withdraw();
+            } else {
+                for (const std::uint64_t id : pl.captures) { prefix_cache->forget_capture(id); }
+                // Entries an earlier withdrawal found pinned go once nothing pins them.
+                if (!prefix_withdrawal.empty()) { (void)index.withdraw(prefix_withdrawal); }
+            }
+            prefix_cache->poll();
+            prefix_cache->sweep_device_copies();
+        } catch (...) { clear_prefix_after_release = true; }
+        pl = PrefixLane{};
+        if (clear_prefix_after_release) { reset_prefix_cache(); }
+    }
+
+    // The cache is emptied: after a failure it may hold state no one can vouch for.
+    void reset_prefix_cache() noexcept {
+        if (!prefix_cache) { return; }
+        prefix_withdrawal = {};
+        clear_prefix_after_release = false;
+        pl = PrefixLane{};
+        prefix_cache->clear();
+    }
+
+    [[nodiscard]] HybridPrefixCacheStats prefix_stats() const noexcept {
+        HybridPrefixCacheStats out;
+        if (!prefix_cache) { return out; }
+        const pc::PrefixIndexStats index = prefix_cache->index().stats();
+        const prefix::PrefixCacheCounters& count = prefix_cache->counters();
+        out.nodes = index.nodes;
+        out.snapshots = index.snapshots;
+        out.device_resident_blocks = index.device_resident_blocks;
+        out.device_evictable_blocks = index.device_evictable_blocks;
+        out.host_slabs = index.host_slab_limit;
+        out.host_free_slabs = index.host_free_slabs;
+        out.host_slab_bytes = prefix_cache->host_layout().slab_bytes;
+        out.snapshot_hits = index.snapshot_hits;
+        out.reused_tokens = count.reused_tokens;
+        out.blocks_inserted = count.blocks_inserted;
+        out.blocks_duplicate = count.blocks_duplicate;
+        out.taps_created = count.taps_created;
+        out.taps_skipped = count.taps_skipped;
+        out.endpoints_created = count.endpoints_created;
+        out.host_image_writes = count.host_image_writes;
+        out.host_block_writes = count.host_block_writes;
+        out.host_image_restores = count.host_image_restores;
+        out.host_block_restores = count.host_block_restores;
+        out.host_write_bytes = count.host_write_bytes;
+        out.host_restore_bytes = count.host_restore_bytes;
+        out.evicted_blocks = index.device_block_evictions;
+        out.host_snapshot_evictions = index.host_snapshot_evictions;
+        out.host_dead_reclaims = index.host_dead_reclaims;
+        out.unbacked_node_losses = index.unbacked_node_losses;
+        out.held_snapshots = index.held_snapshots;
+        out.held_device_evictions = index.held_device_evictions;
+        out.held_snapshot_losses = index.held_snapshot_losses;
+        out.held_host_refusals = index.held_host_refusals;
+        return out;
     }
     void run_layers(std::span<const TokenId> tokens, std::uint32_t first,
                     runtime::ExecutionTimingRecorder* timing = nullptr) {
@@ -564,7 +1030,14 @@ RequestBasePlan Program::plan_request(PreparedPrompt&& prompt, const runtime::Re
         throw std::invalid_argument("Gemma4 sampling requires finite parameters and top_k in [1,64]");
     }
     auto plan = std::make_shared<detail::RequestPlan>();
-    plan->owner = impl_.get(); plan->tokens = std::move(prompt.tokens_);
+    plan->owner = impl_.get();
+    plan->reuse = impl_->prefix_cache != nullptr && options.allow_prefix_reuse;
+    // The Frontend keys the prompt; a prompt whose keys do not cover its tokens (changed after
+    // preparation) is keyed here.
+    plan->block_hashes = prompt.block_hashes_.size() == tokens.size() / pc::kBlockTokens
+        ? std::move(prompt.block_hashes_) : pc::block_lookup_hashes(tokens, {});
+    plan->hints = std::move(prompt.tap_hints_);
+    plan->tokens = std::move(prompt.tokens_);
     plan->sampling = s; plan->readout_tokens = options.readout_tokens;
     auto& summary = plan->summary;
     summary.prompt_tokens = static_cast<std::uint32_t>(plan->tokens.size());
@@ -573,30 +1046,103 @@ RequestBasePlan Program::plan_request(PreparedPrompt&& prompt, const runtime::Re
         impl_->capacity() - summary.prompt_tokens + 1);
     summary.effective_limit_reason = summary.effective_output_tokens < options.requested_output_tokens
         ? FinishReason::ContextCapacity : FinishReason::OutputLimit;
-    summary.publish_continuation = false;
+    summary.publish_continuation = plan->reuse;
     return RequestBasePlan(std::move(plan));
 }
-std::vector<SourceCandidate> Program::hybrid_sources(const RequestBasePlan& base, std::uint32_t) {
+std::vector<SourceCandidate> Program::hybrid_sources(const RequestBasePlan& base, std::uint32_t maximum_frontier) {
     if (!base.impl_ || base.impl_->owner != impl_.get()) { throw std::logic_error("Gemma4 foreign request plan"); }
-    return {SourceCandidate{}};
+    auto& p = *impl_;
+    const auto& plan = *base.impl_;
+    std::uint32_t cached = 0;
+    std::vector<SourceCandidate> sources;
+    if (p.prefix_cache && plan.reuse) {
+        // The index's choice first, then a root start. A resumed request's quote is bounded by its
+        // frontier; its binding re-selects over its whole ledger.
+        const auto candidates = p.prefix_candidates(plan.tokens, plan.block_hashes, maximum_frontier,
+                                                    maximum_frontier != UINT32_MAX);
+        cached = candidates.cached_tokens;
+        if (!candidates.list.empty()) {
+            const auto& best = candidates.list.front();
+            sources.push_back(SourceCandidate{best.frontier, reuse_path_for(best.kind), cached});
+        }
+    }
+    sources.push_back(SourceCandidate{0, PrefixReusePath::Root, cached});
+    return sources;
 }
 BindingReservation Program::start_binding(const RequestBasePlan& base, runtime::LaneId lane,
     const SourceCandidate& source, ResumeState* resume, ExecutionUnitKind, std::uint32_t) {
     auto& p = *impl_;
     if (!base.impl_ || base.impl_->owner != impl_.get()) { throw std::logic_error("Gemma4 foreign request plan"); }
     if (lane.value != 0) { throw std::invalid_argument("Gemma4 has only lane zero"); }
-    if (source.reused_tokens != 0 || source.cached_block_tokens != 0 || source.reuse_path != PrefixReusePath::Root) {
-        return {.source_valid = false};
-    }
+    const auto& plan = *base.impl_;
+    const bool cached = p.prefix_cache && plan.reuse;
+    if (source.reused_tokens != 0 && !cached) { return {.source_valid = false}; }
     if (p.binding || p.occupied || p.pending || p.paused) { return {}; }
     if (resume && (!resume->impl_ || resume->impl_->owner != &p || resume->impl_->plan != base.impl_)) {
         throw std::logic_error("Gemma4 foreign or consumed replay state");
     }
     // Stage all potentially throwing host copies before taking ownership of the binding.
-    auto ledger = resume ? resume->impl_->ledger : base.impl_->tokens;
+    auto ledger = resume ? resume->impl_->ledger : plan.tokens;
     ledger.reserve(p.capacity() + 1ULL);
+    // Re-select against the cache as it is now: the quote the Engine holds may be stale. A
+    // resumed request re-selects over its whole ledger (its pause published the frontier).
+    detail::ProgramImpl::PrefixCandidates candidates;
+    std::optional<detail::ProgramImpl::PrefixSelection> selection;
+    if (cached) {
+        std::vector<std::uint64_t> ledger_hashes;
+        if (resume) { ledger_hashes = pc::block_lookup_hashes(ledger, {}); }
+        candidates = p.prefix_candidates(ledger, resume ? std::span<const std::uint64_t>(ledger_hashes)
+                                                         : std::span<const std::uint64_t>(plan.block_hashes),
+                                         resume ? resume->impl_->frontier : UINT32_MAX, resume != nullptr);
+        if (source.reused_tokens != 0) {
+            for (auto& candidate : candidates.list) {
+                if (resume || candidate.frontier == source.reused_tokens) {
+                    selection = std::move(candidate);
+                    break;
+                }
+            }
+            // The quoted snapshot changed (evicted, superseded, its image no longer valid): the
+            // Engine moves to the next source, the root.
+            if (!selection) { return {.source_valid = false}; }
+        }
+        // Pin what the restore reads before anything can evict it.
+        if (selection) {
+            auto& index = p.prefix_cache->index();
+            if (!selection->path.empty()) { index.acquire_path(selection->path); }
+            try {
+                index.pin_snapshot(*selection->snapshot);
+            } catch (...) {
+                if (!selection->path.empty()) { index.release_path(selection->path); }
+                throw;
+            }
+        }
+    }
     p.request = base.impl_; p.ledger = std::move(ledger);
     if (resume) { p.binding_resume = std::move(resume->impl_); }
+    p.pl = {};
+    if (cached) {
+        p.pl.active = true;
+        p.pl.hashes = plan.block_hashes;
+        p.pl.hints = plan.hints;
+        std::uint32_t frontier = 0;
+        bool follow_endpoint = false;
+        if (selection) {
+            frontier = selection->frontier;
+            follow_endpoint = selection->kind == pc::SnapshotKind::Endpoint;
+            p.pl.path = std::move(selection->path);
+            p.pl.restore_snapshot = selection->snapshot;
+            p.pl.pinned_snapshot = selection->snapshot;
+        }
+        // A resumed request publishes blocks, not taps (its ledger is already cached up to where
+        // it was); the call grid then is the plain chunk grid.
+        if (!p.binding_resume) { p.plan_prefill(frontier, candidates.existing, follow_endpoint); }
+    }
+    // The Engine committed the Begin once, at the first admission: a resume keeps it (its own source
+    // only decides where the state is rebuilt from), and a first binding reports the quote it got.
+    p.begin = p.binding_resume ? p.binding_resume->begin
+        : runtime::BeginSummary{.prompt_tokens = plan.summary.prompt_tokens,
+                                .reused_prompt_tokens = source.reused_tokens,
+                                .prefix_reuse_path = source.reused_tokens ? source.reuse_path : PrefixReusePath::Root};
     p.binding = true;
     return {.reserved = true};
 }
@@ -612,13 +1158,43 @@ ContextProgress Program::poll_context(runtime::CancellationFlagView cancellation
     if (cancellation.requested()) { p.clear(); return progress; }
     try {
         p.upload_sampler();
-        CUDA_CHECK(cudaStreamSynchronize(p.stream));
         p.occupied = true; p.binding = false; p.fed = p.physical_written = 0;
         p.prefilled = false; p.finishable = false; p.timings = {};
+        if (p.pl.restore_snapshot) {
+            // The restore batch: blocks, tail page and ring window, enqueued in stream order ahead
+            // of the first forward (the image header is validated again before any copy).
+            auto& cache = *p.prefix_cache;
+            pc::PrefixCacheIndex& index = cache.index();
+            const pc::SnapshotRef snapshot = *p.pl.restore_snapshot;
+            const prefix::RestoreResult restore = cache.restore(p.pl.path, snapshot);
+            if (restore.restored) {
+                const std::uint32_t frontier = index.snapshot(snapshot).frontier;
+                p.fed = p.physical_written = frontier;
+                progress.operations.state_restores = 1;
+                progress.operations.partial_tail_cow_pages = restore.tail ? 1U : 0U;
+                index.note_hit(snapshot);
+                index.unpin_snapshot(snapshot); // the restore batch holds its own pin while it lands
+                p.pl.pinned_snapshot.reset();
+                p.pl.resume = snapshot;
+                p.pl.reused = p.pl.deepest = p.pl.exact_through = frontier;
+                ++cache.counters().admissions;
+                cache.counters().reused_tokens += frontier;
+            } else {
+                // Refused before any copy (an image that no longer validates): start at the root.
+                index.unpin_snapshot(snapshot);
+                p.pl.pinned_snapshot.reset();
+                if (!p.pl.path.empty()) { index.release_path(p.pl.path); }
+                p.pl.path.clear();
+                if (!p.binding_resume) { p.plan_prefill(0, {}, false); }
+            }
+            p.pl.restore_snapshot.reset();
+        }
+        CUDA_CHECK(cudaStreamSynchronize(p.stream));
+        if (p.prefix_cache) { p.prefix_cache->poll(); }
         if (p.binding_resume) {
             p.replay_target = p.binding_resume->frontier;
             p.prefilled = p.binding_resume->prefilled; p.finishable = p.binding_resume->finishable;
-            p.timings = p.binding_resume->timings; p.replaying = p.replay_target != 0;
+            p.timings = p.binding_resume->timings; p.replaying = p.replay_target > p.fed;
             p.binding_resume.reset();
         }
         progress.published = true; progress.sequence = p.handle(); progress.replaying = p.replaying;
@@ -655,10 +1231,15 @@ bool Program::start_pause(SequenceHandle sequence, runtime::ExecutionTiming* obs
     auto& p = *impl_; p.require(sequence);
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Post, observed_timing);
     if (p.pending || has_context_transaction() || p.replaying) { return false; }
+    // Publish what the exact prefix reached (and an endpoint when the committed frontier is its end), so
+    // the resume restores the deepest grid state instead of replaying from the root.
+    p.prefix_finish(true);
     auto data = std::make_unique<detail::ResumeData>();
     data->owner = &p; data->plan = p.request; data->ledger = p.ledger;
     data->frontier = p.fed; data->prefilled = p.prefilled; data->finishable = p.finishable; data->timings = p.timings;
-    // No snapshot is claimed. Replay will rebuild the exact committed target frontier from root.
+    data->begin = p.begin;
+    // The deepest published grid snapshot is the state the resume restores from; replay then rebuilds the
+    // exact committed target frontier on the chunk grid.
     p.clear(); p.paused.emplace(ResumeState(std::move(data))); return true;
 }
 ReplayProgress Program::advance_replay(SequenceHandle sequence, runtime::ExecutionTiming* failed_timing) {
@@ -667,7 +1248,10 @@ ReplayProgress Program::advance_replay(SequenceHandle sequence, runtime::Executi
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
     try {
         const auto n = std::min(p.options.prefill_chunk, p.replay_target - p.fed);
+        const std::uint32_t first = p.fed;
         p.run_layers(std::span<const TokenId>(p.ledger).subspan(p.fed, n), p.fed, &timing);
+        p.note_grid_call(first, n);
+        p.publish_blocks(p.fed);
         p.replaying = p.fed != p.replay_target;
         return {.processed_tokens = n, .complete = !p.replaying, .timing = timing.finish()};
     } catch (...) { p.state_valid = false; throw; }
@@ -678,10 +1262,13 @@ PrefillProgress Program::advance_prefill(SequenceHandle sequence, runtime::Execu
     if (p.prefilled || p.replaying || p.pending || p.finishable) { throw std::logic_error("Gemma4 sequence is not prefilling"); }
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
     try {
-        const auto n = std::min(p.options.prefill_chunk, p.request->summary.prompt_tokens - p.fed);
+        const auto n = std::min(p.options.prefill_chunk, p.next_call_end() - p.fed);
+        const std::uint32_t first = p.fed;
         p.run_layers(std::span<const TokenId>(p.ledger).subspan(p.fed, n), p.fed, &timing);
+        p.note_grid_call(first, n);
+        p.after_prefill_call();
         PrefillProgress progress;
-        progress.summary.prompt_tokens = p.request->summary.prompt_tokens;
+        progress.summary = p.begin;
         progress.processed_prompt_tokens = n;
         progress.complete = p.fed == p.request->summary.prompt_tokens;
         if (progress.complete) {
@@ -803,13 +1390,18 @@ CommitResult Program::commit(PendingBatch&& batch, std::span<const runtime::Comm
         decision.terminal ? runtime::CommitDisposition::Finishable : runtime::CommitDisposition::Active;
     result.timing = p.charge(timing.finish(), p.pending_decode);
     if (observation == runtime::CommitObservation::AllRows || failed || decision.cancelled) { row.timings = p.timings; }
-    if (failed || decision.cancelled) { p.clear(); }
+    if (failed || decision.cancelled) {
+        // Non-finite logits make the sequence's state suspect: what it published is taken back.
+        if (p.pending_failure == runtime::PendingRowFailure::NonFiniteLogits) { p.pl.withdraw = true; }
+        p.clear();
+    }
     else { p.finishable = decision.terminal; }
     return result;
 }
 DiscardResult Program::abort_pending(PendingBatch&& batch) noexcept {
     auto& p = *impl_;
     if (!p.owns(batch)) { return {}; }
+    if (p.pending_failure == runtime::PendingRowFailure::NonFiniteLogits) { p.pl.withdraw = true; }
     p.consume(batch); p.clear();
     return {.status = runtime::ConsumeStatus::Consumed, .row_count = 1};
 }
@@ -817,23 +1409,28 @@ FinishResult Program::finish(SequenceHandle sequence) noexcept {
     auto& p = *impl_;
     if (!p.owns(sequence) || p.pending || !p.finishable || !p.state_valid) { return {}; }
     FinishResult result; result.status = runtime::ConsumeStatus::Consumed; result.timings = p.timings;
+    p.prefix_finish(false);
+    result.cache_created_prompt_tokens = p.prefix_created_tokens();
     p.clear(); return result;
 }
 AbortResult Program::abort(SequenceHandle sequence) noexcept {
     auto& p = *impl_;
     if (!p.owns(sequence)) { return {}; }
     AbortResult result; result.status = runtime::ConsumeStatus::Consumed; result.timings = p.timings;
+    // A consistent abort (no unit in flight) leaves an endpoint a resend resumes from.
+    if (!p.pending) { p.prefix_finish(false); }
     p.clear(); return result;
 }
 void Program::fail_all_cleanup() noexcept {
     (void)settle_after_memory_exhausted();
     impl_->clear();
+    impl_->reset_prefix_cache();
 }
 bool Program::recover_after_failure() noexcept {
     // The caller has settled an OOM once already; this also checks the real stream/device state
     // for other recoverable failures. Never claim recovery while earlier writes are still live.
     const bool usable = settle_after_memory_exhausted();
-    impl_->clear(); return usable;
+    impl_->clear(); impl_->reset_prefix_cache(); return usable;
 }
 void Program::shutdown_cleanup() noexcept {
     if (!impl_) { return; }
@@ -841,12 +1438,33 @@ void Program::shutdown_cleanup() noexcept {
     if (status != cudaSuccess) { report_cuda_cleanup_failure("Gemma4 shutdown synchronize", status); }
     impl_->clear();
 }
-void Program::hybrid_hold_continuation(std::chrono::steady_clock::time_point) {
-    throw std::logic_error("Gemma4's prefix cache has no tool-call holds");
+void Program::hybrid_hold_queue(std::span<const RequestBasePlan* const> queue) noexcept {
+    auto& p = *impl_;
+    if (!p.prefix_cache) { return; }
+    try {
+        std::vector<pc::SnapshotRef> holds;
+        for (const RequestBasePlan* base : queue) {
+            if (holds.size() == pc::kMaxQueueHolds) { break; }
+            if (base == nullptr || !base->impl_ || !base->impl_->reuse) { continue; }
+            const auto& plan = *base->impl_;
+            const auto candidates = p.prefix_candidates(plan.tokens, plan.block_hashes, UINT32_MAX, false);
+            if (!candidates.list.empty()) { holds.push_back(*candidates.list.front().snapshot); }
+        }
+        p.prefix_cache->index().set_queue_holds(holds);
+    } catch (...) {}
 }
+void Program::hybrid_hold_continuation(std::chrono::steady_clock::time_point) {
+    // HybridPrefixCacheOptions::tool_call_hold is refused for Gemma4 at startup (model_instance.cpp),
+    // so the Engine never asks.
+    throw std::logic_error("Gemma4's prefix cache has no tool-call holds (refused at startup)");
+}
+std::uint64_t Program::hybrid_cache_epoch() const noexcept {
+    return impl_->prefix_cache ? impl_->prefix_cache->index().snapshot_epoch() : 0U;
+}
+HybridPrefixCacheStats Program::hybrid_stats() const noexcept { return impl_->prefix_stats(); }
 runtime::prefix_cache::PersistResult Program::attach_prefix_cache_file(const std::filesystem::path&,
     std::string, const StartupObserver&) {
-    throw std::invalid_argument("Gemma4 prefix cache persistence is not implemented; --prefix-cache-file is unsupported");
+    throw std::invalid_argument("Gemma4's prefix cache is not persisted: --prefix-cache-file is unsupported");
 }
 PhysicalUsageSnapshot Program::physical_usage() const noexcept {
     PhysicalUsageSnapshot result;
@@ -991,6 +1609,83 @@ ScoreResult Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_t
         // scoring call can reuse the rings, graph operands or staging addresses.
         const bool recovered = recover_after_failure();
         if (!recovered) { throw std::runtime_error("Gemma4 scoring failed and the device could not recover"); }
+        throw;
+    }
+}
+
+void Program::maintain() noexcept {
+    if (!impl_->prefix_cache) { return; }
+    try {
+        impl_->prefix_cache->poll();
+    } catch (const std::exception& error) {
+        impl_->clear_prefix_after_release = true;
+        try {
+            impl_->diagnostic(std::string("Gemma4: retiring prefix-cache Host transfers failed: ") + error.what(),
+                DiagnosticLevel::Warning);
+        } catch (...) {}
+    } catch (...) {
+        impl_->clear_prefix_after_release = true;
+        impl_->diagnostic("Gemma4: retiring prefix-cache Host transfers failed", DiagnosticLevel::Warning);
+    }
+}
+void Program::maintain_busy() noexcept { maintain(); }
+
+ScoreResult Program::diagnostic_score_bound(SequenceHandle sequence, std::uint32_t first_target,
+    const std::function<void(std::span<const std::uint16_t>, std::int32_t, std::uint32_t)>& observer) {
+    auto& p = *impl_;
+    p.require(sequence);
+    const auto n = static_cast<std::uint32_t>(p.ledger.size());
+    if (!p.options.causal_scoring || !p.request || p.prefilled || p.replaying || p.pending ||
+        p.finishable || has_context_transaction() || !observer || first_target == 0 ||
+        first_target >= n || p.fed > first_target - 1) {
+        throw std::logic_error("Gemma4 diagnostic scoring needs a bound prefill before its first predictor");
+    }
+    ScoreResult result;
+    result.logprobs.reserve(n - first_target);
+    try {
+        // Unlike causal_score, do not reset fed: poll_context's Host restore is the input state.
+        // Feed the full prompt, as serving does, including its final non-predictor input token.
+        while (p.fed < n) {
+            const auto cursor = p.fed;
+            const auto width = std::min(p.options.prefill_chunk, p.next_call_end() - cursor);
+            if (width == 0) { throw std::logic_error("Gemma4 diagnostic prefill made no progress"); }
+            p.run_layers(std::span<const TokenId>(p.ledger).subspan(cursor, width), cursor);
+            p.note_grid_call(cursor, width);
+            p.after_prefill_call();
+            for (auto predictor = std::max(cursor, first_target - 1);
+                 predictor < std::min(cursor + width, n - 1);) {
+                const auto columns = std::min<std::uint32_t>(kScoreTile,
+                    std::min(cursor + width, n - 1) - predictor);
+                // Keep the serving GEMV head for every predictor; batch only transfer/reduction.
+                for (std::uint32_t c = 0; c < columns; ++c) {
+                    p.head_body(static_cast<int>(predictor - cursor + c), 1, static_cast<int>(c));
+                }
+                const auto values = p.logits(static_cast<int>(columns));
+                p.target_scores(values, std::span<const TokenId>(p.ledger).subspan(predictor + 1, columns),
+                    1, result.logprobs);
+                const auto cells = static_cast<std::size_t>(columns) * p.config().vocab_size;
+                if (p.host_logits.size() < cells) { p.host_logits.resize(cells); }
+                CUDA_CHECK(cudaMemcpyAsync(p.host_logits.data(), values.data,
+                    cells * sizeof(std::uint16_t), cudaMemcpyDeviceToHost, p.stream));
+                p.synchronize();
+                observer(std::span<const std::uint16_t>(p.host_logits).first(cells),
+                    static_cast<std::int32_t>(p.config().vocab_size),
+                    predictor + 1 - first_target);
+                predictor += columns;
+            }
+        }
+        if (result.logprobs.size() != n - first_target) {
+            throw std::logic_error("Gemma4 diagnostic scoring omitted suffix targets");
+        }
+        // Ordinary selected-logit scoring reuses this vector as exactly one vocabulary row.
+        p.host_logits.resize(p.config().vocab_size);
+        p.prefix_finish(false);
+        p.clear();
+        return result;
+    } catch (...) {
+        p.host_logits.resize(p.config().vocab_size);
+        const bool recovered = recover_after_failure();
+        if (!recovered) { throw std::runtime_error("Gemma4 diagnostic scoring failed and the device could not recover"); }
         throw;
     }
 }

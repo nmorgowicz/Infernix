@@ -1,7 +1,8 @@
 #pragma once
 
-// Native single-lane Gemma 4 execution. The prefix cache reserves its Host tier but binds every
-// request at the root: no cached state is published, reused or persisted yet.
+// Native single-lane Gemma 4 execution with a Host-tier prefix cache: global KV blocks are content
+// addressed on the Host (one slab per 64-token page), snapshots keep the sliding rings' window, and
+// a binding restores the deepest matching snapshot. No cached state is persisted (D5).
 #include "models/gemma4/config.h"
 #include "infernix/ops/gemma4_cache.h"
 #include "models/gemma4/model.h"
@@ -249,31 +250,42 @@ public:
     void fail_all_cleanup() noexcept;
     [[nodiscard]] bool recover_after_failure() noexcept;
     void shutdown_cleanup() noexcept;
-    // This dense cold-cache Program has no elastic Host prefix/expert tier, SSD transfers or
-    // maintenance producer. Its fixed KV, graph operands and pinned staging remain reserved for
-    // execution, so idle and between-round maintenance have no resize or deferred work to apply.
-    void maintain() noexcept {}
-    void maintain_busy() noexcept {}
+    // No elastic tiers or SSD producer. Maintenance nonblockingly retires completed Host
+    // prefix-cache copies; the fixed Host capacity does not resize.
+    void maintain() noexcept;
+    void maintain_busy() noexcept;
     void set_maintenance_waker(std::function<void()>) noexcept {}
     [[nodiscard]] std::uint64_t engine_thread_cpus() const noexcept { return 0; }
     [[nodiscard]] std::optional<ExpertCacheTotals> expert_cache_totals() const noexcept { return std::nullopt; }
+    // Global KV lives in the sequence's own contiguous pages, so no cached block holds Device
+    // memory a shortage could reclaim and there is no spare Device cache to prefetch into.
     [[nodiscard]] bool hybrid_reclaim(runtime::ContextResourceUsage) noexcept { return false; }
     [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan&) const noexcept { return 0; }
     [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept { return 0; }
-    void hybrid_hold_queue(std::span<const RequestBasePlan* const>) noexcept {}
+    // Holds the snapshots the queued requests would resume from (hybrid-prefix-cache-spec §9.6).
+    void hybrid_hold_queue(std::span<const RequestBasePlan* const>) noexcept;
+    // Tool-call holds are refused at startup (model_instance.cpp); this is never reached.
     void hybrid_hold_continuation(std::chrono::steady_clock::time_point);
     [[nodiscard]] bool hybrid_holds_stale() const noexcept { return false; }
-    [[nodiscard]] std::uint64_t hybrid_cache_epoch() const noexcept { return 0; }
+    // Changes whenever a snapshot is published or removed.
+    [[nodiscard]] std::uint64_t hybrid_cache_epoch() const noexcept;
+    // There is no SSD tier: nothing is read from or written to storage.
     [[nodiscard]] bool hybrid_poll_storage() noexcept { return false; }
     [[nodiscard]] bool hybrid_source_pending() const noexcept { return false; }
     [[nodiscard]] bool hybrid_storage_due() const noexcept { return false; }
+    // A request resumes from any position (fork behavior): the grid is one token.
     [[nodiscard]] std::uint32_t hybrid_resume_grid() const noexcept { return 1; }
-    [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept { return {}; }
+    [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept;
     [[nodiscard]] runtime::prefix_cache::PersistResult attach_prefix_cache_file(
         const std::filesystem::path&, std::string, const StartupObserver&);
     [[nodiscard]] std::optional<runtime::prefix_cache::PersistResult> prefix_shutdown_save() const { return std::nullopt; }
     [[nodiscard]] std::optional<runtime::prefix_cache::PersistResult> save_prefix_cache_now(const CancellationView&) { return std::nullopt; }
     [[nodiscard]] ScoreResult causal_score(PreparedPrompt&&, std::uint32_t, const ScoreOptions&);
+    // Prefix-cache quality evidence seam (P7 conditional-distribution instrument): scores every suffix
+    // predictor of an already bound prefill, preserving its restored frontier and serving call partition.
+    // Observer receives BF16 [columns,vocab] tiles and the first scored-position offset.
+    [[nodiscard]] ScoreResult diagnostic_score_bound(SequenceHandle, std::uint32_t first_target,
+        const std::function<void(std::span<const std::uint16_t>, std::int32_t, std::uint32_t)>& observer);
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     // What the device and host hold now, by use (RuntimeStats::memory; the prefix cache's Host and SSD tiers and the

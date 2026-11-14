@@ -13,6 +13,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
+#include <stdexcept>
 #include <string>
 
 namespace infernix::models::gemma4::prefix {
@@ -103,4 +105,53 @@ struct LayoutIdentity {
     }
 };
 
+// The identity of the cache this process builds: every field comes from the per-layer facts (the
+// same ones prefix_cache_geometry sums), the window, the prefill chunk and the requested global
+// KV format and QK mode. Global layers must agree on heads and head dimension, and so must the
+// sliding layers (they share one block and one ring layout each); a model that breaks that has
+// no single identity and the cache refuses it.
+[[nodiscard]] inline LayoutIdentity make_layout_identity(std::span<const KvLayerFact> layers,
+                                                         std::uint32_t window,
+                                                         std::uint32_t prefill_chunk,
+                                                         KvCacheStorage global_format,
+                                                         ops::Gemma4QkMode qk_mode) {
+    LayoutIdentity id;
+    id.qk_mode = qk_mode;
+    id.window_tokens = window;
+    id.prefill_chunk = prefill_chunk;
+    id.page_tokens = static_cast<std::uint32_t>(ops::kGemma4KvPageTokens);
+    for (const auto& layer : layers) {
+        const auto layout = require_implemented_storage(kv_layer_layout(
+            layer.global ? global_format : KvCacheStorage::BFloat16, layer.global, layer.head_dim,
+            layer.kv_heads));
+        const auto heads = static_cast<std::uint32_t>(layer.kv_heads);
+        const auto dim = static_cast<std::uint32_t>(layer.head_dim);
+        if (layer.global) {
+            if (id.global_layers != 0 && (id.global_kv_heads != heads || id.global_head_dim != dim)) {
+                throw std::invalid_argument("Gemma4 prefix cache needs uniform global layers");
+            }
+            id.kv_format = layout.format;
+            id.code_dtype = layout.code_dtype;
+            id.scale_group_columns = layout.scale_page_bytes != 0
+                ? static_cast<std::uint32_t>(ops::kGemma4KvFp8Group) : 0U;
+            id.scale_element_bytes = layout.scale_page_bytes != 0
+                ? static_cast<std::uint32_t>(sizeof(std::uint16_t)) : 0U;
+            id.storage = layout.storage;
+            id.global_kv_heads = heads;
+            id.global_head_dim = dim;
+            ++id.global_layers;
+        } else {
+            if (id.sliding_layers != 0 && (id.sliding_kv_heads != heads || id.sliding_head_dim != dim)) {
+                throw std::invalid_argument("Gemma4 prefix cache needs uniform sliding layers");
+            }
+            id.sliding_kv_heads = heads;
+            id.sliding_head_dim = dim;
+            ++id.sliding_layers;
+        }
+    }
+    const auto geometry = prefix_cache_geometry(layers, window, global_format);
+    id.block_bytes = geometry.block_bytes;
+    id.image_bytes = geometry.image_bytes;
+    return id;
+}
 } // namespace infernix::models::gemma4::prefix

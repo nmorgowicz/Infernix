@@ -169,7 +169,7 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& supplied, DeviceContext&
             const std::string refusal =
                 "--host-context-mib is too small for the Gemma4 prefix cache: one ring snapshot needs " +
                 std::to_string(mib) + " MiB (" + std::to_string(tier.image_slabs) + "+2 slabs of " +
-                std::to_string(tier.slab_bytes >> 20) + " MiB from this artifact's geometry)";
+                std::to_string((tier.slab_bytes + 1023) >> 10) + " KiB from this artifact's geometry)";
             if (!planned) { throw std::invalid_argument(refusal); }
             planned->architecture = "Gemma4ForCausalLM";
             plan_readings(*planned, device.props.name, before, host_memory_snapshot(), options);

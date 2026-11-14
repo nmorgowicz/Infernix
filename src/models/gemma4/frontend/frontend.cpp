@@ -339,6 +339,51 @@ struct Frontend::Impl {
         checkpoint(control);
         return rendered;
     }
+
+    // The role of the turn whose `<|turn>` token is at `at`: the header text up to its newline.
+    std::string turn_role(std::span<const TokenId> tokens, std::size_t at) const {
+        std::string header;
+        for (std::size_t i = at + 1; i < tokens.size() && header.size() <= 64; ++i) {
+            header += tokenizer->token_bytes(tokens[i]);
+            if (const auto newline = header.find('\n'); newline != std::string::npos) {
+                header.resize(newline);
+                return header;
+            }
+        }
+        return header;
+    }
+
+    // Where a later prompt is expected to diverge or share (hybrid-prefix-cache-spec §7.1), read off
+    // the rendered turns: every turn start is a message boundary; the open model turn at the end is
+    // the generation opener; the turn before it (or the last complete turn) is the automatic
+    // last-message boundary; the end of a leading system/developer turn (which holds the tools'
+    // declarations) is structural.
+    std::vector<runtime::prefix_cache::TapHint> tap_hints(std::span<const TokenId> tokens) const {
+        using runtime::prefix_cache::TapHint;
+        using runtime::prefix_cache::TapHintKind;
+        std::vector<std::uint32_t> starts;
+        for (std::size_t i = 0; i < tokens.size(); ++i) {
+            if (tokens[i] == turn_open) { starts.push_back(static_cast<std::uint32_t>(i)); }
+        }
+        std::vector<TapHint> hints;
+        if (starts.empty()) { return hints; }
+        for (const std::uint32_t start : starts) {
+            if (start != 0) { hints.push_back({start, TapHintKind::MessageBoundary}); }
+        }
+        const std::uint32_t last = starts.back();
+        const bool open = std::find(tokens.begin() + last, tokens.end(), turn_close) == tokens.end();
+        const bool opener = open && turn_role(tokens, last) == "model";
+        if (opener && last != 0) { hints.push_back({last, TapHintKind::GenerationOpener}); }
+        if (opener ? starts.size() >= 2 : true) {
+            const std::uint32_t message = starts[opener ? starts.size() - 2 : starts.size() - 1];
+            if (message != 0) { hints.push_back({message, TapHintKind::Automatic}); }
+        }
+        if (starts.size() >= 2) {
+            const std::string role = turn_role(tokens, starts.front());
+            if (role == "system" || role == "developer") { hints.push_back({starts[1], TapHintKind::Structural}); }
+        }
+        return hints;
+    }
 };
 
 Frontend::Frontend(const TextResources& resources, FrontendOptions options)
@@ -355,7 +400,9 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids, bool) co
     }
     PromptSummary summary;
     summary.prompt_tokens = static_cast<std::uint32_t>(token_ids.size());
-    return PreparedPrompt(std::move(token_ids), summary);
+    auto prompt = PreparedPrompt(std::move(token_ids), summary);
+    prompt.tap_hints_ = impl_->tap_hints(prompt.tokens_);
+    return prompt;
 }
 
 PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& control) const {
@@ -559,6 +606,7 @@ void Frontend::apply_tool_choice(PreparedPrompt& prompt, const ToolChoice& choic
     prompt.tokens_.push_back(prompt.tool_call_open_);
     prompt.tokens_.insert(prompt.tokens_.end(), opener->tokens.begin(), opener->tokens.end());
     prompt.summary_.prompt_tokens = static_cast<std::uint32_t>(prompt.tokens_.size());
+    prompt.refresh_block_keys();
     prompt.forced_call_ = std::string(kCallPrefix) + name;
 }
 void Frontend::warm_constraints() const { (void)impl_->grammars(); }
