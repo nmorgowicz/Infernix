@@ -498,6 +498,56 @@ normal CLI/serving smoke test) before relying on it -- name-mapping mistakes for
 component this map doesn't cover fail as a missing-tensor error, but a wrong
 element ordering for a component it does claim to cover would not.
 
+## Gemma 4 31B: builder presets and the self-contained workflow
+
+`python -m tools.convert.gemma4_build` turns a BF16 Gemma 4 31B dense checkpoint (or a fine-tune of it) into a
+4-bit W4A8 `.ninfer` with the MTP assistant, then writes the receipts, a Windows `infernix-serve` launcher and
+`BUILD-SUMMARY.md`. It only builds command lines and records which step finished; the conversion itself is
+`python -m tools.convert.gemma4_q4 {convert,verify,calibration-text}` and the GPTQ scripts in `tools/gptq/`.
+Nothing outside this checkout is needed. Source weights are only read, outputs are never overwritten, and a
+failed build resumes by rerunning the same command.
+
+| preset | method | format | file | mean KL (lower is better) |
+|---|---|---|---|---|
+| `best-small` (recommended) | GPTQ, group 256 | `q4_g256_fp16` | 16.85 GB | 0.1213 |
+| `best-medium` | GPTQ, group 32 | `q4_g32_fp16` | 18.41 GB | 0.0845 |
+| `draft` | uncalibrated absmax, group 32 | `q4_g32_fp16` | 18.41 GB | 0.2654 |
+
+The KL figures are the author's (one fine-tune, English text, FP8 MTP assistant). The two-level 6-bit scale
+format `q4_g32_s6_fp16` and the calibrated round-to-nearest `lite-*` presets are not built here; asking for one
+is refused with the reason.
+
+GPTQ runs in its own interpreter, pinned by `tools/gptq/requirements.txt`, and never in the converter's: create
+it once, then point the builder at it with `--gptq-python` or `INFERNIX_GPTQ_PYTHON` (default
+`.venv-gptq` in the checkout).
+
+```text
+python -m tools.convert.gemma4_build setup-gptq --venv .venv-gptq
+python -m tools.convert.gemma4_build --preset best-small --model <BF16 dir> --assistant <assistant dir> --out-dir <dir> --check
+python -m tools.convert.gemma4_build --preset best-small --model <BF16 dir> --assistant <assistant dir> --out-dir <dir> --dry-run
+python -m tools.convert.gemma4_build --preset best-small --model <BF16 dir> --assistant <assistant dir> --out-dir <dir> --yes
+```
+
+`--check` runs the preflight only (GPU, RAM, disk, both Python environments, the server binary, the git revision),
+`--dry-run` prints the exact commands, `--score` adds a paired-KL quality check with `infernix-perplexity`
+(about an hour and 60 GB more), and `--calibration-text FILE` replaces the pinned public English corpus.
+
+The launcher runs `infernix-serve` with the operator roleplay profile: `--max-context 131072` (alias `131k`),
+`--kv-dtype fp8`, `--gemma4-qk fp8`, `--prefill-chunk auto`, one lane, `--spec mtp --draft-tokens 1` when the
+file carries the assistant, `--logits-dtype bf16`, a host-only prefix cache (`--device-snapshot-slots 0
+--host-context-mib 8192`), `--any-model-name`, and `0.0.0.0:8001`. The server binary is
+`apps/Release/infernix-serve.exe` (or a `build*/apps/Release` of the checkout) unless `--serve` names another.
+Every setting has a flag; `--gemma4-qk bf16` omits the QK flag.
+
+```text
+python -m tools.convert.gemma4_build launcher --artifact <file.ninfer> --out <serve.cmd>
+python -m tools.convert.gemma4_build serve-check --launcher <serve.cmd>
+```
+
+`serve-check` starts the server the launcher runs, checks `/v1/models` and chat requests with the launcher's
+model id, another model name (200 with `--any-model-name`, 404 without), no model field (400) and an arbitrary
+bearer key, stops the server and writes a JSON receipt with the launcher's effective profile.
+
 ## Write a conversion method
 
 A method receives a `PrepareRequest` and returns `request.job(produce=...)`. Preparation validates
