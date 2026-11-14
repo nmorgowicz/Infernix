@@ -461,6 +461,15 @@ def _low_g64(base: torch.Tensor, groups: int) -> torch.Tensor:
     )
 
 
+def _low_nibbles(base: torch.Tensor, groups: int) -> torch.Tensor:
+    """Unpack 4-bit codes of any group size: group 64 stores 32 bytes, group 32 stores 16, g128/g256 more."""
+    bytes_per_group = base.numel() // groups
+    packed = base.reshape(groups, bytes_per_group).to(torch.int16)
+    return torch.stack((packed & 0x0F, (packed >> 4) & 0x0F), dim=-1).reshape(
+        groups, bytes_per_group * 2
+    )
+
+
 def _dequant2(base, _high, scale, _byte_indices, _shifts):
     scales = _scales(scale)
     groups = scales.numel()
@@ -474,7 +483,7 @@ def _dequant2(base, _high, scale, _byte_indices, _shifts):
 
 def _dequant4(base, _high, scale, _byte_indices, _shifts):
     scales = _scales(scale)
-    unsigned = _low_g64(base, scales.numel())
+    unsigned = _low_nibbles(base, scales.numel())
     codes = torch.where((unsigned & 8) != 0, unsigned - 16, unsigned).float()
     return (codes * scales).to(torch.bfloat16)
 
