@@ -156,6 +156,9 @@ def build_parser() -> argparse.ArgumentParser:
         "evaluate on (default: download the pinned public English corpus)")
     add("--gptq-python", type=Path, help=f"python.exe of the GPTQ environment (default: ${GPTQ_PYTHON_ENV}, else "
         "<checkout>/.venv-gptq); never the converter's interpreter")
+    add("--gptq-max-cpu-gb", type=int, default=32, help="GPTQ host-RAM budget for offloaded weights (default 32, the "
+        "measured route; host peak is about this plus 8 GiB; lower it on a machine with less free RAM, the rest "
+        "goes to disk and the step runs slower)")
     add_serve_arguments(parser, prefix="launcher")
     add("--serve", "--server-exe", dest="serve", type=Path, help="infernix-serve executable (default: the newest "
         "apps/Release or build*/apps/Release of the checkout that knows the preset's format)")
@@ -257,6 +260,7 @@ def resolve_config(args: argparse.Namespace) -> tuple[BuildConfig, ServeSettings
     cfg = BuildConfig(
         preset=preset, model=model, assistant=args.assistant.resolve() if args.assistant else None,
         with_vision=args.with_vision, out_dir=out_dir, work_dir=work_dir, name=name, gptq_python=gptq_python,
+        gptq_max_cpu_gb=args.gptq_max_cpu_gb,
         calibration_text=args.calibration_text.resolve() if args.calibration_text else None,
         score=args.score, perplexity_exe=launcher_tools.sibling_binary(server, launcher_tools.PERPLEXITY_NAME)
         if args.score and server else None, keep_work=args.keep_work,

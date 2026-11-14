@@ -32,7 +32,7 @@ from .gemma4_build import (
 GIB = 2**30
 GPTQ_PINS = ("torch", "transformers", "llmcompressor", "compressed-tensors")
 GPTQ_VRAM_GIB = 12
-GPTQ_RAM_AVAILABLE_GIB = 40  # measured host RSS peak with --max-cpu-gb 32
+GPTQ_RAM_HEADROOM_GIB = 8  # measured host RSS peak is about max-cpu-gb + 5 (37.1 GiB at 32); 8 keeps a margin
 GPTQ_RAM_TOTAL_GIB = 64
 EXPECTED_TEXT = {"hidden_size": 5376, "num_hidden_layers": 60}
 SETUP_HINT = "python -m tools.convert.gemma4_build setup-gptq"
@@ -293,9 +293,11 @@ def check_machine(report: Report, cfg: BuildConfig, probes) -> None:
                        "serve it on another machine")
     total, available = probes.ram()
     detail = f"{available / GIB:.0f} GiB available of {total / GIB:.0f} GiB"
-    if gptq and available < GPTQ_RAM_AVAILABLE_GIB * GIB:
-        report.add("fail", "RAM", f"{detail}; GPTQ's host peak is about {GPTQ_RAM_AVAILABLE_GIB} GiB with --max-cpu-gb 32",
-                   "close other programs (the biggest memory users first) and rerun")
+    need_gib = cfg.gptq_max_cpu_gb + GPTQ_RAM_HEADROOM_GIB
+    if gptq and available < need_gib * GIB:
+        report.add("fail", "RAM", f"{detail}; GPTQ's host peak is about {need_gib} GiB with --max-cpu-gb {cfg.gptq_max_cpu_gb}",
+                   "close other programs (the biggest memory users first), or lower --gptq-max-cpu-gb (more disk offload, "
+                   "slower) and rerun")
     elif gptq and total < GPTQ_RAM_TOTAL_GIB * GIB:
         report.add("warn", "RAM", f"{detail}; the measured route used a 64 GiB machine")
     else:

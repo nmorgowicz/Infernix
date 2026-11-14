@@ -125,6 +125,7 @@ class BuildConfig:
     name: str
     python: str = sys.executable
     gptq_python: Path | None = None
+    gptq_max_cpu_gb: int = 32
     calibration_text: Path | None = None
     score: bool = False
     perplexity_exe: Path | None = None
@@ -269,7 +270,7 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
             Step("gptq", f"GPTQ, group {preset.group_size}, imatrix_mse observer (the long step)", minutes["gptq"],
                  [gpy, str(gptq_dir / "run_gptq.py"), "--tree", str(tree), "--calib", str(calib), "--out",
                   str(checkpoint), "--recipe", GPTQ_RECIPE, "--observer", "imatrix_mse", "--group-size",
-                  str(preset.group_size), "--max-cpu-gb", "32", "--offload-dir", str(offload), "--peak-log",
+                  str(preset.group_size), "--max-cpu-gb", str(cfg.gptq_max_cpu_gb), "--offload-dir", str(offload), "--peak-log",
                   str(cfg.work("gptq.peak.jsonl"))],
                  outputs=(checkpoint, offload, cfg.work("gptq.peak.jsonl")), prune_always=(offload,)),
             Step("gptq-check", "Check the GPTQ checkpoint is importable (4-bit codes, exact binary16 scales)",
