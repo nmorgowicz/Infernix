@@ -27,6 +27,33 @@ infernix_add_test(infernix_gemma4_tool_parser_test
 infernix_add_test(infernix_gemma4_prefix_geometry_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_prefix_geometry.cpp")
 
+# P7 store mechanics on the pure helpers, over the 31B-like and 26B-A4B-like descriptors: image and
+# block layouts equal the geometry, header round trip and refusal of foreign/value-only identities,
+# window runs across the ring wrap, gather/scatter round trips on a host ring emulation, copy
+# planning, the Host floor refusal text, the tap ladder and call planning. CPU only: no GPU, no
+# artifact (PrefixCache itself pins Host memory with the driver, so its scenarios are the real tests').
+infernix_add_test(infernix_gemma4_prefix_store_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_prefix_store.cpp"
+  LIBRARIES infernix_model_runtime)
+
+# P7 scenarios on a real artifact (INFERNIX_GEMMA4_ARTIFACT; INFERNIX_GEMMA4_HOST_MIB sizes the Host tier):
+# frontiers around pages and the ring wrap, displaced/branch/return conversations, three layout identities,
+# chat turns through the Engine and a cache-off Engine. Every resume equals a cache-off lane's output.
+infernix_add_test(infernix_gemma4_prefix_scenarios_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_prefix_scenarios_real.cpp"
+  LIBRARIES infernix_engine infernix_model_runtime)
+set_tests_properties(infernix_gemma4_prefix_scenarios_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+
+# P7 recovery on a real artifact: cancel mid-prefill/decode, non-finite withdrawal, abort during restore,
+# capture then cancel, a memory fault after a restore, and the Engine's cancel/heal paths; each leaves the
+# lane and cache at baseline and the next request equal to a cache-off lane's.
+infernix_add_test(infernix_gemma4_prefix_recovery_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_prefix_recovery_real.cpp"
+  LIBRARIES infernix_engine infernix_model_runtime)
+set_tests_properties(infernix_gemma4_prefix_recovery_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+
 # Original HF-template fixture byte identity, plus fixed-template override behavior, tool calls
 # through the output session, required tool choice, EOS arrays and thinking precedence. CPU only. Skips (77)
 # without INFERNIX_GEMMA4_HF (a Hugging Face Gemma 4 directory with tokenizer.json and chat_template.jinja);

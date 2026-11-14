@@ -7,6 +7,7 @@
 
 #include "models/gemma4/program/kv_layout.h"
 #include "models/gemma4/program/prefix/layout_identity.h"
+#include "prefix_geometry_support.h"
 
 #include <cstdint>
 #include <iostream>
@@ -17,64 +18,12 @@
 
 namespace {
 
-int failures = 0;
-
-void check(bool ok, const std::string& label, const std::string& detail = {}) {
-    if (ok) { return; }
-    std::cerr << "FAIL " << label << ": " << detail << '\n';
-    ++failures;
-}
 
 namespace g4  = infernix::models::gemma4;
 namespace g4p = infernix::models::gemma4::prefix;
 namespace ops = infernix::ops;
 
-// One descriptor's layer facts: the global layers first, then the sliding ones.
-std::vector<g4::KvLayerFact> layer_facts(std::size_t global_count, std::size_t global_heads,
-                                         std::size_t sliding_count, std::size_t sliding_heads) {
-    std::vector<g4::KvLayerFact> out;
-    for (std::size_t i = 0; i < global_count; ++i) {
-        out.push_back({true, 512, static_cast<int>(global_heads)});
-    }
-    for (std::size_t i = 0; i < sliding_count; ++i) {
-        out.push_back({false, 256, static_cast<int>(sliding_heads)});
-    }
-    return out;
-}
-
-// Contract 1's formulas, derived from the descriptor independently of prefix_cache_geometry:
-// FP8 global pages carry one FP16 scale per 256 columns (K==V doubles the planes), sliding
-// windows stay BF16 with a K part then a V part, the header and every part are 256-aligned, and
-// blocks/slabs are 4096-aligned with a floor of image slabs plus two.
-struct GeometryExpectation {
-    std::size_t global_bytes_per_token = 0;
-    std::size_t sliding_bytes_per_token = 0;
-    std::size_t block_bytes = 0;
-    std::size_t image_bytes = 0;
-    std::uint32_t image_slabs = 0;
-    std::size_t host_floor_bytes = 0;
-};
-
-GeometryExpectation expected_geometry(std::size_t global_layers, std::size_t global_heads,
-                                      std::size_t sliding_layers, std::size_t sliding_heads,
-                                      std::size_t window) {
-    constexpr std::size_t page  = 64;   // ops::kGemma4KvPageTokens
-    constexpr std::size_t group = 256;  // ops::kGemma4KvFp8Group
-    const std::size_t window_tokens = window - 1;
-    const std::size_t global_per_layer =
-        2U * (page * global_heads * 512U + page * global_heads * (512U / group) * 2U);
-    const std::size_t sliding_per_layer = 2U * 2U * page * sliding_heads * 256U;
-    GeometryExpectation out;
-    out.global_bytes_per_token  = global_layers * global_per_layer / page;
-    out.sliding_bytes_per_token = sliding_layers * sliding_per_layer / page;
-    out.block_bytes = g4::align_bytes(out.global_bytes_per_token * page, 4096);
-    const std::size_t part = g4::align_bytes(window_tokens * sliding_per_layer / (2U * page), 256);
-    out.image_bytes  = 256U + sliding_layers * 2U * part;
-    out.image_slabs = static_cast<std::uint32_t>(
-        (out.image_bytes + out.block_bytes - 1U) / out.block_bytes);
-    out.host_floor_bytes = (static_cast<std::size_t>(out.image_slabs) + 2U) * out.block_bytes;
-    return out;
-}
+using namespace prefix_test;
 
 void assert_geometry(const char* label, std::size_t global_layers, std::size_t global_heads,
                      std::size_t sliding_layers, std::size_t sliding_heads, std::size_t window) {
