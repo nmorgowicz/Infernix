@@ -510,7 +510,7 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     };
     const bool forced_adaptive = forced(FastPath::AdaptiveSpeculation) &&
                                  (forced(FastPath::AdaptiveDFlash) || forced(FastPath::AdaptiveMtp));
-    if (!qwen4_exp && options.speculative.draft_tokens_auto && options.speculative.backend != SpeculativeBackend::None &&
+    if (!qwen4_exp && !gemma4 && options.speculative.draft_tokens_auto && options.speculative.backend != SpeculativeBackend::None &&
         models::qwen3_5::auto_drafts_nothing(offloaded_experts, options.speculative.backend) && !forced_adaptive) {
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                            "--draft-tokens auto: plain decode is faster than any of this drafter's lengths here "
@@ -568,7 +568,8 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
         throw std::invalid_argument("--a8-activations is approximate; the reproducible route (--reproducible) refuses it");
     }
     // An automatic draft length chooses up to the model's most drafts unless given a ceiling: MTP on
-    // Qwen3.8-Flash-Next verifies 8 columns column-invariantly, the Qwen3.5 planner captures 5. The
+    // Qwen3.8-Flash-Next verifies 8 columns column-invariantly, the Qwen3.5 planner captures 5, Gemma 4's
+    // assistant drafts 6 (the ninfer.spo measurement; its launchers default to 1). The
     // block drafters propose their whole block: Qwen3.8-Flash-Next's DFlash2 7; the Qwen3.5 planner
     // resolves its DFlash and DFlash2 blocks per configuration (resolve_auto_draft_length).
     const bool block_drafter = options.speculative.backend == SpeculativeBackend::DFlash ||
@@ -577,9 +578,11 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
         if (options.speculative.backend != SpeculativeBackend::Mtp && !block_drafter) {
             throw std::invalid_argument("--draft-tokens auto requires --spec mtp, dflash, dflash2 or auto");
         }
-        if (options.speculative.draft_tokens == 0 && (qwen4_exp || !block_drafter)) {
-            options.speculative.draft_tokens = qwen4_exp ? 7U : 5U;
+        if (options.speculative.draft_tokens == 0 && (qwen4_exp || gemma4 || !block_drafter)) {
+            options.speculative.draft_tokens = qwen4_exp ? 7U : gemma4 ? 6U : 5U;
         }
+        // Gemma uses the fork's fixed auto length, not Qwen's learned adaptive policy.
+        if (gemma4) { options.speculative.draft_tokens_auto = false; }
     } else {
         for (const FastPath policy : {FastPath::AdaptiveMtp, FastPath::AdaptiveDFlash}) {
             if (std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(), policy) !=

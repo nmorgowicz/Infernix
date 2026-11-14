@@ -391,6 +391,14 @@ void test_library() {
               contains(gemma_args, {"--prefill-chunk", "auto"}) &&
               has_flag(gemma_args, "--no-prefix-reuse") && !has_flag(gemma_args, "--host-context-mib"),
           "Gemma launcher defaults use automatic full-context prefill with supported execution options");
+    check(contains(gemma_args, {"--spec", "off"}) && !has_flag(gemma_args, "--draft-tokens"),
+          "a Gemma artifact without its assistant decodes plainly");
+    ScannedModel gemma_mtp = gemma;
+    gemma_mtp.has_mtp = true;
+    const Args gemma_mtp_args = default_args(scan, gemma_mtp, rtx5090);
+    check(contains(gemma_mtp_args, {"--spec", "mtp"}) && contains(gemma_mtp_args, {"--draft-tokens", "1"}) &&
+              !contains(gemma_mtp_args, {"--spec", "off"}),
+          "a Gemma artifact with its assistant drafts one token per round");
     // On a 32 GB RTX 5090 this artifact started with at most ~196,000 tokens beside the Engine's
     // 1 GiB headroom (240,000 failed): the default stays inside that, with room for other programs.
     const std::uint64_t fit = fitting_27b_context(dense, rtx5090);

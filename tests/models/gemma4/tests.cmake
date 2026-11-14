@@ -54,6 +54,25 @@ infernix_add_test(infernix_gemma4_prefix_recovery_real_test
 set_tests_properties(infernix_gemma4_prefix_recovery_real_test
   PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
+# P8 MTP on a real artifact with its assistant (INFERNIX_GEMMA4_ARTIFACT; INFERNIX_GEMMA4_KV/QK=fp8 select the
+# FP8 KV and QK routes): greedy MTP at 1 and 5 drafts equals plain decode up to a scored near tie, sampled MTP
+# keeps plain decode's opening distribution and seed determinism, and a restored turn equals a cache-off turn.
+infernix_add_test(infernix_gemma4_mtp_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mtp_real.cpp"
+  LIBRARIES infernix_engine infernix_model_runtime)
+set_tests_properties(infernix_gemma4_mtp_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+
+infernix_add_test(infernix_gemma4_mtp_options_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mtp_options.cpp"
+  LIBRARIES infernix_engine infernix_model_runtime)
+
+infernix_add_test(infernix_gemma4_mtp_transactions_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mtp_transactions_real.cpp"
+  LIBRARIES infernix_engine infernix_model_runtime)
+set_tests_properties(infernix_gemma4_mtp_transactions_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+
 # Original HF-template fixture byte identity, plus fixed-template override behavior, tool calls
 # through the output session, required tool choice, EOS arrays and thinking precedence. CPU only. Skips (77)
 # without INFERNIX_GEMMA4_HF (a Hugging Face Gemma 4 directory with tokenizer.json and chat_template.jinja);

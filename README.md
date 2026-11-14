@@ -676,9 +676,14 @@ C++ callers set `EngineOptions::context_cache.enabled = false` and concurrency 1
 Use BF16 KV and logits with `infernix-perplexity` too. Qualification runs use the
 explicit Q4 exact-route environment setting above.
 
-Not enabled here: FP8 KV/QK, MTP or other speculation/ngram sessions, prefix-cache
-reuse/persistence, concurrency >1, reproducible/lossless/reference math, top-k >20,
-tools/grammars, media, reasoning-loop budgets and the HTTP/launcher serving profile.
+MTP drafts with Google's separate assistant when the artifact carries it: `--spec mtp
+--draft-tokens N` (`1..7`, `auto` = 6; the launcher defaults to 1). The assistant reads the
+target's KV and keeps none of its own; constrained rows decode plainly. `--spec auto` decodes plainly.
+Native full-vocabulary KL, HTTP tail/MTP campaigns and the selecting-logit evidence
+contract are in [Gemma4 benchmark tools](docs/maintainer/gemma4-benchmarks.md).
+
+Not enabled here: other speculation and ngram sessions, prefix-cache persistence and the SSD tier,
+concurrency >1, reproducible/lossless/reference math, media and reasoning-loop budgets.
 Unsupported requests refuse rather than silently selecting a Qwen implementation.
 The startup warning that the constraint vocabulary was not built is expected until
 Gemma grammar support lands. Conversion, existing launchers and published models

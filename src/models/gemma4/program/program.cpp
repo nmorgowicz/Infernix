@@ -6,9 +6,14 @@
 #include "models/gemma4/execution/parameters.h"
 #include "models/gemma4/program/kv_layout.h"
 #include "infernix/types.h"
+#include "models/gemma4/execution/draft_forward.h"
+#include "models/gemma4/execution/projection.h"
 #include "models/gemma4/execution/text_forward.h"
+#include "infernix/ops/argmax.h"
 #include "infernix/ops/fp8_row_cublas.h"
+#include "infernix/ops/rmsnorm.h"
 #include "infernix/ops/sampling.h"
+#include "infernix/ops/speculative_round.h"
 #include "infernix/ops/target_logprobs.h"
 #include "infernix/ops/top_logprobs.h"
 #include "models/gemma4/program/prefix/layout_identity.h"
@@ -37,6 +42,22 @@ constexpr std::uint32_t kPage = ops::kGemma4KvPageTokens;
 constexpr int kScoreTile = 128;
 constexpr std::array<std::uint32_t, 6> kGraphWidths{32, 64, 128, 256, 512, 1024};
 constexpr std::uint64_t kGraphAllowance = 64ULL << 20;
+// MTP rounds: at most kMaxDraftTokens drafts (the CLI's range). One I32 slot block carries a round's
+// device inputs and outputs, so a captured round replays after one upload: the draft position, the
+// anchor and drafts (verify ids), the verify positions, the target argmaxes, the licensed tokens and
+// the accept op's per-row scalars.
+constexpr std::uint32_t kMaxDraftTokens = 7;
+constexpr std::uint32_t kRoundWidth = kMaxDraftTokens + 1;
+enum RoundSlot : std::uint32_t {
+    kRoundPosition = 0,
+    kRoundIds = 1,
+    kRoundVerify = kRoundIds + kRoundWidth,
+    kRoundTargets = kRoundVerify + kRoundWidth,
+    kRoundLicensed = kRoundTargets + kRoundWidth,
+    kRoundExtent = kRoundLicensed + kRoundWidth,
+    kRoundLength, kRoundAnchor, kRoundCount, kRoundAccepted,
+    kRoundSlots
+};
 // Ranking only (CacheCostModel never decides feasibility): what a prefilled token costs against a
 // restore's copy time when the cache chooses between sources and values snapshots.
 constexpr double kCacheTokenSeconds = 1.0 / 1500.0;
@@ -48,14 +69,19 @@ std::uint32_t pages_for(std::uint32_t tokens) { return (tokens + kPage - 1) / kP
 std::uint32_t ring_pages(std::uint32_t chunk, std::uint32_t window) {
     return pages_for(chunk + window - 1);
 }
-std::uint64_t io_bytes(const TextConfig& c, std::uint32_t chunk, std::uint32_t columns) {
+std::uint64_t io_bytes(const TextConfig& c, std::uint32_t chunk, std::uint32_t columns, bool mtp) {
     // Each item is a separate aligned arena allocation. Head and distribution staging are shared
-    // by prefill readout, decode and scoring; no hot-path device allocation is required.
+    // by prefill readout, decode, MTP verification and scoring; no hot-path device allocation is required.
     return aligned(4ULL * chunk) * 2 + aligned(2ULL * c.hidden_size * chunk) +
         aligned(2ULL * c.vocab_size * columns) + aligned(sizeof(ops::SamplingConfig)) +
         aligned(4ULL * c.vocab_size) + aligned(4ULL * ((c.vocab_size + 31) / 32)) +
         aligned(4 * sizeof(std::int32_t)) +
-        2 * aligned(4ULL * kMaximumScoreTopTokens * columns);
+        2 * aligned(4ULL * kMaximumScoreTopTokens * columns) +
+        (mtp ? aligned(4ULL * kRoundSlots) + aligned(2ULL * c.hidden_size) : 0);
+}
+// The head's logits columns: a scoring tile, an MTP round's verified width, or one decode column.
+std::uint32_t head_columns(const ProgramOptions& o) {
+    return o.causal_scoring ? static_cast<std::uint32_t>(kScoreTile) : o.draft_tokens + 1;
 }
 void validate_options(const Model& model, const ProgramOptions& o, std::uint32_t public_tokens) {
     const auto& c = model.config().text;
@@ -77,7 +103,14 @@ void validate_options(const Model& model, const ProgramOptions& o, std::uint32_t
     }
     (void)gemma4_kv_format(o.kv_cache);
     validate_gemma4_qk(o.qk_mode, true, o.kv_cache);
-    if (model.config().mtp) { throw std::invalid_argument("Gemma4 P4 does not execute MTP"); }
+    if (model.config().mtp ? o.draft_tokens == 0 || o.draft_tokens > kMaxDraftTokens : o.draft_tokens != 0) {
+        throw std::invalid_argument(model.config().mtp
+            ? "Gemma4 MTP drafts 1.." + std::to_string(kMaxDraftTokens) + " tokens per round"
+            : std::string("Gemma4 draft tokens need the MTP assistant (--spec mtp)"));
+    }
+    if (o.draft_tokens != 0 && o.causal_scoring) {
+        throw std::invalid_argument("Gemma4 causal scoring does not draft");
+    }
     if (o.prefill_chunk < 16 || o.prefill_chunk > 16384) {
         throw std::invalid_argument("Gemma4 prefill_chunk must be in [16,16384]");
     }
@@ -116,6 +149,16 @@ ProgramDevicePlan Program::plan_device(const Model& model, const ProgramOptions&
     plan.workspace = std::max<std::uint64_t>(plan.workspace,
         gemma4_logits_workspace_bytes(geometry.output_head, 1) +
         ops::sampling_workspace_capacity_bytes(static_cast<int>(public_tokens), 1, 1, ops::kSamplingMaxTopK));
+    if (geometry.draft) {
+        // A round runs the drafter steps, then the K+1-column verify (within the prefill workspace
+        // above), then its logits and the acceptance, each from a reset arena.
+        const auto width = static_cast<std::int32_t>(options.draft_tokens + 1);
+        plan.workspace = std::max<std::uint64_t>(plan.workspace, gemma4_draft_workspace_bytes(*geometry.draft));
+        plan.workspace = std::max<std::uint64_t>(plan.workspace,
+            gemma4_logits_workspace_bytes(geometry.output_head, width) +
+            ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(static_cast<std::int32_t>(public_tokens),
+                1, static_cast<std::int32_t>(options.draft_tokens), 1, 1, ops::kSamplingMaxTopK));
+    }
     plan.workspace = aligned(plan.workspace + 4096);
     plan.prepared_row_scales = geometry.derived_device_bytes;
     // The affine capacity curve starts where all sliding rings have reached their fixed size.
@@ -126,7 +169,7 @@ ProgramDevicePlan Program::plan_device(const Model& model, const ProgramOptions&
     }
     plan.kv = global_page_bytes * plan.kv_pages + sliding_page_bytes * rings + 8ULL * plan.kv_pages;
     plan.kv_max = global_page_bytes * maximum_pages + sliding_page_bytes * rings + 8ULL * maximum_pages;
-    plan.io = io_bytes(c, options.prefill_chunk, options.causal_scoring ? kScoreTile : 1);
+    plan.io = io_bytes(c, options.prefill_chunk, head_columns(options), geometry.draft.has_value());
     if (options.use_cuda_graph) {
         plan.graph_bound = 1;
         for (const auto width : kGraphWidths) {
@@ -134,6 +177,7 @@ ProgramDevicePlan Program::plan_device(const Model& model, const ProgramOptions&
                 ++plan.graph_bound;
             }
         }
+        if (geometry.draft) { ++plan.graph_bound; } // the round graph
         plan.graph_allowance = kGraphAllowance;
     }
     plan.curve.main_page_tokens = kPage;
@@ -167,6 +211,7 @@ struct ResumeData {
     bool prefilled = false;
     bool finishable = false;
     GenerationTimings timings;
+    SpeculativeStats speculative;
     // The Begin the Engine committed at the request's first admission: it never changes, so a
     // resumed binding reports it again whatever source the resume restored from.
     runtime::BeginSummary begin;
@@ -195,6 +240,7 @@ struct ProgramImpl {
     std::vector<std::int32_t> host_counts;
     std::vector<std::uint32_t> host_mask;
     std::vector<std::uint16_t> host_logits;
+    std::vector<std::uint16_t> observed_logits;
     DecodeGraphDefinition decode_definition;
     DecodeGraphExecutable decode_graph;
     struct PrefillGraph { DecodeGraphDefinition definition; DecodeGraphExecutable executable; };
@@ -204,6 +250,22 @@ struct ProgramImpl {
     // fast path served before), the 64-wide path the rest. The decode graph embeds the sampler, so a
     // change recaptures it (select_sampler).
     std::int32_t sampler_capacity = ops::kSamplingFastTopK;
+    // ---- MTP (options.draft_tokens != 0) ---------------------------------------------------------
+    // round: the RoundSlot block; carry: the drafter's [backbone] input, the target's final-normed
+    // hidden state of the last fed position. carry_column names the hidden column holding that
+    // position after the latest forward of this sequence (none after a restore with no forward:
+    // the next step then decodes plainly). The round graph serves full rounds (draft_tokens drafts).
+    Tensor round, carry;
+    PinnedHostBuffer host_round{kRoundSlots * sizeof(std::int32_t)};
+    std::optional<std::int32_t> carry_column;
+    DecodeGraphDefinition round_definition;
+    DecodeGraphExecutable round_graph;
+    // The pending round: its base frontier, drafts verified and accepted, and licensed tokens.
+    bool pending_round = false;
+    std::uint32_t round_base = 0, round_drafts = 0, round_accepted = 0;
+    std::array<TokenId, kRoundWidth> round_tokens{};
+    std::int32_t round_count = 0;
+    SpeculativeStats speculative;
 
     std::shared_ptr<const RequestPlan> request;
     std::unique_ptr<ResumeData> binding_resume;
@@ -279,17 +341,21 @@ struct ProgramImpl {
           global_table_storage(plan.kv_pages * sizeof(std::int32_t)),
           ring_table_storage(plan.kv_pages * sizeof(std::int32_t)) {
         const auto& c = config();
-        const int head_columns = options.causal_scoring ? kScoreTile : 1;
+        const int columns = static_cast<int>(head_columns(options));
         ids = io.alloc(DType::I32, {static_cast<int>(options.prefill_chunk)});
         positions = io.alloc(DType::I32, {static_cast<int>(options.prefill_chunk)});
         hidden = io.alloc(DType::BF16, {static_cast<int>(c.hidden_size), static_cast<int>(options.prefill_chunk)});
-        head = io.alloc(DType::BF16, {static_cast<int>(c.vocab_size), head_columns});
+        head = io.alloc(DType::BF16, {static_cast<int>(c.vocab_size), columns});
         sampling_device = static_cast<ops::SamplingConfig*>(io.alloc_bytes(sizeof(ops::SamplingConfig)).data);
         counts = io.alloc(DType::I32, {static_cast<int>(c.vocab_size)});
         mask = io.alloc(DType::I32, {static_cast<int>((c.vocab_size + 31) / 32)});
         step = io.alloc(DType::I32, {4});
-        distribution_ids = io.alloc(DType::I32, {static_cast<int>(kMaximumScoreTopTokens), head_columns});
-        distribution_values = io.alloc(DType::FP32, {static_cast<int>(kMaximumScoreTopTokens), head_columns});
+        distribution_ids = io.alloc(DType::I32, {static_cast<int>(kMaximumScoreTopTokens), columns});
+        distribution_values = io.alloc(DType::FP32, {static_cast<int>(kMaximumScoreTopTokens), columns});
+        if (p.draft) {
+            round = io.alloc(DType::I32, {static_cast<int>(kRoundSlots)});
+            carry = io.alloc(DType::BF16, {static_cast<int>(c.hidden_size), 1});
+        }
         host_positions.resize(options.prefill_chunk);
         host_counts.resize(c.vocab_size);
         host_mask.resize((c.vocab_size + 31) / 32);
@@ -392,6 +458,7 @@ struct ProgramImpl {
         ledger.clear(); request.reset(); binding_resume.reset(); paused.reset();
         pending_failure = runtime::PendingRowFailure::None;
         timings = {};
+        carry_column.reset(); pending_round = false; speculative = {};
         ++epoch; ++transaction;
     }
     Tensor hidden_columns(int first, int n) const { return hidden.slice(1, first, n); }
@@ -422,6 +489,72 @@ struct ProgramImpl {
         head_body(0, 1);
         sample_body(ops::kSamplePurposeDecode);
     }
+    // The request's speculative statistics as a fresh binding starts them.
+    SpeculativeStats fresh_speculative() const {
+        SpeculativeStats s;
+        if (options.draft_tokens == 0) { return s; }
+        s.backend = SpeculativeBackend::Mtp; s.enabled = true; s.draft_window = options.draft_tokens;
+        s.accepted_per_position.assign(options.draft_tokens, 0);
+        s.rounds_by_draft_length.assign(options.draft_tokens, 0);
+        s.round_steps.reserve(request->summary.effective_output_tokens);
+        return s;
+    }
+    // carry = the target's final norm of hidden column `column` (the drafter's backbone input).
+    void carry_from(std::int32_t column) {
+        ops::rmsnorm(hidden_columns(column, 1), norm_weight(parameters.final_norm, static_cast<int>(config().hidden_size)),
+            config().rms_norm_eps, false, carry, stream);
+    }
+    void observe_head(std::uint32_t first_predictor, std::uint32_t width) {
+        if (!options.logits_observer) { return; }
+        observed_logits.resize(static_cast<std::size_t>(config().vocab_size) * width);
+        CUDA_CHECK(cudaMemcpyAsync(observed_logits.data(), head.data, observed_logits.size() * sizeof(std::uint16_t),
+                                    cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        options.logits_observer(first_predictor, width, observed_logits);
+    }
+    // One MTP round over the uploaded slots: `drafts` drafter steps from the carry, all querying at the
+    // last fed position; the verify forward of the anchor and the drafts (writing their K/V); the
+    // target's logits and argmaxes; then the acceptance (greedy prefix match, or for a sampled row
+    // rejection sampling against the one-hot drafts), which writes the licensed tokens and counts.
+    // Reads and writes only io, the caches and the workspace, so it is captured once and replayed.
+    void round_body(std::uint32_t drafts) {
+        auto* slots = static_cast<std::int32_t*>(round.data);
+        const Tensor position(slots + kRoundPosition, DType::I32, {1});
+        for (std::uint32_t i = 0; i < drafts; ++i) {
+            workspace.reset();
+            const Tensor token(slots + kRoundIds + i, DType::I32, {1});
+            Tensor next(slots + kRoundIds + i + 1, DType::I32, {1});
+            gemma4_draft_step(token, position, carry, next, parameters.embedding, *parameters.draft, caches, gemm,
+                workspace, device.execution_view());
+        }
+        const auto width = static_cast<int>(drafts + 1);
+        workspace.reset();
+        const Tensor verify_ids(slots + kRoundIds, DType::I32, {width});
+        const Tensor verify_positions(slots + kRoundVerify, DType::I32, {width});
+        auto columns = hidden_columns(0, width);
+        gemma4_layers(verify_ids, columns, parameters.embedding, parameters.layers, caches, verify_positions, gemm,
+            workspace, stream);
+        head_body(0, width);
+        const auto vocab = static_cast<std::int32_t>(config().vocab_size);
+        const Tensor targets(slots + kRoundTargets, DType::I32, {width, 1});
+        Tensor flat_targets(slots + kRoundTargets, DType::I32, {width});
+        ops::argmax(logits(width), flat_targets, vocab, stream);
+        const Tensor verify_logits(head.data, DType::BF16, {vocab, width, 1});
+        const Tensor draft_ids(slots + kRoundIds + 1, DType::I32, {static_cast<int>(drafts), 1});
+        const Tensor extents(slots + kRoundExtent, DType::I32, {1});
+        Tensor lengths(slots + kRoundLength, DType::I32, {1});
+        Tensor anchors(slots + kRoundAnchor, DType::I32, {1});
+        Tensor licensed(slots + kRoundLicensed, DType::I32, {width, 1});
+        Tensor licensed_counts(slots + kRoundCount, DType::I32, {1});
+        Tensor accepted(slots + kRoundAccepted, DType::I32, {1});
+        ops::speculative_accept_greedy_drafts(targets, verify_logits, draft_ids, extents, lengths, anchors, licensed,
+            licensed_counts, accepted, vocab, sampling_device, workspace, stream, sampler_capacity);
+    }
+    void capture_round_graph() {
+        round_definition.capture(stream, [this] { round_body(options.draft_tokens); });
+        round_graph.instantiate(round_definition);
+        round_graph.upload(stream);
+    }
     void prepare_graphs() {
         // All graphs are instantiated/uploaded at startup. Ordinary units only replay them.
         // Warm eager calls settle cuBLAS and module initialization before stream capture.
@@ -448,6 +581,17 @@ struct ProgramImpl {
         decode_graph.instantiate(decode_definition);
         decode_graph.upload(stream);
         decode_graph.launch(stream);
+        if (parameters.draft) {
+            // A round at position zero (no live state yet), eagerly at both sampler widths first so no
+            // module loads inside the capture; the full-width round is the graph's.
+            for (const auto width : {ops::kSamplingMaxTopK, ops::kSamplingFastTopK}) {
+                sampler_capacity = width;
+                round_body(options.draft_tokens);
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+            }
+            capture_round_graph();
+            round_graph.launch(stream);
+        }
         for (std::size_t i = 0; i < kGraphWidths.size(); ++i) {
             if (kGraphWidths[i] > options.prefill_chunk || kGraphWidths[i] > capacity()) { continue; }
             auto& graph = prefill_graphs[i];
@@ -472,6 +616,11 @@ struct ProgramImpl {
         decode_definition.capture(stream, [this] { decode_body(); });
         decode_graph.instantiate(decode_definition);
         decode_graph.upload(stream);
+        if (parameters.draft) {
+            round_graph.reset();
+            round_definition.reset();
+            capture_round_graph();
+        }
     }
     void upload_sampler() {
         const auto& s = request->sampling;
@@ -916,6 +1065,7 @@ struct ProgramImpl {
             timing->include(gpu);
         }
         fed = physical_written;
+        carry_column = static_cast<std::int32_t>(tokens.size()) - 1;
     }
     runtime::PendingRowFailure prepare_sample(runtime::TokenMaskProvider* masks, std::uint32_t logical) {
         runtime::PendingRowFailure failure = runtime::PendingRowFailure::None;
@@ -963,8 +1113,32 @@ struct ProgramImpl {
         result.tokens_ = {&pending_token, 1}; result.failure_ = failure; result.timing_ = timing;
         return result;
     }
+    // A round's pending row: round_count licensed tokens of a round_drafts + 1 wide verification.
+    PendingBatch stage_round(runtime::PendingRowFailure failure, runtime::ExecutionTiming timing) {
+        if (pending) { throw std::logic_error("Gemma4 already has a pending output transaction"); }
+        pending = true; pending_round = true; pending_failure = failure; pending_decode = true;
+        PendingBatch result;
+        result.owner_ = this; result.transaction_ = ++transaction; result.sequence_ = handle();
+        result.tokens_ = {round_tokens.data(), round_drafts + 1U};
+        result.row_counts_ = {&round_count, 1};
+        result.row_stride_ = round_drafts + 1U;
+        result.failure_ = failure; result.timing_ = timing;
+        return result;
+    }
     void consume(PendingBatch& batch) noexcept {
-        batch.owner_ = nullptr; batch.transaction_ = 0; batch.tokens_ = {}; pending = false;
+        batch.owner_ = nullptr; batch.transaction_ = 0; batch.tokens_ = {}; batch.row_counts_ = {};
+        pending = false; pending_round = false;
+    }
+    // The drafts a round can verify now: the configured count, within the row's output budget (the
+    // round licenses drafts + 1 tokens) and the capacity (it writes drafts + 1 positions). 0 decodes
+    // plainly: no drafter, no carry yet (a restore with no forward since), or a constrained row (its
+    // mask is one position's).
+    std::uint32_t round_drafts_now(std::uint32_t remaining, runtime::TokenMaskProvider* masks) const {
+        if (options.draft_tokens == 0 || !carry_column || fed == 0 || remaining < 2 ||
+            (masks != nullptr && masks->constrained(0))) {
+            return 0;
+        }
+        return std::min({options.draft_tokens, remaining - 1U, capacity() - fed - 1U});
     }
     void target_scores(const Tensor& values, std::span<const TokenId> targets, int per_column,
                        std::vector<float>& output, runtime::ExecutionTimingRecorder* timing = nullptr) {
@@ -1166,6 +1340,7 @@ ContextProgress Program::poll_context(runtime::CancellationFlagView cancellation
         p.upload_sampler();
         p.occupied = true; p.binding = false; p.fed = p.physical_written = 0;
         p.prefilled = false; p.finishable = false; p.timings = {};
+        p.speculative = p.fresh_speculative(); p.carry_column.reset();
         if (p.pl.restore_snapshot) {
             // The restore batch: blocks, tail page and ring window, enqueued in stream order ahead
             // of the first forward (the image header is validated again before any copy).
@@ -1201,6 +1376,7 @@ ContextProgress Program::poll_context(runtime::CancellationFlagView cancellation
             p.replay_target = p.binding_resume->frontier;
             p.prefilled = p.binding_resume->prefilled; p.finishable = p.binding_resume->finishable;
             p.timings = p.binding_resume->timings; p.replaying = p.replay_target > p.fed;
+            p.speculative = p.binding_resume->speculative;
             p.binding_resume.reset();
         }
         progress.published = true; progress.sequence = p.handle(); progress.replaying = p.replaying;
@@ -1243,6 +1419,7 @@ bool Program::start_pause(SequenceHandle sequence, runtime::ExecutionTiming* obs
     auto data = std::make_unique<detail::ResumeData>();
     data->owner = &p; data->plan = p.request; data->ledger = p.ledger;
     data->frontier = p.fed; data->prefilled = p.prefilled; data->finishable = p.finishable; data->timings = p.timings;
+    data->speculative = p.speculative;
     data->begin = p.begin;
     // The deepest published grid snapshot is the state the resume restores from; replay then rebuilds the
     // exact committed target frontier on the chunk grid.
@@ -1297,6 +1474,7 @@ PrefillProgress Program::advance_prefill(SequenceHandle sequence, runtime::Execu
             auto failure = p.prepare_sample(masks, p.fed);
             p.sample_body(ops::kSamplePurposePrefill);
             const auto token = p.collect_sample(failure, &timing);
+            p.observe_head(p.fed - 1, 1);
             p.prefilled = true;
             progress.timing = p.charge(timing.finish(), false);
             progress.pending.emplace(p.stage(token, failure, progress.timing));
@@ -1321,6 +1499,42 @@ PendingBatch Program::decode(std::span<const SequenceHandle> sequences, std::spa
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
     try {
         auto failure = p.prepare_sample(masks, p.fed + 1);
+        const auto drafts = p.round_drafts_now(budgets[0].generated_tokens_remaining, masks);
+        if (drafts != 0) {
+            // Host slots: the drafter queries at the last fed position; the verify forward feeds the
+            // anchor and the drafts at fed..fed+drafts; the acceptance's logical length is fed.
+            auto* slots = static_cast<std::int32_t*>(p.host_round.data());
+            std::fill(slots, slots + kRoundSlots, 0);
+            slots[kRoundPosition] = static_cast<std::int32_t>(p.fed) - 1;
+            slots[kRoundIds] = p.ledger.back();
+            for (std::uint32_t i = 0; i <= drafts; ++i) { slots[kRoundVerify + i] = static_cast<std::int32_t>(p.fed + i); }
+            slots[kRoundExtent] = static_cast<std::int32_t>(drafts);
+            slots[kRoundLength] = static_cast<std::int32_t>(p.fed);
+            slots[kRoundAnchor] = p.ledger.back();
+            upload_pinned(p.round.data, slots, kRoundSlots * sizeof(std::int32_t), p.stream);
+            p.carry_from(*p.carry_column);
+            p.physical_written = p.fed + drafts + 1;
+            if (p.options.use_cuda_graph && drafts == p.options.draft_tokens) { p.round_graph.launch(p.stream); }
+            else { p.round_body(drafts); }
+            CUDA_CHECK(cudaMemcpyAsync(slots, p.round.data, kRoundSlots * sizeof(std::int32_t), cudaMemcpyDeviceToHost,
+                p.stream));
+            (void)p.collect_sample(failure, &timing); // the nonfinite word; the round's tokens are in its slots
+            p.observe_head(p.fed, drafts + 1);
+            const std::int32_t count = slots[kRoundCount], accepted = slots[kRoundAccepted];
+            if (count < 1 || count > static_cast<std::int32_t>(drafts) + 1 || accepted != count - 1) {
+                throw runtime::RecoverableExecutionError("Gemma4 MTP acceptance returned an invalid count");
+            }
+            for (std::int32_t i = 0; i < count; ++i) {
+                const auto token = slots[kRoundLicensed + i];
+                if (token < 0 || static_cast<std::uint32_t>(token) >= p.config().vocab_size) {
+                    throw runtime::RecoverableExecutionError("Gemma4 MTP acceptance returned an invalid token");
+                }
+            }
+            std::copy(slots + kRoundLicensed, slots + kRoundLicensed + drafts + 1, p.round_tokens.begin());
+            p.round_base = p.fed; p.round_drafts = drafts;
+            p.round_accepted = static_cast<std::uint32_t>(accepted); p.round_count = count;
+            return p.stage_round(failure, p.charge(timing.finish(), true));
+        }
         const auto token = p.ledger.back();
         const auto position = static_cast<std::int32_t>(p.fed);
         upload_pinned(p.ids.data, &token, sizeof(token), p.stream);
@@ -1329,7 +1543,10 @@ PendingBatch Program::decode(std::span<const SequenceHandle> sequences, std::spa
         if (p.options.use_cuda_graph) { p.decode_graph.launch(p.stream); }
         else { p.decode_body(); }
         const auto next = p.collect_sample(failure, &timing);
+        p.observe_head(p.fed, 1);
         p.fed = p.physical_written;
+        p.carry_column = 0;
+        if (p.options.draft_tokens != 0) { ++p.speculative.fallback_steps; }
         return p.stage(next, failure, p.charge(timing.finish(), true), true);
     } catch (...) {
         p.state_valid = false;
@@ -1382,21 +1599,49 @@ CommitResult Program::commit(PendingBatch&& batch, std::span<const runtime::Comm
     }
     const auto& decision = decisions[0];
     const bool failed = decision.failed || p.pending_failure != runtime::PendingRowFailure::None;
-    if (decision.accepted_tokens > 1 || ((!failed && !decision.cancelled && !decision.terminal) &&
-        decision.accepted_tokens != 1) || (decision.prefix_execution_split_after &&
-        *decision.prefix_execution_split_after > decision.accepted_tokens)) {
+    // A round licenses round_count tokens, a plain step one; a live row accepts all of them.
+    const bool round = p.pending_round;
+    const std::uint32_t produced = round ? static_cast<std::uint32_t>(p.round_count) : 1U;
+    if (decision.accepted_tokens > produced ||
+        ((failed || decision.cancelled) && (decision.accepted_tokens != 0 || !decision.terminal)) ||
+        ((!failed && !decision.cancelled && !decision.terminal) && decision.accepted_tokens != produced) ||
+        (decision.prefix_execution_split_after && *decision.prefix_execution_split_after > decision.accepted_tokens)) {
         throw std::logic_error("Gemma4 commit has an invalid accepted extent");
     }
     CommitResult result; result.row_count = 1;
-    if (!failed && !decision.cancelled && decision.accepted_tokens == 1) { p.ledger.push_back(p.pending_token); }
+    const bool keep = !failed && !decision.cancelled;
+    if (round) {
+        // The round fed the anchor and the drafts at round_base..; the first `accepted` licensed tokens
+        // extend the ledger, so the target state is valid through round_base + accepted (the K/V written
+        // past it is never read before the next round overwrites it). The last kept position's verify
+        // column holds the next carry.
+        const std::uint32_t accepted = keep ? decision.accepted_tokens : 0U;
+        auto& s = p.speculative;
+        ++s.rounds;
+        s.drafted_tokens += p.round_drafts;
+        const std::uint32_t drafted = std::min(p.round_accepted, accepted);
+        s.accepted_tokens += drafted;
+        for (std::uint32_t i = 0; i < drafted; ++i) { ++s.accepted_per_position[i]; }
+        ++s.rounds_by_draft_length[p.round_drafts - 1];
+        s.round_steps.push_back({.drafted = static_cast<std::uint16_t>(p.round_drafts),
+                                 .accepted = static_cast<std::uint16_t>(drafted)});
+        p.ledger.insert(p.ledger.end(), p.round_tokens.begin(), p.round_tokens.begin() + accepted);
+        p.fed = p.round_base + accepted;
+        if (accepted != 0) { p.carry_column = static_cast<std::int32_t>(accepted) - 1; }
+    } else if (keep && decision.accepted_tokens == 1) {
+        p.ledger.push_back(p.pending_token);
+    }
     p.consume(batch);
     auto& row = result.rows[0];
+    row.speculative_counters = {.rounds = p.speculative.rounds, .drafted_tokens = p.speculative.drafted_tokens,
+        .accepted_tokens = p.speculative.accepted_tokens, .fallback_steps = p.speculative.fallback_steps};
     row.disposition = failed ? runtime::CommitDisposition::FailedReleased :
         decision.cancelled ? runtime::CommitDisposition::CancelledReleased :
         decision.terminal ? runtime::CommitDisposition::Finishable : runtime::CommitDisposition::Active;
     result.timing = p.charge(timing.finish(), p.pending_decode);
     if (observation == runtime::CommitObservation::AllRows || failed || decision.cancelled) { row.timings = p.timings; }
     if (failed || decision.cancelled) {
+        row.speculative = std::move(p.speculative);
         // Non-finite logits make the sequence's state suspect: what it published is taken back.
         if (p.pending_failure == runtime::PendingRowFailure::NonFiniteLogits) { p.pl.withdraw = true; }
         p.clear();
@@ -1415,6 +1660,7 @@ FinishResult Program::finish(SequenceHandle sequence) noexcept {
     auto& p = *impl_;
     if (!p.owns(sequence) || p.pending || !p.finishable || !p.state_valid) { return {}; }
     FinishResult result; result.status = runtime::ConsumeStatus::Consumed; result.timings = p.timings;
+    result.speculative = std::move(p.speculative);
     p.prefix_finish(false);
     result.cache_created_prompt_tokens = p.prefix_created_tokens();
     p.clear(); return result;
@@ -1423,6 +1669,7 @@ AbortResult Program::abort(SequenceHandle sequence) noexcept {
     auto& p = *impl_;
     if (!p.owns(sequence)) { return {}; }
     AbortResult result; result.status = runtime::ConsumeStatus::Consumed; result.timings = p.timings;
+    result.speculative = std::move(p.speculative);
     // A consistent abort (no unit in flight) leaves an endpoint a resend resumes from.
     if (!p.pending) { p.prefix_finish(false); }
     p.clear(); return result;

@@ -84,7 +84,13 @@ Args default_args(const LibraryScan& scan, const ScannedModel& model, const Host
         add("--prefill-chunk", "auto");
         add("--logits-dtype", "bf16");
         add("--no-prefix-reuse");
-        add("--spec", "off");
+        // The assistant's one-draft rounds (the operator profile); without it, plain decode.
+        if (model.has_mtp) {
+            add("--spec", "mtp");
+            add("--draft-tokens", "1");
+        } else {
+            add("--spec", "off");
+        }
     }
 
     // Speculative decoding: the Engine picks the drafter measured fastest for the artifact.

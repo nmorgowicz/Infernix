@@ -126,7 +126,7 @@ EngineOptions normalize_options(EngineOptions engine_options, models::Architectu
             engine_options.speculative.draft_tokens_auto = false;
             engine_options.speculative.proposal_head = ProposalHead::Full;
             runtime::publish_diagnostic(engine_options.diagnostic_observer, DiagnosticLevel::Info,
-                                        "--spec auto: Gemma4 cold-cache execution uses plain decode");
+                                        "--spec auto: Gemma4 decodes plainly; --spec mtp drafts with its assistant");
         }
         if (engine_options.prefill_chunk == 0) { engine_options.prefill_chunk = 128; }
     }

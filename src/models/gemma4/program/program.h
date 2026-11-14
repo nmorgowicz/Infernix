@@ -110,15 +110,18 @@ public:
     PendingBatch() noexcept = default;
     PendingBatch(PendingBatch&& other) noexcept
         : owner_(std::exchange(other.owner_, nullptr)), transaction_(std::exchange(other.transaction_, 0)),
-          sequence_(other.sequence_), tokens_(std::exchange(other.tokens_, {})), timing_(other.timing_),
+          sequence_(other.sequence_), tokens_(std::exchange(other.tokens_, {})),
+          row_counts_(std::exchange(other.row_counts_, {})), row_stride_(other.row_stride_), timing_(other.timing_),
           failure_(other.failure_) {}
     PendingBatch& operator=(PendingBatch&&) = delete;
     PendingBatch(const PendingBatch&) = delete;
     PendingBatch& operator=(const PendingBatch&) = delete;
     [[nodiscard]] std::size_t row_count() const noexcept { return owner_ ? 1 : 0; }
+    // A speculative round's row holds its licensed tokens (accepted drafts, then the correction or
+    // bonus): row_counts() names how many, row_stride() the round's verified width.
     [[nodiscard]] std::span<const TokenId> tokens() const noexcept { return tokens_; }
-    [[nodiscard]] std::span<const std::int32_t> row_counts() const noexcept { return {}; }
-    [[nodiscard]] std::uint32_t row_stride() const noexcept { return 1; }
+    [[nodiscard]] std::span<const std::int32_t> row_counts() const noexcept { return row_counts_; }
+    [[nodiscard]] std::uint32_t row_stride() const noexcept { return row_stride_; }
     [[nodiscard]] runtime::ExecutionTiming execution_timing() const noexcept { return timing_; }
     [[nodiscard]] runtime::PendingRowFailure row_failure(std::size_t row) const {
         if (row >= row_count()) { throw std::out_of_range("Gemma4 pending row"); }
@@ -129,6 +132,8 @@ private:
     std::uint64_t transaction_ = 0;
     SequenceHandle sequence_;
     std::span<const TokenId> tokens_;
+    std::span<const std::int32_t> row_counts_;
+    std::uint32_t row_stride_ = 1;
     runtime::ExecutionTiming timing_;
     runtime::PendingRowFailure failure_ = runtime::PendingRowFailure::None;
     friend struct detail::ProgramImpl;
@@ -208,6 +213,8 @@ struct ProgramOptions {
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     ops::Gemma4QkMode qk_mode = ops::Gemma4QkMode::BFloat16;
     bool causal_scoring = false;
+    // MTP drafts per round (1..kMaxDraftTokens) with the assistant loaded; 0 decodes plainly.
+    std::uint32_t draft_tokens = 0;
     bool prefix_cache = false;
     // The prefix cache's pinned Host tier in bytes; 0 disables its construction (a cold lane).
     std::uint64_t host_bytes = 0;
@@ -215,6 +222,12 @@ struct ProgramOptions {
     bool use_cuda_graph = true;
     DiagnosticObserver diagnostics;
     StartupObserver startup_observer;
+    // Private numerical-evidence seam, never called during graph capture. Observes the already
+    // produced BF16 [vocab,width] selecting logits after sampling/verification, before head reuse.
+    // first_predictor is the absolute input position of column 0 (its output is at +1).
+    // All host staging/copies are absent when unset; the span lives only for the callback.
+    std::function<void(std::uint32_t first_predictor, std::uint32_t width,
+                       std::span<const std::uint16_t>)> logits_observer;
 };
 class Program {
 public:

@@ -13,6 +13,7 @@
 #include "runtime/engine/kv_capacity.h"
 #include "runtime/expert_offload/memory_plan.h"
 
+#include <algorithm>
 #include <chrono>
 #include <map>
 #include <set>
@@ -37,6 +38,7 @@ ProgramOptions program_options(const EngineOptions& options, std::uint64_t host_
     out.kv_cache = options.kv_cache;
     out.qk_mode = options.gemma4_qk;
     out.causal_scoring = options.purpose == EnginePurpose::CausalScoring;
+    out.draft_tokens = options.speculative.backend == SpeculativeBackend::Mtp ? options.speculative.draft_tokens : 0U;
     // A Host tier is the prefix cache's only capacity on Gemma: 0 (--host-context-mib 0) is the
     // off switch and leaves a cold lane.
     out.prefix_cache = options.context_cache.enabled && host_bytes != 0;
@@ -92,9 +94,20 @@ void validate_gemma4_options(const EngineOptions& options) {
     (void)models::gemma4::gemma4_kv_format(options.kv_cache);
     validate_gemma4_qk(options.gemma4_qk, true, options.kv_cache);
     const auto& spec = options.speculative;
-    if (spec.backend_auto || spec.backend != SpeculativeBackend::None || spec.ngram_draft_tokens != 0 ||
-        spec.ngram_draft_tokens_auto || spec.ngram_archive_bytes != 0 || !spec.draft_model.empty()) {
-        throw std::invalid_argument("Gemma4 cold-cache execution requires --spec off and no ngram drafting");
+    if (spec.backend_auto || (spec.backend != SpeculativeBackend::None && spec.backend != SpeculativeBackend::Mtp) ||
+        spec.ngram_draft_tokens != 0 || spec.ngram_draft_tokens_auto || spec.ngram_archive_bytes != 0 ||
+        !spec.draft_model.empty()) {
+        throw std::invalid_argument("Gemma4 drafts only with its MTP assistant (--spec mtp or off); no ngram drafting");
+    }
+    if (spec.backend == SpeculativeBackend::Mtp && (spec.draft_tokens < 1 || spec.draft_tokens > 7)) {
+        throw std::invalid_argument("Gemma4 --spec mtp drafts 1..7 tokens per round (--draft-tokens)");
+    }
+    if (spec.draft_min_p || spec.proposal_head != ProposalHead::Full) {
+        throw std::invalid_argument("Gemma4 MTP has no draft-confidence cut (--spec-min-p) or proposal head");
+    }
+    if (spec.draft_tree_auto || std::any_of(spec.draft_tree_nodes.begin(), spec.draft_tree_nodes.end(),
+                                          [](std::uint32_t n) { return n != 0; })) {
+        throw std::invalid_argument("Gemma4 MTP supports chain verification only; draft trees are unsupported");
     }
     if (options.enable_vision || options.vision_offload == VisionOffload::On) {
         throw std::invalid_argument("Gemma4 vision and audio input are not supported by the text route");

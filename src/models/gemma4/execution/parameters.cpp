@@ -110,8 +110,8 @@ ParameterGeometry Parameters::geometry(const Model& source) {
     const Prepare prepare(source);
     const auto& weights = source.weights().text;
     const auto& config = source.config().text;
-    if (source.config().mtp) {
-        throw std::invalid_argument("Gemma4 P4 execution requires speculative decoding off");
+    if (source.config().mtp.has_value() != source.weights().mtp.has_value()) {
+        throw std::invalid_argument("Gemma4 parameters: the MTP config and weights disagree");
     }
     if (weights.layers.size() != config.layer_types.size() ||
         weights.layers.size() != config.num_hidden_layers || weights.layers.empty()) {
@@ -189,6 +189,63 @@ ParameterGeometry Parameters::geometry(const Model& source) {
         }
         out.layers.push_back(layer);
     }
+    if (const auto& assistant = source.config().mtp) {
+        const auto& mtp = *source.weights().mtp;
+        if (mtp.layers.size() != assistant->num_hidden_layers || mtp.layers.empty() ||
+            assistant->kv_source_layers.size() != mtp.layers.size()) {
+            throw std::invalid_argument("Gemma4 parameters: one weight block per configured MTP layer");
+        }
+        if (mtp.output_head_use.parameter != mtp.output_head) {
+            throw std::invalid_argument("Gemma4 parameters: MTP head Use refers to another parameter");
+        }
+        Gemma4DraftWeights draft;
+        draft.hidden = dimension(assistant->hidden_size);
+        draft.backbone = dimension(assistant->backbone_hidden_size);
+        draft.vocab = dimension(assistant->vocab_size);
+        draft.rms_eps = assistant->rms_norm_eps;
+        draft.input_projection = prepare.linear({mtp.input_projection}, "mtp/stem_input").weight;
+        draft.output_projection = prepare.linear({mtp.output_projection}, "mtp/final_hidden").weight;
+        draft.output_head = prepare.linear({mtp.output_head}, "mtp/final_hidden").weight;
+        draft.final_norm = prepare.norm(mtp.final_norm, draft.hidden);
+        draft.layers.reserve(mtp.layers.size());
+        for (std::size_t i = 0; i < mtp.layers.size(); ++i) {
+            const auto& stored = mtp.layers[i];
+            const auto kind = assistant->layer_types[i];
+            const auto prefix = "mtp/layers/" + std::to_string(i) + "/";
+            Gemma4LayerWeights layer;
+            layer.hidden = draft.hidden;
+            layer.intermediate = dimension(assistant->intermediate_size);
+            layer.head_dim = dimension(assistant->head_dim_of(kind));
+            layer.q_heads = dimension(assistant->num_attention_heads);
+            layer.kv_heads = dimension(assistant->kv_heads_of(kind));
+            layer.window = dimension(assistant->window_of(kind));
+            layer.rotary_dim = dimension(kind == LayerKind::Global ? assistant->prope_rotary_dim : assistant->head_dim);
+            layer.rope_theta = kind == LayerKind::Global ? assistant->prope_theta_eff : assistant->rope_sliding_theta;
+            layer.rms_eps = assistant->rms_norm_eps;
+            layer.global_layer = kind == LayerKind::Global;
+            const auto query = prepare.linear({stored.query}, prefix + "mixer_input");
+            const auto o = prepare.linear({stored.output}, prefix + "attention_output");
+            const auto gate_up = prepare.linear({stored.gate, stored.up}, prefix + "ffn_input");
+            const auto down = prepare.linear({stored.down}, prefix + "mlp/product");
+            layer.qkv = query.weight;
+            layer.qkv_policy = query.policy;
+            layer.o_proj = o.weight;
+            layer.o_policy = o.policy;
+            layer.gate_up = gate_up.weight;
+            layer.gate_up_policy = gate_up.policy;
+            layer.down = down.weight;
+            layer.down_policy = down.policy;
+            layer.q_norm = prepare.norm(stored.query_norm, layer.head_dim);
+            layer.input_norm = prepare.norm(stored.input_norm, layer.hidden);
+            layer.post_attn_norm = prepare.norm(stored.post_attention_norm, layer.hidden);
+            layer.pre_ff_norm = prepare.norm(stored.pre_feedforward_norm, layer.hidden);
+            layer.post_ff_norm = prepare.norm(stored.post_feedforward_norm, layer.hidden);
+            layer.layer_scalar = stored.layer_scalar_value;
+            draft.layers.push_back(layer);
+            draft.kv_source.push_back(dimension(assistant->kv_source_layers[i]));
+        }
+        out.draft = std::move(draft);
+    }
     return out;
 }
 
@@ -202,6 +259,7 @@ Parameters::Parameters(const Model& source, cudaStream_t stream) : model(source)
     final_norm = prepared.final_norm;
     output_head = prepared.output_head;
     row_scales_.reserve(layers.size() * 4);
+    draft = std::move(prepared.draft);
     for (auto& layer : layers) {
         for (Weight* projection : {&layer.qkv, &layer.o_proj, &layer.gate_up, &layer.down}) {
             ops::linear_prepare_a8_rows(*projection, row_scales_.emplace_back(), stream);

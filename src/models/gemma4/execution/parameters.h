@@ -1,12 +1,14 @@
 #pragma once
 
 #include "core/arena.h"
+#include "models/gemma4/execution/draft_forward.h"
 #include "models/gemma4/execution/text_forward.h"
 #include "models/gemma4/model.h"
 
 #include <cuda_runtime.h>
 
 #include <cstddef>
+#include <optional>
 #include <vector>
 
 namespace infernix::models::gemma4::execution {
@@ -18,6 +20,8 @@ struct ParameterGeometry {
     std::vector<Gemma4LayerWeights> layers;
     const void* final_norm = nullptr;
     Weight output_head;
+    // The MTP assistant, present when the load selected it (LoadOptions::mtp()).
+    std::optional<Gemma4DraftWeights> draft;
     std::size_t derived_device_bytes = 0;
 };
 
@@ -41,6 +45,7 @@ public:
     std::vector<Gemma4LayerWeights> layers;
     const void* final_norm = nullptr;
     Weight output_head;
+    std::optional<Gemma4DraftWeights> draft;
 };
 
 } // namespace infernix::models::gemma4::execution
