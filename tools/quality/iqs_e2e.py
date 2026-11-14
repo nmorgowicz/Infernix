@@ -291,6 +291,21 @@ def homogeneity(a: list[str], b: list[str]) -> tuple[float, int]:
     return chi2_sf(stat, dof), dof
 
 
+def largest_gaps(a: list[str], b: list[str], top: int = 3) -> list[dict]:
+    """The categories whose frequency differs most between two samples: the size of a difference, not only its p-value.
+
+    A one-degree-of-freedom failure on a near-tied choice can be a 5-point gap or a 0.5-point one; the p-value alone
+    cannot tell them apart.
+    """
+    counts: dict[str, list[int]] = {}
+    for value in a:
+        counts.setdefault(value, [0, 0])[0] += 1
+    for value in b:
+        counts.setdefault(value, [0, 0])[1] += 1
+    rows = sorted(((abs(x / len(a) - y / len(b)), k, x, y) for k, (x, y) in counts.items()), reverse=True)[:top]
+    return [{"content": k, "spec": x, "plain": y, "abs_prob_gap": gap} for gap, k, x, y in rows]
+
+
 def sample(client: Client, prompts: list[str], samples: int) -> list[list[str]]:
     out = []
     for p, prompt in enumerate(prompts):
@@ -314,6 +329,7 @@ def check_specdist(args) -> dict:
     alpha = 1e-3 / len(prompts)
     passed = all(p >= alpha for p, _ in tests)
     return {"passed": passed, "p_values": [p for p, _ in tests], "dof": [d for _, d in tests],
+            "effect": [largest_gaps(a, b) for a, b in zip(with_spec, without)],
             "detail": "speculative sampling matches plain sampling: p " + ", ".join(f"{p:.3g}" for p, _ in tests)}
 
 

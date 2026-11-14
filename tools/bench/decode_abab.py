@@ -18,7 +18,7 @@ import sys
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from tools.bench.gemma4_common import add_pool_args, add_server_args, gpu_lock, running_server, server_argv
+from tools.bench.gemma4_common import add_pool_args, add_server_args, add_thinking_arg, gpu_lock, running_server, server_argv
 from tools.bench.kv_eval.common import sha256_file
 
 
@@ -32,6 +32,7 @@ def main():
     ap.add_argument("--mtp-draft", type=int, choices=range(1, 8))
     ap.add_argument("--tag", default="decode")
     ap.add_argument("--reps", type=int, default=3)
+    add_thinking_arg(ap, "default")
     args = ap.parse_args()
     arms = json.loads(args.arms_json.read_text(encoding="utf-8"))
     for key in ("a", "b"):
@@ -54,7 +55,8 @@ def main():
             if arm.get("exe"):
                 argv[0] = str((args.arms_json.resolve().parent / arm["exe"]).resolve())
             env = dict(os.environ, **arm.get("env", {}))
-            rec = {"arm": name, "argv": argv, "env": arm.get("env", {}), "binary_sha256": sha256_file(Path(argv[0]))}
+            rec = {"arm": name, "argv": argv, "env": arm.get("env", {}), "binary_sha256": sha256_file(Path(argv[0])),
+                   "enable_thinking": args.enable_thinking}
             try:
                 with running_server(args, argv, args.out_dir / f"{label}.server.log", env) as ready:
                     rec["ready_s"] = ready
@@ -62,7 +64,8 @@ def main():
                               "--out", str(cells.resolve()), "--url", f"http://127.0.0.1:{args.port}/v1/chat/completions",
                               "--model", args.model, "--manifest", str(args.manifest.resolve()),
                               "--artifact", str(args.artifact.resolve()), "--pool-domains", args.pool_domains,
-                              "--lengths", args.lengths, "--reps", str(args.reps)]
+                              "--lengths", args.lengths, "--reps", str(args.reps),
+                              "--enable-thinking", args.enable_thinking]
                     if args.tokenizer:
                         client += ["--tokenizer", str(args.tokenizer.resolve())]
                     rec["client_argv"] = client

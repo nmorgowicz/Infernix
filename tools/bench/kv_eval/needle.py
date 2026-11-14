@@ -34,6 +34,7 @@ from pathlib import Path
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
+from tools.bench.gemma4_common import add_thinking_arg, thinking_value
 from tools.bench.kv_eval.common import fail, resolve_tokenizer, use_utf8_stdio
 from tools.bench.kv_eval.corpus_pool import DEFAULT_DOMAINS, Pool
 from tools.bench.kv_eval.metrics import mcnemar_exact, wilson
@@ -117,6 +118,8 @@ def run(args):
             continue
         body = {"model": args.model, "messages": [{"role": "user", "content": c["prompt"]}], "max_tokens": MAX_NEW,
                 "temperature": 0, "top_k": TOP_K, "seed": SEED, "stream": False}
+        if thinking_value(args) is not None:
+            body["enable_thinking"] = thinking_value(args)
         req = urllib.request.Request(args.url, data=json.dumps(body).encode("utf-8"), headers={"Content-Type": "application/json"})
         row = {k: c[k] for k in ("id", "length", "depth", "needle", "name", "code", "pool_first_token", "pool_last_token",
                                  "actual_depth_tokens", "prompt_sha256")}
@@ -129,7 +132,7 @@ def run(args):
             row.update({"reply": reply, "correct": score(reply, c["code"]), "finish_reason": payload["choices"][0]["finish_reason"],
                         "prompt_tokens": payload["usage"]["prompt_tokens"], "completion_tokens": payload["usage"]["completion_tokens"],
                         "cache_n": payload["timings"]["cache_n"], "prompt_ms": payload["timings"]["prompt_ms"],
-                        "request_params": {k: body[k] for k in ("temperature", "top_k", "seed", "max_tokens")}, "error": None})
+                        "request_params": {k: body.get(k) for k in ("temperature", "top_k", "seed", "max_tokens", "enable_thinking")}, "error": None})
         except urllib.error.HTTPError as exc:
             row.update({"reply": None, "correct": False, "error": f"{type(exc).__name__}: {exc} | " + exc.read().decode("utf-8", "replace")[:500]})
         except urllib.error.URLError as exc:
@@ -236,6 +239,8 @@ def main():
     r.add_argument("--overhead-tokens", type=int, default=OVERHEAD_TOKENS, help="template/question allowance subtracted from the nominal length")
     r.add_argument("--master-seed", type=int, default=MASTER_SEED)
     r.add_argument("--dry-run", action="store_true", help="build the cases and print prompt hashes; contact no server")
+    add_thinking_arg(r, "false", "Defaults to false: the 32-token answer budget cannot hold a reasoning block, "
+                     "so with thinking on the reply comes back empty. ")
     s = sub.add_parser("summarize", help="grids, Wilson intervals and paired exact McNemar across arms")
     s.add_argument("--arms", required=True)
     s.add_argument("--dir", type=Path, required=True, help="directory holding <arm>.jsonl")

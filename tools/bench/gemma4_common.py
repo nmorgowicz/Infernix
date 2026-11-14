@@ -53,7 +53,8 @@ def server_argv(args, spec):
     argv = [str(args.exe.resolve()), str(args.artifact.resolve()), "--host", "127.0.0.1", "--port", str(args.port),
             "--model-id", args.model, "--max-context", str(args.max_context), "--kv-capacity", "auto",
             "--vram-headroom-mib", str(args.vram_headroom_mib), "--kv-dtype", args.kv_dtype,
-            "--gemma4-qk", args.gemma4_qk, "--max-concurrency", "1", "--prefill-chunk", str(args.prefill_chunk)]
+            "--gemma4-qk", args.gemma4_qk, "--max-concurrency", "1", "--prefill-chunk", str(args.prefill_chunk),
+            "--logits-dtype", "bf16"]
     argv += ["--no-prefix-reuse"] if args.no_prefix_reuse else ["--host-context-mib", str(args.host_context_mib)]
     return argv + list(spec) + args.serve_arg
 
@@ -121,9 +122,23 @@ def running_server(args, argv, log_path, env=None):
             stop(process)
 
 
-def chat(url, model, messages, max_tokens, *, temperature=0, seed=1234, timeout=3600, top_k=20):
+def add_thinking_arg(parser, default, note=""):
+    """--enable-thinking {true,false,default}; `default` omits the field so the server decides."""
+    parser.add_argument("--enable-thinking", choices=("true", "false", "default"), default=default,
+                        help="send enable_thinking in every chat request; 'default' omits the field and the server "
+                             f"decides (infernix resolves an absent value to true on Gemma 4). {note}(default: {default})")
+
+
+def thinking_value(args):
+    """Map the parsed --enable-thinking choice to True, False or None (omit)."""
+    return {"true": True, "false": False, "default": None}[args.enable_thinking]
+
+
+def chat(url, model, messages, max_tokens, *, temperature=0, seed=1234, timeout=3600, top_k=20, enable_thinking=None):
     body = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature,
             "top_p": 0.95, "top_k": top_k, "seed": seed, "stream": False}
+    if enable_thinking is not None:
+        body["enable_thinking"] = enable_thinking
     req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), headers={"Content-Type": "application/json"})
     started = time.monotonic()
     with urllib.request.urlopen(req, timeout=timeout) as response:

@@ -31,6 +31,7 @@ from pathlib import Path
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
+from tools.bench.gemma4_common import add_thinking_arg, thinking_value
 from tools.bench.kv_eval.common import fail, resolve_tokenizer, use_utf8_stdio
 from tools.bench.kv_eval.corpus_pool import DEFAULT_DOMAINS, Pool
 
@@ -59,9 +60,11 @@ def build_prompt(pool, nominal, rep, overhead=OVERHEAD_TOKENS, window_stride=WIN
                     "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest()}
 
 
-def request(url, model, prompt, timeout, max_new):
+def request(url, model, prompt, timeout, max_new, enable_thinking=None):
     body = {"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": max_new,
             "temperature": 0, "top_k": TOP_K, "seed": SEED, "stream": False}
+    if enable_thinking is not None:
+        body["enable_thinking"] = enable_thinking
     req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), headers={"Content-Type": "application/json"})
     t0 = time.monotonic()
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -86,6 +89,7 @@ def main() -> None:
     ap.add_argument("--overhead-tokens", type=int, default=OVERHEAD_TOKENS)
     ap.add_argument("--window-stride-tokens", type=int, default=WINDOW_STRIDE_TOKENS)
     ap.add_argument("--timeout", type=float, default=1800)
+    add_thinking_arg(ap, "default")
     ap.add_argument("--dry-run", action="store_true", help="build the prompts and print their hashes; contact no server")
     args = ap.parse_args()
 
@@ -111,7 +115,8 @@ def main() -> None:
         for rep in range(args.reps + 1):               # rep 0 is the warmup
             prompt, meta = build_prompt(pool, nominal, rep, args.overhead_tokens, args.window_stride_tokens)
             try:
-                payload, wall, body = request(args.url, args.model, prompt, args.timeout, args.max_new)
+                payload, wall, body = request(args.url, args.model, prompt, args.timeout, args.max_new,
+                                              thinking_value(args))
                 err = None
             except urllib.error.HTTPError as exc:      # a cell that does not fit must be reported, not skipped
                 payload, wall, body = None, None, None
@@ -137,7 +142,8 @@ def main() -> None:
                     "draft_n": t.get("draft_n"), "draft_n_accepted": t.get("draft_n_accepted"),
                     "finish_reason": payload["choices"][0]["finish_reason"],
                     "text_head": payload["choices"][0]["message"]["content"][:120],
-                    "request_params": {k: body[k] for k in ("temperature", "top_k", "seed", "max_tokens")}})
+                    "request_params": {k: body.get(k) for k in ("temperature", "top_k", "seed", "max_tokens", "enable_thinking")},
+                    "enable_thinking": args.enable_thinking})
             emit(row)
             print(json.dumps({k: row.get(k) for k in ("label", "nominal", "rep", "prompt_tokens", "prompt_n", "cache_n",
                   "prefill_tok_s", "predicted_n", "decode_tok_s", "draft_n", "draft_n_accepted", "finish_reason",

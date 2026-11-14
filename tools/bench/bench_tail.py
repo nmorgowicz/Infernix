@@ -20,7 +20,7 @@ import sys
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from tools.bench.gemma4_common import add_pool_args, make_pool, chat, gpu_state
+from tools.bench.gemma4_common import add_pool_args, add_thinking_arg, make_pool, chat, gpu_state, thinking_value
 
 SEED = 1234
 GEN_TOKENS = 256
@@ -37,8 +37,10 @@ def main():
     ap.add_argument("--tail", type=int, default=1200)
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--stride", type=int, default=61000)
+    add_thinking_arg(ap, "default")
     args = ap.parse_args()
     args.out.parent.mkdir(parents=True, exist_ok=True)
+    thinking = thinking_value(args)
 
     pool = make_pool(args, args.out.resolve().parent)
     print(f"pool tokens: {pool.n_tokens} text sha {pool.text_sha256[:16]}", flush=True)
@@ -54,14 +56,15 @@ def main():
 
             msgs1 = [{"role": "user", "content": f"Reference id rp{rep:02d}-{first}-{last}\n\n{task}\n\n{hist}"}]
             before = gpu_state()
-            r1, w1 = chat(args.url, args.model, msgs1, GEN_TOKENS)
+            r1, w1 = chat(args.url, args.model, msgs1, GEN_TOKENS, enable_thinking=thinking)
             reply = r1["choices"][0]["message"]["content"]
 
             msgs2 = msgs1 + [{"role": "assistant", "content": reply},
                              {"role": "user", "content": f"Reference id rp{rep:02d}-tail-{tfirst}\n\n{question}\n\n{tail}"}]
-            r2, w2 = chat(args.url, args.model, msgs2, GEN_TOKENS)
+            r2, w2 = chat(args.url, args.model, msgs2, GEN_TOKENS, enable_thinking=thinking)
 
             row = {"label": args.label, "rep": rep, "utc": datetime.now(timezone.utc).isoformat(),
+                   "enable_thinking": args.enable_thinking,
                    "gpu_before": before,
                    "t1_wall_s": round(w1, 3), "t1": r1.get("timings"), "t1_usage": r1.get("usage"),
                    "t2_wall_s": round(w2, 3), "t2": r2.get("timings"), "t2_usage": r2.get("usage"),

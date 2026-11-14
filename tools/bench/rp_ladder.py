@@ -18,8 +18,8 @@ from pathlib import Path
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from tools.bench.gemma4_common import (add_pool_args, add_server_args, make_pool, server_argv,
-                                         gpu_lock, running_server, gpu_state, chat)
+from tools.bench.gemma4_common import (add_pool_args, add_server_args, add_thinking_arg, make_pool, server_argv,
+                                         gpu_lock, running_server, gpu_state, chat, thinking_value)
 from tools.bench.kv_eval.common import sha256_file
 
 PERSONA = ("You are Mara, a wry harbor-master in a rain-soaked port city. Stay in character, answer in vivid "
@@ -58,12 +58,12 @@ def build(pool, hist, offset, turns):
 
 def request(args, msgs, seed, temperature):
     payload, wall = chat(f"http://127.0.0.1:{args.port}/v1/chat/completions", args.model, msgs, 300,
-                         temperature=temperature, seed=seed, top_k=64)
+                         temperature=temperature, seed=seed, top_k=64, enable_thinking=thinking_value(args))
     t = payload["timings"]
     row = {"prompt_n": t["prompt_n"], "cache_n": t["cache_n"], "ttft_proxy_s": t["prompt_ms"] / 1000,
            "pp_tok_s": t["prompt_n"] / t["prompt_ms"] * 1000 if t["prompt_ms"] else None,
            "tg_tok_s": t["predicted_per_second"], "predicted_n": t["predicted_n"], "draft_n": t.get("draft_n"),
-           "draft_accepted": t.get("draft_n_accepted"), "wall_s": wall,
+           "draft_accepted": t.get("draft_n_accepted"), "wall_s": wall, "enable_thinking": args.enable_thinking,
            "reply_head": payload["choices"][0]["message"]["content"][:60]}
     return row, payload["choices"][0]["message"]["content"]
 
@@ -96,6 +96,7 @@ def main():
     add_pool_args(ap)
     add_server_args(ap)
     ap.add_argument("--out-dir", type=Path, required=True)
+    add_thinking_arg(ap, "default")
     ap.add_argument("--arms", default=",".join(ARMS))
     ap.add_argument("--contexts", default=",".join(map(str, CONTEXTS)))
     args = ap.parse_args()
@@ -117,6 +118,7 @@ def main():
                 ap.error(f"output exists: {out}; use a fresh output directory")
             argv = server_argv(args, ARMS[name])
             rec = {"arm": name, "argv": argv, "binary_sha256": sha256_file(args.exe), "contexts": {},
+                   "enable_thinking": args.enable_thinking,
                    "artifact": str(args.artifact), "artifact_bytes": args.artifact.stat().st_size,
                    "pool_sha256": pool.text_sha256, "idle_gpu": gpu_state(), "vram": {}}
             try:

@@ -212,6 +212,18 @@ The process-owning ladder/ABAB tools use target serve flags, including
 settings are explicit `--serve-arg=--flag` / `--serve-arg=value` tokens. To disable
 cache reuse, pass `--no-prefix-reuse` (then no Host-cache option is emitted).
 
+Every chat-issuing tool (`rp_ladder`, `bench_tail`, `fixed_tail`, `decode_abab`, `soak`,
+`retrieval-smoke`, `kv_eval/needle.py`, `kv_eval/speed_client.py`) takes
+`--enable-thinking {true,false,default}`. `true`/`false` send `enable_thinking` in every
+request body; `default` omits the field so the server decides, and infernix resolves an
+absent value to thinking ON on Gemma 4 (the old fork's server left it to the template,
+which is off). The chosen value is recorded in each tool's receipt or cells. Campaigns
+that compare engines, or that measure roleplay behaviour, MUST pass the same explicit
+value on every arm; otherwise the arms may measure different generation lengths and
+prompts. `retrieval-smoke` and `needle` default to `false`: their 32-token answer budget
+cannot hold a reasoning block, so with thinking left on the reply comes back empty and
+every case scores as failed. All other tools default to `default` (field omitted).
+
 ## Verification handoff
 
 These commands are for the integration owner; porting the scripts alone does not

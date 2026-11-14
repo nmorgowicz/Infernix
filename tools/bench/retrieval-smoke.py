@@ -16,7 +16,7 @@ import urllib.error
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from tools.bench.gemma4_common import add_pool_args, chat, make_pool
+from tools.bench.gemma4_common import add_pool_args, add_thinking_arg, chat, make_pool, thinking_value
 from tools.bench.kv_eval.needle import build_cases, score, MASTER_SEED, OVERHEAD_TOKENS
 
 
@@ -29,6 +29,8 @@ def main():
     parser.add_argument("--model", default="gemma-bench")
     parser.add_argument("--timeout", type=float, default=1800)
     parser.add_argument("--dry-run", action="store_true")
+    add_thinking_arg(parser, "false", "Defaults to false: the 32-token answer budget cannot hold a reasoning block, "
+                     "so with thinking on the reply comes back empty. ")
     args = parser.parse_args()
     pool = make_pool(args, args.out.resolve().parent)
     cases = build_cases(pool, (32000, 100000), (0.05, 0.50, 0.95), 1, MASTER_SEED, OVERHEAD_TOKENS)
@@ -42,10 +44,11 @@ def main():
         for case in cases:
             row = {key: value for key, value in case.items() if key != "prompt"}
             row["label"] = args.label
+            row["enable_thinking"] = args.enable_thinking
             started = time.monotonic()
             try:
                 payload, wall = chat(args.url, args.model, [{"role": "user", "content": case["prompt"]}],
-                                     32, timeout=args.timeout)
+                                     32, timeout=args.timeout, enable_thinking=thinking_value(args))
                 reply = payload["choices"][0]["message"]["content"]
                 row.update({"reply": reply, "correct": score(reply, case["code"]), "error": None,
                             "timings": payload.get("timings"), "usage": payload.get("usage"), "wall_s": wall})

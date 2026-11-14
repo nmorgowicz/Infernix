@@ -15,7 +15,7 @@ from pathlib import Path
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from tools.bench.gemma4_common import add_pool_args, make_pool, chat, gpu_state
+from tools.bench.gemma4_common import add_pool_args, add_thinking_arg, make_pool, chat, gpu_state, thinking_value
 
 
 def main():
@@ -27,7 +27,9 @@ def main():
     ap.add_argument('--out', type=Path, required=True)
     ap.add_argument('--history', type=int, default=100000)
     ap.add_argument('--reps', type=int, default=3)
+    add_thinking_arg(ap, 'default')
     args = ap.parse_args()
+    thinking = thinking_value(args)
     pool = make_pool(args, args.out.resolve().parent)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open('x', encoding='utf-8') as fh:
@@ -39,9 +41,10 @@ def main():
             m2 = m1 + [{'role': 'assistant', 'content': reply},
                        {'role': 'user', 'content': f'{tail}\nContinue the summary using this additional material.'}]
             before = gpu_state()
-            r1, w1 = chat(args.url, args.model, m1, 256)
-            r2, w2 = chat(args.url, args.model, m2, 64)
+            r1, w1 = chat(args.url, args.model, m1, 256, enable_thinking=thinking)
+            r2, w2 = chat(args.url, args.model, m2, 64, enable_thinking=thinking)
             row = {'label': args.label, 'rep': rep, 'scenario': 'scripted-reply-divergence',
+                   'enable_thinking': args.enable_thinking,
                    'messages1_sha256': hashlib.sha256(json.dumps(m1, ensure_ascii=False).encode()).hexdigest(),
                    'messages2_sha256': hashlib.sha256(json.dumps(m2, ensure_ascii=False).encode()).hexdigest(),
                    'gpu_before': before, 'gpu_after': gpu_state(),
