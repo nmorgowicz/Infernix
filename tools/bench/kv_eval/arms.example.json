@@ -1,0 +1,9 @@
+{
+  "arms": [
+    {"name": "bf16", "role": "reference", "flags": ["--kv-dtype", "bf16"]},
+    {"name": "bf16-repeat", "role": "noise", "flags": ["--kv-dtype", "bf16"]},
+    {"name": "fp8", "role": "quant", "flags": ["--kv-dtype", "fp8", "--gemma4-qk", "bf16"]},
+    {"name": "fp8-qk", "role": "quant", "flags": ["--kv-dtype", "fp8", "--gemma4-qk", "fp8"]},
+    {"name": "int8", "role": "quant", "flags": ["--kv-dtype", "int8"]}
+  ]
+}

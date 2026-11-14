@@ -1,0 +1,5 @@
+# KV-format evaluation kit (tools/bench/kv_eval). The analysis, needle and speed tools need only numpy and tokenizers;
+# derive_prefix_ids.py additionally needs transformers (Jinja2 chat-template rendering). Loads local files only.
+numpy>=1.26
+tokenizers>=0.19
+transformers>=4.40

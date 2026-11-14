@@ -2,6 +2,7 @@
 #include "corpus.h"
 #include "distribution.h"
 #include "evaluation.h"
+#include "kl.h"
 
 #include "product/logits_options.h"
 #include "product/rope_yarn_options.h"
@@ -17,6 +18,8 @@
 #include <algorithm>
 #include <charconv>
 #include <chrono>
+#include <cmath>
+#include <cstring>
 #include <cctype>
 #include <cstdint>
 #include <ctime>
@@ -26,6 +29,9 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <memory>
+#include <numeric>
+#include <span>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -53,6 +59,13 @@ struct Options {
     std::optional<std::filesystem::path> save_top_tokens;
     std::optional<std::filesystem::path> save_tokens;
     std::optional<std::filesystem::path> kl_reference;
+    std::optional<std::filesystem::path> full_vocab_reference_write;
+    std::optional<std::filesystem::path> full_vocab_reference;
+    std::optional<std::string> full_vocab_reference_kv;
+    std::optional<infernix::ops::Gemma4QkMode> full_vocab_reference_qk;
+    std::vector<infernix::TokenId> full_vocab_prefix;
+    std::uint64_t full_vocab_seed = 20261105;
+    std::uint32_t full_vocab_resamples = 1000;
     std::filesystem::path expert_stripe; // Qwen3.8-Flash-Next's record tails on a second drive
     float rope_yarn_factor              = 1.0F;
     std::uint32_t context               = 4096;
@@ -114,6 +127,13 @@ std::string usage_text() {
            "        evaluator that writes a --kl-reference of the same windows)\n"
            "       [--kl-reference <file>] (KL divergence from a --save-top-tokens run of the\n"
            "        same corpus, context and stride, by context length)\n"
+           "       [--full-vocab-reference-write <cache.nklref> | --full-vocab-reference <cache.nklref>]\n"
+           "       [--full-vocab-seed N] [--full-vocab-resamples N] (exact full-vocabulary KL;\n"
+           "        requires --logits-dtype bf16; default seed 20261105, resamples 1000)\n"
+           "       [--full-vocab-reference-kv-dtype bf16|bf16p|int8|fp8|nvfp4|k8v4|vq2|k4v2]\n"
+           "       [--full-vocab-reference-gemma4-qk bf16|fp8] (expected reference configuration;\n"
+           "        defaults to this run; token/window protocol must still match exactly)\n"
+           "       [--full-vocab-prefix-ids id,id,...] (prepend these tokens to every native KL window)\n"
            "       [--expert-stripe <file>] (Qwen3.8-Flash-Next's expert record tails on a second\n"
            "        drive, read beside the artifact by the SSD expert tier)\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n";
@@ -230,6 +250,38 @@ Options parse_options(int argc, char** argv) {
             out.save_tokens = std::filesystem::path(value("--save-tokens"));
         } else if (option == "--kl-reference") {
             out.kl_reference = std::filesystem::path(value("--kl-reference"));
+        } else if (option == "--full-vocab-reference-write") {
+            out.full_vocab_reference_write = std::filesystem::path(value("--full-vocab-reference-write"));
+        } else if (option == "--full-vocab-reference") {
+            out.full_vocab_reference = std::filesystem::path(value("--full-vocab-reference"));
+        } else if (option == "--full-vocab-seed") {
+            out.full_vocab_seed = parse_integer<std::uint64_t>(value("--full-vocab-seed"), "full-vocab seed");
+        } else if (option == "--full-vocab-resamples") {
+            out.full_vocab_resamples = parse_integer<std::uint32_t>(value("--full-vocab-resamples"), "full-vocab resamples");
+        } else if (option == "--full-vocab-reference-kv-dtype") {
+            const std::string_view dtype = value("--full-vocab-reference-kv-dtype");
+            if (dtype == "int8") { out.full_vocab_reference_kv = "int8-g64"; }
+            else if (dtype == "fp8") { out.full_vocab_reference_kv = "fp8-e4m3-r256"; }
+            else if (dtype == "bf16" || dtype == "bf16p" || dtype == "nvfp4" ||
+                     dtype == "k8v4" || dtype == "vq2" || dtype == "k4v2") {
+                out.full_vocab_reference_kv = std::string(dtype);
+            } else { usage_error("invalid --full-vocab-reference-kv-dtype"); }
+        } else if (option == "--full-vocab-reference-gemma4-qk") {
+            out.full_vocab_reference_qk = infernix::parse_gemma4_qk(value("--full-vocab-reference-gemma4-qk"));
+        } else if (option == "--full-vocab-prefix-ids") {
+            std::string_view list = value("--full-vocab-prefix-ids");
+            out.full_vocab_prefix.clear();
+            while (!list.empty()) {
+                const auto comma = list.find(',');
+                const auto id = parse_integer<infernix::TokenId>(list.substr(0, comma), "full-vocab prefix id");
+                if (id < 0) { usage_error("--full-vocab-prefix-ids requires nonnegative token IDs"); }
+                out.full_vocab_prefix.push_back(id);
+                if (comma != std::string_view::npos && comma + 1 == list.size()) {
+                    usage_error("--full-vocab-prefix-ids cannot end with a comma");
+                }
+                list = comma == std::string_view::npos ? std::string_view{} : list.substr(comma + 1);
+            }
+            if (out.full_vocab_prefix.empty()) { usage_error("--full-vocab-prefix-ids requires token IDs"); }
         } else if (option == "--expert-stripe") {
             out.expert_stripe = std::filesystem::path(value("--expert-stripe"));
         } else if (option == "--log-level") {
@@ -242,6 +294,27 @@ Options parse_options(int argc, char** argv) {
         usage_error("exactly one of --corpus and --text is required");
     }
     if (out.quick && !out.corpus) { usage_error("--quick requires --corpus"); }
+    if (out.full_vocab_reference_write && out.full_vocab_reference) {
+        usage_error("--full-vocab-reference-write and --full-vocab-reference are mutually exclusive");
+    }
+    if (out.full_vocab_reference_write || out.full_vocab_reference) {
+        if (out.kl_reference || out.save_top_tokens) {
+            usage_error("full-vocabulary modes cannot be combined with --kl-reference or --save-top-tokens");
+        }
+        if (out.logits_dtype != infernix::LogitsDtype::BF16) {
+            usage_error("full-vocabulary modes require --logits-dtype bf16");
+        }
+    }
+    if ((out.full_vocab_reference_kv || out.full_vocab_reference_qk) && !out.full_vocab_reference) {
+        usage_error("reference configuration overrides require --full-vocab-reference");
+    }
+    if (out.full_vocab_resamples == 0) { usage_error("--full-vocab-resamples must be positive"); }
+    if (!out.full_vocab_prefix.empty() && !out.full_vocab_reference_write && !out.full_vocab_reference) {
+        usage_error("--full-vocab-prefix-ids requires a full-vocabulary mode");
+    }
+    if (out.full_vocab_prefix.size() > std::numeric_limits<std::uint32_t>::max() - out.context) {
+        usage_error("context plus full-vocabulary prefix is too large");
+    }
     if (out.context < 2 || out.stride == 0 || out.stride >= out.context) {
         usage_error("context/stride must satisfy context>=2 and 1<=stride<context");
     }
@@ -329,6 +402,284 @@ struct EvaluationStream {
     std::vector<WindowPlan> windows;
 };
 
+namespace kl = infernix::perplexity::kl;
+
+// Ported from ninfer.spo: exact paired full-vocabulary KL. Receives widened BF16 logits, turns
+// them into F32 log-probabilities and either appends them to the reference cache or compares them
+// with the cached reference rows. The cache stores no logits and is bound to the run protocol.
+class KlRun {
+public:
+    KlRun(const Options& options, const infernix::LoadSummary& load, const CorpusSelection& corpus,
+          const std::vector<EvaluationStream>& streams, const infernix::EngineOptions& engine,
+          std::uint64_t total_positions)
+        : options_(options), writing_(options.full_vocab_reference_write.has_value()),
+          total_(total_positions) {
+        kl::Fnv64 hash;
+        json stream_ids = json::array();
+        for (const auto& stream : streams) {
+            stream_ids.push_back({{"id", stream.source.id},
+                                  {"domain", stream.source.domain},
+                                  {"tokens", stream.tokens.size()}});
+            hash.add(stream.tokens.data(), stream.tokens.size() * sizeof(infernix::TokenId));
+            for (const WindowPlan& window : stream.windows) {
+                hash.add_value(window.input_begin);
+                hash.add_value(window.input_end);
+                hash.add_value(window.target_begin);
+                hash.add_value(window.target_end);
+            }
+        }
+        if (!options.full_vocab_prefix.empty()) {
+            hash.add(options.full_vocab_prefix.data(),
+                     options.full_vocab_prefix.size() * sizeof(infernix::TokenId));
+        }
+        std::ostringstream hex;
+        hex << std::hex << std::setw(16) << std::setfill('0') << hash.value();
+        protocol_ = {{"schema", "ninfer-kl-protocol/1"},
+                     {"corpus_id", corpus.corpus_id},
+                     {"corpus_mode", corpus.mode},
+                     {"streams", std::move(stream_ids)},
+                     {"token_window_hash_fnv64", hex.str()},
+                     {"context_tokens", options.context},
+                     {"stride_tokens", options.stride},
+                     {"prefill_chunk_tokens", engine.prefill_chunk},
+                     {"prefix_ids", options.full_vocab_prefix},
+                     {"kv_dtype", kv_name(options.kv)},
+                     {"gemma4_qk", infernix::gemma4_qk_name(engine.gemma4_qk)},
+                     {"positions", total_positions}};
+        std::error_code size_error;
+        const auto bytes = std::filesystem::file_size(options.artifact, size_error);
+        reference_ = {{"artifact",
+                       std::filesystem::absolute(options.artifact).lexically_normal().string()},
+                      {"artifact_file_bytes", size_error ? json(nullptr) : json(bytes)},
+                      {"name", load.model_name},
+                      {"architecture", load.architecture},
+                      {"prefill_signature", load.prefill_signature},
+                      {"formats", load.weight_formats}};
+        stats_.kl.assign(total_, 0.0F);
+        stats_.ref_lp.assign(total_, 0.0F);
+        stats_.cand_lp.assign(total_, 0.0F);
+        stats_.top1_agree.assign(total_, 1);
+        if (!writing_) {
+            if (options.full_vocab_reference_kv) {
+                protocol_["kv_dtype"] = *options.full_vocab_reference_kv;
+            }
+            if (options.full_vocab_reference_qk) {
+                protocol_["gemma4_qk"] = infernix::gemma4_qk_name(*options.full_vocab_reference_qk);
+            }
+        }
+        candidate_configuration_ = {{"kv_dtype", kv_name(options.kv)},
+                                    {"gemma4_qk", infernix::gemma4_qk_name(engine.gemma4_qk)},
+                                    {"logits_dtype", "bf16"},
+                                    {"rope_yarn_factor", options.rope_yarn_factor},
+                                    {"lossless", options.lossless}, {"reference", options.reference},
+                                    {"expert_a4_activations", options.expert_a4_activations},
+                                    {"expert_a16_activations", options.expert_a16_activations},
+                                    {"fast_paths", load.fast_paths},
+                                    {"fast_path_configuration", load.fast_path_configuration}};
+    }
+
+    // The public API returns at most 256 full-logit rows. Replay an identical independent
+    // window for further selections; never shorten it or change its prefill schedule.
+    [[nodiscard]] infernix::ScoreResult score(infernix::Engine& engine,
+                                               const std::vector<infernix::TokenId>& input,
+                                               std::uint32_t first_target) {
+        infernix::ScoreResult result;
+        for (std::size_t begin = 0; begin < targets_.size();) {
+            const auto columns = static_cast<std::uint32_t>(std::min<std::size_t>(
+                targets_.size() - begin, infernix::kMaximumScoreLogitPositions));
+            infernix::ScoreOptions selection;
+            selection.logits_positions.resize(columns);
+            std::iota(selection.logits_positions.begin(), selection.logits_positions.end(),
+                      static_cast<std::uint32_t>(begin));
+            auto scored = engine.score_tokens(input, first_target, std::move(selection));
+            if (scored.logprobs.size() != targets_.size() || scored.logits.empty() ||
+                scored.logits.size() % columns != 0 ||
+                scored.logits.size() / columns > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+                throw std::runtime_error("full-vocabulary scoring returned an invalid logit shape");
+            }
+            if (begin != 0 &&
+                std::memcmp(scored.logprobs.data(), result.logprobs.data(),
+                            scored.logprobs.size() * sizeof(float)) != 0) {
+                throw std::runtime_error(
+                    "full-vocabulary window replay changed target log-probability bits; "
+                    "refusing to assemble distributions from different forward passes");
+            }
+            const auto vocab = static_cast<std::int32_t>(scored.logits.size() / columns);
+            tile(scored.logits, vocab, static_cast<std::int32_t>(columns));
+            // Check every selected row against its own scoring call, including replay batches.
+            for (std::size_t i = 0; i < columns; ++i) {
+                const double diff = std::abs(static_cast<double>(scored.logprobs[begin + i]) -
+                    static_cast<double>(stats_.cand_lp[window_begin_ + begin + i]));
+                if (!std::isfinite(diff)) { throw std::runtime_error("non-finite full-vocabulary target log-probability"); }
+                max_target_diff_ = std::max(max_target_diff_, diff);
+            }
+            if (begin == 0) { result.logprobs = std::move(scored.logprobs); }
+            begin += columns;
+        }
+        return result;
+    }
+
+    void begin_window(std::span<const infernix::TokenId> targets, const std::string& stream,
+                      const std::string& domain) {
+        targets_       = targets;
+        stream_        = stream;
+        domain_        = domain;
+        window_cursor_ = 0;
+        window_begin_  = position_;
+        window_logits_hash_ = kl::Fnv64{};
+    }
+
+    void end_window(std::span<const float> engine_logprobs) {
+        if (window_cursor_ != targets_.size() || engine_logprobs.size() != targets_.size()) {
+            throw std::runtime_error("KL observer saw " + std::to_string(window_cursor_) +
+                                     " columns for a window of " + std::to_string(targets_.size()) +
+                                     " targets");
+        }
+        for (std::size_t i = 0; i < targets_.size(); ++i) {
+            const double diff = std::abs(static_cast<double>(engine_logprobs[i]) -
+                                         static_cast<double>(stats_.cand_lp[window_begin_ + i]));
+            max_target_diff_  = std::max(max_target_diff_, diff);
+        }
+        // The host log-softmax of the BF16 logits must agree with the engine's own target
+        // log-probability; a larger gap means the observer columns are misaligned with targets.
+        if (max_target_diff_ > 0.05) {
+            throw std::runtime_error("KL observer target log-probability disagrees with the "
+                                     "engine by " + std::to_string(max_target_diff_));
+        }
+        windows_.push_back(
+            kl::WindowRecord{.stream = stream_, .domain = domain_, .begin = window_begin_,
+                             .count = targets_.size()});
+        std::ostringstream digest;
+        digest << std::hex << std::setw(16) << std::setfill('0') << window_logits_hash_.value();
+        logit_hashes_.push_back(digest.str());
+    }
+
+    [[nodiscard]] const json& logit_hashes() const noexcept { return logit_hashes_; }
+
+    [[nodiscard]] json finish(const std::filesystem::path& output_directory) {
+        if (position_ != total_) {
+            throw std::runtime_error("KL run scored " + std::to_string(position_) + " of " +
+                                     std::to_string(total_) + " positions");
+        }
+        json out{{"mode", writing_ ? "reference_write" : "compare"},
+                 {"protocol", protocol_},
+                 {"target_logprob_max_abs_diff", max_target_diff_},
+                 {"dtype", "f32"},
+                 {"candidate_configuration", candidate_configuration_}};
+        if (writing_) {
+            writer_->finish();
+            out["cache"]     = std::filesystem::absolute(*options_.full_vocab_reference_write).string();
+            out["positions"] = writer_->positions();
+            return out;
+        }
+        if (reader_->consumed() != reader_->positions()) {
+            throw std::runtime_error("KL reference cache holds " +
+                                     std::to_string(reader_->positions()) +
+                                     " positions but this run consumed " +
+                                     std::to_string(reader_->consumed()));
+        }
+        out["reference_cache"]    = std::filesystem::absolute(*options_.full_vocab_reference).string();
+        out["reference_artifact"] = reader_->reference();
+        out["candidate_artifact"] = reference_;
+        out["statistics"]         = kl::summarize(stats_, windows_, options_.full_vocab_resamples,
+                                                  options_.full_vocab_seed);
+        const std::filesystem::path sidecar = output_directory / "kl_positions.f32";
+        std::ofstream file(sidecar, std::ios::binary | std::ios::trunc);
+        for (std::size_t i = 0; i < total_; ++i) {
+            const float record[4] = {stats_.kl[i], stats_.ref_lp[i], stats_.cand_lp[i],
+                                     static_cast<float>(stats_.top1_agree[i])};
+            file.write(reinterpret_cast<const char*>(record), sizeof(record));
+        }
+        if (!file) { throw std::runtime_error("cannot write " + sidecar.string()); }
+        out["per_position_file"] = {{"path", sidecar.string()},
+                                    {"record", "f32 x4: kl, ref_target_lp, cand_target_lp, top1_agree"}};
+        return out;
+    }
+
+private:
+    void open(std::int32_t vocab) {
+        vocab_             = vocab;
+        protocol_["vocab"] = vocab;
+        if (writing_) {
+            writer_ = std::make_unique<kl::CacheWriter>(*options_.full_vocab_reference_write, vocab,
+                                                        protocol_, reference_);
+        } else {
+            reader_ = std::make_unique<kl::CacheReader>(*options_.full_vocab_reference, vocab, protocol_);
+        }
+    }
+
+    void tile(std::span<const float> logits, std::int32_t vocab, std::int32_t columns) {
+        if (vocab_ == 0) { open(vocab); }
+        if (vocab != vocab_ || logits.size() != static_cast<std::size_t>(vocab) * columns) {
+            throw std::runtime_error("KL observer tile has an inconsistent shape");
+        }
+        if (window_cursor_ + static_cast<std::size_t>(columns) > targets_.size() ||
+            position_ + static_cast<std::uint64_t>(columns) > total_) {
+            throw std::runtime_error("KL observer received more columns than scored positions");
+        }
+        kl::hash_bf16_logits(window_logits_hash_, logits);
+        const std::size_t cells = static_cast<std::size_t>(vocab) * columns;
+        cand_.resize(cells);
+        kl::parallel_columns(columns, [&](std::int32_t begin, std::int32_t end) {
+            for (std::int32_t c = begin; c < end; ++c) {
+                kl::log_softmax_f32(logits.data() + static_cast<std::size_t>(c) * vocab, vocab,
+                                     cand_.data() + static_cast<std::size_t>(c) * vocab);
+            }
+        });
+        if (writing_) {
+            writer_->append(cand_, columns);
+        } else {
+            ref_.resize(cells);
+            reader_->read(columns, ref_);
+        }
+        for (std::int32_t c = 0; c < columns; ++c) {
+            const auto target = targets_[window_cursor_ + static_cast<std::size_t>(c)];
+            if (target < 0 || target >= vocab) {
+                throw std::runtime_error("KL observer target id is outside the vocab");
+            }
+        }
+        kl::parallel_columns(columns, [&](std::int32_t begin, std::int32_t end) {
+            for (std::int32_t c = begin; c < end; ++c) {
+                const float* q = cand_.data() + static_cast<std::size_t>(c) * vocab;
+                const auto t   = targets_[window_cursor_ + static_cast<std::size_t>(c)];
+                const std::size_t at = position_ + static_cast<std::size_t>(c);
+                stats_.cand_lp[at]   = q[t];
+                if (!writing_) {
+                    const float* r      = ref_.data() + static_cast<std::size_t>(c) * vocab;
+                    stats_.ref_lp[at]   = r[t];
+                    stats_.kl[at]       = static_cast<float>(kl::kl_divergence(r, q, vocab));
+                    stats_.top1_agree[at] = kl::argmax(r, vocab) == kl::argmax(q, vocab) ? 1 : 0;
+                }
+            }
+        });
+        position_ += static_cast<std::uint64_t>(columns);
+        window_cursor_ += static_cast<std::size_t>(columns);
+    }
+
+    const Options& options_;
+    bool writing_;
+    std::uint64_t total_;
+    json protocol_;
+    json reference_;
+    json candidate_configuration_;
+    kl::Fnv64 window_logits_hash_;
+    json logit_hashes_ = json::array();
+    std::unique_ptr<kl::CacheWriter> writer_;
+    std::unique_ptr<kl::CacheReader> reader_;
+    std::int32_t vocab_ = 0;
+    std::vector<float> cand_;
+    std::vector<float> ref_;
+    kl::PositionStats stats_;
+    std::vector<kl::WindowRecord> windows_;
+    std::span<const infernix::TokenId> targets_;
+    std::string stream_;
+    std::string domain_;
+    std::size_t window_cursor_ = 0;
+    std::uint64_t window_begin_ = 0;
+    std::uint64_t position_     = 0;
+    double max_target_diff_     = 0.0;
+};
+
 int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         infernix::product::StartupLogRenderer& startup_log,
         const std::shared_ptr<infernix::product::TerminalProgress>& progress) {
@@ -337,7 +688,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.artifact_path    = options.artifact;
     engine_options.purpose          = infernix::EnginePurpose::CausalScoring;
     engine_options.device           = options.device;
-    engine_options.max_context      = options.context;
+    engine_options.max_context      = options.context + static_cast<std::uint32_t>(options.full_vocab_prefix.size());
     engine_options.rope_yarn_factor  = options.rope_yarn_factor;
     if (options.prefill_chunk) { engine_options.prefill_chunk = *options.prefill_chunk; }
     engine_options.kv_cache         = options.kv;
@@ -394,6 +745,11 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
                  infernix::product::format_pretty_duration(preflight_seconds));
 
     const std::filesystem::path output_directory = prepare_output_directory(options, load, corpus);
+    std::unique_ptr<KlRun> kl_run;
+    if (options.full_vocab_reference_write || options.full_vocab_reference) {
+        kl_run = std::make_unique<KlRun>(options, load, corpus, streams, engine.options(),
+                                        total_scored_tokens);
+    }
     const infernix::perplexity::ReferenceHeader reference_header{.corpus_id = corpus.corpus_id,
                                                                 .mode      = corpus.mode,
                                                                 .context   = options.context,
@@ -447,16 +803,19 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         json window_reports = json::array();
         for (std::size_t window_index = 0; window_index < stream.windows.size(); ++window_index) {
             const WindowPlan& window = stream.windows[window_index];
-            std::vector<infernix::TokenId> input(
-                stream.tokens.begin() + static_cast<std::ptrdiff_t>(window.input_begin),
-                stream.tokens.begin() + static_cast<std::ptrdiff_t>(window.input_end));
+            std::vector<infernix::TokenId> input = options.full_vocab_prefix;
+            input.insert(input.end(),
+                         stream.tokens.begin() + static_cast<std::ptrdiff_t>(window.input_begin),
+                         stream.tokens.begin() + static_cast<std::ptrdiff_t>(window.input_end));
+            const auto first_target = window.first_target +
+                                      static_cast<std::uint32_t>(options.full_vocab_prefix.size());
             const Clock::time_point window_started = Clock::now();
             const std::uint64_t input_hash = infernix::perplexity::token_fingerprint(input);
             if (options.save_tokens) {
                 saved_windows.push_back({{"stream_index", stream_index},
                                          {"target_begin", window.target_begin},
                                          {"target_end", window.target_end},
-                                         {"first_target", window.first_target},
+                                         {"first_target", first_target},
                                          {"input_hash", input_hash},
                                          {"tokens", input}});
             }
@@ -477,8 +836,17 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
             }
             infernix::ScoreResult scored;
             try {
-                scored = engine.score_tokens(std::move(input), window.first_target,
-                                             std::move(score_options));
+                if (kl_run) {
+                    const std::size_t count = window.target_end - window.target_begin;
+                    kl_run->begin_window(std::span<const infernix::TokenId>(stream.tokens)
+                                             .subspan(window.target_begin, count),
+                                         stream.source.id, stream.source.domain);
+                    scored = kl_run->score(engine, input, first_target);
+                    kl_run->end_window(scored.logprobs);
+                } else {
+                    scored = engine.score_tokens(std::move(input), first_target,
+                                                 std::move(score_options));
+                }
             } catch (const std::exception& error) {
                 throw std::runtime_error("scoring " + stream.source.id + " window " +
                                          std::to_string(window_index) + " failed: " + error.what());
@@ -530,7 +898,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
             window_report["input_end"]    = window.input_end;
             window_report["target_begin"] = window.target_begin;
             window_report["target_end"]   = window.target_end;
-            window_report["first_target"] = window.first_target;
+            window_report["first_target"] = first_target;
             window_report["seconds"]      = seconds_since(window_started);
             // Windows are independent samples, which a comparison pairs between runs.
             if (reference) { window_report["kl_divergence"] = window_divergence.summary_json(); }
@@ -671,6 +1039,11 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
             "KL(reference || this run) over the reference's top tokens plus one bucket for all "
             "others (a lower bound); context is the number of tokens before the predicted one";
         report["kl_divergence"] = std::move(divergence);
+    }
+
+    if (kl_run) {
+        report["kl"] = kl_run->finish(output_directory);
+        report["logit_window_hashes_fnv64"] = kl_run->logit_hashes();
     }
 
     const std::filesystem::path temporary = output_directory / "report.json.tmp";

@@ -56,6 +56,7 @@ add_executable(infernix-perplexity
   perplexity/main.cpp
   perplexity/corpus.cpp
   perplexity/evaluation.cpp
+  perplexity/kl.cpp
   perplexity/distribution.cpp)
 infernix_internal_includes(infernix-perplexity)
 target_include_directories(infernix-perplexity PRIVATE
