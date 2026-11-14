@@ -68,6 +68,9 @@ struct BindingReservation {
     bool source_valid = true;
     bool capacity_possible = true;
     runtime::ContextResourceUsage shortage;
+    // Whether evicting cached Device pages could cover the shortage: no cached block holds Device
+    // memory here (hybrid_reclaim), so the Engine's reclaim finds nothing either way.
+    bool reclaim_cache = true;
     std::exception_ptr refusal;
     explicit operator bool() const noexcept { return reserved; }
 };
@@ -224,7 +227,8 @@ public:
     // The prefix cache's pinned Host tier the Program was constructed with (0: none constructed).
     [[nodiscard]] std::uint64_t host_bytes() const noexcept;
     [[nodiscard]] RequestBasePlan plan_request(PreparedPrompt&&, const runtime::ResolvedExecutionOptions&);
-    [[nodiscard]] std::vector<SourceCandidate> hybrid_sources(const RequestBasePlan&, std::uint32_t);
+    // A paused request's (`resume`) quote never passes its paused frontier.
+    [[nodiscard]] std::vector<SourceCandidate> hybrid_sources(const RequestBasePlan&, const ResumeState*);
     [[nodiscard]] BindingReservation start_binding(const RequestBasePlan&, runtime::LaneId,
         const SourceCandidate&, ResumeState* = nullptr, ExecutionUnitKind = ExecutionUnitKind::Decode, std::uint32_t = 1);
     [[nodiscard]] ContextProgress poll_context(runtime::CancellationFlagView);
@@ -262,8 +266,9 @@ public:
     [[nodiscard]] bool hybrid_reclaim(runtime::ContextResourceUsage) noexcept { return false; }
     [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan&) const noexcept { return 0; }
     [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept { return 0; }
-    // Holds the snapshots the queued requests would resume from (hybrid-prefix-cache-spec §9.6).
-    void hybrid_hold_queue(std::span<const RequestBasePlan* const>) noexcept;
+    // Holds the snapshots the queued requests would resume from (hybrid-prefix-cache-spec §9.6);
+    // `resumes` names each paused request's state (null for a fresh one).
+    void hybrid_hold_queue(std::span<const RequestBasePlan* const>, std::span<const ResumeState* const>) noexcept;
     // Tool-call holds are refused at startup (model_instance.cpp); this is never reached.
     void hybrid_hold_continuation(std::chrono::steady_clock::time_point);
     [[nodiscard]] bool hybrid_holds_stale() const noexcept { return false; }

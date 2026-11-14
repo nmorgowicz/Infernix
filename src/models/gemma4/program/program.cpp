@@ -351,9 +351,9 @@ struct ProgramImpl {
         try {
             if (options.use_cuda_graph) {
                 StartupPhaseScope graph_phase(options.startup_observer, StartupPhase::CudaGraphPrepare);
-                const auto free_before = device.free_bytes();
+                const auto free_before = device_free_bytes();
                 prepare_graphs();
-                const auto free_after = device.free_bytes();
+                const auto free_after = device_free_bytes();
                 graph_measured_bytes = free_before > free_after ? free_before - free_after : 0;
                 if (graph_measured_bytes > plan.graph_allowance) {
                     throw std::runtime_error("Gemma4 CUDA graph preparation exceeded its planned device allowance; reduce prefill_chunk or disable CUDA graphs");
@@ -364,6 +364,11 @@ struct ProgramImpl {
         catch (...) { (void)settle_after_memory_exhausted(); throw; }
     }
     const TextConfig& config() const noexcept { return parameters.model.config().text; }
+    static std::size_t device_free_bytes() {
+        std::size_t free = 0, total = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free, &total));
+        return free;
+    }
     std::uint32_t capacity() const noexcept { return std::min(options.max_context, plan.kv_pages * kPage); }
     SequenceHandle handle() const noexcept {
         SequenceHandle h; h.owner_ = this; h.epoch_ = epoch; return h;
@@ -1049,7 +1054,8 @@ RequestBasePlan Program::plan_request(PreparedPrompt&& prompt, const runtime::Re
     summary.publish_continuation = plan->reuse;
     return RequestBasePlan(std::move(plan));
 }
-std::vector<SourceCandidate> Program::hybrid_sources(const RequestBasePlan& base, std::uint32_t maximum_frontier) {
+std::vector<SourceCandidate> Program::hybrid_sources(const RequestBasePlan& base, const ResumeState* resume) {
+    const std::uint32_t maximum_frontier = resume ? resume->frontier() : UINT32_MAX;
     if (!base.impl_ || base.impl_->owner != impl_.get()) { throw std::logic_error("Gemma4 foreign request plan"); }
     auto& p = *impl_;
     const auto& plan = *base.impl_;
@@ -1172,7 +1178,7 @@ ContextProgress Program::poll_context(runtime::CancellationFlagView cancellation
                 p.fed = p.physical_written = frontier;
                 progress.operations.state_restores = 1;
                 progress.operations.partial_tail_cow_pages = restore.tail ? 1U : 0U;
-                index.note_hit(snapshot);
+                index.note_hit(snapshot, !p.binding_resume); // a paused request's resume adds no frequency
                 index.unpin_snapshot(snapshot); // the restore batch holds its own pin while it lands
                 p.pl.pinned_snapshot.reset();
                 p.pl.resume = snapshot;
@@ -1438,16 +1444,20 @@ void Program::shutdown_cleanup() noexcept {
     if (status != cudaSuccess) { report_cuda_cleanup_failure("Gemma4 shutdown synchronize", status); }
     impl_->clear();
 }
-void Program::hybrid_hold_queue(std::span<const RequestBasePlan* const> queue) noexcept {
+void Program::hybrid_hold_queue(std::span<const RequestBasePlan* const> queue,
+                                std::span<const ResumeState* const> resumes) noexcept {
     auto& p = *impl_;
-    if (!p.prefix_cache) { return; }
+    if (!p.prefix_cache || resumes.size() != queue.size()) { return; }
     try {
         std::vector<pc::SnapshotRef> holds;
-        for (const RequestBasePlan* base : queue) {
+        for (std::size_t entry = 0; entry < queue.size(); ++entry) {
             if (holds.size() == pc::kMaxQueueHolds) { break; }
+            const RequestBasePlan* base = queue[entry];
             if (base == nullptr || !base->impl_ || !base->impl_->reuse) { continue; }
             const auto& plan = *base->impl_;
-            const auto candidates = p.prefix_candidates(plan.tokens, plan.block_hashes, UINT32_MAX, false);
+            // A paused request holds the deepest source up to its paused frontier.
+            const std::uint32_t bound = resumes[entry] ? resumes[entry]->frontier() : UINT32_MAX;
+            const auto candidates = p.prefix_candidates(plan.tokens, plan.block_hashes, bound, bound != UINT32_MAX);
             if (!candidates.list.empty()) { holds.push_back(*candidates.list.front().snapshot); }
         }
         p.prefix_cache->index().set_queue_holds(holds);

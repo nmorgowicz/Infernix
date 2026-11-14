@@ -126,7 +126,7 @@ inline Started start(g4::Program& program, const g4::Frontend& frontend, const T
                      bool reuse, rt::CancellationFlagView cancel = {}) {
     auto plan = program.plan_request(frontend.prepare_tokens(prompt), greedy_execution(outputs, reuse));
     const std::uint64_t before = program.hybrid_stats().reused_tokens;
-    for (const g4::SourceCandidate& source : program.hybrid_sources(plan, UINT32_MAX)) {
+    for (const g4::SourceCandidate& source : program.hybrid_sources(plan, nullptr)) {
         const auto reservation = program.start_binding(plan, rt::LaneId{0}, source);
         if (!reservation) {
             require(!reservation.source_valid, "the lane refused a binding (busy or out of capacity)");
@@ -230,7 +230,7 @@ inline std::string describe_stats(const g4::HybridPrefixCacheStats& s) {
 inline std::string describe_sources(g4::Program& program, const g4::Frontend& frontend, const Tokens& prompt) {
     auto plan = program.plan_request(frontend.prepare_tokens(prompt), greedy_execution(1, true));
     std::string out = "sources";
-    for (const g4::SourceCandidate& source : program.hybrid_sources(plan, UINT32_MAX)) {
+    for (const g4::SourceCandidate& source : program.hybrid_sources(plan, nullptr)) {
         out += " [" + std::to_string(source.reused_tokens) + "/path " + std::to_string(static_cast<int>(source.reuse_path)) +
                "/blocks " + std::to_string(source.cached_block_tokens) + "]";
     }

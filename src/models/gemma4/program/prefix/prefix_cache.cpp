@@ -119,7 +119,8 @@ PrefixCache::PrefixCache(const PrefixCacheConfig& config, const PrefixCacheGeome
     index.block_bytes           = host_.block_bytes;
     index.image_bytes           = host_.image_bytes;
     index.host_blocks           = true;
-    store_ = pc::HostSlabStore(host_.slab_bytes, host_.slabs, pc::HostSlabStore::kChunkBytes,
+    // The tier is fixed-size: every slab is page-locked at startup, none left to grow into.
+    store_ = pc::HostSlabStore(host_.slab_bytes, host_.slabs, host_.slabs, pc::HostSlabStore::kChunkBytes,
                                "Gemma4 prefix cache Host tier");
     snapshot_meta_.assign(index.max_snapshots, StateImageHeader{});
     rings_.emplace(image_, std::move(sliding), ring_pages);
