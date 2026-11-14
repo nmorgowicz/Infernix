@@ -30,10 +30,13 @@ from .methods import (
     METHODS,
     cast_direct,
     grouped_absmax,
+    grouped_absmax_emulated,
     grouped_mse,
+    grouped_mse_search,
     fp8_row_maxabs,
     import_encoded,
     import_ggml_rows,
+    q4_g32_qat,
     nvfp4_absmax,
     nvfp4_mse,
 )
@@ -411,10 +414,13 @@ class Recipe:
         standard = (
             cast_direct,
             grouped_absmax,
+            grouped_absmax_emulated,
             grouped_mse,
+            grouped_mse_search,
             fp8_row_maxabs,
             import_encoded,
             import_ggml_rows,
+            q4_g32_qat,
             nvfp4_absmax,
             nvfp4_mse,
         )

@@ -15,6 +15,7 @@ from .pipeline import DEFAULT_MAX_BUFFERED_BYTES, convert
 from .proposal import DEFAULT_RANKING, add_official_proposal
 from . import qwen4_exp
 from .screen import add_screen_heads
+from .gemma4 import build_model as build_gemma4
 from .qwen3_5 import build_model
 from .recipe import Recipe
 from .sources.safetensors import SafetensorsSource
@@ -278,7 +279,17 @@ def main(argv=None):
         else:
             if args.ngram_out is not None:
                 raise ValueError("--ngram-out applies only to Qwen4Exp sources")
-            if gguf_store is not None:
+            gemma4 = (base.config.get("architectures") or [""])[0] == "Gemma4ForConditionalGeneration"
+            if gemma4:
+                if gguf_store is not None:
+                    raise ValueError("a Gemma 4 conversion reads a Hugging Face checkpoint, not --gguf")
+                model = build_gemma4(
+                    base,
+                    components=components,
+                    companions={key: sources[key] for key in ("mtp",) if key in components},
+                    resource_overrides=overrides,
+                )
+            elif gguf_store is not None:
                 from . import qwen3_5_gguf
 
                 model = qwen3_5_gguf.build_model(

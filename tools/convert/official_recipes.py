@@ -9,6 +9,7 @@ from .methods import (
     grouped_mse,
     import_encoded,
     nvfp4_mse,
+    q4_g32_qat,
 )
 
 Q2 = "q2_g64_fp16"
@@ -17,6 +18,7 @@ Q5 = "q5_g64_fp16"
 Q6 = "q6_g64_fp16"
 Q8 = "q8_g32_fp16"
 FP8 = "fp8_e4m3fn_row_bf16"
+Q4_G32 = "q4_g32_fp16"
 
 
 def _assign(recipe, name, format, *, source=None, method=grouped_absmax):
@@ -744,6 +746,98 @@ def qwen3_8_flash_next_dflash2(model, recipe, sources):
     _optional(model, recipe)
 
 
+def _require_gemma4(model, recipe_name):
+    if model.config.get("model_type") != "gemma4_text":
+        raise ValueError(f"{recipe_name} requires Gemma 4 text mathematics")
+
+
+def gemma4_31b_bf16(model, recipe, sources):
+    _require_gemma4(model, "gemma4_31b_bf16")
+    for name, parameter in model.parameters.items():
+        recipe.assign(name, format=parameter.direct_format, method=cast_direct)
+
+
+def gemma4_31b_fp8(model, recipe, sources):
+    """One FP8-row vocabulary table for the embedding and the head, an FP8 MTP head, and FP8-row text
+    projections; everything else stays direct.
+
+    The embedding binds the head's unscaled object (`text/token_embedding` and `text/output_head` are
+    shared), and the runtime gather multiplies its rows by the BF16 sqrt(hidden) normalizer. The MTP
+    assistant's layer projections stay BF16.
+    """
+    _require_gemma4(model, "gemma4_31b_fp8")
+    for name, parameter in model.parameters.items():
+        if name in ("text/token_embedding", "text/output_head", "mtp/output_head") or (
+            name.startswith("text/layers/") and parameter.projection
+        ):
+            recipe.assign(name, format=FP8, method=fp8_row_maxabs)
+        else:
+            recipe.assign(name, format=parameter.direct_format, method=cast_direct)
+    recipe.share("text/token_embedding", "text/output_head")
+
+
+def gemma4_31b_q4_qat(model, recipe, sources):
+    """QAT text projections, embedding, and head on their stored 4-bit grid.
+
+    Text and vision values come from `--source qat`. The MTP assistant stays on its own
+    component source: the QAT checkpoint does not contain it, and its head stays FP8.
+    The embedding table is stored after the BF16 sqrt(hidden) normalizer; its groups are
+    still one scale times codes in [-8, 7] up to that BF16 rounding, so `q4_g32_qat`
+    recovers them.
+    """
+    _require_gemma4(model, "gemma4_31b_q4_qat")
+    qat = sources["qat"]
+    for name, parameter in model.parameters.items():
+        source = (
+            model.source(name, qat)
+            if name.startswith("text/") or name.startswith("vision/")
+            else None
+        )
+        if name == "mtp/output_head":
+            recipe.assign(name, format=FP8, method=fp8_row_maxabs, source=source)
+        elif name in ("text/token_embedding", "text/output_head"):
+            recipe.assign(name, format=Q4_G32, method=q4_g32_qat, source=source)
+        elif name.startswith("text/layers/") and parameter.projection:
+            recipe.assign(name, format=Q4_G32, method=q4_g32_qat, source=source)
+        else:
+            recipe.assign(
+                name, format=parameter.direct_format, method=cast_direct, source=source
+            )
+
+
+Q4_A8_FORMATS = (Q4_G32, "q4_g128_fp16", "q4_g256_fp16")
+
+
+def gemma4_q4_a8(model, recipe, sources):
+    """Override: allow A8 on every q4_g32/g128/g256 text-layer projection.
+
+    The embedding and the output head stay A16Only.
+    """
+    _require_gemma4(model, "gemma4_q4_a8")
+    for name, parameter in model.parameters.items():
+        if not name.startswith("text/layers/") or not parameter.projection:
+            continue
+        if not all(s.format in Q4_A8_FORMATS for s in recipe.selections[name]):
+            continue
+        for input_name in parameter.inputs:
+            recipe.use(name, input_name, activation_policy="AllowA8")
+
+
+def gemma4_fp8_a8(model, recipe, sources):
+    """Override: allow A8 (per-token FP8 activations) on every FP8 text-layer projection.
+
+    The embedding and the output head keep A16Only.
+    """
+    _require_gemma4(model, "gemma4_fp8_a8")
+    for name, parameter in model.parameters.items():
+        if not name.startswith("text/layers/") or not parameter.projection:
+            continue
+        if not all(s.format == FP8 for s in recipe.selections[name]):
+            continue
+        for input_name in parameter.inputs:
+            recipe.use(name, input_name, activation_policy="AllowA8")
+
+
 RECIPES = {
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
@@ -762,4 +856,9 @@ RECIPES = {
     "qwen3_8_flash_next_fp4_local": qwen3_8_flash_next_fp4_local,
     "qwen3_8_flash_next_gsq_rco_iq3s": qwen3_8_flash_next_gsq_rco_iq3s,
     "qwen3_8_flash_next_dflash2": qwen3_8_flash_next_dflash2,
+    "gemma4_31b_bf16": gemma4_31b_bf16,
+    "gemma4_31b_fp8": gemma4_31b_fp8,
+    "gemma4_31b_q4_qat": gemma4_31b_q4_qat,
+    "gemma4_q4_a8": gemma4_q4_a8,
+    "gemma4_fp8_a8": gemma4_fp8_a8,
 }

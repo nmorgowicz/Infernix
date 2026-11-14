@@ -11,7 +11,7 @@ from tools.artifact.codecs.row_split import decode_row_split_codes
 from tools.artifact.codecs.nvfp4 import encode_nvfp4
 from tools.artifact.schema import binding_parts
 from tools.artifact.writer import ArtifactWriter
-from tools.convert.methods import grouped_absmax, import_encoded
+from tools.convert.methods import grouped_absmax, import_encoded, q4_g32_qat
 from tools.convert.model import Model, Parameter
 from tools.artifact.tensor_output import TensorOutput
 from tools.convert.recipe import Recipe
@@ -116,6 +116,15 @@ def test_mixed_attention_uses_two_parents_and_distinct_permissions(tmp_path):
             "gate": "AllowA8",
             "value": "AllowA8",
         }
+
+
+def test_qat_grid_recovery_packs_like_fresh_quantization():
+    model = _model()
+    recipe = Recipe(model)
+    recipe.assign("*", format="q4_g32_fp16", method=q4_g32_qat)
+    prepared = recipe.prepare(device="cpu")
+    assert len(prepared.weights) == 1
+    assert prepared.weights[0].spec.shape == (16, 128)
 
 
 def test_row_overrides_preserve_binding_order_and_coverage(tmp_path):

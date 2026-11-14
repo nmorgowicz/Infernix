@@ -25,7 +25,17 @@ from tools.artifact.schema import TensorSpec
 from tools.artifact.tensor_output import TensorOutput
 
 from .quantization.fp8_row import quantize_bf16_rows
-from .quantization.groupwise import quantize_matrix, quantize_matrix_mse, quantize_matrix_mse_norm
+from .quantization.groupwise import (
+    VIRTUAL_GROUP_SIZES,
+    quantize_matrix,
+    quantize_matrix_mse,
+    quantize_matrix_mse_norm,
+    quantize_q4_g32_qat,
+    quantize_q4_scale_search,
+    quantize_q4_virtual_groups,
+    to_native_groups,
+)
+from .quantization.importance import importance_for
 from .quantization.nvfp4 import E2M1_MAX, quantize_nvfp4, quantize_nvfp4_mse, weight_divisor
 from .sources.logical import EncodedRows, LogicalSource
 
@@ -166,10 +176,14 @@ Method = Callable[[PrepareRequest], PreparedMethod]
 _DIRECT_DTYPES = {"bf16": torch.bfloat16, "fp32": torch.float32, "int32": torch.int32}
 
 
-def _preflight(request: PrepareRequest, *, values: bool = True) -> None:
-    if request.parameters:
+def _preflight(
+    request: PrepareRequest, *, values: bool = True, allowed: tuple[str, ...] = ()
+) -> None:
+    if set(request.parameters) - set(allowed):
         raise ValueError(
             f"{request.target.id}: this method accepts no numerical parameters"
+            if not allowed
+            else f"{request.target.id}: this method accepts only parameters {allowed}"
         )
     if prod(request.target.shape) != sum(
         prod(item.source.shape) for item in request.inputs
@@ -320,6 +334,125 @@ def grouped_mse_norm(request: PrepareRequest) -> PreparedMethod:
     return request.job(produce=produce)
 
 
+def q4_g32_qat(request: PrepareRequest) -> PreparedMethod:
+    """Recover the QAT 4-bit group-32 grid instead of quantizing the matrix again."""
+    if request.target.format != "q4_g32_fp16" or len(request.target.shape) != 2:
+        raise ValueError("q4_g32_qat requires the q4_g32_fp16 matrix format")
+    _preflight(request)
+    n, k = request.target.shape
+
+    def produce(output):
+        for begin in range(0, n, request.rows_per_chunk):
+            end = min(n, begin + request.rows_per_chunk)
+            values = request.values(begin * k, end * k).reshape(end - begin, k)
+            if not values.dtype.is_floating_point:
+                raise TypeError("q4_g32_qat source must provide floating-point values")
+            encoded = quantize_q4_g32_qat(values, device=request.device)
+            output.write_codes(begin, encoded.codes, encoded.scales)
+
+    return request.job(produce=produce)
+
+
+def _q4_native_target(request: PrepareRequest, method: str, group_size: int) -> bool:
+    """True for a native q4_g{G}_fp16 target, False for emulation in q4_g32_fp16; otherwise refuse."""
+    native_name = f"q4_g{group_size}_fp16"
+    if request.target.format == "q4_g32_fp16":
+        return False
+    if request.target.format == native_name and group_size > 32:
+        return True
+    raise ValueError(
+        f"{method} with group_size {group_size} requires target format q4_g32_fp16 (emulated) "
+        f"or {native_name} (native), not {request.target.format}"
+    )
+
+
+def grouped_absmax_emulated(request: PrepareRequest) -> PreparedMethod:
+    """Absmax over logical groups of 32/64/128/256.
+
+    Parameter ``group_size`` (required) is the logical group. With target q4_g32_fp16 the
+    coarse scale is repeated per 32-wide subgroup, so the stored bytes decode exactly to the
+    coarse-group values (quality only: the artifact does not shrink). With the matching native
+    target q4_g128_fp16 / q4_g256_fp16 one scale is stored per group.
+    """
+    if len(request.target.shape) != 2:
+        raise ValueError("grouped_absmax_emulated requires a rank-2 q4 matrix")
+    group_size = request.parameters.get("group_size")
+    if type(group_size) is not int or group_size not in VIRTUAL_GROUP_SIZES:
+        raise ValueError(
+            f"grouped_absmax_emulated requires parameters.group_size in {VIRTUAL_GROUP_SIZES}"
+        )
+    native = _q4_native_target(request, "grouped_absmax_emulated", group_size)
+    _preflight(request, allowed=("group_size",))
+    n, k = request.target.shape
+
+    def produce(output):
+        for begin in range(0, n, request.rows_per_chunk):
+            end = min(n, begin + request.rows_per_chunk)
+            values = request.values(begin * k, end * k).reshape(end - begin, k)
+            if not values.dtype.is_floating_point:
+                raise TypeError(
+                    "grouped_absmax_emulated source must provide floating-point values"
+                )
+            encoded = quantize_q4_virtual_groups(
+                values, group_size, device=request.device
+            )
+            if native:
+                encoded = to_native_groups(encoded, group_size)
+            output.write_codes(begin, encoded.codes, encoded.scales)
+
+    return request.job(produce=produce)
+
+
+def grouped_mse_search(request: PrepareRequest) -> PreparedMethod:
+    """Squared-error scale search over logical groups, stored as ordinary q4_g32 words.
+
+    ``group_size`` (required) is the logical group; ``weighted`` (default false) weights each
+    column's error by the imatrix importance registered for the parent's logical inputs. The
+    unweighted arm sets every weight to 1 and changes nothing else. With a native target
+    (q4_g128_fp16 / q4_g256_fp16) one scale is stored per group; otherwise the coarse scale is
+    repeated over its 32-wide subgroups (quality only).
+    """
+    if len(request.target.shape) != 2:
+        raise ValueError("grouped_mse_search requires a rank-2 q4 matrix")
+    if "scale_bits" in request.parameters:
+        raise ValueError(
+            "grouped_mse_search: two-level scales (scale_bits) are not supported in this converter yet"
+        )
+    group_size = request.parameters.get("group_size")
+    weighted = request.parameters.get("weighted", False)
+    if type(group_size) is not int or group_size not in VIRTUAL_GROUP_SIZES:
+        raise ValueError(
+            f"grouped_mse_search requires parameters.group_size in {VIRTUAL_GROUP_SIZES}"
+        )
+    native = _q4_native_target(request, "grouped_mse_search", group_size)
+    if type(weighted) is not bool:
+        raise ValueError("grouped_mse_search parameters.weighted must be a boolean")
+    _preflight(request, allowed=("group_size", "weighted"))
+    n, k = request.target.shape
+    importance = (
+        importance_for(tuple(item.parameter for item in request.inputs), k)
+        if weighted
+        else None
+    )
+
+    def produce(output):
+        for begin in range(0, n, request.rows_per_chunk):
+            end = min(n, begin + request.rows_per_chunk)
+            values = request.values(begin * k, end * k).reshape(end - begin, k)
+            if not values.dtype.is_floating_point:
+                raise TypeError(
+                    "grouped_mse_search source must provide floating-point values"
+                )
+            encoded = quantize_q4_scale_search(
+                values, group_size, importance, device=request.device
+            )
+            if native:
+                encoded = to_native_groups(encoded, group_size)
+            output.write_codes(begin, encoded.codes, encoded.scales)
+
+    return request.job(produce=produce)
+
+
 def fp8_row_maxabs(request: PrepareRequest) -> PreparedMethod:
     """Round inputs to BF16, then quantize to FP8 codes with BF16 row scales."""
     if request.target.format != "fp8_e4m3fn_row_bf16" or len(request.target.shape) != 2:
@@ -343,6 +476,7 @@ def fp8_row_maxabs(request: PrepareRequest) -> PreparedMethod:
 
 _IMPORT_FORMATS = (
     "nvfp4", "nvfp4_mul", "fp8_e4m3fn_row_bf16", "fp8_e4m3fn_row_f32", "fp8_e4m3fn_g32_e8m0", "q8_g32_fp16",
+    "q4_g32_fp16", "q4_g128_fp16", "q4_g256_fp16",
 )
 
 
@@ -557,6 +691,9 @@ def nvfp4_mse(request: PrepareRequest) -> PreparedMethod:
 METHODS: dict[str, Method] = {
     "cast_direct": cast_direct,
     "grouped_absmax": grouped_absmax,
+    "grouped_absmax_emulated": grouped_absmax_emulated,
+    "grouped_mse_search": grouped_mse_search,
+    "q4_g32_qat": q4_g32_qat,
     "grouped_mse": grouped_mse,
     "grouped_mse_norm": grouped_mse_norm,
     "fp8_row_maxabs": fp8_row_maxabs,
