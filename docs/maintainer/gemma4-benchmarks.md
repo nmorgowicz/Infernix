@@ -36,6 +36,31 @@ to be at most 0.125. The candidate distribution's gap is retained as diagnostic
 evidence, not used as a second reference. This check does not replace the
 separate paired KL/NLL or sampled-distribution gates.
 
+The real MTP test also prints, per prompt, the logit drift between the MTP and plain paths over the
+positions before their first token difference. Measured 2026-11-14 (FP8 KV and QK, 128 outputs, ten
+prompt/draft cells each): the plain winner's logit moves by a mean of 0.03-0.04 (BF16 logits step 0.125 at
+16-32) in both q4_g256 and q4_g32, and by up to 1.0 at worst; any-token maxima reach 1.4-1.9 on g256 and up
+to 6.2 on g32 (low-probability tokens). A greedy divergence therefore needs a near tie, and g256 simply
+met none on those prompts while g32 met a few. It is rounding-scale and is not an arithmetic defect of one
+quantization. Forcing the q4 GEMV for T=2..8 did not remove the g32 divergences; BF16 KV/QK did not either.
+
+### Decode speed, best-medium (q4_g32 GPTQ, MTP d1)
+
+Port only, FP8 KV and FP8 QK, 3 timed reps per length after a discarded warmup, one server per run (median
+decode tokens/s; draft acceptance in brackets). `INFERNIX_TMP_Q4_EXACT=1` changes only prefill passes of 128
+tokens and up, not decode.
+
+| Context | Default route | `INFERNIX_TMP_Q4_EXACT=1` |
+|---:|---:|---:|
+| 1k | 113.78 (0.82) | 116.12 (0.83) |
+| 8k | 110.71 (0.80) | 111.35 (0.80) |
+| 32k | 101.34 (0.85) | 101.16 (0.83) |
+| 100k | 83.01 (0.85) | 84.04 (0.85) |
+
+Cold prefill at 32k is 4,178-4,303 tok/s on the default route against 3,450-3,455 with the exact flag
+(about -18%), and at 100k 2,393-2,436 against 2,123-2,162 (about -11%). For reference, best-small (g256)
+decodes 121.35 / 120.76 / 108.75 / 86.75 tok/s at the same four lengths.
+
 ## Native full-vocabulary KL
 
 `infernix-perplexity --full-vocab-reference-write CACHE` creates the fork-compatible

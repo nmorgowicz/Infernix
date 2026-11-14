@@ -155,6 +155,25 @@ void greedy_equality(const Setup& setup) {
             const auto& reference = plain[index];
             const auto same = common_prefix(trace.tokens, reference.tokens);
             const auto name = "d" + std::to_string(drafts) + " prompt " + std::to_string(index);
+            {
+                // Diagnostic: how far the MTP path's logits sit from the plain path's at positions both
+                // produced from the same context (everything before the first token difference).
+                const std::size_t shared = std::min(same + 1, std::min(trace.tokens.size(), reference.tokens.size()));
+                float worst = 0.0F, winner_worst = 0.0F; std::size_t worst_at = 0; double winner_sum = 0.0;
+                for (std::size_t p = 0; p < shared; ++p) {
+                    const auto pr = std::span<const std::uint16_t>(reference.logits).subspan(p * vocab, vocab);
+                    const auto mr = std::span<const std::uint16_t>(trace.logits).subspan(p * vocab, vocab);
+                    float row_max = 0.0F;
+                    for (std::size_t v = 0; v < vocab; ++v) {
+                        row_max = std::max(row_max, std::fabs(bf16_value(pr[v]) - bf16_value(mr[v])));
+                    }
+                    const float wd = std::fabs(bf16_value(pr[reference.tokens[p]]) - bf16_value(mr[reference.tokens[p]]));
+                    winner_sum += wd; winner_worst = std::max(winner_worst, wd);
+                    if (row_max > worst) { worst = row_max; worst_at = p; }
+                }
+                std::printf("%s drift over %zu shared positions: winner-logit mean %.4f max %.4f; any-token max %.4f at output %zu\n",
+                            name.c_str(), shared, winner_sum / static_cast<double>(shared), winner_worst, worst, worst_at);
+            }
             if (trace.tokens == reference.tokens) {
                 expect(true, name + " matches plain greedy");
             } else if (same < trace.tokens.size() && same < reference.tokens.size()) {
