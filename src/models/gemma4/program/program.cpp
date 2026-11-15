@@ -41,6 +41,7 @@ namespace {
 constexpr std::uint32_t kPage = ops::kGemma4KvPageTokens;
 constexpr int kScoreTile = 128;
 constexpr std::array<std::uint32_t, 6> kGraphWidths{32, 64, 128, 256, 512, 1024};
+constexpr std::uint64_t kGraphGuardMargin = 256ULL << 20;
 constexpr std::uint64_t kGraphAllowance = 64ULL << 20;
 // MTP rounds: at most kMaxDraftTokens drafts (the CLI's range). One I32 slot block carries a round's
 // device inputs and outputs, so a captured round replays after one upload: the draft position, the
@@ -421,7 +422,10 @@ struct ProgramImpl {
                 prepare_graphs();
                 const auto free_after = device_free_bytes();
                 graph_measured_bytes = free_before > free_after ? free_before - free_after : 0;
-                if (graph_measured_bytes > plan.graph_allowance) {
+                // The delta is the whole device's free memory: another process allocating during capture (the desktop, a
+                // browser) inflates it, so a run with 0-19 MiB of graphs can read as 64+. The KV pool was sized with slack
+                // beside the allowance and the serve log warns when the allowance is exceeded, so only a gross excess is an error.
+                if (graph_measured_bytes > plan.graph_allowance + kGraphGuardMargin) {
                     throw std::runtime_error("Gemma4 CUDA graph preparation exceeded its planned device allowance; reduce prefill_chunk or disable CUDA graphs");
                 }
                 graph_phase.complete();

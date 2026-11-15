@@ -1187,6 +1187,7 @@ def serve_check(launcher: Path, out: Path | None = None, *, host: str | None = N
         "started": _utcstamp(started),
         "finished": _utcstamp(time.time()),
         "engine": engine,
+        "server_startup_errors": [line for line in stdout.splitlines() if " ERROR " in line or " FATAL " in line][-6:],
         "checks": checks,
     }
     out = out or launcher.resolve().parent / f"serve-check-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime(started))}.json"
