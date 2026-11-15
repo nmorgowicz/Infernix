@@ -663,6 +663,12 @@ void tap_hint_checks(const g4::Frontend& frontend) {
         std::sort(positions.begin(), positions.end());
         return positions;
     };
+    const auto has_opener = [](const g4::PreparedPrompt& prompt) {
+        for (const auto& hint : prompt.tap_hints()) {
+            if (hint.kind == Kind::GenerationOpener) { return true; }
+        }
+        return false;
+    };
     {   // turns: 0 system, 1 user, 2 model, 3 system (note), 4 user, 5 system, 6 system, 7 open model turn
         infernix::PromptInput input;
         input.messages.push_back(message(infernix::ChatRole::System, "Be brief."));
@@ -675,10 +681,25 @@ void tap_hint_checks(const g4::Frontend& frontend) {
         const auto prompt = frontend.prepare(std::move(input), {});
         const auto starts = starts_of(prompt.tokens());
         check(starts.size() == 8, "the rendered prompt has eight turns");
-        check(starts.size() == 8 && automatic(prompt) == std::vector<std::uint32_t>({starts[3], starts[5]}),
-              "automatic hints name the note and the first system turn after the last message");
+        check(starts.size() == 8 && automatic(prompt) == std::vector<std::uint32_t>({starts[3]}),
+              "the one automatic hint names the note, the earliest re-rendered system turn");
+        check(!has_opener(prompt), "no opener hint when system turns are re-rendered around the history");
     }
-    {   // Without system turns around the history the last message is the boundary, as before.
+    {   // turns: 0 system, 1 user, 2 model, 3 user, 4 system, 5 system, 6 open model turn
+        infernix::PromptInput input;
+        input.messages.push_back(message(infernix::ChatRole::System, "Be brief."));
+        input.messages.push_back(message(infernix::ChatRole::User, "u1"));
+        input.messages.push_back(message(infernix::ChatRole::Assistant, "a1"));
+        input.messages.push_back(message(infernix::ChatRole::User, "u2"));
+        input.messages.push_back(message(infernix::ChatRole::System, "post one"));
+        input.messages.push_back(message(infernix::ChatRole::System, "post two"));
+        const auto prompt = frontend.prepare(std::move(input), {});
+        const auto starts = starts_of(prompt.tokens());
+        check(starts.size() == 7 && automatic(prompt) == std::vector<std::uint32_t>({starts[4]}),
+              "trailing system turns: the automatic hint names the first of them");
+        check(!has_opener(prompt), "no opener hint with trailing system turns");
+    }
+    {   // Without system turns around the history the last message is the boundary and the opener is hinted.
         infernix::PromptInput input;
         input.messages.push_back(message(infernix::ChatRole::System, "Be brief."));
         input.messages.push_back(message(infernix::ChatRole::User, "u1"));
@@ -688,6 +709,7 @@ void tap_hint_checks(const g4::Frontend& frontend) {
         const auto starts = starts_of(prompt.tokens());
         check(starts.size() == 5 && automatic(prompt) == std::vector<std::uint32_t>({starts[3]}),
               "the last message is the automatic boundary of a plain conversation");
+        check(has_opener(prompt), "a plain conversation keeps its opener hint");
     }
 }
 

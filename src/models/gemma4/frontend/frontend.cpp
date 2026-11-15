@@ -359,9 +359,12 @@ struct Frontend::Impl {
     // declarations) is structural. The automatic last-message boundary is where the next turn of this
     // conversation diverges. Frontends that add system turns around the history (post-history
     // instructions after the last message, notes and lore entries a few messages back) re-render
-    // them for every request, so the next prompt shares this one only up to the first such turn that
-    // moved: the start of the run of system turns after the last conversational message, and of each
-    // system turn among the last kRecentTurns turns before it. Without them it is the last turn.
+    // them for every request, and each one shifts relative to the history: the next prompt shares
+    // this one only up to the earliest of them. Only that turn is hinted (a snapshot there serves the
+    // next turn; one at a later turn would lie past its divergence and cost a ring image of Host
+    // memory for nothing): the first system turn among the last kRecentTurns turns before the last
+    // conversational message, else the start of the run of system turns after it. Without such turns
+    // the boundary is the last turn, and the generation opener is the end the next turn resumes at.
     std::vector<runtime::prefix_cache::TapHint> tap_hints(std::span<const TokenId> tokens) const {
         using runtime::prefix_cache::TapHint;
         using runtime::prefix_cache::TapHintKind;
@@ -378,7 +381,6 @@ struct Frontend::Impl {
         const std::uint32_t last = starts.back();
         const bool open = std::find(tokens.begin() + last, tokens.end(), turn_close) == tokens.end();
         const bool opener = open && turn_role(tokens, last) == "model";
-        if (opener && last != 0) { hints.push_back({last, TapHintKind::GenerationOpener}); }
 
         const std::size_t turns = opener ? starts.size() - 1 : starts.size(); // complete turns
         std::vector<bool> system(turns);
@@ -388,15 +390,23 @@ struct Frontend::Impl {
         }
         std::size_t conversation = turns; // turns up to and including the last user, model or tool turn
         while (conversation > 0 && system[conversation - 1]) { --conversation; }
-        if (turns != 0) {
-            const std::size_t message = conversation != 0 && conversation < turns ? conversation : turns - 1;
-            if (starts[message] != 0) { hints.push_back({starts[message], TapHintKind::Automatic}); }
-        }
         const std::size_t first_conversation =
             static_cast<std::size_t>(std::find(system.begin(), system.end(), false) - system.begin());
+        // The earliest re-rendered system turn: inside the history, else the trailing run's first.
+        std::optional<std::size_t> moved;
         for (std::size_t i = std::max(first_conversation + 1, conversation > kRecentTurns ? conversation - kRecentTurns : 0);
              i < conversation; ++i) {
-            if (system[i] && starts[i] != 0) { hints.push_back({starts[i], TapHintKind::Automatic}); }
+            if (system[i]) {
+                moved = i;
+                break;
+            }
+        }
+        if (!moved && conversation != 0 && conversation < turns) { moved = conversation; }
+        if (opener && last != 0 && !moved) { hints.push_back({last, TapHintKind::GenerationOpener}); }
+        if (moved) {
+            if (starts[*moved] != 0) { hints.push_back({starts[*moved], TapHintKind::Automatic}); }
+        } else if (turns != 0 && starts[turns - 1] != 0) {
+            hints.push_back({starts[turns - 1], TapHintKind::Automatic});
         }
         if (starts.size() >= 2) {
             const std::string role = turn_role(tokens, starts.front());
