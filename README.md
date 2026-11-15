@@ -683,6 +683,11 @@ fixed Gemma chat template (`tools/chat_templates/gemma4_fixed.jinja`); `--chat-t
 --spec mtp --draft-tokens 1 --device-snapshot-slots 0 --host-context-mib 8192`. Bound beyond loopback with no API key,
 so on Windows the serving executable needs an inbound firewall rule for its path.
 
+**Continuing turns** resume where the new prompt leaves the previous request: on the state the lane still holds,
+copying nothing, else on a snapshot from the RAM cache. A 20-300-token tail at 124K context reaches its first token in
+about 0.1-0.3 s; measured against ninfer.spo, 0.57-0.73× its time at 32K-124K. `--no-fast-path free-cache-resume` resumes only at whole prefill chunks instead:
+bit-identical to a cold prefill, but each turn recomputes up to one chunk (2,048 tokens).
+
 **Thinking is on by default**, as for every infernix chat template that has a reasoning channel: replies carry
 `reasoning_content` beside `content`, and a request that sets a small `max_tokens` can spend all of it thinking. Send
 `enable_thinking: false` (or `reasoning_effort: none`) per request, or start the server with `--no-thinking`, for direct

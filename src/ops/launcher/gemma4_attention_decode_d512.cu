@@ -26,6 +26,8 @@ static_assert(kGemma4DecodeD512MaxGroup <= kTile);
 // Resident CTAs per SM the launch bounds ask for; the chunk count fills whole waves of it.
 constexpr int kBlocksPerSm = 2;
 constexpr int kMaxChunks   = 128;
+// Decode and MTP verification (1 + at most 7 drafts) keep the floor split their qualification measured.
+constexpr std::int64_t kFloorSplitMaxTokens = 8;
 // A chunk covers at least this many keys (a multiple of kTile): short contexts leave the
 // trailing chunks empty instead of splitting a few keys across many CTAs.
 constexpr int kMinChunkKeys = 128;
@@ -481,7 +483,11 @@ int gemma4_decode_d512_chunks(std::int32_t tokens, std::int32_t kv_heads) {
     const std::int64_t blocks = static_cast<std::int64_t>(tokens) * kv_heads;
     if (blocks <= 0) { return 1; }
     const std::int64_t wave = static_cast<std::int64_t>(device_sm_count()) * kBlocksPerSm;
-    return static_cast<int>(std::clamp<std::int64_t>(wave / blocks, 1, kMaxChunks));
+    // Wider calls (a prefill tail below the tensor-core width) round up: with the floor a grid just past
+    // half a wave gets one chunk and each CTA walks the whole context alone (124K keys: a 45-token tail
+    // took 0.32 s against 0.19 s for 42 tokens, which split in two).
+    const std::int64_t chunks = tokens <= kFloorSplitMaxTokens ? wave / blocks : (wave + blocks - 1) / blocks;
+    return static_cast<int>(std::clamp<std::int64_t>(chunks, 1, kMaxChunks));
 }
 
 void gemma4_attention_decode_d512_launch(const Tensor& q, const Gemma4CacheView& cache,
