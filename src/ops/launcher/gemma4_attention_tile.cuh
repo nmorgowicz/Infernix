@@ -8,9 +8,9 @@
 
 namespace infernix::ops::detail {
 
-// Gemma 4's online-softmax row, bit-identical to ninfer.spo b330aaf. The shared Bf16KvSoftmaxRow
-// rescales with causal_rescale (two rounded products, candidates UV-01), which differs from the
-// fork's alpha by an ulp wherever the maximum holds; the qualified Gemma logits use the fork's one
+// Gemma 4's online-softmax row, qualified bit for bit against the pinned Gemma logits. The shared Bf16KvSoftmaxRow
+// rescales with causal_rescale (two rounded products, candidates UV-01), which differs from
+// this row's alpha by an ulp wherever the maximum holds; the qualified Gemma logits use one
 // FMA of the previous maximum against the new scaled maximum. Keep this copy Gemma-local.
 struct Gemma4KvSoftmaxRow {
     float maximum;

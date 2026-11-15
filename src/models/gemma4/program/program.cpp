@@ -334,7 +334,7 @@ struct ProgramImpl {
     bool clear_prefix_after_release = false;
     std::uint32_t ring_pages_ = 0;
     // free-cache-resume: what the lane's Device state still holds after its last consistent sequence
-    // (ninfer.spo's live reuse). Global KV of positions [0, tokens.size()) is in the sequence's pages;
+    // (live reuse). Global KV of positions [0, tokens.size()) is in the sequence's pages;
     // the rings hold position p in [ring_low, ring_end) unless a later write reached p + ring capacity.
     // Every binding clears it before its first forward; a restore skips the parts it still holds.
     struct ResidentState {
@@ -815,8 +815,8 @@ struct ProgramImpl {
         out.image = resident_ring_holds(frontier);
         return out;
     }
-    // The frontier a request over `tokens` can continue the lane's state at without any copy (ninfer.spo's
-    // live reuse): the common prefix, leaving at least the last prompt token to compute, when the rings
+    // The frontier a request over `tokens` can continue the lane's state at without any copy (live reuse):
+    // the common prefix, leaving at least the last prompt token to compute, when the rings
     // still hold its window; 0 when none.
     [[nodiscard]] std::uint32_t live_frontier(std::span<const TokenId> tokens, std::uint32_t maximum) const {
         if (!prefix_cache || tokens.size() < 2) { return 0; }

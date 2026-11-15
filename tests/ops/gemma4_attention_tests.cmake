@@ -1,4 +1,4 @@
-# Gemma 4 attention oracles, adapted from ninfer.spo b330aaf. Include from tests/ops/tests.cmake
+# Gemma 4 attention oracles. Include from tests/ops/tests.cmake
 # before infernix_finish_op_families(). Each split arm is a fresh process: temporary switches
 # are immutable after their first snapshot. --split 0 selects one segment; --split 1 selects
 # the automatic rule. --segments 1..13 forces that many segments through the same switch.
@@ -25,6 +25,6 @@ set_tests_properties(${infernix_gemma4_attention_oracle_tests} PROPERTIES
 # Manual event benchmark (not a CTest): infernix_ops_gemma4_attention_test gemma4_fp8_kv
 # --benchmark --chunks 128,512,640,1024 --histories 8192,32768,131072
 # This is 36 cells: four chunks x three histories x bf16/fp8_phase1/fp8_phase2.
-# Resource usage and rotating-order samples/medians retain the fork's record names;
-# the 128-wide cells also retain its independent sampled long-context FP64 oracle.
+# Resource usage and rotating-order samples/medians use stable record names;
+# the 128-wide cells also run an independent sampled long-context FP64 oracle.
 # A segment sweep runs each family member in a fresh process with --segments N, N=1..13.

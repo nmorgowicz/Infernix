@@ -6,8 +6,8 @@
 //   INFERNIX_GEMMA4_FIXTURES  optional fixture directory; default tests/models/gemma4/fixtures.
 //
 // The fixture directory holds tok_fixtures.json (text, ids, decoded) and chat_fixtures20.json
-// (messages, tools, enable_thinking, continue_final, text, ids). As in the fork's fixture harness,
-// chats use their reference HF chat_template.jinja. The separate behavioral checks use the fixed override.
+// (messages, tools, enable_thinking, continue_final, text, ids). Chats use their reference HF chat_template.jinja.
+// The separate behavioral checks use the fixed override.
 // The remaining checks cover tool calls through the output session, required tool choice, EOS arrays,
 // history-argument refusal and the thinking precedence rules.
 

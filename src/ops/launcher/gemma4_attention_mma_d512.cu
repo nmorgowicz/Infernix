@@ -64,7 +64,7 @@ __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
     float* __restrict__ partial_stats) {
     constexpr unsigned FullMask = 0xffffffffu;
 
-    extern __shared__ __align__(1024) __nv_bfloat16 gemma4_d512_smem[]; // Preserve the qualified fork module's alignment.
+    extern __shared__ __align__(1024) __nv_bfloat16 gemma4_d512_smem[]; // Preserve the qualified module's alignment.
     static_assert(!Fp8Qk || Fmt == Gemma4KvFormat::Fp8E4m3Row256);
     __nv_bfloat16* q_s = gemma4_d512_smem;
     auto* q_fp8 = reinterpret_cast<std::uint8_t*>(q_s);

@@ -1,4 +1,4 @@
-// Adapted from ninfer.spo b330aaf (Gemma 4 FP8 KV/QK oracles and event benchmark).
+// Gemma 4 FP8 KV/QK oracles and event benchmark.
 #include "core/temporary_switches.h"
 #include "infernix/ops/gemma4_attention.h"
 #include "infernix/ops/gemma4_kv_append.h"

@@ -544,7 +544,7 @@ void chat_scenarios(const char* artifact, std::uint64_t slab_bytes) {
 }
 
 // free-cache-resume (the serving default): a turn continues the previous request's state where the two
-// diverge, off the chunk grid, as ninfer.spo does. Its output is not compared with a cold prefill: a different
+// diverge, off the chunk grid. Its output is not compared with a cold prefill: a different
 // call partition changes the arithmetic (plan §17.6); its quality gate is the noise envelope (§17.11).
 void free_resume_chat(const char* artifact) {
     std::printf("== chat through the Engine with free-cache-resume\n");
@@ -568,7 +568,7 @@ void free_resume_chat(const char* artifact) {
 
     // Straight after the previous request the lane still holds its state: a follow-up continues it at the
     // common prefix of that request's fed tokens (its prompt and all but its last output) and copies nothing
-    // (ninfer.spo's live reuse). After an unrelated request overwrote the lane, the follow-up restores a
+    // (live reuse). After an unrelated request overwrote the lane, the follow-up restores a
     // cached snapshot from the Host instead.
     const auto follow = [&](const std::string& what, const infernix::PromptInput& input, const Tokens& previous,
                             const Served& previous_reply, bool lane_resident) {

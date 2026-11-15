@@ -1246,10 +1246,10 @@ def test_serve_check_takes_the_server_from_serve_when_given(tmp_path):
     assert cli.main(["serve-check", "--launcher", str(cmd), "--serve", str(tmp_path / "nope.exe")]) == 1
 
 
-def test_serve_check_refuses_a_fork_launcher_and_a_missing_server(tmp_path, capsys, monkeypatch):
-    fork = write_fake_launcher(tmp_path, server=tmp_path / "ninfer-spo-serve.exe")
-    assert cli.main(["serve-check", "--launcher", str(fork)]) == 1
-    assert "ninfer.spo server" in capsys.readouterr().err
+def test_serve_check_refuses_another_engines_launcher_and_a_missing_server(tmp_path, capsys, monkeypatch):
+    other = write_fake_launcher(tmp_path, server=tmp_path / "ninfer-spo-serve.exe")
+    assert cli.main(["serve-check", "--launcher", str(other)]) == 1
+    assert "another engine's server" in capsys.readouterr().err
     monkeypatch.setattr(build.launcher_tools, "find_server_exe", lambda root, required=(): None)
     gone = write_fake_launcher(tmp_path, server=tmp_path / "missing" / "infernix-serve.exe")
     assert cli.main(["serve-check", "--launcher", str(gone)]) == 1

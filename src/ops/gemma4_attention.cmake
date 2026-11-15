@@ -1,5 +1,5 @@
-# Gemma-4 attention and paged append, ported from ninfer.spo b330aaf.
-# Keep the fork's RDC code generation without adding these kernels to infernix_ops'
+# Gemma-4 attention and paged append.
+# Keep RDC code generation without adding these kernels to infernix_ops'
 # large device link. The non-RDC D512 FP8 specializations spill on CUDA 13.5.
 add_library(infernix_gemma4_attention_ops STATIC)
 infernix_internal_includes(infernix_gemma4_attention_ops)

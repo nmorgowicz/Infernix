@@ -1,4 +1,4 @@
-// Adapted from ninfer.spo b330aaf (Gemma 4 attention oracles).
+// Gemma 4 attention oracles.
 #include "core/temporary_switches.h"
 #include "infernix/ops/gemma4_attention.h"
 #include "ops/op_family.h"

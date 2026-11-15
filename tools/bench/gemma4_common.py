@@ -1,6 +1,6 @@
 """Standalone corpus, HTTP and process helpers for the Gemma benchmark campaigns.
 
-Workloads ported from ninfer.spo / pp-bench-20261108; no external tooling checkout is used.
+Campaign workloads run from this checkout; no external tooling checkout is used.
 """
 from __future__ import annotations
 

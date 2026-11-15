@@ -220,7 +220,7 @@ struct ProgramOptions {
     std::uint64_t host_bytes = 0;
     // free-cache-resume (the serving default; operator decision 2026-11-15, plan §17.11): blocks and
     // snapshots publish up to the valid frontier, including a prompt's end and decode-computed
-    // endpoints, and a request resumes at any cached frontier, as ninfer.spo does. Without it (the
+    // endpoints, and a request resumes at any cached frontier. Without it (the
     // reproducible route) only state full prefill calls on the chunk grid computed is published and
     // restored, so a cached request's logits equal a cold prefill's bit for bit.
     bool free_cache_resume = false;

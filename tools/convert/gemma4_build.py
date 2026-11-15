@@ -98,7 +98,7 @@ PRESETS: dict[str, Preset] = {
         {"convert": 15, "receipt-check": 0.5, "finalize": 0.5},
     ),
 }
-# Presets that exist in the fork but are not built by infernix, with the reason a caller gets.
+# Presets that are not built by infernix, with the reason a caller gets.
 UNAVAILABLE_PRESETS = {
     "lite-medium": "it needs the q4_g32_s6_fp16 format (two-level 6-bit scales), which infernix has not ported yet; "
                    "use best-small or best-medium",
@@ -1066,14 +1066,14 @@ def _chat(url: str, headers: dict | None = None, **fields) -> tuple[int, bytes]:
 
 
 def resolve_serve_exe(plan: LauncherCommand, override: Path | None) -> Path:
-    """The `infernix-serve` to start: `--serve` if given, else the launcher's own, never a fork binary."""
+    """The `infernix-serve` to start: `--serve` if given, else the launcher's own, never another engine's binary."""
     if override is not None:
         if not override.is_file():
             raise ValueError(f"--serve binary not found: {override}")
         return override.resolve()
     if "ninfer-spo" in plan.server.name.lower():
         raise ValueError(
-            f"the launcher runs the ninfer.spo server {plan.server}; write it again with "
+            f"the launcher runs another engine's server {plan.server}; write it again with "
             "`python -m tools.convert.gemma4_build launcher` or pass --serve <infernix-serve>"
         )
     if plan.server.is_file():
