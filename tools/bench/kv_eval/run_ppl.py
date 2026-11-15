@@ -4,7 +4,6 @@
 Default: --save-top-tokens diagnostic consumed by analyze. Native full-vocabulary modes:
 --full-vocab-reference-write CACHE or --full-vocab-reference CACHE. These are not the
 existing target --kl-reference (top-token lower-bound) mode. Native prefix ids must match the cache.
-Ported from ninfer.spo tools/bench/kv_eval/run_ppl.py.
 """
 from __future__ import annotations
 

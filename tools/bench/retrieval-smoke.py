@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Six deterministic long-context retrieval cases; smoke, not a quality benchmark.
 
-Ported from pp-bench-20261108/retrieval-smoke.py; uses the in-tree needle instrument
+It uses the in-tree needle instrument
 for corpus selection, prompt construction and exact six-digit answer scoring.
 """
 from __future__ import annotations

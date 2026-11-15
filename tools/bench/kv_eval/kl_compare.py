@@ -1,4 +1,3 @@
-# Ported from ninfer.spo tools/bench/kv_eval; instrument definitions retained.
 """Paired comparison of two ``infernix-perplexity --full-vocab-reference`` reports.
 
 Both reports must have scored the same windows against the same reference cache (identical

@@ -1,4 +1,3 @@
-# Ported from ninfer.spo tools/bench/kv_eval; instrument definitions retained.
 #!/usr/bin/env python3
 """Record one GPU/process idle-state snapshot as a receipt: gpu_state.py <label> --log <file.jsonl>.
 

@@ -1,4 +1,3 @@
-# Ported from pp-bench-20261108/fixed_tail.py (ninfer.spo campaign).
 """Controlled scripted-divergence tail probe; does not use generated replies as benchmark input.
 
 Request 1 generates up to 256 tokens to exercise sliding-ring movement. Request 2 replaces that

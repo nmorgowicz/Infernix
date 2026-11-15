@@ -1,4 +1,3 @@
-# Ported from ninfer.spo tools/bench/kv_eval; instrument definitions retained.
 #!/usr/bin/env python3
 """Needle-in-haystack retrieval over HTTP for one running infernix-serve instance, plus the cross-arm summary.
 

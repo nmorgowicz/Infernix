@@ -1,4 +1,3 @@
-# Ported from ninfer.spo tools/bench/kv_eval; instrument definitions retained.
 """Shared helpers of the KV-format evaluation kit: stdio, hashing, arms files, tokenizer and corpus identity."""
 
 from __future__ import annotations

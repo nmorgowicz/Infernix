@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""ABAB serving decode campaign, ported from pp-bench-20261108/decode_abab.py.
+"""ABAB serving decode campaign.
 
-Two explicit arms replace the fork-only decode environment selector. --arms-json is an
+Two explicit arms replace any decode environment selector. --arms-json is an
 object with `a` and `b` objects: optional `exe`, `args` argv list, and `env` string map.
 Executable paths are relative to that JSON file, or absolute. Every run starts a fresh
 server, then measures unique corpus prompts with a discarded warmup at each length.

@@ -1,4 +1,3 @@
-# Ported from ninfer.spo tools/bench/kv_eval; instrument definitions retained.
 #!/usr/bin/env python3
 """Compare KV/quantization arms from infernix-perplexity reports and --save-top-tokens files.
 

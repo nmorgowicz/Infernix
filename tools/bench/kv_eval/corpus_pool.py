@@ -1,4 +1,3 @@
-# Ported from ninfer.spo tools/bench/kv_eval; instrument definitions retained.
 """Natural filler text drawn from a perplexity corpus, shared by the needle and speed harnesses.
 
 The pool is the streams of the chosen domains (default: the English ones) of the corpus manifest joined with a blank

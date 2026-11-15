@@ -1,4 +1,3 @@
-# Ported from pp-bench-20261108/bench_tail.py (ninfer.spo campaign).
 """SillyTavern-style cached-tail probe against one running OpenAI-compatible server.
 
 Replicates what a chat frontend does: request 1 ingests a large history (unique corpus window per rep,

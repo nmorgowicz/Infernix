@@ -1,4 +1,3 @@
-# Ported from ninfer.spo tools/bench/kv_eval; instrument definitions retained.
 """Analysis core of the KV-format evaluation kit (the instrument definition; see docs/maintainer/gemma4-benchmarks.md).
 
 Pure functions over `infernix-perplexity` report.json documents and `--save-top-tokens` files

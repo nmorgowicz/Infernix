@@ -1,4 +1,3 @@
-# Ported from pp-bench-20261108/rp_ladder.py (ninfer.spo campaign).
 """MTP draft-count x context ladder under the operator launcher settings (FP8 KV, FP8-QK, chunk auto).
 
 One server per arm (MTP off, draft 1/2/4), then for each context size a fresh corpus-derived chat history

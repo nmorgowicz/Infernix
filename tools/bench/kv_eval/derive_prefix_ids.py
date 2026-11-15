@@ -1,4 +1,3 @@
-# Ported from ninfer.spo tools/bench/kv_eval; instrument definitions retained.
 #!/usr/bin/env python3
 """Derive native full-vocabulary scoring prefix ids from an artifact's own template and tokenizer.
 

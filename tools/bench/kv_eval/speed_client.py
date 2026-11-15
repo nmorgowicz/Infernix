@@ -1,4 +1,3 @@
-# Ported from ninfer.spo tools/bench/kv_eval; instrument definitions retained.
 #!/usr/bin/env python3
 """Speed client for one running infernix-serve instance (HTTP /v1/chat/completions).
 

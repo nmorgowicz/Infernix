@@ -1,4 +1,3 @@
-# Ported from ninfer.spo tools/bench/kv_eval; instrument definitions retained.
 """Deterministic head-truncated subset of a perplexity corpus for exact full-vocabulary KL.
 
 The KL reference cache stores one F32 row of vocab floats per scored position (about 1 MiB at

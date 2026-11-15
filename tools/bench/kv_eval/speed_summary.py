@@ -1,4 +1,3 @@
-# Ported from ninfer.spo tools/bench/kv_eval; instrument definitions retained.
 #!/usr/bin/env python3
 """Aggregate <label>.cells.jsonl (+ <label>.serve.jsonl server_start events) into summary.{json,md}.
 
