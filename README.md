@@ -9,12 +9,12 @@
 > written with AI (mostly Claude Opus 5.5 and Qwen3.8-27B running on Infernix). It is likely to be
 > neither complete nor entirely accurate. This is hobby development.
 
-Infernix is a C++/CUDA inference engine that serves Qwen models on one NVIDIA RTX 5090. This branch also has [Gemma 4 31B cold-cache text execution](#gemma-4-31b-cold-cache-text) under qualification. It began as a fork of [NInfer](https://github.com/Neroued/ninfer) by
+Infernix is a C++/CUDA inference engine that serves Qwen models on one NVIDIA RTX 5090. This branch also serves [Gemma 4 31B (dense, text)](#gemma-4-31b-dense-text), with its own converter and launcher. It began as a fork of [NInfer](https://github.com/Neroued/ninfer) by
 [Neroued](https://github.com/Neroued) and reads NInfer's `.ninfer` artifacts as well as its own
 `.infernix` files.
 
 The headline results and general agent features below describe the Qwen routes;
-Gemma's current, narrower scope is listed in its model section.
+Gemma's scope and profile are listed in its model section.
 
 ## Headline results
 
@@ -655,39 +655,54 @@ Podman takes the same commands, with `--device nvidia.com/gpu=0` in place of `--
 
 Each repository's model card gives its files, requirements, recommended command, quality and speed.
 `python -m tools.convert` converts your own Qwen checkpoints of the architectures below
-([weight conversion](docs/weight-conversion.md)); Gemma conversion remains in the source fork.
+([weight conversion](docs/weight-conversion.md)); Gemma 4 31B has its own builder, below.
 
-### Gemma 4 31B: cold-cache text
+### Gemma 4 31B (dense, text)
 
-Qualification in progress on this branch; not the complete Gemma serving profile.
-Existing `ninfer.spo` text artifacts load unchanged: BF16, row-scaled FP8 and grouped
-Q4 g32/g128/g256 projections. Text generation and public causal scoring use native
-Gemma weights, tokenizer/template, sliding rings and global attention, not a Qwen model cast.
-K **and V** stay BF16. The head's BF16 rounding is preserved, so explicitly select
-`--logits-dtype bf16`; unrounded FP32 head sums are not implemented.
+Serves the operator roleplay profile: grouped-Q4 weights (`q4_g32`/`q4_g128`/`q4_g256`, FP16 scales; W4A8 prefill),
+FP8 global KV with BF16 sliding rings, optional FP8 attention QK, MTP with Google's separate assistant, a host-only
+prefix cache and 131,072 tokens of context on one 32 GB card. Existing `ninfer.spo` text artifacts load unchanged.
+Text generation and public causal scoring use native Gemma weights, tokenizer/template, sliding rings and global
+attention, not a Qwen model cast. K **and V** of the sliding layers stay BF16, and the head's BF16 rounding is
+preserved, so select `--logits-dtype bf16`; unrounded FP32 head sums are not implemented.
+
+**Build a file and a launcher** (conversion, GPTQ and the launcher all live in this checkout; GPTQ runs in its own
+pinned environment, see [`tools/gptq/README.md`](tools/gptq/README.md)):
+
+```bat
+python -m tools.convert.gemma4_build --preset best-small --model <BF16 Gemma-4-31B dir> --assistant <gemma-4-31B-it-assistant dir> --out-dir <dir>
+python -m tools.convert.gemma4_build serve-check --launcher <dir>\serve-<name>.cmd
+```
+
+`best-small` is GPTQ group 256 (about 16.9 GB), `best-medium` GPTQ group 32 (about 18.4 GB, better quality);
+re-running a preset on the same BF16 tree reproduces the previous file object for object. The converter embeds the
+fixed Gemma chat template (`tools/chat_templates/gemma4_fixed.jinja`); `--chat-template FILE` replaces it at serve time.
+
+**Serve it.** The generated launcher runs the profile below (`0.0.0.0:8001`, alias `131k`, any model name accepted):
+`--max-context 131072 --kv-dtype fp8 --gemma4-qk fp8 --prefill-chunk auto --logits-dtype bf16 --max-concurrency 1
+--spec mtp --draft-tokens 1 --device-snapshot-slots 0 --host-context-mib 8192`. Bound beyond loopback with no API key,
+so on Windows the serving executable needs an inbound firewall rule for its path.
+
+**Thinking is on by default**, as for every infernix chat template that has a reasoning channel: replies carry
+`reasoning_content` beside `content`, and a request that sets a small `max_tokens` can spend all of it thinking. Send
+`enable_thinking: false` (or `reasoning_effort: none`) per request, or start the server with `--no-thinking`, for direct
+answers.
 
 ```bat
 set INFERNIX_TMP_Q4_EXACT=1
 infernix.exe model.ninfer --max-context 2048 --prefill-chunk 128 --kv-dtype bf16 --logits-dtype bf16 --spec off --prompt "Hello" --max-new 64 --greedy
 ```
 
-The one-shot CLI already disables prefix reuse; it has no `--no-prefix-reuse` option.
-C++ callers set `EngineOptions::context_cache.enabled = false` and concurrency 1.
-Use BF16 KV and logits with `infernix-perplexity` too. Qualification runs use the
-explicit Q4 exact-route environment setting above.
+The one-shot CLI above disables prefix reuse and is the historical scoring configuration; `INFERNIX_TMP_Q4_EXACT=1`
+selects the exact W4A8 prefill route for scoring only (decode and serving do not need it). MTP drafts with Google's
+assistant when the artifact carries it: `--spec mtp --draft-tokens N` (`1..7`, `auto` = 6; the launcher uses 1); the
+assistant reads the target's KV and keeps none of its own, and constrained rows decode plainly. `--spec auto` decodes
+plainly. Native full-vocabulary KL, the HTTP tail, MTP and soak campaigns and the selecting-logit evidence contract are
+in [Gemma4 benchmark tools](docs/maintainer/gemma4-benchmarks.md).
 
-MTP drafts with Google's separate assistant when the artifact carries it: `--spec mtp
---draft-tokens N` (`1..7`, `auto` = 6; the launcher defaults to 1). The assistant reads the
-target's KV and keeps none of its own; constrained rows decode plainly. `--spec auto` decodes plainly.
-Native full-vocabulary KL, HTTP tail/MTP campaigns and the selecting-logit evidence
-contract are in [Gemma4 benchmark tools](docs/maintainer/gemma4-benchmarks.md).
-
-Not enabled here: other speculation and ngram sessions, prefix-cache persistence and the SSD tier,
-concurrency >1, reproducible/lossless/reference math, media and reasoning-loop budgets.
-Unsupported requests refuse rather than silently selecting a Qwen implementation.
-The startup warning that the constraint vocabulary was not built is expected until
-Gemma grammar support lands. Conversion, existing launchers and published models
-are not rewritten by loading an artifact.
+Not enabled: other speculation and ngram sessions, prefix-cache persistence and the SSD tier, concurrency above 1,
+reproducible/lossless/reference math, media (the vision tower is not served) and reasoning-loop budgets. Unsupported
+requests refuse rather than silently selecting a Qwen implementation.
 
 ### Qwen3.8-Flash-Next
 
