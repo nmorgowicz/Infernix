@@ -688,6 +688,13 @@ copying nothing, else on a snapshot from the RAM cache. A 20-300-token tail at 1
 about 0.1-0.3 s. `--no-fast-path free-cache-resume` resumes only at whole prefill chunks instead: bit-identical to a
 cold prefill, but each turn recomputes up to one chunk (2,048 tokens).
 
+A frontend that adds system prompts after the last message or a few messages back (post-history instructions, an
+author's note or lore entries at a depth) re-renders them for every request, so the next prompt diverges at the earliest
+of them. The server snapshots exactly there and recomputes from it: nothing after the history if the prompts trail it
+(hundreds of tokens, about 0.4-0.6 s at 100K context), but the history behind the earliest one if an entry is injected
+at depth, which no cache avoids. A macro that changes the text in front of the history (a `{{roll}}` or `{{random}}` in the
+system block) makes every turn a full prefill.
+
 **Thinking is on by default**, as for every infernix chat template that has a reasoning channel: replies carry
 `reasoning_content` beside `content`, and a request that sets a small `max_tokens` can spend all of it thinking. Send
 `enable_thinking: false` (or `reasoning_effort: none`) per request, or start the server with `--no-thinking`, for direct
