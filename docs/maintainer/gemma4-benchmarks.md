@@ -224,6 +224,18 @@ prompts. `retrieval-smoke` and `needle` default to `false`: their 32-token answe
 cannot hold a reasoning block, so with thinking left on the reply comes back empty and
 every case scores as failed. All other tools default to `default` (field omitted).
 
+## Soak and cross-engine tools
+
+- `python -m tools.bench.soak` starts one production-profile server and runs the cached-tail probe at near-capacity history sizes
+  (a stress pass: GPU memory before and after, liveness, log error lines, a sampled final request).
+- `python -m tools.bench.roleplay_soak` is a client-only sustained session against any running server (start the real launcher
+  yourself, so the exact production command is what is tested): growing conversations to `--context-limit`, sampled turns with
+  thinking as stated, a streamed request dropped every `--abort-every` turns, GPU memory sampled in the background. It reports
+  failed requests, liveness, VRAM growth (second quarter against last quarter) and the fraction of turns that restored most of
+  their prompt from the cache; exit 0 only if all hold. It measures stability, not output quality.
+- `rp_ladder.py --arm-argv-json FILE` replaces the built server command per arm with a complete argv, so another engine can be the
+  control while the client, requests and corpus stay identical. Cross-engine pairing and gates live in the tooling repo.
+
 ## Verification handoff
 
 These commands are for the integration owner; porting the scripts alone does not

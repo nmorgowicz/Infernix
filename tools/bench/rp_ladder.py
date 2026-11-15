@@ -99,7 +99,13 @@ def main():
     add_thinking_arg(ap, "default")
     ap.add_argument("--arms", default=",".join(ARMS))
     ap.add_argument("--contexts", default=",".join(map(str, CONTEXTS)))
+    ap.add_argument("--arm-argv-json", type=Path, help="JSON object {arm: complete server argv}; replaces the built "
+                    "command for those arms (another engine as the control, or a hand-built profile); the client and "
+                    "requests stay identical")
     args = ap.parse_args()
+    overrides = json.loads(args.arm_argv_json.read_text(encoding="utf-8")) if args.arm_argv_json else None
+    if overrides is not None and any(name not in overrides for name in args.arms.split(",")):
+        ap.error("--arm-argv-json must give an argv for every selected arm")
     contexts = [int(c) for c in args.contexts.split(",")]
     names = args.arms.split(",")
     if not contexts or min(contexts) <= 0 or any(n not in ARMS for n in names):
@@ -116,8 +122,8 @@ def main():
             out = args.out_dir / f"{name}.json"
             if out.exists():
                 ap.error(f"output exists: {out}; use a fresh output directory")
-            argv = server_argv(args, ARMS[name])
-            rec = {"arm": name, "argv": argv, "binary_sha256": sha256_file(args.exe), "contexts": {},
+            argv = overrides[name] if overrides else server_argv(args, ARMS[name])
+            rec = {"arm": name, "argv": argv, "binary_sha256": sha256_file(Path(argv[0])), "contexts": {},
                    "enable_thinking": args.enable_thinking,
                    "artifact": str(args.artifact), "artifact_bytes": args.artifact.stat().st_size,
                    "pool_sha256": pool.text_sha256, "idle_gpu": gpu_state(), "vram": {}}
