@@ -97,8 +97,18 @@ struct RestoreResult {
     // Why a given snapshot was refused (header validation, before any copy was enqueued).
     HeaderStatus refusal = HeaderStatus::Ok;
     bool refused_host    = false; // a block or image had no Resident Host copy
-    bool image           = false;
+    bool image           = false; // the ring window was copied
+    bool tail            = false; // the tail page was copied
+    std::uint32_t resident_blocks = 0; // leading path blocks the sequence's pages already held
+};
+
+// What the sequence's Device state already holds of a restore (free-cache-resume only): the first
+// `blocks` path blocks' KV in pages 0..blocks-1, the tail page's positions below the frontier, and
+// the ring window [image_start, frontier). Those parts are not copied.
+struct ResidentParts {
+    std::uint32_t blocks = 0;
     bool tail            = false;
+    bool image           = false;
 };
 
 class PrefixCache final : public runtime::prefix_cache::PrefixIndexBackend {
@@ -164,10 +174,13 @@ public:
     // ---- restore -----------------------------------------------------------------------------
     // Validates the snapshot's header and every Host copy first, then enqueues, in stream order,
     // the `path` blocks into the sequence's pages 0..k-1, the tail page into page k and the ring
-    // window into the rings, pinning the sources until the batch lands. Nothing is enqueued when
-    // the result is not restored.
+    // window into the rings, pinning the sources until the batch lands; parts `resident` names are
+    // already on the Device and are skipped. Nothing is enqueued when the result is not restored.
     [[nodiscard]] RestoreResult restore(std::span<const runtime::prefix_cache::NodeRef> path,
-                                        std::optional<runtime::prefix_cache::SnapshotRef> snapshot);
+                                        std::optional<runtime::prefix_cache::SnapshotRef> snapshot,
+                                        ResidentParts resident = {});
+    // The first logical position of the ring window a snapshot at `frontier` keeps.
+    [[nodiscard]] std::uint32_t image_start(std::uint32_t frontier) const noexcept;
 
     // ---- bookkeeping -------------------------------------------------------------------------
     // Publishes landed captures, completes landed writes, retires landed restores and evicts the

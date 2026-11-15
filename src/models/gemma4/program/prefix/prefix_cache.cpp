@@ -313,7 +313,12 @@ void PrefixCache::forget_capture(std::uint64_t id) noexcept { published_.erase(i
 
 // ---- restore ---------------------------------------------------------------------------------
 
-RestoreResult PrefixCache::restore(std::span<const pc::NodeRef> path, std::optional<pc::SnapshotRef> snapshot) {
+std::uint32_t PrefixCache::image_start(std::uint32_t frontier) const noexcept {
+    return image_window_start(frontier, image_.window_tokens);
+}
+
+RestoreResult PrefixCache::restore(std::span<const pc::NodeRef> path, std::optional<pc::SnapshotRef> snapshot,
+                                   ResidentParts resident) {
     RestoreResult result;
     // Everything is checked before the first byte is enqueued or a pin taken.
     std::vector<std::uint32_t> pages;
@@ -370,16 +375,19 @@ RestoreResult PrefixCache::restore(std::span<const pc::NodeRef> path, std::optio
             index_->pin_snapshot(*snapshot);
             batch.snapshot = snapshot;
         }
+        // The resident parts are skipped; the copied ones are what a full restore would enqueue.
+        result.resident_blocks = std::min<std::uint32_t>(resident.blocks, static_cast<std::uint32_t>(path.size()));
         std::vector<CopyPiece> pieces;
-        append_block_pieces(pages, slab_ids, pieces);
-        if (snapshot && view.tail_len != 0) {
+        append_block_pieces(std::span<const std::uint32_t>(pages).subspan(result.resident_blocks),
+                            std::span<const std::uint32_t>(slab_ids).subspan(result.resident_blocks), pieces);
+        if (snapshot && view.tail_len != 0 && !resident.tail) {
             const std::uint32_t tail_page[1] = {static_cast<std::uint32_t>(path.size())};
             const std::uint32_t tail_slab[1] = {view.host_slabs.back()};
             append_block_pieces(tail_page, tail_slab, pieces);
             result.tail = true;
         }
-        submit_copy_ops(plan_copy_ops(pieces), cudaMemcpyHostToDevice, stream_);
-        if (snapshot) {
+        if (!pieces.empty()) { submit_copy_ops(plan_copy_ops(pieces), cudaMemcpyHostToDevice, stream_); }
+        if (snapshot && !resident.image) {
             const HostImage host = segments.view(host_.slab_bytes);
             for (std::uint32_t group = 0; group < image_.groups(); ++group) {
                 rings_->scatter_group(group, start, view.frontier, host, stream_);
@@ -394,9 +402,9 @@ RestoreResult PrefixCache::restore(std::span<const pc::NodeRef> path, std::optio
         throw;
     }
     batch.event = event;
-    counters_.host_block_restores += path.size();
-    counters_.host_restore_bytes += path.size() * blocks_.record_bytes + (result.tail ? blocks_.record_bytes : 0U) +
-                                    (result.image ? host_.image_bytes : 0U);
+    counters_.host_block_restores += path.size() - result.resident_blocks;
+    counters_.host_restore_bytes += (path.size() - result.resident_blocks) * blocks_.record_bytes +
+                                    (result.tail ? blocks_.record_bytes : 0U) + (result.image ? host_.image_bytes : 0U);
     if (result.tail) { ++counters_.host_tail_restores; }
     if (result.image) { ++counters_.host_image_restores; }
     landing_.push_back(std::move(batch));

@@ -311,15 +311,17 @@ struct ProgramImpl {
         std::size_t next_call = 0;
         std::optional<pc::SnapshotRef> restore_snapshot; // selected at binding, restored by poll_context
         std::optional<pc::SnapshotRef> pinned_snapshot;  // the selection's pin, until the restore holds its own
+        std::uint32_t live = 0;                          // the lane-resident frontier it continues at (no restore)
         std::optional<pc::SnapshotRef> resume;           // the snapshot the sequence was restored from
         std::optional<pc::SnapshotRef> superseded;       // the snapshot its first capture superseded
         std::uint32_t reused = 0;                        // the resume frontier
         std::uint32_t deepest = 0;                       // the deepest snapshot frontier of this lineage
-        // The end of the prefix computed only by full, grid-aligned prefill calls ([kC,(k+1)C) for chunk C), from
-        // the root or from a restore at a grid frontier: the arithmetic a cold prefill of any longer prompt
-        // applies to those positions, bit for bit. Only blocks and snapshots below it are published, so a
-        // restore reproduces a cold prefill exactly; a partial final call, decode, forced feeds or an
-        // off-grid replay never reach the cache (plan §8.4, §17.6 grid-aligned policy).
+        // Reproducible route (no free-cache-resume): the end of the prefix computed only by full, grid-aligned
+        // prefill calls ([kC,(k+1)C) for chunk C), from the root or from a restore at a grid frontier: the
+        // arithmetic a cold prefill of any longer prompt applies to those positions, bit for bit. Only blocks
+        // and snapshots below it are published, so a restore reproduces a cold prefill exactly; a partial final
+        // call, decode, forced feeds or an off-grid replay never reach the cache (plan §8.4, §17.6). With
+        // free-cache-resume the publishable frontier is `fed` instead (ProgramImpl::publishable).
         std::uint32_t exact_through = 0;
         std::vector<pc::NodeRef> owned;                  // blocks whose Device copy this sequence inserted
         std::vector<std::uint64_t> captures;             // every capture it asked for
@@ -331,6 +333,15 @@ struct ProgramImpl {
     std::uint64_t next_capture = 0;
     bool clear_prefix_after_release = false;
     std::uint32_t ring_pages_ = 0;
+    // free-cache-resume: what the lane's Device state still holds after its last consistent sequence
+    // (ninfer.spo's live reuse). Global KV of positions [0, tokens.size()) is in the sequence's pages;
+    // the rings hold position p in [ring_low, ring_end) unless a later write reached p + ring capacity.
+    // Every binding clears it before its first forward; a restore skips the parts it still holds.
+    struct ResidentState {
+        std::vector<TokenId> tokens;
+        std::uint32_t ring_low = 0, ring_end = 0;
+    } resident;
+    std::uint32_t ring_low = 0; // the live sequence's lowest ring position holding its own state
     // Last: destroyed first, waiting for its copies before the Device buffers it reads are freed.
     std::unique_ptr<prefix::PrefixCache> prefix_cache;
 
@@ -730,11 +741,12 @@ struct ProgramImpl {
             match = index.match(tokens, hashes, {}, n);
         }
         out.cached_tokens = static_cast<std::uint32_t>(match.path.size()) * pc::kBlockTokens;
-        // Only a grid frontier restores to a cold prefill's state (PrefixLane::exact_through); a snapshot
-        // elsewhere is skipped.
+        // On the reproducible route only a grid frontier restores to a cold prefill's state
+        // (PrefixLane::exact_through); a snapshot elsewhere is skipped. free-cache-resume takes any.
         std::erase_if(match.candidates, [&](const pc::MatchCandidate& c) {
             return c.filling_blocks != 0 || c.ssd_only_blocks != 0 || c.image_on_ssd_only || c.tail_on_ssd_only ||
-                   c.frontier > maximum_frontier || c.frontier % options.prefill_chunk != 0 ||
+                   c.frontier > maximum_frontier ||
+                   (!options.free_cache_resume && c.frontier % options.prefill_chunk != 0) ||
                    !prefix_cache->image_valid(c.snapshot);
         });
         for (const pc::MatchCandidate& c : match.candidates) { out.existing.push_back(c.frontier); }
@@ -774,12 +786,57 @@ struct ProgramImpl {
         pl.next_call = 0;
     }
 
+    // ---- free-cache-resume: the lane's resident state --------------------------------------------
+    // Only on the free route: the reproducible route copies everything, so its bits never depend on
+    // which call partition computed the resident state.
+    // How many leading `tokens` the lane's Device state holds.
+    [[nodiscard]] std::uint32_t resident_common(std::span<const TokenId> tokens) const noexcept {
+        if (!options.free_cache_resume) { return 0; }
+        const auto limit = std::min(resident.tokens.size(), tokens.size());
+        std::size_t common = 0;
+        while (common < limit && resident.tokens[common] == tokens[common]) { ++common; }
+        return static_cast<std::uint32_t>(common);
+    }
+    // Whether the rings still hold the window [image_start, frontier) of the resident state: no later
+    // write wrapped a ring over it.
+    [[nodiscard]] bool resident_ring_holds(std::uint32_t frontier) const noexcept {
+        const std::uint32_t start = prefix_cache->image_start(frontier);
+        const std::uint64_t capacity = static_cast<std::uint64_t>(ring_pages_) * kPage;
+        return start >= resident.ring_low && std::uint64_t{start} + capacity >= resident.ring_end;
+    }
+    // What the lane still holds of a restore at `frontier` for the bound ledger: blocks below the common
+    // prefix, the tail page when that prefix reaches the frontier, and the ring window when it is intact.
+    [[nodiscard]] prefix::ResidentParts resident_parts(std::uint32_t frontier) const {
+        prefix::ResidentParts out;
+        const std::uint32_t common = resident_common(ledger);
+        out.blocks = std::min(common, frontier) / pc::kBlockTokens;
+        if (common == 0 || common < frontier) { return out; }
+        out.tail = true;
+        out.image = resident_ring_holds(frontier);
+        return out;
+    }
+    // The frontier a request over `tokens` can continue the lane's state at without any copy (ninfer.spo's
+    // live reuse): the common prefix, leaving at least the last prompt token to compute, when the rings
+    // still hold its window; 0 when none.
+    [[nodiscard]] std::uint32_t live_frontier(std::span<const TokenId> tokens, std::uint32_t maximum) const {
+        if (!prefix_cache || tokens.size() < 2) { return 0; }
+        const std::uint32_t live = std::min({resident_common(tokens), static_cast<std::uint32_t>(tokens.size() - 1),
+                                             maximum});
+        return live != 0 && resident_ring_holds(live) ? live : 0;
+    }
+
     // Records a prefill or replay call over [first, first + width): a full call on the chunk grid that
     // continues the exact prefix extends it.
     void note_grid_call(std::uint32_t first, std::uint32_t width) noexcept {
         if (first == pl.exact_through && first % options.prefill_chunk == 0 && width == options.prefill_chunk) {
             pl.exact_through = first + width;
         }
+    }
+
+    // The end of the state the cache may take from this sequence: its valid frontier with
+    // free-cache-resume, else the exact grid prefix.
+    [[nodiscard]] std::uint32_t publishable() const noexcept {
+        return options.free_cache_resume ? fed : pl.exact_through;
     }
 
     // Exclusive end of the prefill call that starts at `fed`. advance_prefill takes every prefill call's
@@ -792,14 +849,15 @@ struct ProgramImpl {
     }
 
     // ---- prefix cache: publication ------------------------------------------------------------
-    // Publishes the full blocks below `frontier` and below the exact prefix (PrefixLane::exact_through):
-    // positions whose input token is in the committed ledger and whose KV full grid prefill calls wrote.
+    // Publishes the full blocks below `frontier` and below publishable(): positions whose input token is
+    // in the committed ledger and whose KV this sequence computed (on the reproducible route, full grid
+    // prefill calls only).
     // Nothing past `fed` is ever published, so a rejected or uncommitted write reaches no block and no
     // snapshot (plan §8.4 invariant 1). Each new block is written through to the Host at once; a block
     // already cached stays as it is.
     void publish_blocks(std::uint32_t frontier) {
         if (!prefix_cache || !pl.active) { return; }
-        frontier = std::min({frontier, pl.exact_through, static_cast<std::uint32_t>(ledger.size())});
+        frontier = std::min({frontier, publishable(), static_cast<std::uint32_t>(ledger.size())});
         const std::uint32_t blocks = frontier / pc::kBlockTokens;
         std::vector<pc::NodeRef> fresh;
         std::vector<std::uint32_t> pages;
@@ -825,12 +883,12 @@ struct ProgramImpl {
         prefix_cache->write_blocks(fresh, pages);
     }
 
-    // A snapshot of the sequence's state at its frontier `fed`, Host-born; only at the end of the exact
-    // prefix, the one state a cold prefill reaches too.
+    // A snapshot of the sequence's state at its frontier `fed`, Host-born; only where publishable() ends
+    // (on the reproducible route, the end of the exact prefix: the one state a cold prefill reaches too).
     void prefix_capture(pc::SnapshotKind kind, bool resume_point) {
         const std::uint32_t F = fed;
         const std::uint32_t k = F / pc::kBlockTokens;
-        if (F == 0 || F != pl.exact_through || pl.path.size() < k || F > ledger.size()) { return; }
+        if (F == 0 || F != publishable() || pl.path.size() < k || F > ledger.size()) { return; }
         pc::PrefixCacheIndex& index = prefix_cache->index();
         prefix::PrefixCache::Capture c;
         c.id = ++next_capture;
@@ -889,20 +947,21 @@ struct ProgramImpl {
     }
 
     // After a prefill call ending at `fed`: publish its blocks and realize the taps due here. The
-    // prompt's deepest grid state is always offered as a tap, so a next turn resumes there and replays
-    // at most one chunk of this prompt: the end of the prompt when it ends on the grid, else the start
-    // of its final (partial) call.
+    // prompt's end is always offered as a tap, so a next turn that extends this prompt resumes there.
+    // On the reproducible route that tap exists only when the prompt ends on the grid, so the prompt's
+    // deepest grid state (the start of its final, partial call) is offered instead: a next turn then
+    // replays at most one chunk of this prompt.
     void after_prefill_call() {
         if (!pl.active) { return; }
         publish_blocks(fed);
         const std::uint32_t prompt = request->summary.prompt_tokens;
         bool is_boundary = false, forward = false;
         if (fed >= prompt) {
-            if (fed == pl.exact_through && tap_far_enough(fed, true)) { prefix_capture(pc::SnapshotKind::Tap, false); }
+            if (fed == publishable() && tap_far_enough(fed, true)) { prefix_capture(pc::SnapshotKind::Tap, false); }
             return;
         }
         const bool final_next = next_call_end() == prompt;
-        const bool deepest = final_next && prompt % options.prefill_chunk != 0;
+        const bool deepest = !options.free_cache_resume && final_next && prompt % options.prefill_chunk != 0;
         if (deepest) { forward = true; }
         if ((take_due_taps(fed, final_next, is_boundary, forward) || deepest) && tap_far_enough(fed, forward)) {
             prefix_capture(is_boundary ? pc::SnapshotKind::Boundary : pc::SnapshotKind::Tap, false);
@@ -910,8 +969,9 @@ struct ProgramImpl {
     }
 
     // The end of a consistent sequence (finish, abort, pause): its remaining blocks and an endpoint
-    // snapshot at the committed frontier when that is the exact prefix's end (a pausing sequence past it
-    // resumes from its last grid snapshot and replays the rest on the chunk grid).
+    // snapshot at the committed frontier when publishable() reaches it (always with free-cache-resume; on
+    // the reproducible route a pausing sequence past the exact prefix resumes from its last grid snapshot
+    // and replays the rest on the chunk grid).
     void prefix_finish(bool pausing) noexcept {
         if (!prefix_cache || !pl.active || !state_valid) { return; }
         try {
@@ -921,6 +981,11 @@ struct ProgramImpl {
                                     (pl.close_endpoint && F >= pl.deepest + pc::kMinimumForwardTokens);
             if (far_enough && pl.path.size() >= F / pc::kBlockTokens) {
                 prefix_capture(pc::SnapshotKind::Endpoint, pausing);
+            }
+            if (options.free_cache_resume) {
+                resident.tokens.assign(ledger.begin(), ledger.begin() + static_cast<std::ptrdiff_t>(F));
+                resident.ring_low = ring_low;
+                resident.ring_end = std::max(physical_written, fed);
             }
         } catch (const std::exception& error) {
             diagnostic(std::string("Gemma4: publishing the prefix cache failed: ") + error.what(),
@@ -979,6 +1044,7 @@ struct ProgramImpl {
     void release_prefix(bool invalid) noexcept {
         if (!prefix_cache) { return; }
         if (invalid && pl.active) { pl.withdraw = true; }
+        if (invalid || pl.withdraw) { resident = {}; } // the Device state is not vouched for
         pc::PrefixCacheIndex& index = prefix_cache->index();
         try {
             if (pl.pinned_snapshot) { index.unpin_snapshot(*pl.pinned_snapshot); }
@@ -1005,6 +1071,7 @@ struct ProgramImpl {
         prefix_withdrawal = {};
         clear_prefix_after_release = false;
         pl = PrefixLane{};
+        resident = {};
         prefix_cache->clear();
     }
 
@@ -1240,11 +1307,15 @@ std::vector<SourceCandidate> Program::hybrid_sources(const RequestBasePlan& base
     std::uint32_t cached = 0;
     std::vector<SourceCandidate> sources;
     if (p.prefix_cache && plan.reuse) {
-        // The index's choice first, then a root start. A resumed request's quote is bounded by its
-        // frontier; its binding re-selects over its whole ledger.
+        // The lane's own state when it continues further than any snapshot (free-cache-resume), the
+        // index's choice, then a root start. A resumed request's quote is bounded by its frontier; its
+        // binding re-selects over its whole ledger (and skips what the lane holds of that restore).
         const auto candidates = p.prefix_candidates(plan.tokens, plan.block_hashes, maximum_frontier,
                                                     maximum_frontier != UINT32_MAX);
         cached = candidates.cached_tokens;
+        const std::uint32_t snapshot = candidates.list.empty() ? 0U : candidates.list.front().frontier;
+        const std::uint32_t live = resume ? 0U : p.live_frontier(plan.tokens, maximum_frontier);
+        if (live > snapshot) { sources.push_back(SourceCandidate{live, PrefixReusePath::LaneResident, cached}); }
         if (!candidates.list.empty()) {
             const auto& best = candidates.list.front();
             sources.push_back(SourceCandidate{best.frontier, reuse_path_for(best.kind), cached});
@@ -1278,7 +1349,13 @@ BindingReservation Program::start_binding(const RequestBasePlan& base, runtime::
         candidates = p.prefix_candidates(ledger, resume ? std::span<const std::uint64_t>(ledger_hashes)
                                                          : std::span<const std::uint64_t>(plan.block_hashes),
                                          resume ? resume->impl_->frontier : UINT32_MAX, resume != nullptr);
-        if (source.reused_tokens != 0) {
+        if (source.reuse_path == PrefixReusePath::LaneResident) {
+            // The lane's own state, still exactly where the quote found it (no forward ran since).
+            if (resume || source.reused_tokens == 0 ||
+                p.live_frontier(ledger, UINT32_MAX) != source.reused_tokens) {
+                return {.source_valid = false};
+            }
+        } else if (source.reused_tokens != 0) {
             for (auto& candidate : candidates.list) {
                 if (resume || candidate.frontier == source.reused_tokens) {
                     selection = std::move(candidate);
@@ -1316,6 +1393,8 @@ BindingReservation Program::start_binding(const RequestBasePlan& base, runtime::
             p.pl.path = std::move(selection->path);
             p.pl.restore_snapshot = selection->snapshot;
             p.pl.pinned_snapshot = selection->snapshot;
+        } else if (source.reuse_path == PrefixReusePath::LaneResident) {
+            frontier = p.pl.live = source.reused_tokens;
         }
         // A resumed request publishes blocks, not taps (its ledger is already cached up to where
         // it was); the call grid then is the plain chunk grid.
@@ -1345,16 +1424,29 @@ ContextProgress Program::poll_context(runtime::CancellationFlagView cancellation
         p.occupied = true; p.binding = false; p.fed = p.physical_written = 0;
         p.prefilled = false; p.finishable = false; p.timings = {};
         p.speculative = p.fresh_speculative(); p.carry_column.reset();
-        if (p.pl.restore_snapshot) {
+        p.ring_low = 0;
+        if (p.pl.live != 0) {
+            // The lane already holds the state at the live frontier: nothing to copy. Its blocks are
+            // published from the ledger as the prefill goes, as a cold request's are.
+            auto& cache = *p.prefix_cache;
+            p.fed = p.physical_written = p.pl.live;
+            p.ring_low = p.resident.ring_low;
+            p.pl.reused = p.pl.deepest = p.pl.live;
+            ++cache.counters().admissions;
+            cache.counters().reused_tokens += p.pl.live;
+        } else if (p.pl.restore_snapshot) {
             // The restore batch: blocks, tail page and ring window, enqueued in stream order ahead
-            // of the first forward (the image header is validated again before any copy).
+            // of the first forward (the image header is validated again before any copy); what the
+            // lane's Device state still holds of it is not copied (free-cache-resume).
             auto& cache = *p.prefix_cache;
             pc::PrefixCacheIndex& index = cache.index();
             const pc::SnapshotRef snapshot = *p.pl.restore_snapshot;
-            const prefix::RestoreResult restore = cache.restore(p.pl.path, snapshot);
+            const prefix::ResidentParts held = p.resident_parts(index.snapshot(snapshot).frontier);
+            const prefix::RestoreResult restore = cache.restore(p.pl.path, snapshot, held);
             if (restore.restored) {
                 const std::uint32_t frontier = index.snapshot(snapshot).frontier;
                 p.fed = p.physical_written = frontier;
+                p.ring_low = restore.image ? cache.image_start(frontier) : p.resident.ring_low;
                 progress.operations.state_restores = 1;
                 progress.operations.partial_tail_cow_pages = restore.tail ? 1U : 0U;
                 index.note_hit(snapshot, !p.binding_resume); // a paused request's resume adds no frequency
@@ -1374,6 +1466,7 @@ ContextProgress Program::poll_context(runtime::CancellationFlagView cancellation
             }
             p.pl.restore_snapshot.reset();
         }
+        p.resident = {}; // this binding's forwards overwrite the lane from here
         CUDA_CHECK(cudaStreamSynchronize(p.stream));
         if (p.prefix_cache) { p.prefix_cache->poll(); }
         if (p.binding_resume) {
@@ -1417,16 +1510,16 @@ bool Program::start_pause(SequenceHandle sequence, runtime::ExecutionTiming* obs
     auto& p = *impl_; p.require(sequence);
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Post, observed_timing);
     if (p.pending || has_context_transaction() || p.replaying) { return false; }
-    // Publish what the exact prefix reached (and an endpoint when the committed frontier is its end), so
-    // the resume restores the deepest grid state instead of replaying from the root.
+    // Publish what publishable() reached (and an endpoint when the committed frontier is its end), so
+    // the resume restores the deepest published state instead of replaying from the root.
     p.prefix_finish(true);
     auto data = std::make_unique<detail::ResumeData>();
     data->owner = &p; data->plan = p.request; data->ledger = p.ledger;
     data->frontier = p.fed; data->prefilled = p.prefilled; data->finishable = p.finishable; data->timings = p.timings;
     data->speculative = p.speculative;
     data->begin = p.begin;
-    // The deepest published grid snapshot is the state the resume restores from; replay then rebuilds the
-    // exact committed target frontier on the chunk grid.
+    // The deepest published snapshot is the state the resume restores from (the paused frontier itself
+    // with free-cache-resume); replay then rebuilds the committed target frontier.
     p.clear(); p.paused.emplace(ResumeState(std::move(data))); return true;
 }
 ReplayProgress Program::advance_replay(SequenceHandle sequence, runtime::ExecutionTiming* failed_timing) {
@@ -1721,6 +1814,9 @@ void Program::hybrid_hold_continuation(std::chrono::steady_clock::time_point) {
 }
 std::uint64_t Program::hybrid_cache_epoch() const noexcept {
     return impl_->prefix_cache ? impl_->prefix_cache->index().snapshot_epoch() : 0U;
+}
+std::uint32_t Program::hybrid_resume_grid() const noexcept {
+    return impl_->options.free_cache_resume ? 1U : impl_->options.prefill_chunk;
 }
 HybridPrefixCacheStats Program::hybrid_stats() const noexcept { return impl_->prefix_stats(); }
 runtime::prefix_cache::PersistResult Program::attach_prefix_cache_file(const std::filesystem::path&,

@@ -151,10 +151,11 @@ inline g4::PendingBatch first_token(g4::Program& program, g4::SequenceHandle seq
     }
 }
 
+// A cancelled or failed row is always terminal, as the Engine commits it (engine_core.h).
 inline rt::CommitDecision decision(bool terminal = false, bool cancelled = false, bool failed = false) {
     rt::CommitDecision d;
     d.accepted_tokens = cancelled || failed ? 0U : 1U;
-    d.terminal        = terminal;
+    d.terminal        = terminal || cancelled || failed;
     d.cancelled       = cancelled;
     d.failed          = failed;
     return d;
@@ -258,6 +259,9 @@ inline infernix::EngineOptions engine_options(const char* artifact, std::uint32_
     // KvCapacityPolicy defaults to an explicit 2048 tokens: a larger --max-context needs its own capacity.
     options.kv_capacity = infernix::KvCapacityPolicy::explicit_capacity(max_context);
     options.context_cache.host_capacity_bytes = host_bytes; // 0: the cache off
+    // The exact-equality scenarios run the reproducible cache route; a test of free-cache-resume
+    // clears this.
+    options.fast_path_exclusions = {infernix::FastPath::FreeCacheResume};
     return options;
 }
 

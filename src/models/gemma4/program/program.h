@@ -218,6 +218,12 @@ struct ProgramOptions {
     bool prefix_cache = false;
     // The prefix cache's pinned Host tier in bytes; 0 disables its construction (a cold lane).
     std::uint64_t host_bytes = 0;
+    // free-cache-resume (the serving default; operator decision 2026-11-15, plan §17.11): blocks and
+    // snapshots publish up to the valid frontier, including a prompt's end and decode-computed
+    // endpoints, and a request resumes at any cached frontier, as ninfer.spo does. Without it (the
+    // reproducible route) only state full prefill calls on the chunk grid computed is published and
+    // restored, so a cached request's logits equal a cold prefill's bit for bit.
+    bool free_cache_resume = false;
     bool reproducible = false;
     bool use_cuda_graph = true;
     DiagnosticObserver diagnostics;
@@ -291,8 +297,9 @@ public:
     [[nodiscard]] bool hybrid_poll_storage() noexcept { return false; }
     [[nodiscard]] bool hybrid_source_pending() const noexcept { return false; }
     [[nodiscard]] bool hybrid_storage_due() const noexcept { return false; }
-    // A request resumes from any position (fork behavior): the grid is one token.
-    [[nodiscard]] std::uint32_t hybrid_resume_grid() const noexcept { return 1; }
+    // A request resumes from any position with free-cache-resume (the grid is one token), else only
+    // at multiples of the prefill chunk.
+    [[nodiscard]] std::uint32_t hybrid_resume_grid() const noexcept;
     [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept;
     [[nodiscard]] runtime::prefix_cache::PersistResult attach_prefix_cache_file(
         const std::filesystem::path&, std::string, const StartupObserver&);

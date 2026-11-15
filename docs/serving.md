@@ -2624,8 +2624,9 @@ Compatible prefixes are reused for both text and multimodal histories unless the
 positions, encoded-media digest, grid, and consumer spans. Media wholly inside a matched prefix
 skips Vision execution, while new suffix media is encoded normally. The pretty completion record
 shows `cache N (P%, path)` using readable path labels; JSONL retains the exact
-`prefix_cache_hit_tokens` and `prefix_reuse_path` fields (`root`, `hybrid_endpoint` or
-`hybrid_snapshot`). When more of the prompt was held as cached KV blocks than could be reused,
+`prefix_cache_hit_tokens` and `prefix_reuse_path` fields (`root`, `hybrid_endpoint`,
+`hybrid_snapshot`, or `lane_resident`: Gemma 4 continued the state its lane still held from the
+previous request, copying nothing). When more of the prompt was held as cached KV blocks than could be reused,
 because no state snapshot was left to resume from at their end (it was evicted, or a restart did
 not restore it), the record adds `; M in cached blocks, no state to resume`, and JSONL's
 `prefix_cache_block_tokens` gives that longest cached block prefix M for every request. Reuse

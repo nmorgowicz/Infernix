@@ -1906,11 +1906,13 @@ struct ConstraintObservation {
     std::uint64_t mask_upload_bytes = 0;
 };
 
-// A root start, or a prefix-cache snapshot: a previous generation's endpoint, or a prefill tap.
+// A root start, or a prefix-cache snapshot: a previous generation's endpoint, or a prefill tap; or
+// (Gemma 4 with free-cache-resume) the state the lane still holds from its previous request.
 enum class PrefixReusePath : std::uint8_t {
     Root,
     HybridEndpoint,
     HybridSnapshot,
+    LaneResident,
 };
 
 enum class AdmissionFallbackReason : std::uint8_t {

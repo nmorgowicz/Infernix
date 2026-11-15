@@ -543,6 +543,80 @@ void chat_scenarios(const char* artifact, std::uint64_t slab_bytes) {
                std::to_string(slab_bytes) + " bytes)");
 }
 
+// free-cache-resume (the serving default): a turn continues the previous request's state where the two
+// diverge, off the chunk grid, as ninfer.spo does. Its output is not compared with a cold prefill: a different
+// call partition changes the arithmetic (plan §17.6); its quality gate is the noise envelope (§17.11).
+void free_resume_chat(const char* artifact) {
+    std::printf("== chat through the Engine with free-cache-resume\n");
+    infernix::EngineOptions options = engine_options(artifact, kChunk, host_bytes_from_env(), 3072);
+    options.fast_path_exclusions.clear();
+    infernix::Engine engine = start_engine(options);
+    const auto baseline = engine.runtime_stats();
+    const auto ids_of = [&](const infernix::PromptInput& input) {
+        const infernix::PreparedPrompt prepared = engine.prepare(input);
+        const auto ids = prepared.token_ids();
+        return Tokens(ids.begin(), ids.end());
+    };
+    const std::string notes = numbered("Pantry", 12, 3);
+    const std::string question = "Here is what I have at home:\n" + notes + "What should I cook tonight?";
+    const infernix::PromptInput first_input = voice(question);
+    const Tokens ids1 = ids_of(first_input);
+    require(ids1.size() % kChunk != 0, "the first turn ends off the chunk grid (prompt " + std::to_string(ids1.size()) + ")");
+    const Served v1 = chat(engine, first_input, 32, true);
+    require(!v1.content.empty(), "the first turn answered nothing; the follow-up echoes its reply");
+    std::uint64_t served_reused = v1.reused;
+
+    // Straight after the previous request the lane still holds its state: a follow-up continues it at the
+    // common prefix of that request's fed tokens (its prompt and all but its last output) and copies nothing
+    // (ninfer.spo's live reuse). After an unrelated request overwrote the lane, the follow-up restores a
+    // cached snapshot from the Host instead.
+    const auto follow = [&](const std::string& what, const infernix::PromptInput& input, const Tokens& previous,
+                            const Served& previous_reply, bool lane_resident) {
+        const Tokens ids = ids_of(input);
+        Tokens fed = previous;
+        fed.insert(fed.end(), previous_reply.tokens.begin(), previous_reply.tokens.end() - 1);
+        const auto live = static_cast<std::uint32_t>(std::min(common_prefix(fed, ids), ids.size() - 1));
+        require(live >= previous.size() - 16, what + ": the rendering keeps the previous prompt (shares " +
+                                                  std::to_string(live) + " of " + std::to_string(previous.size()) + ")");
+        const auto before = engine.runtime_stats();
+        const Served s = chat(engine, input, 32, true);
+        const auto after = engine.runtime_stats();
+        served_reused += s.reused;
+        expect(!s.tokens.empty() && s.prompt == ids.size(), what + ": generates");
+        const auto images = after.hybrid_host_image_restores - before.hybrid_host_image_restores;
+        const auto blocks = after.hybrid_host_block_restores - before.hybrid_host_block_restores;
+        if (lane_resident) {
+            expect(s.reused == live && images == 0 && blocks == 0,
+                   what + ": continues the lane at " + std::to_string(live) + " and copies nothing (restored " +
+                       std::to_string(s.reused) + ", image restores " + std::to_string(images) + ", block restores " +
+                       std::to_string(blocks) + ")");
+        } else {
+            expect(s.reused > 0 && s.reused <= live && images == 1 && blocks == s.reused / 64,
+                   what + ": restores a snapshot from the Host (restored " + std::to_string(s.reused) + " of " +
+                       std::to_string(live) + " shared, image restores " + std::to_string(images) +
+                       ", block restores " + std::to_string(blocks) + ")");
+        }
+        return std::pair{s, ids};
+    };
+    const infernix::PromptInput second = voice(question, v1.content, "Something quicker, please.");
+    const auto [v2, ids2] = follow("the follow-up turn", second, ids1, v1, true);
+    infernix::PromptInput third = second;
+    add_message(third, infernix::ChatRole::Assistant, v2.content);
+    add_message(third, infernix::ChatRole::User, "And a dessert?");
+    const auto [v3, ids3] = follow("the third turn", third, ids2, v2, true);
+    served_reused += chat(engine, side(numbered("Report", 40, 2)), 32, true).reused;
+    infernix::PromptInput fourth = third;
+    add_message(fourth, infernix::ChatRole::Assistant, v3.content);
+    add_message(fourth, infernix::ChatRole::User, "Thanks.");
+    (void)follow("a turn after an unrelated request", fourth, ids3, v3, false);
+
+    const auto stats = settled(engine, "free-cache-resume chat");
+    expect(stats.reused_prompt_tokens - baseline.reused_prompt_tokens == served_reused,
+           "Engine counters agree with the requests (Engine " +
+               std::to_string(stats.reused_prompt_tokens - baseline.reused_prompt_tokens) + ", requests " +
+               std::to_string(served_reused) + " tokens)");
+}
+
 void disabled_engine(const char* artifact) {
     std::printf("== cache off (--host-context-mib 0)\n");
     infernix::Engine engine = start_engine(engine_options(artifact, kChunk, 0, 2048));
@@ -575,6 +649,7 @@ int main() {
         const std::uint64_t slab_bytes = program_scenarios(artifact);
         chat_scenarios(artifact, slab_bytes);
         disabled_engine(artifact);
+        free_resume_chat(artifact);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

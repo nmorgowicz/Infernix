@@ -44,6 +44,9 @@ ProgramOptions program_options(const EngineOptions& options, std::uint64_t host_
     out.prefix_cache = options.context_cache.enabled && host_bytes != 0;
     out.host_bytes = options.context_cache.enabled ? host_bytes : 0;
     out.reproducible = !options.fast_paths;
+    // free-cache-resume is Gemma's one optional fast path: on unless --no-fast-path leaves it out.
+    out.free_cache_resume = std::find(options.fast_path_exclusions.begin(), options.fast_path_exclusions.end(),
+                                      FastPath::FreeCacheResume) == options.fast_path_exclusions.end();
     out.use_cuda_graph = options.use_cuda_graph;
     out.diagnostics = options.diagnostic_observer;
     out.startup_observer = options.startup_observer;
@@ -114,8 +117,12 @@ void validate_gemma4_options(const EngineOptions& options) {
     }
     if (options.rope_yarn_factor != 1.0F || options.embedding_host || options.a8_activations ||
         options.expert_a4_activations || options.expert_a16_activations || options.expert_csf ||
-        !options.fast_path_candidates.empty() || !options.fast_path_exclusions.empty()) {
-        throw std::invalid_argument("Gemma4 runs its artifact-declared projection policies; Qwen activation, fast-path, embedding-host and YaRN overrides are unsupported");
+        !options.fast_path_candidates.empty() ||
+        std::any_of(options.fast_path_exclusions.begin(), options.fast_path_exclusions.end(),
+                    [](FastPath path) { return path != FastPath::FreeCacheResume; })) {
+        throw std::invalid_argument("Gemma4 runs its artifact-declared projection policies; Qwen activation, fast-path "
+                                    "(other than --no-fast-path free-cache-resume), embedding-host and YaRN overrides "
+                                    "are unsupported");
     }
     if (!options.thinking_budget_message.empty()) {
         throw std::invalid_argument("Gemma4 thinking budgets are accounting-only; a budget-control message is unsupported");

@@ -151,6 +151,8 @@ const char* prefix_reuse_path_name(infernix::PrefixReusePath path) {
         return "hybrid_endpoint";
     case infernix::PrefixReusePath::HybridSnapshot:
         return "hybrid_snapshot";
+    case infernix::PrefixReusePath::LaneResident:
+        return "lane_resident";
     }
     return "unknown";
 }
