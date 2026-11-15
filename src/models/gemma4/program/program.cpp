@@ -777,12 +777,21 @@ struct ProgramImpl {
 
     // The prompt's prefill calls from the grid frontier `frontier`: the plain chunk grid, as a cold
     // prefill runs. The taps the planner places (the generation opener moves forward unless the
-    // lineage echoes its replies) are realized at the first full-call boundary at or past them; none
-    // cuts a call, since a narrower call changes the arithmetic of the positions it covers.
+    // lineage echoes its replies) are realized at the first full-call boundary at or past them; on the
+    // reproducible route none cuts a call, since a narrower call changes the arithmetic of the
+    // positions it covers. With free-cache-resume the exact taps (message boundaries and the system
+    // turns a frontend re-renders for every request) end a call: a snapshot taken past the point
+    // where the next prompt diverges serves nothing.
     void plan_prefill(std::uint32_t frontier, std::span<const std::uint32_t> existing, bool follow_endpoint) {
         const std::uint32_t n = request->summary.prompt_tokens;
         pl.taps = pc::plan_taps(n, frontier, pl.hints, existing, {}, prefix_cache->taps(), !follow_endpoint);
-        pl.call_ends = prefix::plan_call_ends(frontier, n, options.prefill_chunk, {});
+        std::vector<std::uint32_t> cuts;
+        if (options.free_cache_resume) {
+            for (const pc::PlannedTap& tap : pl.taps) {
+                if (tap.placement == pc::TapPlacement::Exact) { cuts.push_back(tap.position); }
+            }
+        }
+        pl.call_ends = prefix::plan_call_ends(frontier, n, options.prefill_chunk, cuts);
         pl.next_call = 0;
     }
 

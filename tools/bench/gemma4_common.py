@@ -134,11 +134,13 @@ def thinking_value(args):
     return {"true": True, "false": False, "default": None}[args.enable_thinking]
 
 
-def chat(url, model, messages, max_tokens, *, temperature=0, seed=1234, timeout=3600, top_k=20, enable_thinking=None):
+def chat(url, model, messages, max_tokens, *, temperature=0, seed=1234, timeout=3600, top_k=20, enable_thinking=None,
+         extra=None):
     body = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature,
             "top_p": 0.95, "top_k": top_k, "seed": seed, "stream": False}
     if enable_thinking is not None:
         body["enable_thinking"] = enable_thinking
+    body.update(extra or {})
     req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), headers={"Content-Type": "application/json"})
     started = time.monotonic()
     with urllib.request.urlopen(req, timeout=timeout) as response:

@@ -642,6 +642,55 @@ void precedence_checks(const g4::Frontend& frontend) {
     }
 }
 
+// Frontends that re-render system turns for every request (a note a few messages back, instructions after the
+// last message) make the next prompt diverge at the first of them that moved: the automatic hints must name those
+// turn starts and not the last turn's.
+void tap_hint_checks(const g4::Frontend& frontend) {
+    using Kind = infernix::runtime::prefix_cache::TapHintKind;
+    const auto starts_of = [&](const std::vector<infernix::TokenId>& tokens) {
+        const auto open = frontend.tokenize_text("<|turn>");
+        std::vector<std::uint32_t> starts;
+        for (std::size_t i = 0; i < tokens.size(); ++i) {
+            if (open.size() == 1 && tokens[i] == open.front()) { starts.push_back(static_cast<std::uint32_t>(i)); }
+        }
+        return starts;
+    };
+    const auto automatic = [](const g4::PreparedPrompt& prompt) {
+        std::vector<std::uint32_t> positions;
+        for (const auto& hint : prompt.tap_hints()) {
+            if (hint.kind == Kind::Automatic) { positions.push_back(hint.position); }
+        }
+        std::sort(positions.begin(), positions.end());
+        return positions;
+    };
+    {   // turns: 0 system, 1 user, 2 model, 3 system (note), 4 user, 5 system, 6 system, 7 open model turn
+        infernix::PromptInput input;
+        input.messages.push_back(message(infernix::ChatRole::System, "Be brief."));
+        input.messages.push_back(message(infernix::ChatRole::User, "u1"));
+        input.messages.push_back(message(infernix::ChatRole::Assistant, "a1"));
+        input.messages.push_back(message(infernix::ChatRole::System, "note"));
+        input.messages.push_back(message(infernix::ChatRole::User, "u2"));
+        input.messages.push_back(message(infernix::ChatRole::System, "post one"));
+        input.messages.push_back(message(infernix::ChatRole::System, "post two"));
+        const auto prompt = frontend.prepare(std::move(input), {});
+        const auto starts = starts_of(prompt.tokens());
+        check(starts.size() == 8, "the rendered prompt has eight turns");
+        check(starts.size() == 8 && automatic(prompt) == std::vector<std::uint32_t>({starts[3], starts[5]}),
+              "automatic hints name the note and the first system turn after the last message");
+    }
+    {   // Without system turns around the history the last message is the boundary, as before.
+        infernix::PromptInput input;
+        input.messages.push_back(message(infernix::ChatRole::System, "Be brief."));
+        input.messages.push_back(message(infernix::ChatRole::User, "u1"));
+        input.messages.push_back(message(infernix::ChatRole::Assistant, "a1"));
+        input.messages.push_back(message(infernix::ChatRole::User, "u2"));
+        const auto prompt = frontend.prepare(std::move(input), {});
+        const auto starts = starts_of(prompt.tokens());
+        check(starts.size() == 5 && automatic(prompt) == std::vector<std::uint32_t>({starts[3]}),
+              "the last message is the automatic boundary of a plain conversation");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -713,6 +762,7 @@ int main() {
         multi_eos_checks(tokenizer_json, embedded_template, fixed_template);
         history_checks(frontend);
         precedence_checks(frontend);
+        tap_hint_checks(frontend);
 
         // A prompt past max_context is a request error, which serve answers with HTTP 400.
         const auto tight = make_frontend(tokenizer_json, embedded_template, generation, 16, fixed_template);
