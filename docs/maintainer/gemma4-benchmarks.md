@@ -1,8 +1,8 @@
 # Gemma4 benchmark tools
 
 The workloads in `tools/bench/kv_eval/`, `rp_ladder.py`, `bench_tail.py`,
-`fixed_tail.py`, `decode_abab.py`, and `retrieval-smoke.py` are ported from
-`ninfer.spo` and its `pp-bench-20261108` campaign. They run from this checkout,
+`fixed_tail.py`, `decode_abab.py`, and `retrieval-smoke.py`
+run from this checkout,
 use local artifacts and corpus files, and do not import an operator/tooling checkout.
 They do not download models or corpus data. Run commands from the repository root
 with Python 3.11 and the dependencies in `tools/bench/kv_eval/requirements.txt`.
@@ -63,13 +63,13 @@ decodes 121.35 / 120.76 / 108.75 / 86.75 tok/s at the same four lengths.
 
 ## Native full-vocabulary KL
 
-`infernix-perplexity --full-vocab-reference-write CACHE` creates the fork-compatible
+`infernix-perplexity --full-vocab-reference-write CACHE` creates the
 `.nklref` full-vocabulary cache. `--full-vocab-reference CACHE` scores against it,
 requiring the same pinned protocol and BF16-rounded logits (`--logits-dtype bf16`).
 These flags are distinct from the existing `--kl-reference` top-token lower-bound
 instrument. Do not substitute one for the other.
 
-The native comparison writes the fork `report.json` `kl` structure and
+The native comparison writes the `report.json` `kl` structure and
 `kl_positions.f32` (four F32 values per scored position). Reference metadata and
 protocol checks remain fail-closed; neither corpus nor tokenizer nor window settings
 may be silently changed. Native prefix IDs are explicit `--full-vocab-prefix-ids`
@@ -102,7 +102,7 @@ py -3.11 -m tools.bench.kv_eval.kl_corpus --source <manifest.json> --out <new-su
 py -3.11 -m tools.bench.kv_eval.kl_compare --baseline <baseline/report.json> --candidate <candidate/report.json> --out <paired.json>
 ```
 
-`kl_compare` preserves the fork paired whole-window bootstrap: 2000 resamples by
+`kl_compare` runs a paired whole-window bootstrap: 2000 resamples by
 default, seed 20261105, overall and per domain. `--delta` has no default: only the
 operator chooses an acceptance factor. When supplied, acceptance still requires the
 upper 95% mean-KL ratio bound to be at most `1 + delta` overall and in every domain,
@@ -134,9 +134,9 @@ Exactly one arm is the reference. `tools/bench/kv_eval/arms.example.json` suppli
 BF16, repeat, FP8, FP8-QK and INT8 examples; select only formats the artifact supports.
 
 Without a full-vocabulary mode, `run_ppl` requests the target's `--save-top-tokens`
-format (`NINFTOPK`, version 1), not the fork's obsolete flat `NTOPK001` format. Its
+format (`NINFTOPK`, version 1). Its
 reader checks the native header, complete end marker, position count and window
-layout against the report. `analyze` retains the fork instrument definitions:
+layout against the report. `analyze` computes the instrument definitions:
 PPL/dPPL, top-1 agreement, renormalized top-64 truncated KL, both-in-top-64 target
 log-probability differences, paired-window statistics, domains and position bins.
 The truncated diagnostic is **not exact full-vocabulary KL** and is also distinct
@@ -194,8 +194,7 @@ py -3.11 tools/bench/decode_abab.py --exe <infernix-serve> --artifact <artifact.
 - `retrieval-smoke` runs six cases: 32k/100k at depths .05/.50/.95, one needle per
   cell. It exits nonzero for any failed answer or request. This is only a smoke.
 - `decode_abab` starts fresh servers in A/B/A/B order and uses the in-tree speed
-  client. The fork-only `NINFER_GEMMA4_DECODE_ATTN` selector is not forwarded to
-  Infernix. Instead, explicitly specify executable/argument/environment differences:
+  client. No decode-attention selector variable is forwarded. Instead, explicitly specify executable/argument/environment differences:
 
   ```json
   {"a": {"exe": "<baseline-serve>", "args": [], "env": {}},
@@ -206,9 +205,9 @@ py -3.11 tools/bench/decode_abab.py --exe <infernix-serve> --artifact <artifact.
   common default. Environment values are string maps; argument values are argv
   lists. Both runs use the same corpus prompts and sampling settings.
 
-The process-owning ladder/ABAB tools use target serve flags, including
-`--vram-headroom-mib` and `--host-context-mib`; they never pass the fork's removed
-`--model-match`, `--kv-headroom-mib` or `--device-state-slots` options. Additional
+The process-owning ladder/ABAB tools use the serve flags `--vram-headroom-mib` and
+`--host-context-mib`; they pass no `--model-match`, `--kv-headroom-mib` or `--device-state-slots`
+options. Additional
 settings are explicit `--serve-arg=--flag` / `--serve-arg=value` tokens. To disable
 cache reuse, pass `--no-prefix-reuse` (then no Host-cache option is emitted).
 
@@ -216,8 +215,7 @@ Every chat-issuing tool (`rp_ladder`, `bench_tail`, `fixed_tail`, `decode_abab`,
 `retrieval-smoke`, `kv_eval/needle.py`, `kv_eval/speed_client.py`) takes
 `--enable-thinking {true,false,default}`. `true`/`false` send `enable_thinking` in every
 request body; `default` omits the field so the server decides, and infernix resolves an
-absent value to thinking ON on Gemma 4 (the old fork's server left it to the template,
-which is off). The chosen value is recorded in each tool's receipt or cells. Campaigns
+absent value to thinking ON on Gemma 4. The chosen value is recorded in each tool's receipt or cells. Campaigns
 that compare engines, or that measure roleplay behaviour, MUST pass the same explicit
 value on every arm; otherwise the arms may measure different generation lengths and
 prompts. `retrieval-smoke` and `needle` default to `false`: their 32-token answer budget

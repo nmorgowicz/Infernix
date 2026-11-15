@@ -661,7 +661,7 @@ Each repository's model card gives its files, requirements, recommended command,
 
 Serves the operator roleplay profile: grouped-Q4 weights (`q4_g32`/`q4_g128`/`q4_g256`, FP16 scales; W4A8 prefill),
 FP8 global KV with BF16 sliding rings, optional FP8 attention QK, MTP with Google's separate assistant, a host-only
-prefix cache and 131,072 tokens of context on one 32 GB card. Existing `ninfer.spo` text artifacts load unchanged.
+prefix cache and 131,072 tokens of context on one 32 GB card.
 Text generation and public causal scoring use native Gemma weights, tokenizer/template, sliding rings and global
 attention, not a Qwen model cast. K **and V** of the sliding layers stay BF16, and the head's BF16 rounding is
 preserved, so select `--logits-dtype bf16`; unrounded FP32 head sums are not implemented.
@@ -685,8 +685,8 @@ so on Windows the serving executable needs an inbound firewall rule for its path
 
 **Continuing turns** resume where the new prompt leaves the previous request: on the state the lane still holds,
 copying nothing, else on a snapshot from the RAM cache. A 20-300-token tail at 124K context reaches its first token in
-about 0.1-0.3 s; measured against ninfer.spo, 0.57-0.73× its time at 32K-124K. `--no-fast-path free-cache-resume` resumes only at whole prefill chunks instead:
-bit-identical to a cold prefill, but each turn recomputes up to one chunk (2,048 tokens).
+about 0.1-0.3 s. `--no-fast-path free-cache-resume` resumes only at whole prefill chunks instead: bit-identical to a
+cold prefill, but each turn recomputes up to one chunk (2,048 tokens).
 
 **Thinking is on by default**, as for every infernix chat template that has a reasoning channel: replies carry
 `reasoning_content` beside `content`, and a request that sets a small `max_tokens` can spend all of it thinking. Send
