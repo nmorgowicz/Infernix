@@ -17,6 +17,75 @@ The lock coordinates these runners, not arbitrary external GPU processes.
 Servers bind loopback, have a health/readiness timeout, capture logs, and are stopped
 on failure as well as success. No firewall or machine-specific paths are assumed.
 
+## Four-tier comparison
+
+This is the canonical measured comparison of `best-medium`, `best-small`, `iq3-xs` and `iq3-xxs`.
+All four are **the same Wicked-Stuff-31B-Final diode-s15-t005 model**, text-only **including the FP8 MTP
+assistant**, without vision. Their HF text-weight/config/index identities match and the bound assistant
+parameter payloads are byte-identical; the encoded trunk weights intentionally differ. File bytes are the
+actual measured artifacts, not estimates or a different build's receipt. Artifact SHA-256 prefixes, in table
+order: `11347ddc8860`, `fc32d729d5ba`, `4404999e58ae`, `d0fdeef561a5`.
+
+**Quality instrument:** each artifact against the **same diode-own Q8_0 full-vocabulary reference**,
+native `infernix-perplexity`, 47 windows / 13,728 positions, context 512, stride 256, prefill chunk 128,
+FP8 KV, BF16 QK and BF16-rounded logits, identical prefix and token-window bounds. Reference window hash
+`e07b21a0629a9f4e`; the corpus includes English prose and code. The two q4 files were newly scored;
+the matching IQ3 reports were reused. These are teacher-forced causal KL results, not generated-output/MTP
+quality. Older preset hints such as 0.0845 / 0.1213 used an FP8-row reference and different artifact builds;
+they are **not** the matched-reference quality column below. Plain-model IQ3 results remain separate below.
+
+**Serving instrument:** RTX 5090, CUDA 13.5 development server, FP8 KV/QK, BF16 logits, MTP depth 1,
+maximum context 32768, **auto prefill actually selected 2048**, prefix reuse and host cache disabled.
+At each of ~1k and ~16k: one excluded warmup and three timed, cold, natural English corpus prompts,
+byte-identical cross-arm and Gemma-tokenized. Actual timed prompt counts are 992–993 and 15,989–15,993.
+Greedy temperature 0, top-k **20**, seed 1234, top-p omitted, cap **256**, explicit `enable_thinking=true`:
+the established cold four-bit HTTP comparison settings, **not** the roleplay launcher's sampling defaults.
+All arms explicitly use the same `tools/chat_templates/gemma4_fixed.jinja` because their embedded template
+bytes differ. Serving binary SHA-256 prefix: `f0073e790fb9`. Every timing run used the 8 GiB free-RAM floor.
+
+**Thinking is proven, but this is capped thought generation:** all **24 timed responses** published nonempty
+`reasoning_content` SSE deltas and reported **256 reasoning / 256 total completion tokens**, `finish_reason=length`,
+with **zero final-answer tokens**. Rendered thinking controls use the system `<|think|>` opener and the
+generation suffix `<|turn>model\n<|channel>thought\n`; request logs also resolve thinking true.
+Decode rates and MTP counts include those reasoning tokens. This is neither a completed-answer comparison,
+a long-thinking soak nor a measure of reasoning quality.
+
+All paired serving columns below are **~1k / ~16k**; rates and latency are medians of three timed reps.
+Accepted/drafted counts sum those three reps. Wire TTFT ends at the first nonempty reasoning/content delta;
+the prompt-time proxy excludes template/tokenization/transport and is shown separately.
+
+| Tier | Actual file bytes, text + MTP | Own-Q8 KL [95% CI] | Prefill tok/s | Decode + MTP tok/s | MTP accepted/drafted | Wire TTFT ms | Prompt proxy ms | GPU used MiB |
+|---|---:|---:|---:|---:|---|---:|---:|---:|
+| `best-medium` | 18,405,559,556 | 0.0941 [0.0803, 0.1099] | 6552.9 / 5545.4 | 118.38 / 110.04 | 344/420 / 340/425 | 182 / 2934 | 151 / 2884 | 25834 / 25839 |
+| `best-small` | 16,852,045,060 | 0.1291 [0.1099, 0.1503] | 6615.8 / 5531.8 | 127.09 / 118.37 | 348/415 / 336/429 | 173 / 2950 | 150 / 2891 | 24366 / 24346 |
+| `iq3-xs` | 13,902,732,292 | 0.2256 [0.1971, 0.2547] | 6519.0 / 5412.8 | 128.59 / 118.03 | 347/417 / 341/422 | 159 / 3003 | 152 / 2955 | 21534 / 21542 |
+| `iq3-xxs` | 13,019,175,940 | 0.3154 [0.2711, 0.3701] | 6511.6 / 5399.0 | 126.92 / 120.14 | 335/427 / 332/430 | 175 / 3035 | 152 / 2962 | 20695 / 20694 |
+
+Decode repetition ranges, ~1k / ~16k (tok/s; **not confidence intervals**): best-medium
+116.10–122.92 / 109.80–115.51; best-small 126.31–133.95 / 117.20–119.20; IQ3_XS
+127.27–129.60 / 117.35–120.59; IQ3_XXS 124.59–134.71 / 118.44–120.43.
+IQ3_XS reaches 101.2% / **99.7%** of best-small's decode medians; IQ3_XXS **99.9%** / 101.5%.
+Thus neither IQ3 tier meets strict median decode parity at **both** lengths; overlapping repetition ranges
+are not proof of equality. Best-medium is 93.1% / 93.0% of best-small here, in exchange for lower causal KL.
+IQ3 prefill is about 97.6–98.5% of best-small. Smaller files trade quality for storage, not a blanket speed win.
+
+Memory is whole-device `nvidia-smi` used/total snapshots after requests (total 32607 MiB), **not model-only
+weights, peak allocation or an allocator high-water mark**. No smaller-card fit, 131k capacity or longer-prompt
+throughput claim follows from this 32k-reservation campaign. Results are unavailable for completed final
+answers under these capped requests, long-thought stability and generated-output KL; unavailable is not zero.
+
+Optional per-token streaming timing telemetry initially returned `invalid OpenAI Chat live-timing state`
+before generation on every arm. It was omitted for the successful campaign; terminal timing/usage chunks,
+raw SSE and independently timestamped wire TTFT were retained. An initial incompatible redundant cache flag
+was also rejected before loading. Those failed attempts are retained, not counted as timed repetitions.
+No server telemetry fix or per-token timing qualification is claimed.
+
+For creating either small file from HF BF16, see
+[IQ3 creation](../weight-conversion.md#create-the-smaller-iq3-files-from-hf-bf16). Use this table rather than
+combining the earlier unmatched/route-specific measurements below into a new ranking.
+
+## Route-specific measurements
+
 ### MTP selecting-logit evidence
 
 The family-private `gemma4::ProgramOptions::logits_observer` observes the BF16
@@ -46,7 +115,7 @@ quantization. Forcing the q4 GEMV for T=2..8 did not remove the g32 divergences;
 
 ### Decode speed, best-medium (q4_g32 GPTQ, MTP d1)
 
-Port only, FP8 KV and FP8 QK, 3 timed reps per length after a discarded warmup, one server per run (median
+FP8 KV and FP8 QK, 3 timed reps per length after a discarded warmup, one server per run (median
 decode tokens/s; draft acceptance in brackets). `INFERNIX_TMP_Q4_EXACT=1` changes only prefill passes of 128
 tokens and up, not decode.
 
@@ -60,6 +129,9 @@ tokens and up, not decode.
 Cold prefill at 32k is 4,178-4,303 tok/s on the default route against 3,450-3,455 with the exact flag
 (about -18%), and at 100k 2,393-2,436 against 2,123-2,162 (about -11%). For reference, best-small (g256)
 decodes 121.35 / 120.76 / 108.75 / 86.75 tok/s at the same four lengths.
+
+This earlier route comparison is not the matched four-tier study: its request thinking field was omitted.
+Use [Four-tier comparison](#four-tier-comparison) for current, explicitly thinking-enabled tier comparisons.
 
 ### GGUF-block artifacts (IQ3_XS import): prefill and decode
 
@@ -92,10 +164,10 @@ BF16 QK/logits. Paired differences reuse the corresponding exact-A16 reports:
 |---|---:|---:|---:|---:|
 | plain IQ3_XS | 0.1762 [0.1534, 0.1996] | +0.0662 | 12.63% | +0.0129 [+0.0084, +0.0175] |
 | plain IQ3_XXS | 0.2273 [0.1984, 0.2589] | +0.0826 | 14.40% | +0.0095 [+0.0050, +0.0146] |
-| diode IQ3_XS | 0.2256 [0.1971, 0.2547] | +0.0786 | 14.03% | +0.0159 [+0.0119, +0.0196] |
-| diode IQ3_XXS | 0.3154 [0.2711, 0.3701] | +0.1585 | 16.84% | +0.0120 [+0.0070, +0.0175] |
 
 The cost is measurable: all paired KL intervals exclude zero despite overlapping marginal intervals.
+The diode IQ3 results are kept with the matched diode q4 results in the canonical four-tier comparison;
+their paired default-minus-A16 KL costs are +0.0159 (XS) and +0.0120 (XXS), also excluding zero.
 Causal scoring at chunk 128 predominantly exercises wide projections; it is not generated-output KL.
 
 Real HTTP MTP: RTX 5090, FP8 KV/QK, BF16 logits, same assistant, draft depth 1, automatic prefill,

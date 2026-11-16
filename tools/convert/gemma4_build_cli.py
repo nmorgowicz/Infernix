@@ -49,8 +49,9 @@ NEEDS = {
     "gguf": "llama.cpp binaries and source (--llama-cpp, --llama-cpp-source); own-model imatrix",
 }
 EPILOG = f"""\
-presets (measured on one model, text only, 8-bit prompt activations; KL is mean KL from the near-lossless
-reference for q4, or the model's Q8_0 reference for IQ3; lower is better):
+presets (text only, sizes include MTP; quality hints are historical, NOT a matched ranking):
+q4 hints use the diode variant / FP8-row reference; IQ3 hints use the plain variant / own-Q8_0 reference.
+See docs/maintainer/gemma4-benchmarks.md#four-tier-comparison for matched diode quality and thinking-enabled speed.
 
 {{table}}
 

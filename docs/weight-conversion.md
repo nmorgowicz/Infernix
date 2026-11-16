@@ -507,17 +507,18 @@ q4 or IQ3 `.ninfer` with the MTP assistant, then writes the receipts, a Windows 
 collector/quantizer by an existing llama.cpp build supplied explicitly below. No other orchestration repository
 is needed. Source weights are read-only, outputs are never overwritten, and a failed build resumes with the same command.
 
-| preset | method | format | file | mean KL (lower is better) |
-|---|---|---|---|---|
-| `best-small` (recommended) | GPTQ, group 256 | `q4_g256_fp16` | 16.85 GB | 0.1213 |
-| `best-medium` | GPTQ, group 32 | `q4_g32_fp16` | 18.41 GB | 0.0845 |
-| `draft` | uncalibrated absmax, group 32 | `q4_g32_fp16` | 18.41 GB | 0.2654 |
-| `iq3-xs` | own-model imatrix, IQ3_XS allocation | GGUF IQ3_S / IQ3_XXS / Q6_K blocks | about 13.9 GB | 0.1762 (own-model Q8_0 ref) |
-| `iq3-xxs` | own-model imatrix, IQ3_XXS allocation | GGUF IQ3_XXS / IQ2_S / IQ3_S blocks | about 13.0 GB | 0.2273 (own-model Q8_0 ref) |
+| preset | quantization method | stored text projections |
+|---|---|---|
+| `best-small` (recommended q4) | calibrated GPTQ, group 256 | `q4_g256_fp16` plus permutation-safe g32 global output projections |
+| `best-medium` | calibrated GPTQ, group 32 | `q4_g32_fp16` |
+| `iq3-xs` | own-model importance matrix, IQ3_XS allocation | GGUF IQ3_S / IQ3_XXS / Q6_K blocks |
+| `iq3-xxs` | own-model importance matrix, IQ3_XXS allocation | GGUF IQ3_XXS / IQ2_S / IQ3_S blocks |
+| `draft` | uncalibrated absmax, group 32 | `q4_g32_fp16`; a quick conversion smoke, not a calibrated tier |
 
-The q4 KL figures are the author's (one fine-tune, English text, FP8-row reference). File sizes include MTP.
-The two-level 6-bit scale format `q4_g32_s6_fp16` and calibrated round-to-nearest `lite-*` presets are not built here; asking for one
-is refused with the reason.
+See the [canonical four-tier comparison](maintainer/gemma4-benchmarks.md#four-tier-comparison) for measured
+text-plus-MTP bytes, model/reference-specific KL, matched thinking-enabled serving and limitations. In particular,
+do not compare the plain-model IQ3 KL numbers to a diode-model q4 number or mix FP8-row and Q8_0 references.
+The two-level 6-bit `q4_g32_s6_fp16` and calibrated round-to-nearest `lite-*` presets are not built here.
 
 GPTQ runs in its own interpreter, pinned by `tools/gptq/requirements.txt`, and never in the converter's: create
 it once, then point the builder at it with `--gptq-python` or `INFERNIX_GPTQ_PYTHON` (default
@@ -530,29 +531,78 @@ python -m tools.convert.gemma4_build --preset best-small --model <BF16 dir> --as
 python -m tools.convert.gemma4_build --preset best-small --model <BF16 dir> --assistant <assistant dir> --out-dir <dir> --yes
 ```
 
-For IQ3, pass `--llama-cpp <binary directory>` (containing `llama-quantize` and `llama-imatrix`) and
-`--llama-cpp-source <llama.cpp checkout>` (containing `convert_hf_to_gguf.py`), or set `INFERNIX_LLAMA_CPP`
-and `INFERNIX_LLAMA_CPP_SOURCE`. The builder interpreter needs `gguf`, `transformers` and `sentencepiece`
-in addition to the converter dependencies; GPTQ's environment is not used.
+### Create the smaller IQ3 files from HF BF16
+
+Start with the complete local BF16 Gemma 4 **31B dense** HF tree (including its tokenizer/config files), a clean
+infernix Git checkout, and a Python environment with the converter dependencies. The 26B-A4B architecture is
+not supported by this builder. Source files stay read-only; use output and scratch directories outside that tree.
+
+IQ3 additionally needs an existing llama.cpp build with GPU-enabled `llama-imatrix` and `llama-quantize`, and
+its source checkout containing `convert_hf_to_gguf.py`. Pass the **binary directory** as `--llama-cpp` and
+the **source directory** as `--llama-cpp-source`, or set `INFERNIX_LLAMA_CPP` and `INFERNIX_LLAMA_CPP_SOURCE`.
+The builder's Python needs `gguf`, `transformers`, `sentencepiece`, `tokenizers` and the ordinary
+`torch`/`numpy`/`safetensors` converter dependencies; default corpus export also needs `pyarrow`.
+The IQ3 route does not use or install the separate GPTQ environment. Conversion/collection needs CUDA;
+serving targets the supported Blackwell GPU build. Use `--check` to see the actual input/tool/GPU/RAM/disk checks.
+
+MTP is a **separate source**, not reconstructed from a trunk GGUF: supply the local
+`google/gemma-4-31B-it-assistant` BF16 checkpoint with `--assistant`. Its projections are encoded FP8 by default.
+To deliberately omit MTP, replace the whole `--assistant "<assistant-dir>"` pair with `--no-mtp`.
+Both IQ3 presets are text-only by default; `--with-vision` is explicit and is outside the measurements below.
+
+Run from this checkout; the two builds use different output/work directories:
 
 ```text
-python -m tools.convert.gemma4_build --preset iq3-xs --model <BF16 dir> --assistant <assistant dir> --llama-cpp <bin dir> --llama-cpp-source <source dir> --out-dir <camp artifact dir> --check
-python -m tools.convert.gemma4_build --preset iq3-xxs --model <BF16 dir> --assistant <assistant dir> --llama-cpp <bin dir> --llama-cpp-source <source dir> --out-dir <camp artifact dir> --yes
+python -m tools.convert.gemma4_build --preset iq3-xs --model "<BF16-dir>" --assistant "<assistant-dir>" --llama-cpp "<llama-bin-dir>" --llama-cpp-source "<llama-source-dir>" --out-dir "<camp>/iq3-xs" --check
+python -m tools.convert.gemma4_build --preset iq3-xs --model "<BF16-dir>" --assistant "<assistant-dir>" --llama-cpp "<llama-bin-dir>" --llama-cpp-source "<llama-source-dir>" --out-dir "<camp>/iq3-xs" --yes
+python -m tools.convert.gemma4_build --preset iq3-xxs --model "<BF16-dir>" --assistant "<assistant-dir>" --llama-cpp "<llama-bin-dir>" --llama-cpp-source "<llama-source-dir>" --out-dir "<camp>/iq3-xxs" --yes
 ```
 
-Both presets render the same 400 × 512-token calibration corpus, export BF16 GGUF, quantize a Q8_0 collection
-copy, collect an importance matrix from **that model**, and call `llama-quantize` with the measured Gemma
-allocation pins. No publisher/base-model importance matrix is substituted. They then import the quantized
-projection blocks verbatim, encode the BF16 source's vocabulary and the explicit assistant, verify storage,
-and write the ordinary launcher and receipts. Large Q8/BF16 intermediates are removed after their last use.
-Keep the output and scratch directories outside the read-only HF source tree. Repeat `serve-check` on the
-generated launcher before deploying; artifact storage verification is not a runtime or quality qualification.
+Here `<name>` defaults to the sanitized `<HF-directory-name>-<preset>`; `--name NAME` sets it explicitly.
+The artifact is `<out-dir>/<name>.ninfer`, and the build prints its actual name and launcher path.
 
+Replace `--yes` with `--dry-run` to preview exact commands without writing. `--work-dir "<scratch-dir>"`
+selects another scratch drive. Each preset renders **400 × 512-token** chat-prefixed calibration chunks,
+exports BF16 GGUF, quantizes a Q8_0 collection copy, runs `llama-imatrix` on **that model**, and quantizes
+with the measured Gemma allocation pins. No publisher/base-model importance matrix is substituted.
+The projections are then imported verbatim, while vocabulary/norms/scalars come from HF BF16 and MTP from
+the explicit assistant. The build verifies storage and writes the artifact, two conversion receipts,
+`BUILD-SUMMARY.md`, the builder receipt and `serve-<name>.cmd`.
 
-`--check` runs preflight only (GPU, RAM, disk, the required Python environments and tools, server, git revision).
-`--dry-run` prints the exact commands; `--score` adds native full-vocabulary KL against an FP8-row reference
-(about an hour and 60 GB more), preserving the IQ3 artifact's default AllowA8 policies.
-`--calibration-text FILE` replaces the pinned public English corpus.
+**Corpus and reuse.** Unless `--calibration-text FILE` supplies disjoint UTF-8 training/calibration text,
+the builder downloads the pinned English `eaddario/imatrix-calibration` `combined_en_large.parquet`
+revision `e87ed55dcba9d9c3a3e41539f3e728e981b1daa4`, verifies its hash, exports the pinned text bytes, then
+renders the model's chat prefix. Do not calibrate on your evaluation corpus or use another model's imatrix.
+The generated `imatrix.gguf`, rendered corpus and step markers are local to that build's work directory.
+Rerunning the **same arguments** resumes completed stages, including collection; it is not a shared
+cross-preset imatrix cache. A different preset/source/corpus cannot borrow that directory's done markers.
+`--keep-work` retains the matrix, corpus, IQ3 GGUF and logs after success, but does not disable normal
+BF16/Q8 scratch pruning. Without it, the builder removes its work directory after a successful build.
+There is no builder `--imatrix`/`--gguf-source` override; an existing own-model GGUF can instead use the
+direct import workflow below without repeating BF16 export, collection or quantization.
+
+**Time and storage.** The printed IQ3 plan estimates roughly 100 minutes, advertised as about two hours
+on RTX 5090 + NVMe: about 15 min BF16 export, 8 min Q8 copy, 25 min collection, 45 min CPU quantization and
+6 min import, plus small rendering/receipt steps. These are estimates, not guarantees or timings of every
+stage on every model. Small output does not mean cheap construction: a 31B BF16 intermediate is about
+62 GB and Q8 about 33 GB, versus final files around 13–14 GB including MTP. Preflight requires at least
+100 GB free scratch (120 GB comfortable), in addition to the original HF source; a separate output drive
+needs the estimated artifact size plus 2 GB. A shared output/work drive uses the peak-stage calculation,
+not the sum of all sequential intermediates. BF16 and Q8 copies are deleted after their last use.
+`--score` adds about 62 GB scratch and a long FP8-row reference build; its reference is not automatically
+the Q8_0 instrument used in the canonical comparison.
+
+After building, verify the file and the generated launcher separately:
+
+```text
+python -m tools.convert.gemma4_q4 verify --artifact "<camp>/iq3-xs/<name>.ninfer"
+python -m tools.convert.gemma4_build serve-check --launcher "<camp>/iq3-xs/serve-<name>.cmd"
+```
+
+Repeat for IQ3_XXS. A storage receipt does not establish runtime behavior or model quality; `serve-check`
+is an HTTP smoke, not a long-context/VRAM/quality certificate. Check the real startup KV capacity and chunk,
+especially on smaller cards. Measured file sizes and matched throughput are in the canonical comparison.
+
 
 The launcher runs `infernix-serve` with the operator roleplay profile: `--max-context 131072` (alias `131k`),
 `--kv-dtype fp8`, `--gemma4-qk fp8`, `--prefill-chunk auto`, one lane, `--spec mtp --draft-tokens 1` when the
@@ -572,8 +622,21 @@ bearer key, stops the server and writes a JSON receipt with the launcher's effec
 
 ### Gemma 4 31B from a llama.cpp GGUF quant (IQ3_XS, IQ3_XXS, ...)
 
-`python -m tools.convert.gemma4_q4 convert --model <BF16 dir> --gguf-source <file.gguf> [--mtp-assistant <dir>] ...`
-keeps every text-layer projection of a `llama-quantize` GGUF of the same model verbatim: its blocks are stored in
+If a same-model IQ3_XS/IQ3_XXS GGUF already exists, skip collection/quantization and import it directly.
+The original BF16 tree is still required; this is not a GGUF-only conversion:
+
+```text
+python -m tools.convert.gemma4_q4 convert --model "<BF16-dir>" --gguf-source "<same-model-IQ3.gguf>" --mtp-assistant "<assistant-dir>" --text-only --out "<camp>/model-iq3-mtp.ninfer"
+python -m tools.convert.gemma4_q4 verify --artifact "<camp>/model-iq3-mtp.ninfer"
+python -m tools.convert.gemma4_build launcher --artifact "<camp>/model-iq3-mtp.ninfer" --serve "<absolute-infernix-serve-path>" --out "<camp>/serve-model-iq3.cmd"
+python -m tools.convert.gemma4_build serve-check --launcher "<camp>/serve-model-iq3.cmd"
+```
+
+For no MTP replace `--mtp-assistant "<assistant-dir>"` with `--no-mtp`. Every text-layer projection is
+copied **as GGUF blocks, not dequantized and requantized**. The GGUF vocabulary is **not** imported:
+the tied embedding/output vocabulary is encoded from HF BF16 into FP8-row storage. Norms, scalars,
+tokenizer/template and optional components likewise use their explicit HF sources. A published GGUF of a
+different base or a pre-edit variant is not an equivalent source. Projection blocks are stored in
 `ggml_rows_v1` in the GGUF's own format (IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, Q2_0, Q4_K, Q5_K or Q6_K) and run
 by the GGUF block kernels. With the default `--weights q4_g32` the projections allow 8-bit activations (AllowA8), as
 q4 trunks do: decode and MTP verification (up to 63 columns) take `ops::ggml_linear`'s 8-bit activation route, and
@@ -581,11 +644,17 @@ prefill (64 columns and more) widens the blocks once per call to E4M3 rows with 
 (`ops::ggml_widen_e4m3`) and runs the FP8 A8 GEMM. `--weights q4_g32_a16` keeps them on 16-bit activations
 (A16Only): the exact A16 route at decode widths, and from 64 columns the blocks decoded into a dense BF16 matrix and
 run as one cuBLAS GEMM. Existing artifacts keep their stored policies: loading an A16Only artifact does not
-silently opt it into A8. There are no temporary GGUF activation environment switches. Combined-default
-qualification and the earlier separate-route measurements are in `docs/maintainer/gemma4-benchmarks.md`.
-The measured A8 policy adds about 0.010–0.016 KL versus A16 on the measured model variants; the smaller file
-does not imply equal quality. Vocabulary, norms and layer scalars come from `--model` (FP8 vocabulary),
-and MTP comes from the explicit BF16 `--mtp-assistant` source.
+silently opt it into A8. There are no temporary GGUF activation environment switches.
+
+For an explicit exact-A16 activation artifact, add `--weights q4_g32_a16` to the direct import command and
+choose a fresh output path. The `q4_g32` part of this option name does **not** requantize imported IQ3
+weights: `--gguf-source` decides their blocks; the option sets the activation permission. The builder presets
+always choose AllowA8 and have no `--weights` flag. To use their retained GGUF on A16, build with
+`--keep-work`, then import `work-<name>/model-IQ3_XS.gguf` or `model-IQ3_XXS.gguf` with that option.
+This does not overwrite or silently change an existing artifact.
+
+See the [canonical comparison](maintainer/gemma4-benchmarks.md#four-tier-comparison) for model-specific
+quality costs and thinking-enabled rates. Smaller storage does not imply equal quality.
 Global-layer query and key rows are reordered as whole rows; the global output projection keeps the
 GGUF's column order and the text config records `global_output_order: "source"`, so the runtime reads the
 attention output through a permutation of 64-element blocks. A 256-element block cannot be split, so this is the

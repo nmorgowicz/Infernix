@@ -62,7 +62,7 @@ SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 
 @dataclass(frozen=True, slots=True)
 class Preset:
-    """A measured conversion recipe. Quality figures are the author's (one model, text only, W4A8, FP8 MTP)."""
+    """A conversion recipe with model/variant-specific historical quality hints, not a cross-preset ranking."""
 
     id: str
     method: str  # "gptq", "plain" (uncalibrated absmax), or "gguf" (own-imatrix IQ3)
@@ -70,7 +70,7 @@ class Preset:
     meaning: str
     size_class: str
     file_gb: float  # text + MTP
-    kl: float  # mean KL, English: near-lossless FP8-row reference for q4, own-model Q8_0 for IQ3
+    kl: float  # historical English hints: diode / FP8-row reference for q4; plain / own-Q8_0 for IQ3
     wait: str
     group_size: int
     native_groups: bool

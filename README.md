@@ -671,16 +671,18 @@ pinned environment, see [`tools/gptq/README.md`](tools/gptq/README.md)):
 
 ```bat
 python -m tools.convert.gemma4_build --preset best-small --model <BF16 Gemma-4-31B dir> --assistant <gemma-4-31B-it-assistant dir> --out-dir <dir>
+python -m tools.convert.gemma4_build --preset iq3-xs --model <BF16 Gemma-4-31B dir> --assistant <assistant dir> --llama-cpp <llama binary dir> --llama-cpp-source <llama source dir> --out-dir <camp>/iq3-xs
 python -m tools.convert.gemma4_build serve-check --launcher <dir>\serve-<name>.cmd
 ```
 
-`best-small` is GPTQ group 256 (about 16.9 GB), `best-medium` GPTQ group 32 (about 18.4 GB, better quality).
-`iq3-xs` (about 13.9 GB with MTP) and `iq3-xxs` (about 13.0 GB) trade quality for a smaller file. They take
-`--llama-cpp <binary dir> --llama-cpp-source <source dir>`, build BF16 GGUF and a Q8_0 collection copy,
-collect the model's own importance matrix and import the IQ3 blocks; no GPTQ environment is needed.
-See [the builder guide](docs/weight-conversion.md#gemma-4-31b-builder-presets-and-the-self-contained-workflow)
-for dependencies, preflight and quality evidence. The converter embeds the fixed Gemma chat template
-(`tools/chat_templates/gemma4_fixed.jinja`); `--chat-template FILE` replaces it at serve time.
+`best-small` uses GPTQ group 256; `best-medium` uses GPTQ group 32. The smaller `iq3-xs` and `iq3-xxs`
+presets take `--llama-cpp <binary dir> --llama-cpp-source <source dir>`, collect the BF16 model's own
+importance matrix through a Q8_0 copy and import the resulting IQ3 blocks. No GPTQ environment is needed.
+Follow [HF BF16 → IQ3 creation](docs/weight-conversion.md#create-the-smaller-iq3-files-from-hf-bf16) for both
+commands, prerequisites, corpus/resume policy, disk/time costs, MTP and exact-A16 options.
+The [canonical four-tier comparison](docs/maintainer/gemma4-benchmarks.md#four-tier-comparison) states
+measured sizes, matched quality/serving protocols and limitations. The converter embeds the fixed Gemma
+chat template (`tools/chat_templates/gemma4_fixed.jinja`); `--chat-template FILE` replaces it at serve time.
 
 **Serve it.** The generated launcher runs the profile below (`0.0.0.0:8001`, alias `131k`, any model name accepted):
 `--max-context 131072 --kv-dtype fp8 --gemma4-qk fp8 --prefill-chunk auto --logits-dtype bf16 --max-concurrency 1
