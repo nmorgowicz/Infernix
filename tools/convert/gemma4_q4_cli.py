@@ -371,8 +371,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="A llama.cpp GGUF of the same model (llama-quantize output, e.g. IQ3_XS/IQ3_XXS; the first shard of a "
         "split file). Every text-layer projection keeps its GGUF blocks verbatim (ggml_rows_v1 in the GGUF's own "
-        "format: IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, Q2_0, Q4_K, Q5_K or Q6_K), run by the GGUF block kernels on "
-        "16-bit activations; vocabulary, norms and MTP come from --model as before. Mutually exclusive with "
+        "format: IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, Q2_0, Q4_K, Q5_K or Q6_K), run by the GGUF block kernels; "
+        "--weights q4_g32 (default) lets them take 8-bit activations as q4 trunks do (E4M3 rows + FP8 GEMM at prefill, "
+        "the 8-bit GGUF route at decode), --weights q4_g32_a16 keeps the exact 16-bit routes. Vocabulary, norms and "
+        "MTP come from --model as before. Mutually exclusive with "
         "--gptq-source/--scale-search/--imatrix/--group-size/--region-group/--native-groups",
     )
     build.add_argument(

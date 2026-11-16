@@ -550,12 +550,17 @@ bearer key, stops the server and writes a JSON receipt with the launcher's effec
 
 ### Gemma 4 31B from a llama.cpp GGUF quant (IQ3_XS, IQ3_XXS, ...)
 
-`python -m tools.convert.gemma4_q4 convert --model <BF16 dir> --gguf-source <file.gguf> --weights q4_g32_a16 ...`
+`python -m tools.convert.gemma4_q4 convert --model <BF16 dir> --gguf-source <file.gguf> [--mtp-assistant <dir>] ...`
 keeps every text-layer projection of a `llama-quantize` GGUF of the same model verbatim: its blocks are stored in
 `ggml_rows_v1` in the GGUF's own format (IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, Q2_0, Q4_K, Q5_K or Q6_K) and run
-by the GGUF block kernels (`ops::ggml_linear`: exact A16 at decode widths, BF16 tensor-core tiles up to 63 columns;
-from 64 columns the blocks are decoded once per call into a dense BF16 matrix and run as one cuBLAS GEMM), on
-16-bit activations. The vocabulary, norms, layer scalars and the MTP assistant come from `--model` as usual (FP8
+by the GGUF block kernels. With the default `--weights q4_g32` the projections allow 8-bit activations (AllowA8), as
+q4 trunks do: decode and MTP verification (up to 63 columns) take `ops::ggml_linear`'s 8-bit activation route, and
+prefill (64 columns and more) widens the blocks once per call to E4M3 rows with a BF16 row multiplier
+(`ops::ggml_widen_e4m3`) and runs the FP8 A8 GEMM. `--weights q4_g32_a16` keeps them on 16-bit activations
+(A16Only): the exact A16 route at decode widths, and from 64 columns the blocks decoded into a dense BF16 matrix and
+run as one cuBLAS GEMM. On the plain Wicked-Stuff-31B IQ3_XS the 8-bit routes cost +0.013 native KL at prefill and
+about 0.0035 KL at decode against the 16-bit ones, at q4_g256's speed (`docs/maintainer/gemma4-benchmarks.md`).
+The vocabulary, norms, layer scalars and the MTP assistant come from `--model` as usual (FP8
 vocabulary). Global-layer query and key rows are reordered as whole rows; the global output projection keeps the
 GGUF's column order and the text config records `global_output_order: "source"`, so the runtime reads the
 attention output through a permutation of 64-element blocks. A 256-element block cannot be split, so this is the

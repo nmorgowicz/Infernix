@@ -172,8 +172,11 @@ def test_gguf_blocks_reach_the_artifact_verbatim(tmp_path, weights):
     assert built.scale_search["method"] == "gguf_import"
     assert sum(built.scale_search["storage_formats"].values()) == len(stored)
     assert "gguf_import" in built.name
-    # The GGUF projections run on 16-bit activations: the W4A8 override touches only q4 formats.
-    assert not any(policy == "AllowA8" for (name, _), policy in built.recipe.policies.items() if name in stored)
+    # q4_g32 (the default weights) allows 8-bit activations on every GGUF projection, as on q4 trunks; q4_g32_a16 keeps
+    # them on the exact 16-bit routes.
+    policies = {name: policy for (name, _), policy in built.recipe.policies.items() if name in stored}
+    assert set(policies) == set(stored)
+    assert set(policies.values()) == {"AllowA8" if weights == "q4_g32" else "A16Only"}
 
 
 def test_same_format_groups_share_one_parent_and_mixed_ones_split(tmp_path):

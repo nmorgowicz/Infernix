@@ -29,9 +29,11 @@ struct GgmlProjection {
     [[nodiscard]] bool active() const noexcept { return !segments.empty(); }
 };
 
-// GGUF projections take the exact A16 route at decode widths (and ggml_linear's BF16 tensor-core tiles up to
-// kGgmlDenseMinTokens - 1 columns); from kGgmlDenseMinTokens columns, prefill decodes the blocks into a dense BF16
-// matrix in the workspace and runs one cuBLAS GEMM (Fp8RowCublasContext::gemm_bf16_fp32, FP32 sums).
+// GGUF projections by the artifact's input policy. AllowA8 (the converter's default for --weights q4_g32, as on q4
+// trunks): calls of up to kGgmlDenseMinTokens - 1 columns take ggml_linear's 8-bit activation route (decode, MTP
+// verification); wider calls widen the blocks to E4M3 rows (ops::ggml_widen_e4m3) and run the FP8 A8 GEMM. A16Only
+// (--weights q4_g32_a16): narrow calls take the exact A16 route (BF16 tensor-core tiles from 32 columns); wider calls
+// decode the blocks into a dense BF16 matrix and run one cuBLAS GEMM (Fp8RowCublasContext::gemm_bf16_fp32, FP32 sums).
 inline constexpr ops::LinearRoutes kGgmlRoutes = ops::LinearRoutes::GgmlBf16Wide;
 inline constexpr int kGgmlDenseMinTokens = 64;
 

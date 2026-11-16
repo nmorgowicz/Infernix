@@ -805,11 +805,15 @@ def gemma4_31b_q4_qat(model, recipe, sources):
             )
 
 
+# Gemma 4 text-layer formats with an A8 prefill/decode route: the q4 family (W4A8 fused/baked) and GGUF blocks
+# (prefill: E4M3 rows + the FP8 A8 GEMM; decode: ggml_linear's 8-bit activation route).
 Q4_A8_FORMATS = (Q4_G32, "q4_g128_fp16", "q4_g256_fp16")
+GGML_A8_FORMATS = ("ggml_q2_0", "ggml_q4_k", "ggml_q5_k", "ggml_q6_k", "ggml_iq2_s", "ggml_iq3_xxs", "ggml_iq3_s",
+                   "ggml_iq4_xs", "ggml_iq4_nl")
 
 
 def gemma4_q4_a8(model, recipe, sources):
-    """Override: allow A8 on every q4_g32/g128/g256 text-layer projection.
+    """Override: allow A8 on every q4_g32/g128/g256 or GGUF-block text-layer projection.
 
     The embedding and the output head stay A16Only.
     """
@@ -817,7 +821,7 @@ def gemma4_q4_a8(model, recipe, sources):
     for name, parameter in model.parameters.items():
         if not name.startswith("text/layers/") or not parameter.projection:
             continue
-        if not all(s.format in Q4_A8_FORMATS for s in recipe.selections[name]):
+        if not all(s.format in Q4_A8_FORMATS + GGML_A8_FORMATS for s in recipe.selections[name]):
             continue
         for input_name in parameter.inputs:
             recipe.use(name, input_name, activation_policy="AllowA8")

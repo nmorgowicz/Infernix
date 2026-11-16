@@ -1,6 +1,5 @@
 #include "models/gemma4/execution/projection.h"
 
-#include "core/temporary_switches.h"
 #include "infernix/ops/cast.h"
 
 #include <algorithm>
@@ -36,16 +35,16 @@ std::size_t aligned(std::size_t bytes) {
     return (bytes + kAlignment - 1) / kAlignment * kAlignment;
 }
 
-// INFERNIX_TMP_GGML_A8: GGUF projections at prefill widths widen to E4M3 rows and take the FP8 A8 GEMM.
-bool ggml_a8() {
-    static const bool enabled = temporary_switches::flag("INFERNIX_TMP_GGML_A8");
-    return enabled;
+// GGUF projections' routes by the artifact's input policy: AllowA8 adds ggml_linear's 8-bit activation route to the
+// narrow (decode, MTP verification) calls; A16Only keeps the exact A16 route.
+ops::LinearRoutes ggml_narrow_routes(ops::LinearPolicy policy) {
+    return ops::allows_a8(policy) ? kGgmlRoutes | ops::LinearRoutes::GgmlA8 : kGgmlRoutes;
 }
 
-// INFERNIX_TMP_GGML_DECODE_A8: GGUF projections at decode widths add the 8-bit activation route.
-ops::LinearRoutes ggml_narrow_routes() {
-    static const bool a8 = temporary_switches::flag("INFERNIX_TMP_GGML_DECODE_A8");
-    return a8 ? kGgmlRoutes | ops::LinearRoutes::GgmlA8 : kGgmlRoutes;
+void require_ggml_policy(ops::LinearPolicy policy) {
+    if (policy != ops::LinearPolicy::A16Only && policy != ops::LinearPolicy::AllowA8) {
+        throw std::invalid_argument("Gemma4 projection: GGUF blocks take A16Only or AllowA8");
+    }
 }
 
 // The FP8_E4M3FN_ROW_BF16 descriptor of `rows` x `k` codes at `payload` with the row multipliers at the
@@ -92,11 +91,9 @@ void project(const Tensor& x, const Weight& weight, const GgmlProjection& ggml, 
         project(x, weight, policy, out, gemm, workspace, stream);
         return;
     }
-    if (policy != ops::LinearPolicy::A16Only) {
-        throw std::invalid_argument("Gemma4 projection: GGUF blocks run on 16-bit activations (A16Only)");
-    }
-    if (x.ne[1] >= kGgmlDenseMinTokens && out.dtype == DType::BF16 && ggml_a8()) {
-        // Experiment (INFERNIX_TMP_GGML_A8): E4M3 rows with BF16 row multipliers, then the FP8 A8 GEMM.
+    require_ggml_policy(policy);
+    if (x.ne[1] >= kGgmlDenseMinTokens && out.dtype == DType::BF16 && ops::allows_a8(policy)) {
+        // Prefill, AllowA8: E4M3 rows with BF16 row multipliers (q4's bake contract), then the FP8 A8 GEMM.
         auto scope = workspace.scope();
         const auto payload = workspace.alloc_bytes(aligned(checked_bytes(weight.n, weight.k, 1)) +
                                                        checked_bytes(weight.n, 1, 2),
@@ -109,8 +106,8 @@ void project(const Tensor& x, const Weight& weight, const GgmlProjection& ggml, 
         return;
     }
     if (x.ne[1] >= kGgmlDenseMinTokens && out.dtype == DType::BF16) {
-        // Prefill: decode the blocks once into a dense BF16 matrix (global output columns already in the attention
-        // output's order), one cuBLAS GEMM with FP32 sums, one rounding to BF16.
+        // Prefill, A16Only: decode the blocks once into a dense BF16 matrix (global output columns already in the
+        // attention output's order), one cuBLAS GEMM with FP32 sums, one rounding to BF16.
         auto scope = workspace.scope();
         Tensor widened = workspace.alloc(DType::BF16, {weight.k, weight.n});
         ops::ggml_dequantize_bf16(ggml.segments, weight.k, widened, ggml.input_perm, ggml.perm_block, stream);
@@ -119,7 +116,8 @@ void project(const Tensor& x, const Weight& weight, const GgmlProjection& ggml, 
         ops::cast_fp32_to_bf16(partials, out, stream);
         return;
     }
-    ops::ggml_linear(x, ggml.segments, out, ggml.input_perm, ggml.perm_block, workspace, stream, ggml_narrow_routes());
+    ops::ggml_linear(x, ggml.segments, out, ggml.input_perm, ggml.perm_block, workspace, stream,
+                     ggml_narrow_routes(policy));
 }
 
 DownA8 prepare_down_a8(WorkspaceArena& workspace, int rows, int tokens) {
@@ -154,23 +152,22 @@ std::size_t projection_bytes(const Weight& weight, ops::LinearPolicy policy, int
 std::size_t projection_bytes(const Weight& weight, const GgmlProjection& ggml, ops::LinearPolicy policy, int tokens) {
     if (!ggml.active()) { return projection_bytes(weight, policy, tokens); }
     // ggml_linear's workspace depends on the call's width (encoding batches, wide-route planes): the largest
-    // over every width it takes; from kGgmlDenseMinTokens the dense route's matrix and FP32 partials.
+    // over every width it takes; from kGgmlDenseMinTokens the prefill route of the policy: AllowA8 the E4M3 rows and
+    // multipliers plus the FP8 A8 GEMM's own workspace (Gemma trunk shapes), A16Only the dense BF16 matrix and FP32
+    // partials.
     std::size_t bytes = 0;
     for (int columns = 1; columns <= std::min(tokens, kGgmlDenseMinTokens - 1); ++columns) {
         bytes = std::max(bytes, ops::ggml_linear_workspace_bytes(weight.k, columns));
     }
-    if (tokens >= kGgmlDenseMinTokens) {
+    if (tokens >= kGgmlDenseMinTokens && ops::allows_a8(policy)) {
+        bytes = std::max(bytes, aligned(aligned(checked_bytes(weight.n, weight.k, 1)) + checked_bytes(weight.n, 1, 2)) +
+                                    ops::linear_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16, weight.n, weight.k,
+                                                                         ops::LinearPolicy::AllowA8,
+                                                                         kGgmlDenseMinTokens, tokens) +
+                                    2 * kAlignment);
+    } else if (tokens >= kGgmlDenseMinTokens) {
         bytes = std::max(bytes, aligned(checked_bytes(weight.n, weight.k, 2)) +
                                     aligned(checked_bytes(weight.n, tokens, 4)) + 2 * kAlignment);
-        // The INFERNIX_TMP_GGML_A8 arm (Gemma trunk shapes): E4M3 rows and multipliers, then the FP8 A8 GEMM's own
-        // workspace.
-        if (ggml_a8()) {
-            bytes = std::max(bytes, aligned(aligned(checked_bytes(weight.n, weight.k, 1)) + checked_bytes(weight.n, 1, 2)) +
-                                        ops::linear_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16, weight.n,
-                                                                             weight.k, ops::LinearPolicy::AllowA8,
-                                                                             kGgmlDenseMinTokens, tokens) +
-                                        2 * kAlignment);
-        }
     }
     return bytes;
 }

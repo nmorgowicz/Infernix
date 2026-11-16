@@ -132,10 +132,11 @@ private:
     // The projection's rows in order: one segment per region of a GGUF parent (no device address for a
     // geometry-only Model).
     PreparedProjection ggml_linear(std::initializer_list<WeightId> ids, const std::vector<ops::WeightInput>& rows) const {
+        // input() admits A16Only and AllowA8; the routes follow the policy, so a fused projection needs one.
         for (const auto& row : rows) {
-            if (row.policy != ops::LinearPolicy::A16Only) {
+            if (row.policy != rows.front().policy) {
                 throw std::invalid_argument(model_.weight(*ids.begin()).name +
-                                            ": GGUF blocks run on 16-bit activations (A16Only)");
+                                            ": a fused GGUF projection's parameters need one activation policy");
             }
         }
         PreparedProjection out;
@@ -174,7 +175,7 @@ private:
         out.weight.ndim          = 2;
         out.weight.n             = out.weight.shape[0] = out.weight.padded_shape[0] = row;
         out.weight.k             = out.weight.shape[1] = out.weight.padded_shape[1] = dimension(k);
-        out.policy               = ops::LinearPolicy::A16Only;
+        out.policy               = rows.front().policy;
         return out;
     }
 

@@ -93,10 +93,13 @@ std::uint16_t bf16_from_double(double v);
 
 // project() over parts (one stored parent each, stacked rows) with x given in `x_order` (x_order[k] is the
 // source index of element k), the input permutation `perm` (null: none), against the source-order oracle. From
-// kGgmlDenseMinTokens columns the dense route multiplies BF16-rounded weights: the oracle rounds them the same way
-// (ggml_dequantize_bf16's exactness is checked separately), so only the FP32-sum bound remains.
+// kGgmlDenseMinTokens columns the A16Only dense route multiplies BF16-rounded weights: the oracle rounds them the same
+// way (ggml_dequantize_bf16's exactness is checked separately), so only the FP32-sum bound remains. AllowA8 narrow
+// calls quantize each activation slice of 32 to 8 bits: the bound widens by that rounding (a wrong permutation or
+// segment still misses by O(1)).
 void run(const std::string& label, const std::vector<Part>& parts, int k, int columns,
-         const std::vector<int>& x_order, const std::vector<std::int32_t>& perm, std::mt19937& rng) {
+         const std::vector<int>& x_order, const std::vector<std::int32_t>& perm, std::mt19937& rng,
+         ops::LinearPolicy policy = ops::LinearPolicy::A16Only) {
     int n = 0;
     std::vector<std::vector<std::uint8_t>> stored;
     std::vector<double> w; // [n, k] source order
@@ -138,11 +141,11 @@ void run(const std::string& label, const std::vector<Part>& parts, int k, int co
     Weight descriptor;
     descriptor.n = n;
     descriptor.k = k;
-    WorkspaceArena work(g4::projection_bytes(descriptor, projection, ops::LinearPolicy::A16Only, columns) + (1 << 20));
+    WorkspaceArena work(g4::projection_bytes(descriptor, projection, policy, columns) + (1 << 20));
     ops::Fp8RowCublasContext gemm(stream);
     Tensor tx(dx.p, DType::BF16, {k, columns});
     Tensor tout(dout.p, DType::BF16, {n, columns});
-    g4::project(tx, descriptor, projection, ops::LinearPolicy::A16Only, tout, gemm, work, stream);
+    g4::project(tx, descriptor, projection, policy, tout, gemm, work, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     std::vector<std::uint16_t> got(static_cast<std::size_t>(n) * columns);
     dout.copy_to_host(got.data(), got.size() * 2);
@@ -163,7 +166,9 @@ void run(const std::string& label, const std::vector<Part>& parts, int k, int co
                 magnitude += std::fabs(term);
             }
             const double actual = bf16_value(got[static_cast<std::size_t>(t) * n + r]);
-            bad += std::fabs(actual - sum) > std::ldexp(std::fabs(sum), -8) + std::ldexp(magnitude, -14);
+            const double bound = ops::allows_a8(policy) ? std::ldexp(std::fabs(sum), -6) + std::ldexp(magnitude, -8)
+                                                        : std::ldexp(std::fabs(sum), -8) + std::ldexp(magnitude, -14);
+            bad += std::fabs(actual - sum) > bound;
         }
     }
     require(bad == 0, label + ": " + std::to_string(bad) + " of " + std::to_string(got.size()) +
@@ -390,6 +395,16 @@ int main(int argc, char** argv) {
             run("fused IQ3_XXS+IQ2_S+Q6_K" + width,
                 {{QType::GGML_IQ3_XXS, 48}, {QType::GGML_IQ2_S, 16}, {QType::GGML_Q6_K, 16}}, k, columns, identity, {},
                 rng);
+        }
+        // AllowA8 at decode widths (ggml_linear's 8-bit activation route); its prefill route (E4M3 rows + the FP8 A8
+        // GEMM) runs on the Gemma trunk shapes only, and its widening is checked above.
+        for (const int columns : {1, 4, 40}) {
+            const std::string width = " AllowA8 T=" + std::to_string(columns);
+            run("global output IQ3_S" + width, {{QType::GGML_IQ3_S, 96}}, k, columns, order, perm, rng,
+                ops::LinearPolicy::AllowA8);
+            run("fused IQ3_XXS+IQ2_S+Q6_K" + width,
+                {{QType::GGML_IQ3_XXS, 48}, {QType::GGML_IQ2_S, 16}, {QType::GGML_Q6_K, 16}}, k, columns, identity, {},
+                rng, ops::LinearPolicy::AllowA8);
         }
         std::cout << "gemma4 GGUF projections (fused segments, global output permutation) passed\n";
         return 0;
