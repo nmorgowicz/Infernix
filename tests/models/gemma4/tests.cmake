@@ -2,6 +2,14 @@ infernix_add_test(infernix_gemma4_loading_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_loading.cpp"
   LIBRARIES infernix_model_loading)
 
+# Projections stored as GGUF blocks (a llama.cpp GGUF import) through the execution layer's project(): fused
+# segments of mixed ggml formats and the global output projection's input permutation, against a binary64
+# oracle over independently decoded blocks in source order; the permutation table on the real 31B geometry.
+infernix_add_test(infernix_gemma4_gguf_projection_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_projection.cpp"
+  LIBRARIES infernix_model_runtime)
+set_tests_properties(infernix_gemma4_gguf_projection_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu")
+
 # A real Gemma 4 text(+mtp) artifact by explicit path (--artifact); skips (77) without one. Host only.
 infernix_add_test(infernix_gemma4_loading_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_loading_real.cpp"

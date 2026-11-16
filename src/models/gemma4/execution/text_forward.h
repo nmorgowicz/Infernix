@@ -5,6 +5,7 @@
 #include "infernix/ops/fp8_row_cublas.h"
 #include "infernix/ops/gemma4_cache.h"
 #include "infernix/ops/linear.h"
+#include "models/gemma4/execution/projection.h"
 
 #include <cuda_runtime.h>
 
@@ -17,7 +18,8 @@ namespace infernix::models::gemma4 {
 
 // One Gemma 4 text block. x is contiguous BF16 [hidden, T] and is updated in place.
 // qkv holds query rows, then key rows, then (sliding layers only) value rows;
-// gate_up holds gate rows, then up rows. Policies are the artifact's input permissions.
+// gate_up holds gate rows, then up rows. Policies are the artifact's input permissions. A projection
+// stored as GGUF blocks has an active *_ggml (its Weight then only describes [N,K]).
 struct Gemma4LayerWeights {
     const void* input_norm = nullptr;
     Weight qkv;
@@ -32,6 +34,10 @@ struct Gemma4LayerWeights {
     ops::LinearPolicy o_policy = ops::LinearPolicy::A16Only;
     ops::LinearPolicy gate_up_policy = ops::LinearPolicy::A16Only;
     ops::LinearPolicy down_policy = ops::LinearPolicy::A16Only;
+    GgmlProjection qkv_ggml;
+    GgmlProjection o_ggml;
+    GgmlProjection gate_up_ggml;
+    GgmlProjection down_ggml;
     const void* post_ff_norm = nullptr;
     float layer_scalar = 1.0f;
     int hidden = 0;

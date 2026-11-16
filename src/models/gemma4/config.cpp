@@ -97,7 +97,7 @@ TextConfig text(const Json& value) {
          "hidden_activation", "attention_scale", "embed_normalizer", "rope_sliding_theta",
          "rope_global_theta", "partial_rotary_factor", "prope_pairs", "prope_rotary_dim",
          "prope_theta_eff"},
-        {"global_k_norm_scalar"}, "text config");
+        {"global_k_norm_scalar", "global_output_order"}, "text config");
     const auto& names = value.at("architectures");
     if (!names.is_array() || names.size() != 1) {
         throw ArtifactError("architectures must name one implementation");
@@ -163,6 +163,10 @@ TextConfig text(const Json& value) {
             }
             out.global_k_norm_scalar.emplace(layer, static_cast<float>(scalar.get<double>()));
         }
+    }
+    if (value.contains("global_output_order")) {
+        if (value.at("global_output_order") != "source") { throw ArtifactError("global_output_order must be source"); }
+        out.global_output_source_order = true;
     }
     return out;
 }

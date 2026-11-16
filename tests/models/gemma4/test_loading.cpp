@@ -284,6 +284,62 @@ void unsupported_format() {
     throw std::runtime_error("an unsupported projection format was accepted");
 }
 
+// (f) GGUF blocks (a llama.cpp GGUF import): text-layer projections bind ggml_rows_v1 parents, a fused
+// projection may span one parent per member but never mixes GGUF blocks with native formats, the vocabulary
+// table refuses them, and the text config's global_output_order is parsed.
+void gguf_projections() {
+    // A tensor appended after the resources: the file's payload size follows it.
+    const auto ggml_tensor = [](ModelFixture& fixture, const std::string& id, std::vector<std::uint64_t> shape) {
+        fixture.tensor(id, shape, QType::GGML_IQ4_NL, QuantLayout::GgmlRows);
+        fixture.file.root["files"][0]["payload_bytes"] = fixture.file.payload.size();
+    };
+    const auto ggml_parameter = [&](ModelFixture& fixture, const std::string& name, std::vector<std::uint64_t> shape) {
+        ggml_tensor(fixture, name + "#gguf", shape);
+        fixture.file.root["bindings"][name] = {{"object", name + "#gguf"}};
+    };
+    const std::string p = "text/layers/0/";
+    {
+        ModelFixture fixture(false);
+        for (const auto& [role, rows] : {std::pair{"attention/query", 8}, std::pair{"attention/key", 4},
+                                         std::pair{"attention/value", 4}, std::pair{"mlp/gate", 24},
+                                         std::pair{"mlp/up", 24}}) {
+            ggml_parameter(fixture, p + role, {static_cast<std::uint64_t>(rows), H});
+        }
+        fixture.file.root["components"]["text"]["config"]["global_output_order"] = "source";
+        fixture.file.write();
+        artifact::Reader reader(fixture.file.entry);
+        const auto plan = g4::plan_load(reader);
+        require(plan.config().text.global_output_source_order, "global_output_order source was not parsed");
+        const auto& sliding = std::get<g4::SlidingAttentionWeights>(plan.weights().text.layers[0].attention);
+        require(plan.parameter(sliding.query).binding.parts.at(0).object !=
+                    plan.parameter(sliding.key).binding.parts.at(0).object,
+                "GGUF q/k were not bound to their own parents");
+    }
+    {
+        ModelFixture fixture(false);
+        ggml_parameter(fixture, p + "attention/key", {4, H}); // q and v stay in the BF16 qkv parent
+        fixture.file.write();
+        artifact::Reader reader(fixture.file.entry);
+        rejects([&] { (void)g4::plan_load(reader); }, "a fused projection mixing GGUF blocks and BF16 was accepted");
+    }
+    {
+        ModelFixture fixture(false);
+        ggml_tensor(fixture, "embedding-gguf", {V, H});
+        fixture.file.root["bindings"]["text/token_embedding"] = {{"object", "embedding-gguf"}};
+        fixture.file.root["bindings"]["text/output_head"]     = {{"object", "embedding-gguf"}};
+        fixture.file.write();
+        artifact::Reader reader(fixture.file.entry);
+        rejects([&] { (void)g4::plan_load(reader); }, "a GGUF-block vocabulary table was accepted");
+    }
+    {
+        ModelFixture fixture(false);
+        fixture.file.root["components"]["text"]["config"]["global_output_order"] = "ggml";
+        fixture.file.write();
+        artifact::Reader reader(fixture.file.entry);
+        rejects([&] { (void)g4::plan_load(reader); }, "an unknown global_output_order was accepted");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -291,6 +347,7 @@ int main() {
         binds_and_selects();
         absent_mtp_and_foreign_artifact();
         unsupported_format();
+        gguf_projections();
         std::cout << "gemma4 config, binding, MTP selection and format checks passed\n";
         return 0;
     } catch (const std::exception& error) {

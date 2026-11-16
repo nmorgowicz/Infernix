@@ -44,6 +44,18 @@ void project(const Tensor& x, const Weight& weight, ops::LinearPolicy policy, Te
     }
 }
 
+void project(const Tensor& x, const Weight& weight, const GgmlProjection& ggml, ops::LinearPolicy policy,
+             Tensor& out, ops::Fp8RowCublasContext& gemm, WorkspaceArena& workspace, cudaStream_t stream) {
+    if (!ggml.active()) {
+        project(x, weight, policy, out, gemm, workspace, stream);
+        return;
+    }
+    if (policy != ops::LinearPolicy::A16Only) {
+        throw std::invalid_argument("Gemma4 projection: GGUF blocks run on 16-bit activations (A16Only)");
+    }
+    ops::ggml_linear(x, ggml.segments, out, ggml.input_perm, ggml.perm_block, workspace, stream, kGgmlRoutes);
+}
+
 DownA8 prepare_down_a8(WorkspaceArena& workspace, int rows, int tokens) {
     const auto codes = workspace.alloc_bytes(checked_bytes(rows, tokens, 1), kAlignment);
     const auto scales = workspace.alloc_bytes(checked_bytes(1, tokens, sizeof(float)), kAlignment);
@@ -71,6 +83,17 @@ std::size_t projection_bytes(const Weight& weight, ops::LinearPolicy policy, int
                                                              policy, 1, tokens);
     if (!fp8_through_cublas(weight, policy, tokens)) { return linear; }
     return std::max(linear, ops::fp8_row_cublas_workspace_bytes(weight.n, weight.k, tokens));
+}
+
+std::size_t projection_bytes(const Weight& weight, const GgmlProjection& ggml, ops::LinearPolicy policy, int tokens) {
+    if (!ggml.active()) { return projection_bytes(weight, policy, tokens); }
+    // ggml_linear's workspace depends on the call's width (encoding batches, wide-route planes): the largest
+    // over every width up to tokens.
+    std::size_t bytes = 0;
+    for (int columns = 1; columns <= tokens; ++columns) {
+        bytes = std::max(bytes, ops::ggml_linear_workspace_bytes(weight.k, columns));
+    }
+    return bytes;
 }
 
 } // namespace infernix::models::gemma4

@@ -28,6 +28,11 @@ using artifact::Shape;
 // (the tied vocabulary) and the coarse-group Q4 weights.
 constexpr QType kMatrixFormats[] = {QType::BF16, QType::FP8_E4M3FN_ROW_BF16, QType::Q4_G32_FP16,
                                     QType::Q4_G128_FP16, QType::Q4_G256_FP16};
+// A text-layer projection may also be GGUF blocks in ggml_rows_v1 (a llama.cpp GGUF import,
+// tools/convert/gemma4_gguf.py), run by ops::ggml_linear.
+constexpr QType kGgmlFormats[] = {QType::GGML_Q2_0,  QType::GGML_Q4_K,    QType::GGML_Q5_K,
+                                  QType::GGML_Q6_K,  QType::GGML_IQ2_S,   QType::GGML_IQ3_XXS,
+                                  QType::GGML_IQ3_S, QType::GGML_IQ4_XS,  QType::GGML_IQ4_NL};
 
 std::string allowed_formats() {
     std::string out;
@@ -62,20 +67,27 @@ public:
     explicit Bindings(artifact::Binder& binder) : binder(binder) {}
 
     // A stored matrix [rows, K] (a projection, the vocabulary table or a head): device-resident, one of
-    // kMatrixFormats, whole rows, and a complete stored parent where its layout needs one. `inputs` are
-    // the Uses the artifact declares for it (each with an activation policy and no auxiliaries).
+    // kMatrixFormats (or, with `gguf_blocks`, kGgmlFormats in ggml_rows_v1), whole rows, and a complete stored
+    // parent where its layout needs one. `inputs` are the Uses the artifact declares for it (each with an
+    // activation policy and no auxiliaries).
     WeightId matrix(std::string name, Shape shape, std::vector<std::string> inputs = {},
-                    bool grouped = false) {
+                    bool grouped = false, bool gguf_blocks = false) {
         if (shape.size() != 2) { throw ArtifactError(name + ": a matrix parameter is two-dimensional"); }
         PendingWeight pending;
         pending.reference = binder.parameter(name, shape);
         const auto& reader = binder.reader();
         for (const auto& part : pending.reference.binding.parts) {
-            const QType format = reader.geometry(part.object).format;
-            if (std::find(std::begin(kMatrixFormats), std::end(kMatrixFormats), format) ==
-                std::end(kMatrixFormats)) {
+            const auto& geometry = reader.geometry(part.object);
+            const QType format   = geometry.format;
+            const bool native    = std::find(std::begin(kMatrixFormats), std::end(kMatrixFormats), format) !=
+                                std::end(kMatrixFormats);
+            const bool ggml      = gguf_blocks && geometry.layout == QuantLayout::GgmlRows &&
+                              std::find(std::begin(kGgmlFormats), std::end(kGgmlFormats), format) !=
+                                  std::end(kGgmlFormats);
+            if (!native && !ggml) {
                 throw ArtifactError(name + ": stored format " + std::string(artifact::format_name(format)) +
-                                    " is not supported (Gemma4 binds " + allowed_formats() + ")");
+                                    " is not supported (Gemma4 binds " + allowed_formats() +
+                                    (gguf_blocks ? "; text-layer projections also GGUF blocks in ggml_rows_v1)" : ")"));
             }
             if (part.begin % shape[1] != 0 || part.end % shape[1] != 0) {
                 throw ArtifactError(name + ": a matrix binds whole rows of its stored parent");
@@ -133,8 +145,22 @@ public:
 
     // The parameters, in order, are consecutive row ranges of ONE stored matrix (the rows q/k/(v) or
     // gate/up share), which one native Weight spans (contiguous_weight_region). A stored layout that
-    // addresses only its complete parent (FP8 rows) must be filled exactly.
+    // addresses only its complete parent (FP8 rows) must be filled exactly. GGUF blocks may span several
+    // parents (ops::ggml_linear runs one segment per region), but never mix with native formats.
     void group(std::initializer_list<WeightId> ids) const {
+        const auto& reader = binder.reader();
+        bool any_ggml = false, all_ggml = true;
+        for (const WeightId id : ids) {
+            for (const auto& part : at(id).reference.binding.parts) {
+                const bool g = reader.geometry(part.object).layout == QuantLayout::GgmlRows;
+                any_ggml     = any_ggml || g;
+                all_ggml     = all_ggml && g;
+            }
+        }
+        if (any_ggml && !all_ggml) {
+            throw ArtifactError(at(*ids.begin()).reference.name + ": a fused projection mixes GGUF blocks with native formats");
+        }
+        if (any_ggml) { return; }
         std::optional<artifact::Part> run;
         std::string label;
         for (const WeightId id : ids) {
@@ -204,29 +230,29 @@ TextWeights bind_text(Bindings& b, const TextConfig& c) {
         LayerWeights layer;
         if (kind == LayerKind::Sliding) {
             SlidingAttentionWeights a;
-            a.query = b.matrix(p + "attention/query", {q, h}, {input}, true);
-            a.key   = b.matrix(p + "attention/key", {k, h}, {input}, true);
-            a.value = b.matrix(p + "attention/value", {k, h}, {input}, true);
+            a.query = b.matrix(p + "attention/query", {q, h}, {input}, true, true);
+            a.key   = b.matrix(p + "attention/key", {k, h}, {input}, true, true);
+            a.value = b.matrix(p + "attention/value", {k, h}, {input}, true, true);
             b.group({a.query, a.key, a.value});
             a.query_norm = b.direct(p + "attention/query_norm", {dim});
             a.key_norm   = b.direct(p + "attention/key_norm", {dim});
-            a.output     = b.matrix(p + "attention/output", {h, q}, {p + "attention_output"});
+            a.output     = b.matrix(p + "attention/output", {h, q}, {p + "attention_output"}, false, true);
             layer.attention = a;
         } else {
             // Global layers have no value projection: V is K.
             GlobalAttentionWeights a;
-            a.query = b.matrix(p + "attention/query", {q, h}, {input}, true);
-            a.key   = b.matrix(p + "attention/key", {k, h}, {input}, true);
+            a.query = b.matrix(p + "attention/query", {q, h}, {input}, true, true);
+            a.key   = b.matrix(p + "attention/key", {k, h}, {input}, true, true);
             b.group({a.query, a.key});
             a.query_norm = b.direct(p + "attention/query_norm", {dim});
             a.key_norm   = b.direct(p + "attention/key_norm", {dim});
-            a.output     = b.matrix(p + "attention/output", {h, q}, {p + "attention_output"});
+            a.output     = b.matrix(p + "attention/output", {h, q}, {p + "attention_output"}, false, true);
             layer.attention = a;
         }
-        layer.gate = b.matrix(p + "mlp/gate", {inter, h}, {p + "ffn_input"}, true);
-        layer.up   = b.matrix(p + "mlp/up", {inter, h}, {p + "ffn_input"}, true);
+        layer.gate = b.matrix(p + "mlp/gate", {inter, h}, {p + "ffn_input"}, true, true);
+        layer.up   = b.matrix(p + "mlp/up", {inter, h}, {p + "ffn_input"}, true, true);
         b.group({layer.gate, layer.up});
-        layer.down                  = b.matrix(p + "mlp/down", {h, inter}, {p + "mlp/product"});
+        layer.down                  = b.matrix(p + "mlp/down", {h, inter}, {p + "mlp/product"}, false, true);
         layer.input_norm            = b.direct(p + "input_norm", {h});
         layer.post_attention_norm   = b.direct(p + "post_attention_norm", {h});
         layer.pre_feedforward_norm  = b.direct(p + "pre_feedforward_norm", {h});

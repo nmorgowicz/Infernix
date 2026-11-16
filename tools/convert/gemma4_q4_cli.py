@@ -85,6 +85,7 @@ def options_from(args: argparse.Namespace) -> Q4Options:
         imatrix=args.imatrix,
         mtp_weights=args.mtp_weights,
         gptq_source=args.gptq_source,
+        gguf_source=args.gguf_source,
     )
 
 
@@ -364,6 +365,15 @@ def build_parser() -> argparse.ArgumentParser:
         "binary16-exact scales are copied into q4_g32_fp16 (or, with --native-groups, a 128/256-group source "
         "into q4_g128_fp16/q4_g256_fp16) without re-rounding; a layout the converter cannot store "
         "exactly is refused. Mutually exclusive with --scale-search/--imatrix/--group-size/--region-group",
+    )
+    build.add_argument(
+        "--gguf-source",
+        type=Path,
+        help="A llama.cpp GGUF of the same model (llama-quantize output, e.g. IQ3_XS/IQ3_XXS; the first shard of a "
+        "split file). Every text-layer projection keeps its GGUF blocks verbatim (ggml_rows_v1 in the GGUF's own "
+        "format: IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, Q2_0, Q4_K, Q5_K or Q6_K), run by the GGUF block kernels on "
+        "16-bit activations; vocabulary, norms and MTP come from --model as before. Mutually exclusive with "
+        "--gptq-source/--scale-search/--imatrix/--group-size/--region-group/--native-groups",
     )
     build.add_argument(
         "--resource",

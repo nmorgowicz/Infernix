@@ -50,6 +50,10 @@ struct TextConfig {
     float prope_theta_eff          = 0;
     // Global layers whose key norm weight is one constant (layer index -> value); parsed and kept.
     std::map<std::uint32_t, float> global_k_norm_scalar;
+    // A GGUF import (tools/convert/gemma4_gguf.py writes global_output_order "source"): global-layer output
+    // projections keep their columns in source order (GGUF blocks span prope_perm's runs) and read the
+    // attention output through execution::global_output_input_perm.
+    bool global_output_source_order = false;
     // Computed from layer_types; empty when the model has no layer of that kind.
     std::optional<std::uint32_t> last_sliding_layer;
     std::optional<std::uint32_t> last_global_layer;

@@ -42,6 +42,15 @@ Weight matrix_geometry(const WeightView& view) {
     out.group_size = static_cast<std::uint32_t>(out.group);
     return out;
 }
+
+// A prepared projection: the native Weight (or, for GGUF blocks, a descriptor of [N,K]), its policy and,
+// for GGUF blocks, the segments ops::ggml_linear runs.
+struct PreparedProjection {
+    Weight weight;
+    ops::LinearPolicy policy = ops::LinearPolicy::A16Only;
+    GgmlProjection ggml;
+};
+
 class Prepare {
 public:
     explicit Prepare(const Model& model) : model_(model) {}
@@ -65,15 +74,16 @@ public:
         return {bound.view, found->policy, std::nullopt, std::nullopt};
     }
 
-    ops::SingleProjectionWeight linear(std::initializer_list<WeightId> ids,
-                                       std::string_view input_name) const {
+    PreparedProjection linear(std::initializer_list<WeightId> ids, std::string_view input_name) const {
         std::vector<ops::WeightInput> rows;
         rows.reserve(ids.size());
         for (const auto id : ids) { rows.push_back(input(id, input_name)); }
-        if (model_.weights_resident()) {
-            return ops::prepare_linear_weight(std::span<const ops::WeightInput>(rows));
-        }
         if (rows.empty()) { throw std::invalid_argument("Gemma4 parameters: empty projection"); }
+        if (ggml(ids)) { return ggml_linear(ids, rows); }
+        if (model_.weights_resident()) {
+            const auto single = ops::prepare_linear_weight(std::span<const ops::WeightInput>(rows));
+            return {single.weight, single.policy, {}};
+        }
         WeightView joined;
         joined.shape = {0, rows.front().weight.shape.at(1)};
         for (const auto& row : rows) {
@@ -84,7 +94,7 @@ public:
             joined.shape[0] += row.weight.shape[0];
             joined.parts.insert(joined.parts.end(), row.weight.parts.begin(), row.weight.parts.end());
         }
-        return {matrix_geometry(joined), rows.front().policy};
+        return {matrix_geometry(joined), rows.front().policy, {}};
     }
 
     const void* norm(WeightId id, int width) const {
@@ -101,10 +111,108 @@ public:
     }
 
 private:
+    // Whether the parameters are stored as GGUF blocks (ggml_rows_v1); a projection mixing them with native
+    // formats is refused.
+    bool ggml(std::initializer_list<WeightId> ids) const {
+        bool any = false, all = true;
+        for (const auto id : ids) {
+            for (const auto& part : model_.weight(id).view.parts) {
+                const bool g = is_ggml_matrix_layout(part.parent->geometry.layout);
+                any = any || g;
+                all = all && g;
+            }
+        }
+        if (any && !all) {
+            throw std::invalid_argument(model_.weight(*ids.begin()).name +
+                                        ": a projection mixes GGUF blocks with native formats");
+        }
+        return any;
+    }
+
+    // The projection's rows in order: one segment per region of a GGUF parent (no device address for a
+    // geometry-only Model).
+    PreparedProjection ggml_linear(std::initializer_list<WeightId> ids, const std::vector<ops::WeightInput>& rows) const {
+        for (const auto& row : rows) {
+            if (row.policy != ops::LinearPolicy::A16Only) {
+                throw std::invalid_argument(model_.weight(*ids.begin()).name +
+                                            ": GGUF blocks run on 16-bit activations (A16Only)");
+            }
+        }
+        PreparedProjection out;
+        std::int32_t row = 0;
+        std::uint64_t k  = 0;
+        for (const auto id : ids) {
+            const auto& view = model_.weight(id).view;
+            if (view.shape.size() != 2) { throw std::invalid_argument("a GGUF projection parameter must be a matrix"); }
+            if (k == 0) { k = view.shape[1]; }
+            if (view.shape[1] != k) { throw std::invalid_argument("a GGUF projection's parameters must share K"); }
+            for (const auto& part : view.parts) {
+                const auto& parent = *part.parent;
+                const auto& g      = parent.geometry;
+                if (g.layout != QuantLayout::GgmlRows) {
+                    throw std::invalid_argument(model_.weight(id).name + ": Gemma4 binds GGUF blocks as ggml_rows_v1");
+                }
+                if (g.shape[1] != k || part.begin % k || part.end % k) {
+                    throw std::invalid_argument("a GGUF projection region must be whole rows");
+                }
+                ops::GgmlSegment s;
+                s.format = g.format;
+                if (model_.weights_resident()) {
+                    const std::byte* base = parent.device != nullptr ? parent.device : parent.data;
+                    if (base == nullptr) { throw std::invalid_argument("a GGUF projection needs device-visible weights"); }
+                    s.data = reinterpret_cast<const std::uint8_t*>(base + part.begin / k * g.code_bytes_per_row);
+                }
+                s.rows       = static_cast<std::int32_t>((part.end - part.begin) / k);
+                s.out_offset = row;
+                s.layout     = ops::GgmlLayout::Rows;
+                row += s.rows;
+                out.ggml.segments.push_back(s);
+            }
+        }
+        out.weight.qtype         = out.ggml.segments.front().format;
+        out.weight.layout        = QuantLayout::GgmlRows;
+        out.weight.ndim          = 2;
+        out.weight.n             = out.weight.shape[0] = out.weight.padded_shape[0] = row;
+        out.weight.k             = out.weight.shape[1] = out.weight.padded_shape[1] = dimension(k);
+        out.policy               = ops::LinearPolicy::A16Only;
+        return out;
+    }
+
     const Model& model_;
 };
 
 } // namespace
+
+std::vector<std::int32_t> global_output_input_perm(const TextConfig& c) {
+    const int dim = static_cast<int>(c.global_head_dim), pairs = static_cast<int>(c.prope_pairs), half = dim / 2;
+    std::vector<int> perm;
+    for (int i = 0; i < pairs; ++i) { perm.push_back(i); }
+    for (int i = 0; i < pairs; ++i) { perm.push_back(half + i); }
+    for (int i = 0; i < dim; ++i) {
+        if (!(i < pairs || (i >= half && i < half + pairs))) { perm.push_back(i); }
+    }
+    std::vector<int> position(dim);
+    for (int p = 0; p < dim; ++p) { position[perm[p]] = p; }
+    if (dim % kGlobalOutputPermBlock != 0) {
+        throw std::invalid_argument("Gemma4 parameters: global head dim is not whole permutation blocks");
+    }
+    const int per_head = dim / kGlobalOutputPermBlock;
+    std::vector<std::int32_t> blocks;
+    for (int b = 0; b < per_head; ++b) {
+        const int start = position[b * kGlobalOutputPermBlock];
+        for (int e = 0; e < kGlobalOutputPermBlock; ++e) {
+            if (position[b * kGlobalOutputPermBlock + e] != start + e || start % kGlobalOutputPermBlock != 0) {
+                throw std::invalid_argument("Gemma4 parameters: prope_perm does not move whole 64-element blocks");
+            }
+        }
+        blocks.push_back(start / kGlobalOutputPermBlock);
+    }
+    std::vector<std::int32_t> out;
+    for (std::uint32_t h = 0; h < c.num_attention_heads; ++h) {
+        for (const auto b : blocks) { out.push_back(static_cast<std::int32_t>(h * per_head + b)); }
+    }
+    return out;
+}
 
 ParameterGeometry Parameters::geometry(const Model& source) {
     const Prepare prepare(source);
@@ -147,7 +255,7 @@ ParameterGeometry Parameters::geometry(const Model& source) {
         layer.rope_theta = kind == LayerKind::Global ? config.prope_theta_eff : config.rope_sliding_theta;
         layer.rms_eps = config.rms_norm_eps;
         layer.global_layer = kind == LayerKind::Global;
-        ops::SingleProjectionWeight qkv;
+        PreparedProjection qkv;
         WeightId q_norm, k_norm, output;
         if (layer.global_layer) {
             const auto& attention = std::get<GlobalAttentionWeights>(stored.attention);
@@ -175,6 +283,16 @@ ParameterGeometry Parameters::geometry(const Model& source) {
         layer.gate_up_policy = gate_up.policy;
         layer.down = down.weight;
         layer.down_policy = down.policy;
+        layer.qkv_ggml = qkv.ggml;
+        layer.o_ggml = o.ggml;
+        layer.gate_up_ggml = gate_up.ggml;
+        layer.down_ggml = down.ggml;
+        if (layer.global_layer && config.global_output_source_order != layer.o_ggml.active()) {
+            throw std::invalid_argument(prefix + "attention/output: global_output_order \"source\" and a GGUF-block "
+                                                 "global output projection come together");
+        }
+        // The permutation's device array is uploaded by the resident constructor.
+        if (layer.global_layer && layer.o_ggml.active()) { layer.o_ggml.perm_block = kGlobalOutputPermBlock; }
         layer.input_norm = prepare.norm(stored.input_norm, layer.hidden);
         layer.post_attn_norm = prepare.norm(stored.post_attention_norm, layer.hidden);
         layer.pre_ff_norm = prepare.norm(stored.pre_feedforward_norm, layer.hidden);
@@ -188,6 +306,9 @@ ParameterGeometry Parameters::geometry(const Model& source) {
             out.derived_device_bytes += bytes;
         }
         out.layers.push_back(layer);
+    }
+    if (config.global_output_source_order) {
+        out.derived_device_bytes += global_output_input_perm(config).size() * sizeof(std::int32_t);
     }
     if (const auto& assistant = source.config().mtp) {
         const auto& mtp = *source.weights().mtp;
@@ -264,6 +385,17 @@ Parameters::Parameters(const Model& source, cudaStream_t stream) : model(source)
         for (Weight* projection : {&layer.qkv, &layer.o_proj, &layer.gate_up, &layer.down}) {
             ops::linear_prepare_a8_rows(*projection, row_scales_.emplace_back(), stream);
             derived_device_bytes_ += row_scales_.back().bytes;
+        }
+    }
+    if (source.config().text.global_output_source_order) {
+        const auto perm = global_output_input_perm(source.config().text);
+        output_perm_ = DeviceBuffer(perm.size() * sizeof(std::int32_t));
+        output_perm_.copy_from_host(perm.data(), perm.size() * sizeof(std::int32_t));
+        derived_device_bytes_ += output_perm_.bytes;
+        for (auto& layer : layers) {
+            if (layer.o_ggml.perm_block != 0) {
+                layer.o_ggml.input_perm = static_cast<const std::int32_t*>(output_perm_.p);
+            }
         }
     }
 }

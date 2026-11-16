@@ -68,14 +68,15 @@ std::size_t gemma4_layer_workspace_bytes(const Gemma4LayerWeights& weights, int 
     const auto inter = static_cast<std::size_t>(weights.intermediate);
     // qkv (the sliding upper bound), qn, attention; hidden_n, projected; gate_up, activated.
     const auto elements = add_bytes(add_bytes(3 * q, 2 * k), add_bytes(2 * h, 3 * inter));
-    auto down_scratch = projection_bytes(weights.down, weights.down_policy, tokens);
+    auto down_scratch = projection_bytes(weights.down, weights.down_ggml, weights.down_policy, tokens);
     if (ops::allows_a8(weights.down_policy)) {
         // GeGLU's ready codes/scales stay live while linear_a8_ready takes its own scratch.
         down_scratch = add_bytes(down_scratch, down_a8_bytes(weights.intermediate, tokens));
     }
-    const auto scratch = std::max({projection_bytes(weights.qkv, weights.qkv_policy, tokens),
-                                   projection_bytes(weights.o_proj, weights.o_policy, tokens),
-                                   projection_bytes(weights.gate_up, weights.gate_up_policy, tokens),
+    const auto scratch = std::max({projection_bytes(weights.qkv, weights.qkv_ggml, weights.qkv_policy, tokens),
+                                   projection_bytes(weights.o_proj, weights.o_ggml, weights.o_policy, tokens),
+                                   projection_bytes(weights.gate_up, weights.gate_up_ggml, weights.gate_up_policy,
+                                                    tokens),
                                    down_scratch,
                                    ops::gemma4_attention_workspace_capacity_bytes(
                                        weights.head_dim, weights.q_heads, weights.kv_heads, tokens)});
@@ -122,7 +123,7 @@ void layer_body(Tensor& x, Tensor& hidden_n, const Gemma4LayerWeights& weights,
     auto attn = workspace.alloc(DType::BF16, {q_rows, tokens});
     auto projected = workspace.alloc(DType::BF16, {hidden, tokens});
 
-    project(hidden_n, weights.qkv, weights.qkv_policy, qkv, gemm, workspace, stream);
+    project(hidden_n, weights.qkv, weights.qkv_ggml, weights.qkv_policy, qkv, gemm, workspace, stream);
     Tensor qn_heads(qn.data, DType::BF16, {dim, weights.q_heads, tokens});
     ops::gemma4_qkv_prep(qkv, norm_weight(weights.q_norm, dim), norm_weight(weights.k_norm, dim),
                          positions, weights.rotary_dim, weights.rope_theta, weights.rms_eps,
@@ -130,24 +131,27 @@ void layer_body(Tensor& x, Tensor& hidden_n, const Gemma4LayerWeights& weights,
     Tensor attn_heads(attn.data, DType::BF16, {dim, weights.q_heads, tokens});
     ops::gemma4_attention(qn_heads, cache, positions, weights.window, 1.0f, attn_heads,
                           workspace, stream);
-    project(attn, weights.o_proj, weights.o_policy, projected, gemm, workspace, stream);
+    project(attn, weights.o_proj, weights.o_ggml, weights.o_policy, projected, gemm, workspace, stream);
     const Tensor pre_ff_norm = norm_weight(weights.pre_ff_norm, hidden);
     ops::gemma4_residual_norm(projected, norm_weight(weights.post_attn_norm, hidden), 1.0f,
                               &pre_ff_norm, weights.rms_eps, x, &hidden_n, stream);
 
     auto gate_up = workspace.alloc(DType::BF16, {2 * inter, tokens});
-    project(hidden_n, weights.gate_up, weights.gate_up_policy, gate_up, gemm, workspace, stream);
+    project(hidden_n, weights.gate_up, weights.gate_up_ggml, weights.gate_up_policy, gate_up, gemm, workspace,
+            stream);
     const Tensor gate = gate_up.slice(0, 0, inter);
     const Tensor up = gate_up.slice(0, inter, inter);
     auto activated = workspace.alloc(DType::BF16, {inter, tokens});
-    const bool fused_down = ops::linear_takes_a8_ready(weights.down, tokens, weights.down_policy);
+    const bool fused_down =
+        !weights.down_ggml.active() && ops::linear_takes_a8_ready(weights.down, tokens, weights.down_policy);
     const DownA8 down_codes = fused_down ? prepare_down_a8(workspace, inter, tokens) : DownA8{};
     ops::geglu(gate, up, activated, stream, down_codes.codes, down_codes.scales);
     if (fused_down) {
         project_down_ready(activated, weights.down, weights.down_policy, projected, down_codes,
                            gemm, workspace, stream);
     } else {
-        project(activated, weights.down, weights.down_policy, projected, gemm, workspace, stream);
+        project(activated, weights.down, weights.down_ggml, weights.down_policy, projected, gemm, workspace,
+                stream);
     }
     const Tensor next_norm = norm_weight(next_input_norm, hidden);
     ops::gemma4_residual_norm(projected, norm_weight(weights.post_ff_norm, hidden),

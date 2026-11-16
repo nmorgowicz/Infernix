@@ -548,6 +548,20 @@ python -m tools.convert.gemma4_build serve-check --launcher <serve.cmd>
 model id, another model name (200 with `--any-model-name`, 404 without), no model field (400) and an arbitrary
 bearer key, stops the server and writes a JSON receipt with the launcher's effective profile.
 
+### Gemma 4 31B from a llama.cpp GGUF quant (IQ3_XS, IQ3_XXS, ...)
+
+`python -m tools.convert.gemma4_q4 convert --model <BF16 dir> --gguf-source <file.gguf> --weights q4_g32_a16 ...`
+keeps every text-layer projection of a `llama-quantize` GGUF of the same model verbatim: its blocks are stored in
+`ggml_rows_v1` in the GGUF's own format (IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, Q2_0, Q4_K, Q5_K or Q6_K) and run
+by the GGUF block kernels (`ops::ggml_linear`: exact A16 at decode widths, BF16 tensor cores from 32 columns), on
+16-bit activations. The vocabulary, norms, layer scalars and the MTP assistant come from `--model` as usual (FP8
+vocabulary). Global-layer query and key rows are reordered as whole rows; the global output projection keeps the
+GGUF's column order and the text config records `global_output_order: "source"`, so the runtime reads the
+attention output through a permutation of 64-element blocks. A 256-element block cannot be split, so this is the
+only exact way to keep those tensors. `--gguf-source` excludes `--gptq-source`, scale searches, imatrix,
+group sizes and `--native-groups`: the GGUF decides every projection's stored blocks. Code:
+`tools/convert/gemma4_gguf.py`; native test `infernix_gemma4_gguf_projection_test`.
+
 ## Write a conversion method
 
 A method receives a `PrepareRequest` and returns `request.job(produce=...)`. Preparation validates
