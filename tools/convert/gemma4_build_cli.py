@@ -123,6 +123,13 @@ def add_serve_arguments(parser: argparse.ArgumentParser, *, prefix: str) -> None
     add("--top-k", type=int, help="process-level top-k, 0..64 for Gemma (default: no flag; the artifact's sampling "
         "preset applies)")
     add("--chat-template", type=Path, help="Jinja chat template file that replaces the artifact's (--chat-template)")
+    add("--default-thinking-budget", type=int, help="process-level thinking cap for requests that set none, in tokens "
+        "(default: no flag; the server's answer room still ends a long thought). A thought that reaches it is closed "
+        "with a short notice and the model answers")
+    add("--thinking-budget-message", help="text that replaces the built-in notice a reached thinking budget (or "
+        "--reasoning-loop conclude) commits before the thought close (default: no flag, the built-in notice)")
+    add("--reasoning-loop", choices=launcher_tools.REASONING_LOOPS, help="end (stop) or close (conclude) a thought "
+        "that keeps repeating whole passages (default: no flag, off)")
     add("--cuda-bin", type=Path, help="directory the launcher puts on PATH (if the DLLs are not beside the exe)")
 
 
@@ -134,6 +141,8 @@ def serve_kwargs(args: argparse.Namespace) -> dict:
         "prefill_chunk": args.prefill_chunk, "draft_tokens": args.draft_tokens, "logits_dtype": args.logits_dtype,
         "host_context_mib": args.host_context_mib, "vram_headroom_mib": args.vram_headroom_mib,
         "top_k": args.top_k, "chat_template": args.chat_template.resolve() if args.chat_template else None,
+        "default_thinking_budget": args.default_thinking_budget,
+        "thinking_budget_message": args.thinking_budget_message, "reasoning_loop": args.reasoning_loop,
     }
 
 

@@ -1012,6 +1012,41 @@ def test_other_settings_are_refused_with_the_flag_name(bad, message):
         launcher.check_serve_settings(launcher.ServeProfile(**bad))
 
 
+def test_thinking_control_flags_are_optional_and_flow_into_the_launcher(tmp_path):
+    default = "\n".join(launcher.launcher_lines("S", "A", launcher.ServeProfile(), mtp=True, vision=False))
+    for flag in ("--default-thinking-budget", "--thinking-budget-message", "--reasoning-loop"):
+        assert flag not in default  # the operator profile is unchanged unless asked
+    profile = launcher.ServeProfile(default_thinking_budget=6000, thinking_budget_message="Time to act now: <channel|>",
+                                    reasoning_loop="conclude")
+    plan = lines_profile(launcher.launcher_lines("S", "A", profile, mtp=True, vision=False), tmp_path)
+    assert plan.flags[plan.flags.index("--default-thinking-budget") + 1] == "6000"
+    # A message with spaces and CMD metacharacters is one quoted word and reads back whole.
+    assert plan.flags[plan.flags.index("--thinking-budget-message") + 1] == "Time to act now: <channel|>"
+    assert plan.flags[plan.flags.index("--reasoning-loop") + 1] == "conclude"
+    assert plan.effective_profile()["draft_tokens"] == "1"
+    only_loop = lines_profile(
+        launcher.launcher_lines("S", "A", launcher.ServeProfile(reasoning_loop="stop"), mtp=False, vision=False),
+        tmp_path)
+    assert only_loop.flags[only_loop.flags.index("--reasoning-loop") + 1] == "stop"
+    assert "--default-thinking-budget" not in only_loop.flags
+
+
+@pytest.mark.parametrize(
+    "bad, message",
+    [
+        (dict(default_thinking_budget=0), "--default-thinking-budget"),
+        (dict(thinking_budget_message=""), "--thinking-budget-message"),
+        (dict(thinking_budget_message='say "go"'), "--thinking-budget-message"),
+        (dict(thinking_budget_message="100% done"), "--thinking-budget-message"),
+        (dict(thinking_budget_message="two\nlines"), "--thinking-budget-message"),
+        (dict(reasoning_loop="off"), "--reasoning-loop"),
+    ],
+)
+def test_thinking_control_settings_are_refused_with_the_flag_name(bad, message):
+    with pytest.raises(ValueError, match=message):
+        launcher.check_serve_settings(launcher.ServeProfile(**bad))
+
+
 def test_launcher_refuses_quotes_and_neutralizes_percent():
     with pytest.raises(ValueError, match="quotes"):
         launcher.cmd_path(Path('C:/a"b'))

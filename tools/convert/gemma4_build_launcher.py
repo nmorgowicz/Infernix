@@ -35,6 +35,7 @@ DEFAULT_DRAFT_TOKENS = "1"
 DEFAULT_HOST_CONTEXT_MIB = 8192
 DEFAULT_VRAM_HEADROOM_MIB = 1024
 MAX_TOP_K = 64  # Gemma4's sampler ceiling (Qwen stays at 20)
+REASONING_LOOPS = ("stop", "conclude")  # --reasoning-loop; "off" is the server default and emits no flag
 # Libraries infernix binaries load from their own directory: FFmpeg (vcpkg) and the staged cuBLAS.
 REQUIRED_DLLS = (
     "avcodec-*.dll",
@@ -76,6 +77,11 @@ class ServeProfile:
     vram_headroom_mib: int = DEFAULT_VRAM_HEADROOM_MIB
     top_k: int | None = None  # None: no flag, the artifact's sampling preset applies
     chat_template: Path | None = None  # runtime override of the artifact's template (--chat-template)
+    # Thinking control (none by default: the server's answer room already ends a long thought, and the loop guard is
+    # off): --default-thinking-budget N, --thinking-budget-message TEXT, --reasoning-loop stop|conclude.
+    default_thinking_budget: int | None = None
+    thinking_budget_message: str | None = None
+    reasoning_loop: str | None = None
 
     @property
     def model_id(self) -> str:
@@ -134,6 +140,13 @@ def check_serve_settings(profile: ServeProfile) -> None:
         raise ValueError("--vram-headroom-mib must not be negative")
     if profile.top_k is not None and not 0 <= profile.top_k <= MAX_TOP_K:
         raise ValueError(f"--top-k must be 0..{MAX_TOP_K} for Gemma, got {profile.top_k}")
+    if profile.default_thinking_budget is not None and profile.default_thinking_budget < 1:
+        raise ValueError("--default-thinking-budget must be positive")
+    message = profile.thinking_budget_message
+    if message is not None and (not message.strip() or any(char in message for char in ('"', "%", "\r", "\n"))):
+        raise ValueError("--thinking-budget-message must be non-empty text without quotes, '%' or line breaks")
+    if profile.reasoning_loop is not None and profile.reasoning_loop not in REASONING_LOOPS:
+        raise ValueError(f"--reasoning-loop must be one of {REASONING_LOOPS} (omit it for off)")
 
 
 def serve_groups(
@@ -156,6 +169,15 @@ def serve_groups(
         + (["--top-k", str(profile.top_k)] if profile.top_k is not None else [])
         + (["--chat-template", chat_template] if chat_template else []),
     ]
+    thinking = (
+        (["--default-thinking-budget", str(profile.default_thinking_budget)]
+         if profile.default_thinking_budget is not None else [])
+        + (["--thinking-budget-message", profile.thinking_budget_message]
+           if profile.thinking_budget_message is not None else [])
+        + (["--reasoning-loop", profile.reasoning_loop] if profile.reasoning_loop is not None else [])
+    )
+    if thinking:
+        groups.append(thinking)
     if mtp:
         groups.append(["--spec", "mtp", "--draft-tokens", profile.draft_tokens])
     groups.append(["--device-snapshot-slots", "0", "--host-context-mib", str(profile.host_context_mib)]
@@ -171,7 +193,7 @@ def serve_argv(server: Path, artifact: Path, profile: ServeProfile, *, mtp: bool
 
 
 def _cmd_word(word: str) -> str:
-    return f'"{word}"' if any(char.isspace() for char in word) else word
+    return f'"{word}"' if any(char.isspace() or char in "&|<>^()" for char in word) else word
 
 
 def launcher_lines(
