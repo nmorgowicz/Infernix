@@ -197,6 +197,99 @@ quality, or the 8,192-token total budget of long-thinking roleplay.
 Not measured: sampling other than greedy, any prompt beyond 131072, a larger Host tier, concurrency above one, cold
 prefill with a different chunk, and quality at these lengths (no KL or retrieval score exists for them).
 
+## Long-thinking qualification (8192 total tokens including reasoning)
+
+Stability and throughput only; **no reasoning or answer quality is claimed**. Same four artifacts, binary (`f0073e790fb9`),
+fixed template and RTX 5090 as above, with the roleplay launcher profile (131072 context, FP8 KV/QK, auto chunk 2048, MTP d1,
+8192 MiB host tier unless labelled), one fresh server per tier, 8 GiB free-RAM floor (minimum free RAM observed 15.7 GiB with the
+20480 MiB host tier). Every request sets `enable_thinking=true`, `max_tokens=8192` (reasoning and answer share it). Two
+sampling arms: **matched greedy** (temperature 0, top-k 20, seed 1234) and the **roleplay sampler**: temperature 1.0,
+top_p 0.95, top_k 64, min_p 0.03, a different seed per request. The launcher passes no sampling flags, so the sampler is
+written explicitly in each request (Gemma's recommended 1.0 / 0.95 / 64 plus the SillyTavern preset's min_p 0.03). The server
+default answer room was kept: the log shows `thinking N/6,144` for a request with an 8,192 limit.
+
+**Per response** the harness records reasoning, answer and total tokens (from usage), `finish_reason`, empty final, wire TTFT,
+MTP accepted/drafted, decode tok/s and errors, and stores the full text. A response is **complete** only if it ends with
+`finish_reason=stop`, has a non-empty final answer and is not flagged as a loop; throughput is never a gate, because a loop
+inflates both MTP acceptance and decode rate (some looping responses below report 99% acceptance, one garbage-token loop 33%). Loop flag, computed on
+reasoning plus answer text: the last 400 words are periodic (best fraction of words equal to the word *p* positions earlier,
+p = 1-64, at least 0.95), or the last 4000 characters compress to under 0.10 under zlib, or the last 500 words contain under
+10% distinct words. Healthy replies compress to 0.33-0.55 and had at least 0.41 distinct words; none of the 425
+`stop` responses is flagged and none of the 18 `length` responses with a 8,192-token cap is unflagged. A `repetitive` soft flag
+(distinct word 8-grams below 0.5) is recorded for human reading. This is a stuck-output detector, not a quality judgement.
+
+**Part A, cold prompts (~1k, ~16k, ~65k, ~122k; actual 988-992, 15,990-15,993, 64,990-64,992, 121,992-121,993 tokens),
+completed / attempted and decode tok/s median [range] over completed and looping runs:** greedy reps 5 / 5 / 2 / 2 (the ~1k and
+~16k points are the primary run plus the reversed-tier repeat, below) and sampler reps 5 / 5 / 2 / 1; each timed request is a
+distinct document and one excluded 256-token warmup precedes them.
+
+| Prompt | Tier | Greedy complete | Greedy decode tok/s | Sampler complete | Sampler decode tok/s | Wire TTFT s (greedy) |
+|---|---|---|---|---|---|---:|
+| ~1k | `best-medium` | 5/5 | 119.6 [115.4-121.0] | 4/5 | 109.8 [105.1-125.8] | 0.25 |
+| ~1k | `best-small` | 5/5 | 125.6 [114.9-127.0] | 5/5 | 116.9 [115.4-121.9] | 0.25 |
+| ~1k | `iq3-xs` | 5/5 | 123.7 [119.4-127.6] | 4/5 | 109.6 [106.0-133.8] | 0.25 |
+| ~1k | `iq3-xxs` | 5/5 | 126.1 [122.8-128.9] | 4/5 | 117.1 [114.3-135.9] | 0.27 |
+| ~16k | `best-medium` | 5/5 | 108.2 [105.4-110.4] | 5/5 | 106.2 [105.7-108.9] | 3.08 |
+| ~16k | `best-small` | 4/5 | 115.0 [111.2-129.2] | 5/5 | 112.6 [107.6-114.5] | 3.06 |
+| ~16k | `iq3-xs` | 4/5 | 110.6 [106.7-124.2] | 5/5 | 107.8 [103.0-111.3] | 3.26 |
+| ~16k | `iq3-xxs` | 4/5 | 113.3 [110.2-128.2] | 5/5 | 110.8 [109.2-114.6] | 3.18 |
+| ~65k | `best-medium` | 2/2 | 92.5 [92.4-92.7] | 2/2 | 87.7 [86.5-88.8] | 20.70 |
+| ~65k | `best-small` | 2/2 | 97.1 [95.5-98.6] | 2/2 | 91.1 [89.9-92.2] | 20.64 |
+| ~65k | `iq3-xs` | 2/2 | 92.2 [91.3-93.1] | 2/2 | 88.2 [86.7-89.8] | 21.34 |
+| ~65k | `iq3-xxs` | 2/2 | 94.3 [94.1-94.5] | 1/2 | 79.3 [70.4-88.3] | 21.21 |
+| ~122k | `best-medium` | 2/2 | 76.1 [75.9-76.3] | 1/1 | 74.0 | 56.86 |
+| ~122k | `best-small` | 2/2 | 79.1 [77.6-80.6] | 1/1 | 80.1 | 56.62 |
+| ~122k | `iq3-xs` | 2/2 | 76.8 [76.6-77.0] | 1/1 | 73.6 | 58.32 |
+| ~122k | `iq3-xxs` | 2/2 | 77.8 [76.9-78.7] | 1/1 | 77.0 | 58.51 |
+
+Rates of the 122k points are single or paired measurements. The item-1 transient did **not** recur: the reversed-tier repeat of the ~1k
+and ~16k points (iq3-xxs first, best-medium last) gave the same decode rates as the primary order within run-to-run variation.
+Every *completed* response was short: median reasoning 726-1,129 and answer 563-684 tokens (maximum over all 425 completed
+thinking responses, soak and roleplay turns included: 3,777 reasoning, 4,351 total), so the 8,192 cap bound only looping responses.
+
+**Thinking loops occur on every tier, with and without the sampler, and are more frequent on `iq3-xxs`.** All 18 thinking-on
+responses that hit 8,192 tokens were degenerate: 16 never left the reasoning channel (reasoning 8,192, empty final answer,
+`thinking 8,192/6,144` in the server line, i.e. the server's own 6,144-token thinking budget did not close the loop) and 2
+looped inside the final answer. Overall completion over all 443 thinking-on responses
+(Part A + repeat, Part B turns, Part C soak; labelled reruns included): best-medium 42/43, best-small 188/191, iq3-xs 41/43,
+iq3-xxs 154/166. Excluding the roleplay turns (all 16-turn conversations completed): Part A + repeat + soak loop counts are
+1/27, 3/143, 2/27 and 12/134. The same ~16k document looped under greedy on `best-small`, `iq3-xs` and `iq3-xxs` but not
+`best-medium`, so loops are partly prompt-specific; the sampler loops were at other prompts. These counts are small and no
+significance test was run.
+
+**Part D, item-1's degeneracy condition under the roleplay sampler** (thinking off, three ~122k prompts from the long-context
+baseline, cap 8192, seeds 5001-5003): `best-small` 1/3, `iq3-xs` 2/3 and `iq3-xxs` 2/3 generated until the 8,192 cap in a
+degenerate low-vocabulary token loop (the same prompt on all three tiers); the other runs stopped on their own at
+1,653-3,887 tokens. The greedy baseline had 0/6 on q4 and 5/6 on IQ3, so the sampler reduces the IQ3 rate in this small test
+and shows that the q4 tier is not immune; it does not remove the IQ3 gap. No engine change was attempted.
+
+**Part B, multi-turn roleplay (16 turns per tier, thinking on, sampler, cap 8192):** a synthetic fantasy road-journey
+conversation with a ~50k-token compendium inside the system prompt (corpus text), scripted benign user turns, and, like a chat
+frontend, only the `content` of each reply sent back as history. Prompt length grows from 50,147 to 55,036-55,494 tokens.
+**All 16 turns completed on every tier** (finish `stop`, no loop, no empty final) at both host-tier sizes; every turn generated 451-2,183
+tokens. Turn 1 (cold) TTFT was 14.3 (`best-medium`), 14.9, 14.6 and 15.5 s (`iq3-xxs`); later turns resumed 99.0-99.9% of the prompt
+(`lane_resident`, plus one `hybrid_snapshot` on `iq3-xxs`) at median TTFT 0.46, 0.44, 0.85 and 0.78 s (maximum 0.52, 0.51, 0.95, 0.93).
+With the 8192 MiB Host tier each conversation wrote 1,020-1,060 blocks and 19-30 snapshot images and left the tier at 8.23-8.34 GB of
+8.59 GB with 12-23 snapshot evictions. A 20480 MiB tier (`best-small` and `iq3-xxs`, labelled, same 16 turns) also filled
+(21.17-21.18 of 21.47 GB, 45 images written) and changed nothing visible: the same classes and TTFTs. Host restores were 0 (`best-small`) and 1 (`iq3-xxs`);
+because turns are served from the lane, this does not exercise the Host tier. [INFERENCE] The sliding-window image dominates the Host bytes.
+
+**Part C, soak** (45 minutes, one server each, mixed thinking on and off, greedy and sampler, ~1k to ~65k prompts, caps 1,024-8,192,
+about 13% cached continuations, fixed RNG so both tiers received the same request sequence until continuations diverged):
+
+| Tier | Requests | Finish stop / length | HTTP or transport errors | Loops (thinking-on) | Whole-device MiB: ready / first-10-min median / last-10-min median / max | Linear slope |
+|---|---|---|---|---|---|---|
+| `best-small` | 158 | 156 / 2 | 0 | 2 | 27510 / 27605 / 27780 / 28074 | +393 MiB/h |
+| `iq3-xxs` | 143 | 134 / 9 | 0 | 9 | 23860 / 23879 / 23871 / 23969 | -20 MiB/h |
+
+`best-small` stepped up by about 175 MiB between minutes 25 and 30 and was flat afterwards; `iq3-xxs` did not grow. Samples are two seconds
+apart, include the idle desktop and can miss shorter spikes. Neither server died or returned an error; the 2 and 9 `length` finishes are the loops above (in the `iq3-xxs`
+soak 7 stayed in reasoning and 2 looped in the answer). Slow cached turns were rare (one 3.3-3.4 s continuation on each tier whose prompt needed 16.7k tokens recomputed).
+
+**Needs human reading:** every response's reasoning and answer are in the retained evidence; no quality was judged, the loop
+detector's flags were not audited by a person, and the `repetitive` soft flag was not reviewed. Not measured: other samplers or
+seeds, prompts above 122k with thinking, host tiers other than 8192 and 20480 MiB, or any comparison of reasoning quality between tiers.
+
 ## Route-specific measurements
 
 ### MTP selecting-logit evidence
