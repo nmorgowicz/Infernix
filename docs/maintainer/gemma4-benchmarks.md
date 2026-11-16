@@ -295,6 +295,85 @@ soak 7 stayed in reasoning and 2 looped in the answer). Slow cached turns were r
 detector's flags were not audited by a person, and the `repetitive` soft flag was not reviewed. Not measured: other samplers or
 seeds, prompts above 122k with thinking, host tiers other than 8192 and 20480 MiB, or any comparison of reasoning quality between tiers.
 
+## 16 GB-class capacity envelope (simulated available memory on an RTX 5090)
+
+Everything in this section is **simulated available memory on an RTX 5090**, not a physical 16 GB card: no claim is made about
+a real card's fit, driver behaviour, display load or speed. Prefill and decode rates are 5090 relative indicators only.
+Artifacts, binary (`f0073e790fb9`), template and request shape are the same as above; `iq3-xxs` and `iq3-xs` text + FP8 MTP files,
+FP8 KV and FP8 QK, `--max-concurrency 1`, `--vram-headroom-mib 1024` (not binding here), 4096 MiB host cache (host RAM, not VRAM),
+one server per cell, thinking off, greedy. Every cell loads the server, then sends a near-capacity prompt (`min(context, KV capacity)`
+minus 450 tokens, 256 generated) and two ~1k prompts, so a configuration is demonstrated by running, not by loading.
+
+**Ballast.** A torch process holds VRAM until `nvidia-smi` reports the intended free memory, verified before every load
+(`summary.json` in each variant directory). Simulated card total 16303 MiB (RTX 5080-class `memory.total`). The server-usable
+memory is the card total minus a resident reserve: **nominal** 14,767 MiB (1.5 GiB for display, driver and other CUDA contexts),
+**conservative** 13,743 MiB (2.5 GiB, which is what this machine's desktop uses at idle), **headless** 15,791 MiB (0.5 GiB, no display).
+These are assumptions, not measurements of any 16 GB card. This 5090 reports 32,607 MiB but its Windows budget is 31,419 MiB, so
+the ballast is set to usable + 1,161 MiB; ballasting only by `nvidia-smi` free let the server run past the budget and page
+(a first probe at 4k, default chunk: prefill 273 tok/s and decode 21 tok/s). A cell is `fit` only when the whole-device peak used
+(`nvidia-smi`, 0.4 s samples, including the desktop and the ballast) stays within 31,419 MiB; `marginal` is over that line with decode
+within 70% (and prefill within 60%) of the no-ballast reference; `degraded` is over and slower; `FAIL` is a refusal. A sampler can miss
+short spikes, and over-the-line `marginal` cells run at full speed here, which means the ballast is partly evictable: only `fit` is a demonstrated limit.
+
+**What sets the footprint.** Server-added peak MiB at 4,096 context, no ballast: `iq3-xxs` with MTP **14,172** (prefill chunk 128),
+14,191 (256), ~14,470 (512) and **16,833 at the default `auto` chunk (2048)**; without MTP 13,695 (128) and 16,389 (`auto`).
+The plan and logs give the parts: weights 12,385 MiB with MTP and 11,921 MiB with `--spec off` (the plan and the `GPU weights` log line drop the
+464 MiB assistant when speculation is off); the sliding-window ring **900 MiB at chunk 128 against 2.34 GiB at `auto`**; prefill workspace 274, 306, 370, 765 and
+1,530 MiB at chunks 128, 256, 512, 1024 and `auto`; global FP8 KV 41,280 B per token (161 MiB per 4k, 5.04 GiB at 131,072);
+graph allowance 64 MiB; and about 290-390 MiB that no plan line names (CUDA context and kernels). `iq3-xs` adds about 840 MiB over `iq3-xxs`
+(its weights). So at a 16 GB-class card the **default chunk cannot fit** (16.4-16.8 GiB needed at only 4k context); chunk 128-512 is what
+makes `iq3-xxs` fit, and the usable memory left over buys context at 0.04 MiB per token. `--prefill-split-workspace-mib 64/128` and
+`--no-cuda-graph` did not change the plan's workspace; `--no-cuda-graph` saved 16 MiB (14,155 to 14,139 at 4k, chunk 128) and cost
+about 15-20% decode (127 to 106 tok/s with MTP, 84 to 65 without), so it is not a useful fit lever.
+
+Largest demonstrated context by configuration, **`fit` / including `marginal`** (ladder 4k, 8k, 12k, 16k, 20k, 24k, 32k, 40k, 49k, 65k; each
+ladder stops after two consecutive non-`fit` rows; chunk 256 was tested only at 4k and 16k):
+
+| Tier, MTP | Chunk | Headless 15,791 MiB | Nominal 14,767 MiB | Conservative 13,743 MiB |
+|---|---|---|---|---|
+| `iq3-xxs`, MTP d1 | 128 | **40,960** / 49,152 | **16,384** / 24,576 | none (4,096 marginal, +472 MiB over) |
+| `iq3-xxs`, MTP d1 | 512 | 32,768 / 49,152 | 8,192 / 16,384 | none (4,096 marginal) |
+| `iq3-xxs`, no MTP | 128 | **49,152** / 65,536 | **24,576** / 40,960 | **4,096** / 6,144 |
+| `iq3-xxs`, no MTP | 512 | 40,960 / 40,960 | 20,480 / 32,768 | none (4,096 marginal) |
+| `iq3-xs`, MTP d1 | 128 | 20,480 / 32,768 | none (8,192 marginal) | not run |
+| `iq3-xs`, MTP d1 | 512 | 12,288 / 20,480 | none (8,192 marginal) | not run |
+| `iq3-xs`, no MTP | 128 | 32,768 / 40,960 | 8,192 / 16,384 | not run |
+| `iq3-xs`, no MTP | 512 | 24,576 / 40,960 | none (8,192 marginal) | not run |
+
+Default `auto` chunk at these sizes never fit: every ballasted `auto` cell (4k context, `iq3-xxs`, headless and nominal and two scan points) was
+`degraded`, with near-capacity prefill 515-2,311 tok/s and decode 26-54 tok/s against 5,547 and 125 unconstrained. The 65,536-context
+`iq3-xxs` MTP chunk-128 cell (headless) is `degraded` (prefill 343, decode 19-47); the no-MTP chunk-128 cell at 65,536 is `marginal`
+(1,571 / 71-83). Nothing above 65,536 was run on a ballasted card.
+
+Relative decode and prefill, `iq3-xxs` on the 5090 (near-capacity prompt, then ~1k prompts): MTP d1 decodes at 125-135 tok/s
+(120-124 at 16k, 100-111 at 32k-65k) against 82-85 (80-84, 71-78) without it, +45-50% at the same context; `iq3-xs` 113-127 against 80-81.
+MTP costs 464 MiB of weights plus about 13 MiB of draft state (14,172 against 13,695 at 4k), which is 8,192 tokens of context in both
+the headless and nominal chunk-128 ladders (49,152 to 40,960 and 24,576 to 16,384). At this card class that is a trade of
+roughly a third of the context for about +50% decode; it is worth it when 16k or more is enough [INFERENCE on workload; the rates are 5090 ones].
+Chunk costs prefill: near-capacity prefill of `iq3-xxs` MTP is 1,715 / 1,972 tok/s at 4k / 16k with chunk 128, 2,410 / 2,984 at 256,
+2,775 / 3,619 at 512 and 5,547 / 5,256 at the default `auto` (unconstrained), i.e. chunk 128 costs about 2.7-3.2x of the default and chunk 512 about 1.5-2.0x.
+
+**Refusals.** 17 of 161 ballasted cell attempts (and 0 of 10 unconstrained) were refused at startup, all with
+`FATAL server failed during startup | Gemma4 CUDA graph preparation exceeded its planned device allowance; reduce prefill_chunk or disable CUDA graphs`,
+including cells with more than 1 GiB spare (for example headless `iq3-xxs` no-MTP chunk 512 at 4k), and not monotonic with context. A retry
+of the same configuration succeeded for every refused ladder cell (rerun in a later lease, or by the harness's own two retries added after the first
+ladders); all refused attempts are retained. The two refusals that remain (scan cells, `iq3-xxs` MTP chunk 512 at 4k, 15,500 and 15,200 MiB usable) were not retried. The 14
+`--no-cuda-graph` cells were never refused. [INFERENCE] The allowance check reads free memory around graph capture and is perturbed by other
+processes' memory changes in this simulation; it was not isolated.
+
+**Demonstrated launcher flags for a 16 GB-class card** (add to the usual profile; every value below was run with this serve binary):
+
+- No display (headless), `iq3-xxs`, MTP: `--spec mtp --draft-tokens 1 --prefill-chunk 128 --max-context 40960 --kv-dtype fp8 --gemma4-qk fp8
+  --host-context-mib 4096`; no MTP: `--spec off` with `--max-context 49152`. `--prefill-chunk 512` with `--max-context 32768` trades context for 1.5x faster prefill.
+- Display-sharing card (1.5 GiB reserved), `iq3-xxs`: MTP with `--prefill-chunk 128 --max-context 16384`; without MTP `--max-context 24576`.
+  `iq3-xs` fits only without MTP at `--max-context 8192`.
+- A card with 2.5 GiB reserved: only `iq3-xxs` without MTP at `--max-context 4096` demonstrated; no context worth serving.
+
+The default launcher profile (131072 context, `--prefill-chunk auto`) does **not** fit any of these simulated cards. Not measured: a physical 16 GB
+card, Linux or a headless driver stack, any reserve other than the three above, soak, thinking-on generation, contexts above 65,536 under ballast,
+`iq3-xs` at the conservative reserve, and quality at the reduced chunk (the chunk changes scheduling, not the stored weights;
+no KL was scored for it).
+
 ## Route-specific measurements
 
 ### MTP selecting-logit evidence
