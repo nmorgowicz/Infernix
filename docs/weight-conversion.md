@@ -553,7 +553,8 @@ bearer key, stops the server and writes a JSON receipt with the launcher's effec
 `python -m tools.convert.gemma4_q4 convert --model <BF16 dir> --gguf-source <file.gguf> --weights q4_g32_a16 ...`
 keeps every text-layer projection of a `llama-quantize` GGUF of the same model verbatim: its blocks are stored in
 `ggml_rows_v1` in the GGUF's own format (IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, Q2_0, Q4_K, Q5_K or Q6_K) and run
-by the GGUF block kernels (`ops::ggml_linear`: exact A16 at decode widths, BF16 tensor cores from 32 columns), on
+by the GGUF block kernels (`ops::ggml_linear`: exact A16 at decode widths, BF16 tensor-core tiles up to 63 columns;
+from 64 columns the blocks are decoded once per call into a dense BF16 matrix and run as one cuBLAS GEMM), on
 16-bit activations. The vocabulary, norms, layer scalars and the MTP assistant come from `--model` as usual (FP8
 vocabulary). Global-layer query and key rows are reordered as whole rows; the global output projection keeps the
 GGUF's column order and the text config records `global_output_order: "source"`, so the runtime reads the
