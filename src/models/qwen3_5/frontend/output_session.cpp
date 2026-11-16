@@ -1,11 +1,11 @@
 #include "models/qwen3_5/frontend/output_session.h"
 #include "models/qwen3_5/frontend/chat_template.h"
-#include "models/qwen3_5/frontend/reasoning_loop.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/qwen3_5/frontend/tool_call_parser.h"
 #include "runtime/contract/execution.h"
 #include "text/unicode.h"
 #include "text/grammar.h"
+#include "text/thinking_tracker.h"
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -180,27 +180,6 @@ struct DecoderState {
 };
 
 inline constexpr std::string_view kToolCallClose = "</tool_call>";
-
-struct SemanticThinkingState {
-    std::optional<std::uint32_t> budget;
-    std::uint32_t model_thinking_tokens = 0;
-    std::uint32_t injected_tokens       = 0;
-    bool in_reasoning                   = false;
-    bool control_pending                = false;
-    bool applied                        = false;
-    // Reasoning-loop guard: the words of the round being previewed (the committed history lives in
-    // OutputSession::Impl, outside the per-round copy), a word cut by the last token, the recent
-    // reasoning the periodic-tail check reads, the next check and what fired.
-    ReasoningLoopAction loop = ReasoningLoopAction::Off;
-    std::string loop_partial;
-    std::string loop_tail;
-    std::vector<LoopWord> loop_round;
-    std::uint32_t loop_next_check      = kLoopCheckTokens;
-    bool loop_detected                 = false;
-    std::uint32_t loop_thinking_tokens = 0;
-    float loop_coverage                = 0.0F;
-    std::uint32_t loop_run_on_chars    = 0;
-};
 
 struct StopMatch {
     bool found                      = false;
@@ -439,22 +418,12 @@ public:
           tool_call_output(output.raw ? nullptr : std::move(tool_call_output_),
                            output.tool_name_max_length, output.tolerant_tool_calls),
           grammar(std::move(grammar_)), combined(combined_) {
-        if (thinking.budget && *thinking.budget == 0) {
-            throw std::invalid_argument("thinking budget must be positive");
-        }
         state.in_reasoning            = split_reasoning;
         state.exact_reasoning_framing = grammar != nullptr;
         prefix_execution.phase        = starts_in_reasoning ? PrefixExecutionTracker::Phase::Reasoning
                                                             : PrefixExecutionTracker::Phase::Off;
-        semantic.budget      = thinking.budget;
-        semantic.loop        = thinking.loop;
+        thinking_tracker     = text::ThinkingTracker(thinking, starts_in_reasoning);
         end_turn_in_thinking = thinking.end_turn_in_thinking;
-        // The semantic tracker counts the model's own thinking tokens for every response that starts
-        // in thinking: the request log reports that count (model_thinking_tokens), so it must run
-        // without a budget too (NInfer Neroued/ninfer#373; it used to stay 0 unless a budget was
-        // set). The budget caps it and the loop guard reads it. Cost: one token-id comparison per
-        // generated token.
-        semantic.in_reasoning = starts_in_reasoning;
         if (!continuation.empty()) {
             saw_content = true;
             // The client's prefix: a `<tool_call>` it spells is the opener it continues.
@@ -465,16 +434,6 @@ public:
             if (!combined || branch == ConstraintOutputBranch::Tools)
                 tool_call_output.initialize_continuation(continuation);
         }
-    }
-
-    // The repeated-passage coverage of the committed thinking plus the previewed round's words (the
-    // digit-folded one where that alone fires the guard).
-    [[nodiscard]] double loop_coverage(const std::vector<LoopWord>& round) const {
-        const std::size_t keep = kLoopHistoryWords > round.size() ? kLoopHistoryWords - round.size() : 0;
-        std::vector<LoopWord> words(loop_words.end() - static_cast<std::ptrdiff_t>(std::min(keep, loop_words.size())),
-                                    loop_words.end());
-        words.insert(words.end(), round.begin(), round.end());
-        return loop_passage_coverage(words);
     }
 
     // Notes where a previewed `<tool_call>` token's bytes start in its channel's stream. The token
@@ -507,23 +466,6 @@ public:
         for (auto& tokens : preview_tool_call_tokens) { tokens.clear(); }
     }
 
-    // Moves the committed round's words into the history (bounded); drops it once thinking ends.
-    void commit_loop_words() {
-        if (!semantic.in_reasoning || semantic.loop == ReasoningLoopAction::Off || semantic.loop_detected) {
-            loop_words.clear();
-            loop_words.shrink_to_fit();
-            semantic.loop_round.clear();
-            semantic.loop_tail.clear();
-            return;
-        }
-        loop_words.insert(loop_words.end(), semantic.loop_round.begin(), semantic.loop_round.end());
-        semantic.loop_round.clear();
-        if (loop_words.size() > 2 * kLoopHistoryWords) {
-            loop_words.erase(loop_words.begin(),
-                             loop_words.end() - static_cast<std::ptrdiff_t>(kLoopHistoryWords));
-        }
-    }
-
     std::shared_ptr<const fi::Tokenizer> tokenizer;
     fi::OutputMarkerTokens markers;
     StopPolicy policy;
@@ -547,9 +489,7 @@ public:
     std::array<std::uint64_t, 2> published_bytes{};
     DecoderState state;
     DecoderState preview_state;
-    SemanticThinkingState semantic;
-    SemanticThinkingState preview_semantic;
-    std::vector<LoopWord> loop_words; // committed thinking words (reasoning-loop guard)
+    text::ThinkingTracker thinking_tracker;
     PrefixExecutionTracker prefix_execution;
     PrefixExecutionTracker preview_prefix_execution;
     std::optional<std::uint32_t> preview_execution_split_after;
@@ -625,7 +565,7 @@ OutputSession::OutputSession(
 bool OutputSession::constrained() const noexcept { return impl_ && impl_->grammar != nullptr; }
 
 runtime::ReasoningBan OutputSession::reasoning_ban() const noexcept {
-    if (!impl_ || impl_->end_turn_in_thinking || !impl_->semantic.in_reasoning || impl_->markers.reasoning_close < 0 ||
+    if (!impl_ || impl_->end_turn_in_thinking || !impl_->thinking_tracker.in_reasoning() || impl_->markers.reasoning_close < 0 ||
         impl_->markers.turn_ends[0] < 0) {
         return {};
     }
@@ -681,7 +621,7 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
     if (impl_ == nullptr) { throw std::logic_error("output session is empty"); }
     if (impl_->state.terminal) { throw std::logic_error("output session is already terminal"); }
     if (impl_->preview_ready) { throw std::logic_error("output session already has a preview"); }
-    if (impl_->semantic.control_pending) {
+    if (impl_->thinking_tracker.control_pending()) {
         throw std::logic_error("model output cannot advance while thinking control is pending");
     }
     if (tokens.empty()) {
@@ -696,7 +636,7 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
     }
 
     impl_->preview_state            = impl_->state;
-    impl_->preview_semantic         = impl_->semantic;
+    impl_->thinking_tracker.begin_preview();
     impl_->preview_prefix_execution = impl_->prefix_execution;
     impl_->preview_execution_split_after.reset();
     impl_->preview_output.clear();
@@ -705,7 +645,7 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
     const auto complete = [&](std::uint32_t count, FinishReason reason,
                               runtime::ContinuationAction continuation =
                                   runtime::ContinuationAction::Decode) {
-        if (reason != FinishReason::None) { impl_->preview_semantic.control_pending = false; }
+        if (reason != FinishReason::None) { impl_->thinking_tracker.finished(); }
         if (impl_->preview_execution_split_after && *impl_->preview_execution_split_after > count) {
             throw std::logic_error("prefix execution split exceeds the accepted token prefix");
         }
@@ -731,24 +671,8 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
         }
 
         if (impl_->preview_state.in_reasoning) { ++impl_->preview_state.reasoning_tokens; }
-        if (impl_->preview_semantic.in_reasoning) {
-            ++impl_->preview_semantic.model_thinking_tokens;
-            if (impl_->preview_semantic.budget &&
-                impl_->preview_semantic.model_thinking_tokens > *impl_->preview_semantic.budget) {
-                throw std::logic_error("model output exceeded the licensed thinking budget");
-            }
-            if (impl_->preview_semantic.loop != ReasoningLoopAction::Off &&
-                !impl_->preview_semantic.loop_detected) {
-                append_words(decoded.bytes, impl_->preview_semantic.loop_partial,
-                             impl_->preview_semantic.loop_round);
-                append_tail(decoded.bytes, impl_->preview_semantic.loop_tail);
-            }
-            // The close token is the last thinking token; its spelling in ordinary tokens is not.
-            if (reasoning_close) {
-                impl_->preview_semantic.in_reasoning    = false;
-                impl_->preview_semantic.control_pending = false;
-            }
-        }
+        impl_->thinking_tracker.model_token(
+            reasoning_close, impl_->thinking_tracker.preview_reads_bytes() ? decoded.bytes : std::string_view{});
 
         const bool stop_token =
             std::find(impl_->policy.token_ids.begin(), impl_->policy.token_ids.end(), token) !=
@@ -794,57 +718,27 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
         terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, count);
         return complete(count, limit_reason);
     }
-    if (impl_->preview_semantic.in_reasoning && impl_->preview_semantic.budget &&
-        impl_->preview_semantic.model_thinking_tokens == *impl_->preview_semantic.budget) {
-        impl_->preview_semantic.control_pending = true;
+    const std::size_t control_tokens = impl_->thinking_control_tokens ? impl_->thinking_control_tokens->size() : 0U;
+    switch (impl_->thinking_tracker.end_of_round(total_budget_remaining - count, control_tokens)) {
+    case text::ThinkingTracker::Boundary::ApplyControl:
         return complete(count, FinishReason::None, runtime::ContinuationAction::ApplyTargetControl);
-    }
-    // Reasoning-loop guard: once per kLoopCheckTokens thinking tokens, at the end of a round.
-    SemanticThinkingState& semantic = impl_->preview_semantic;
-    if (semantic.loop != ReasoningLoopAction::Off && semantic.in_reasoning && !semantic.applied &&
-        !semantic.loop_detected && semantic.model_thinking_tokens >= semantic.loop_next_check) {
-        semantic.loop_next_check = (semantic.model_thinking_tokens / kLoopCheckTokens + 1) * kLoopCheckTokens;
-        // Strata reads a periodic tail as full coverage before its word measure; thinking that repeats
-        // nothing can still be a hyphen-joined run-on (Strata #5218).
-        const double coverage =
-            periodic_tail(semantic.loop_tail) ? 1.0 : impl_->loop_coverage(semantic.loop_round);
-        const std::size_t run_on = coverage >= kLoopCoverage ? 0 : longest_hyphen_chain(semantic.loop_tail);
-        if (coverage >= kLoopCoverage || run_on >= kLoopRunOnChars) {
-            semantic.loop_detected        = true;
-            semantic.loop_thinking_tokens = semantic.model_thinking_tokens;
-            semantic.loop_coverage        = static_cast<float>(coverage);
-            semantic.loop_run_on_chars    = run_on >= kLoopRunOnChars ? static_cast<std::uint32_t>(run_on) : 0U;
-            const std::uint64_t control =
-                impl_->thinking_control_tokens ? impl_->thinking_control_tokens->size() : 0U;
-            const std::uint64_t remaining = total_budget_remaining - count;
-            if (semantic.loop == ReasoningLoopAction::Conclude && control > 0 && remaining >= control + 1U) {
-                semantic.control_pending = true;
-                return complete(count, FinishReason::None, runtime::ContinuationAction::ApplyTargetControl);
-            }
-            terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, count);
-            return complete(count, FinishReason::OutputLimit);
-        }
+    case text::ThinkingTracker::Boundary::Stop:
+        terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, count);
+        return complete(count, FinishReason::OutputLimit);
+    case text::ThinkingTracker::Boundary::Continue:
+        break;
     }
     return complete(count, FinishReason::None);
 }
 
 std::uint32_t
 OutputSession::model_token_budget_remaining(std::uint32_t total_budget_remaining) const noexcept {
-    if (impl_ != nullptr && impl_->semantic.control_pending) { return 0; } // a budget's or the loop guard's
-    if (impl_ == nullptr || !impl_->semantic.budget || !impl_->semantic.in_reasoning ||
-        impl_->semantic.applied) {
-        return total_budget_remaining;
-    }
-    if (impl_->semantic.control_pending ||
-        impl_->semantic.model_thinking_tokens >= *impl_->semantic.budget) {
-        return 0;
-    }
-    return std::min(total_budget_remaining,
-                    *impl_->semantic.budget - impl_->semantic.model_thinking_tokens);
+    if (impl_ == nullptr) { return total_budget_remaining; }
+    return impl_->thinking_tracker.model_token_budget_remaining(total_budget_remaining);
 }
 
 std::span<const TokenId> OutputSession::pending_control_tokens() const noexcept {
-    if (impl_ == nullptr || !impl_->semantic.control_pending || !impl_->thinking_control_tokens) {
+    if (impl_ == nullptr || !impl_->thinking_tracker.control_pending() || !impl_->thinking_control_tokens) {
         return {};
     }
     return *impl_->thinking_control_tokens;
@@ -865,7 +759,7 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
     }
 
     impl_->preview_state            = impl_->state;
-    impl_->preview_semantic         = impl_->semantic;
+    impl_->thinking_tracker.begin_preview();
     impl_->preview_prefix_execution = impl_->prefix_execution;
     impl_->preview_execution_split_after.reset();
     impl_->preview_output.clear();
@@ -878,7 +772,7 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
             impl_->preview_execution_split_after = static_cast<std::uint32_t>(index + 1U);
         }
         if (impl_->preview_state.in_reasoning) { ++impl_->preview_state.reasoning_tokens; }
-        if (reasoning_close) { impl_->preview_semantic.in_reasoning = false; }
+        impl_->thinking_tracker.control_token(reasoning_close);
         const std::string_view presentation_bytes =
             !impl_->preserve_special && decoded.special ? std::string_view{} : decoded.bytes;
         feed_token(impl_->preview_state, reasoning_close, token == impl_->markers.tool_call, presentation_bytes,
@@ -886,15 +780,10 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
                    impl_->preview_output, static_cast<std::uint32_t>(index + 1), nullptr);
         impl_->record_tool_call(token, presentation_bytes);
     }
-    if (impl_->preview_semantic.in_reasoning) {
-        throw std::logic_error("canonical thinking control did not close the thinking phase");
-    }
     if (impl_->split_reasoning && impl_->preview_state.in_reasoning) {
         throw std::logic_error("canonical thinking control did not close the reasoning channel");
     }
-    impl_->preview_semantic.control_pending = false;
-    impl_->preview_semantic.applied         = true;
-    impl_->preview_semantic.injected_tokens = static_cast<std::uint32_t>(tokens.size());
+    impl_->thinking_tracker.control_applied(static_cast<std::uint32_t>(tokens.size()));
     impl_->accept_grammar(tokens);
     impl_->preview_finish_reason = FinishReason::None;
     impl_->preview_ready         = true;
@@ -906,19 +795,8 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
 
 void OutputSession::validate_generation_capacity(std::uint32_t effective_output_tokens) const {
     if (impl_ == nullptr) { throw std::logic_error("output session is empty"); }
-    if (!impl_->semantic.budget || !impl_->semantic.in_reasoning ||
-        effective_output_tokens <= *impl_->semantic.budget) {
-        return;
-    }
-    const std::uint64_t remaining =
-        static_cast<std::uint64_t>(effective_output_tokens) - *impl_->semantic.budget;
-    const std::uint64_t required =
-        static_cast<std::uint64_t>(impl_->thinking_control_tokens->size()) + 1U;
-    if (remaining < required) {
-        throw std::invalid_argument(
-            "effective output capacity after the thinking budget must fit the complete control "
-            "suffix and one post-close model token");
-    }
+    impl_->thinking_tracker.validate_generation_capacity(
+        effective_output_tokens, impl_->thinking_control_tokens ? impl_->thinking_control_tokens->size() : 0U);
 }
 
 runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
@@ -930,10 +808,10 @@ runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
         throw std::invalid_argument("invalid between-round terminal decoder reason");
     }
     impl_->preview_state            = impl_->state;
-    impl_->preview_semantic         = impl_->semantic;
+    impl_->thinking_tracker.begin_preview();
     impl_->preview_prefix_execution = impl_->prefix_execution;
     impl_->preview_execution_split_after.reset();
-    impl_->preview_semantic.control_pending = false;
+    impl_->thinking_tracker.finished();
     impl_->preview_output.clear();
     impl_->clear_preview_tool_calls();
     terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, 0);
@@ -946,9 +824,8 @@ PublishedOutput OutputSession::commit_preview() {
     if (impl_ == nullptr || !impl_->preview_ready) { std::terminate(); }
     using std::swap;
     swap(impl_->state, impl_->preview_state);
-    swap(impl_->semantic, impl_->preview_semantic);
     swap(impl_->prefix_execution, impl_->preview_prefix_execution);
-    impl_->commit_loop_words();
+    impl_->thinking_tracker.commit_preview();
     PublishedOutput output = std::move(impl_->preview_output);
     impl_->preview_output.clear();
     impl_->preview_ready = false;
@@ -1040,16 +917,7 @@ std::uint32_t OutputSession::reasoning_tokens() const noexcept {
 
 ThinkingBudgetStats OutputSession::thinking_stats() const noexcept {
     if (impl_ == nullptr) { return {}; }
-    return ThinkingBudgetStats{
-        .configured_budget     = impl_->semantic.budget,
-        .model_thinking_tokens = impl_->semantic.model_thinking_tokens,
-        .injected_tokens       = impl_->semantic.injected_tokens,
-        .applied               = impl_->semantic.applied,
-        .loop_detected         = impl_->semantic.loop_detected,
-        .loop_thinking_tokens  = impl_->semantic.loop_thinking_tokens,
-        .loop_coverage         = impl_->semantic.loop_coverage,
-        .loop_run_on_chars     = impl_->semantic.loop_run_on_chars,
-    };
+    return impl_->thinking_tracker.stats();
 }
 
 std::optional<std::string> OutputSession::matched_stop_string() const {

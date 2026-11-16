@@ -130,6 +130,16 @@ infernix_add_test(infernix_jinja_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../text/test_jinja.cpp"
   LIBRARIES infernix_jinja infernix::json)
 
+# The reasoning-loop guard's repeated-passage measure, shared by every frontend with a thinking control (CPU only).
+infernix_add_test(infernix_text_reasoning_loop_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../text/test_reasoning_loop.cpp"
+  LIBRARIES infernix_text)
+
+# The thinking budget's license and control boundary, the capacity check and the loop guard's actions (CPU only).
+infernix_add_test(infernix_text_thinking_tracker_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../text/test_thinking_tracker.cpp"
+  LIBRARIES infernix_text)
+
 add_test(NAME infernix_cuda_stack_tool_test
   COMMAND ${Python3_EXECUTABLE} -B ${PROJECT_SOURCE_DIR}/tests/cuda_stack/test_check_cuda_stack.py)
 # Register spills and local arrays: no kernel of the server may use more per-thread stack or local

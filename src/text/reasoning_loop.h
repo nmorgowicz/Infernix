@@ -27,7 +27,7 @@
 #include <string_view>
 #include <vector>
 
-namespace infernix::models::qwen3_5 {
+namespace infernix::text {
 
 inline constexpr std::uint32_t kLoopCheckTokens   = 512;   // reasoning tokens between two checks
 inline constexpr std::size_t kLoopPassageWords    = 12;    // words in one passage
@@ -90,4 +90,4 @@ void append_tail(std::string_view bytes, std::string& tail);
 // tail (append_tail: at least 4 x kLoopTailChars bytes, every byte since the previous check).
 [[nodiscard]] std::size_t longest_hyphen_chain(std::string_view text);
 
-} // namespace infernix::models::qwen3_5
+} // namespace infernix::text

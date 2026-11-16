@@ -2,7 +2,7 @@
 // rewriting the same verification passes reaches the threshold; varied work, and a short text, stay
 // below it; a passage repeated twice is not a loop; a counting loop (a line changing only in a
 // number) fires on the digit-folded reading, a numbered template with varying words does not.
-#include "models/qwen3_5/frontend/reasoning_loop.h"
+#include "text/reasoning_loop.h"
 
 #include <iostream>
 #include <string>
@@ -10,7 +10,7 @@
 
 namespace {
 
-using namespace infernix::models::qwen3_5;
+using namespace infernix::text;
 
 int failures = 0;
 

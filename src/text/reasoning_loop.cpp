@@ -1,10 +1,10 @@
-#include "models/qwen3_5/frontend/reasoning_loop.h"
+#include "text/reasoning_loop.h"
 #include "text/unicode.h"
 
 #include <algorithm>
 #include <unordered_map>
 
-namespace infernix::models::qwen3_5 {
+namespace infernix::text {
 namespace {
 
 std::uint64_t fnv1a(std::string_view text) {
@@ -260,4 +260,4 @@ std::size_t longest_hyphen_chain(std::string_view text) {
     return best;
 }
 
-} // namespace infernix::models::qwen3_5
+} // namespace infernix::text

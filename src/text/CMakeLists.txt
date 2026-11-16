@@ -1,5 +1,7 @@
 add_library(infernix_text STATIC
   unicode.cpp
+  reasoning_loop.cpp
+  thinking_tracker.cpp
   ${PROJECT_SOURCE_DIR}/third_party/utf8proc/utf8proc.c
 )
 infernix_internal_includes(infernix_text)
