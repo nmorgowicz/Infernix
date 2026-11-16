@@ -258,9 +258,9 @@ iq3-xxs 154/166. Excluding the roleplay turns (all 16-turn conversations complet
 significance test was run.
 
 Cause of the `thinking 8,192/6,144` rows: in the measured binary Gemma's thinking budget was accounting only, so the budget the
-server computed was logged and never enforced. Later builds enforce it (the control span, the budget message and
-`--reasoning-loop` as on Qwen, see [serving](../serving.md#openai-chat-completions)); the rows above are the unenforced
-behaviour and were not re-measured.
+server computed was logged and never enforced. Current builds enforce the thought cap with a native `<channel|>` close,
+a configurable budget message and the reasoning-loop guard; see [serving](../serving.md#openai-chat-completions).
+The historical tables above remain unchanged; the focused enforcement checks below are separate, not a new stability campaign.
 
 **Part D, item-1's degeneracy condition under the roleplay sampler** (thinking off, three ~122k prompts from the long-context
 baseline, cap 8192, seeds 5001-5003): `best-small` 1/3, `iq3-xs` 2/3 and `iq3-xxs` 2/3 generated until the 8,192 cap in a
@@ -294,6 +294,43 @@ soak 7 stayed in reasoning and 2 looped in the answer). Slow cached turns were r
 **Needs human reading:** every response's reasoning and answer are in the retained evidence; no quality was judged, the loop
 detector's flags were not audited by a person, and the `repetitive` soft flag was not reviewed. Not measured: other samplers or
 seeds, prompts above 122k with thinking, host tiers other than 8192 and 20480 MiB, or any comparison of reasoning quality between tiers.
+
+### Thinking-budget enforcement checks (2026-11-16)
+
+Focused public-Engine GPU checks on the same diode `iq3-xxs` text+MTP artifact, RTX 5090 and CUDA 13.5 development runtime
+passed. No production binary was replaced. The default message plus the native `"\n<channel|>"` close totals 24 tokens;
+the control counts against the total output limit and is published in reasoning, not answer content.
+
+With MTP at 3 and 7 drafts, each capped reply contained exactly **24 model thinking + 24 control + 40 answer tokens**,
+`finish_reason=length`, with nonempty content. Every token was accounted for by first-token, draft-round, plain-step and
+control counters. Plain decoding with the custom message `Time to act now:` used **24 + 7 + 40** tokens instead.
+Insufficient post-budget capacity was refused; the smallest sufficient limit admitted the control and one answer token.
+The final native test passed **88 assertions**, including changed-control prefix invalidation, live continuation and
+displaced Host-snapshot restore. Free-cache-resume restored 1,113 tokens through the control ending at 1,018, but is not
+a cold-prefill exact-output contract: its first difference was at zero-based output token 3. Reproducible chunk-grid
+Host restore reused 1,024 tokens and generated the same 24 output tokens as a cache-off request.
+
+The archived greedy `g1k-r0` request (992 prompt tokens), run with no budget and with budget 6,144 on the same native
+executable and with prefix reuse disabled, was token-identical: **979 thinking + 631 answer = 1,610**, natural `stop`,
+no injection. The archived `g16k-r2` request (15,990 prompt tokens), with the usual MTP d1 / FP8 KV/QK / BF16 logits /
+auto-chunk profile, closed at **6,144 model thinking + 24 control** and emitted **2,024 answer tokens**, reaching
+8,192 total with `length`. Its 8,432-byte final answer **still loops** (periodic-tail score 1.0, zlib ratio 0.0275,
+distinct-word fraction 0.034). Closing the thought is enforced; a good or non-looping final answer is not guaranteed.
+
+Real loopback HTTP also passed after the operator approved the development executable in the app firewall.
+With `--default-thinking-budget 24 --thinking-budget-message "Time to act now:"`, a 128-token request with no budget
+overrides produced **24 model thinking + 7 control + 51 post-close = 82 tokens**, natural `stop`. Sending
+`"thinking_budget_tokens": 8` produced **8 + 7 + 113 = 128**, `length`. Both reasoning fields ended with the custom
+message and both final answers were nonempty. A 31-token limit with the default cap returned HTTP 400
+`thinking_budget_capacity_insufficient`; `/health` returned 200. This HTTP smoke used plain decoding, FP8 KV/QK,
+BF16 logits, chunk 128 and context 4,096; MTP is covered by the native checks above.
+
+Evidence: `<camp>/convert/iq3xs-20261115/gemma-budget-20261116/` (`real-host-oracle.log`, archived request outputs,
+`archived-native/analysis.json`, `http-open.{results.json,requests.jsonl,server.log}`); GPU lease receipts
+`gemma-budget-host-oracle`, `gemma-budget-recovery-final` and `gemma-budget-http-approved`. These are behavior checks,
+not throughput, quality, soak or cross-build identity measurements. Earlier connection-timeout failures and test-oracle
+failures are retained: the app firewall caused the former; the latter incorrectly assumed free-resume/cold token
+identity and fixed-length raw-history output with model turn stops enabled. No engine failure was hidden by either fix.
 
 ## 16 GB-class capacity envelope (simulated available memory on an RTX 5090)
 
