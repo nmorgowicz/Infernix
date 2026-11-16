@@ -170,16 +170,19 @@ void general_constraints(const g4::Frontend& frontend) {
             "GBNF/regex/choice/JSON output differs");
     }
     auto thinking_prompt = frontend.prepare(input(true));
+    // A budget the model's own close meets at its boundary leaves the reasoning framing alone (the control span
+    // under a grammar is covered by test_thinking_budget.cpp).
     ThinkingControlOptions thinking;
-    thinking.budget = 1;
+    thinking.budget = static_cast<std::uint32_t>(frontend.tokenize_text("long plan<channel|>").size());
     auto thinking_session = frontend.make_output_session(thinking_prompt, {}, {}, thinking, schema);
     const auto close = frontend.tokenize_text("<channel|>").at(0);
     require(allows(masks(thinking_session), close), "Gemma reasoning close is not allowed");
     Stream thought;
     feed(thinking_session, thought, ending(frontend, "long plan<channel|>{\"ok\":true,\"n\":2}", 50), 1);
     require(thought.reasoning == "long plan" && thought.content == R"({"ok":true,"n":2})" &&
-        thinking_session.pending_control_tokens().empty() && thinking_session.thinking_stats().model_thinking_tokens > 1,
-        "Gemma reasoning framing or accounting-only budget changed");
+        thinking_session.pending_control_tokens().empty() && !thinking_session.thinking_stats().applied &&
+        thinking_session.thinking_stats().model_thinking_tokens == thinking.budget,
+        "Gemma reasoning framing or thinking accounting changed");
     bool invalid = false;
     try { (void)frontend.make_output_session(prompt, {}, {}, {}, OutputConstraint::grammar("root ::= (")); }
     catch (const RequestError& error) { invalid = error.kind() == RequestErrorKind::InvalidGrammar; }

@@ -16,6 +16,10 @@ struct FrontendOptions {
     std::uint32_t max_context = 2048;
     std::filesystem::path chat_template_path;
     std::size_t grammar_cache_bytes = 256ULL * 1024 * 1024;
+    // End-of-thinking message committed when a request hits its thinking budget (or the reasoning-loop
+    // guard concludes). Empty keeps the built-in message; a message that does not end with the
+    // canonical close ("\n<channel|>") gets it appended at startup.
+    std::string thinking_budget_message;
 };
 
 class Frontend {

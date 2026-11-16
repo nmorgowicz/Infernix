@@ -1,6 +1,7 @@
 #include "models/gemma4/frontend/output_session.h"
 
 #include "models/gemma4/frontend/tool_parser.h"
+#include "runtime/contract/execution.h"
 
 #include <algorithm>
 #include <stdexcept>
@@ -67,6 +68,7 @@ OutputSession::OutputSession(std::shared_ptr<const Tokenizer> tokenizer, Setup s
     for (const auto& stop : setup_.stop_strings) {
         if (stop.text.empty()) { throw std::invalid_argument("gemma4 stop strings must be non-empty"); }
     }
+    thinking_ = text::ThinkingTracker(setup_.thinking, setup_.starts_in_reasoning);
     state_.mode = !setup_.output.raw && setup_.starts_in_reasoning ? Mode::Reasoning : Mode::Content;
     if (setup_.forced_call && !setup_.output.raw) {
         // The prompt already holds `<|tool_call>` and the call's opening; the output continues it.
@@ -81,31 +83,91 @@ bool OutputSession::is_stop(TokenId token) const noexcept {
     return std::find(setup_.stop_ids.begin(), setup_.stop_ids.end(), token) != setup_.stop_ids.end();
 }
 
+bool OutputSession::ends_thinking(TokenId token) const noexcept {
+    return token == setup_.channel_close || token == setup_.tool_call_open;
+}
+
 runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> tokens,
     std::uint32_t remaining, FinishReason limit_reason) {
     if (preview_pending_ || terminal_ || tokens.empty() || remaining == 0) {
         throw std::logic_error("gemma4 output preview requires live tokens and no pending preview");
     }
+    if (thinking_.control_pending()) {
+        throw std::logic_error("gemma4 model output cannot advance while thinking control is pending");
+    }
     staged_ = state_;
     staged_tokens_ = 0;
+    thinking_.begin_preview();
     runtime::OutputDecision result;
     for (const auto token : tokens) {
         if (staged_tokens_ == remaining) { break; }
         ++staged_tokens_;
         if (setup_.grammar) { setup_.grammar->accept(token); }
+        // The loop guard reads the thinking's words: only then are the token's bytes needed.
+        thinking_.model_token(ends_thinking(token),
+            thinking_.preview_reads_bytes() ? tokenizer_->token_bytes(token) : std::string{});
         consume(staged_, token);
         if (is_stop(token)) { result.finish_reason = FinishReason::StopToken; break; }
         if (match_stop_string(staged_)) { result.finish_reason = FinishReason::StopString; break; }
     }
     if (!result.finished() && staged_tokens_ == remaining) { result.finish_reason = limit_reason; }
+    if (!result.finished()) {
+        // The output limit, a stop and the model's own close all take priority over the control.
+        switch (thinking_.end_of_round(remaining - staged_tokens_, control_size())) {
+        case text::ThinkingTracker::Boundary::ApplyControl:
+            result.continuation = runtime::ContinuationAction::ApplyTargetControl;
+            break;
+        case text::ThinkingTracker::Boundary::Stop:
+            result.finish_reason = FinishReason::OutputLimit;
+            break;
+        case text::ThinkingTracker::Boundary::Continue:
+            break;
+        }
+    }
+    if (result.finished()) { thinking_.finished(); }
     result.accepted_tokens = staged_tokens_;
     staged_terminal_ = result.finished();
     preview_pending_ = true;
     return result;
 }
 
-runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId>, std::uint32_t) {
-    throw std::logic_error("gemma4 has no target-control suffix");
+// The control span goes through the same transaction as a round of model tokens, but it is not sampled
+// and no stop token or stop string reads it: the Engine commits exactly the pending span.
+runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> tokens, std::uint32_t remaining) {
+    if (preview_pending_ || terminal_) {
+        throw std::logic_error("gemma4 thinking control needs an unfinished session without a pending preview");
+    }
+    const std::span<const TokenId> expected = pending_control_tokens();
+    if (expected.empty() || !std::equal(tokens.begin(), tokens.end(), expected.begin(), expected.end())) {
+        throw std::invalid_argument("thinking control preview requires the exact pending span");
+    }
+    if (tokens.size() > remaining) {
+        throw std::invalid_argument("thinking control span exceeds the remaining output budget");
+    }
+    staged_ = state_;
+    staged_tokens_ = 0;
+    thinking_.begin_preview();
+    for (const auto token : tokens) {
+        ++staged_tokens_;
+        if (setup_.grammar) {
+            // A refusal fails this request only, never the Engine.
+            try { setup_.grammar->accept(token); }
+            catch (const std::exception& error) {
+                throw runtime::RequestOutputError(std::string("constrained output: ") + error.what());
+            }
+        }
+        thinking_.control_token(ends_thinking(token));
+        consume(staged_, token);
+    }
+    if (staged_.mode == Mode::Reasoning || staged_.mode == Mode::ReasoningHeader) {
+        throw std::logic_error("canonical thinking control did not close the reasoning channel");
+    }
+    thinking_.control_applied(staged_tokens_);
+    staged_terminal_ = false;
+    preview_pending_ = true;
+    runtime::OutputDecision result;
+    result.accepted_tokens = staged_tokens_;
+    return result;
 }
 runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
     if (preview_pending_ || terminal_ || reason == FinishReason::None) {
@@ -113,6 +175,8 @@ runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
     }
     staged_ = state_;
     staged_tokens_ = 0;
+    thinking_.begin_preview();
+    thinking_.finished();
     staged_terminal_ = true;
     preview_pending_ = true;
     runtime::OutputDecision result;
@@ -307,6 +371,7 @@ std::size_t OutputSession::stop_hold(const std::string& text, OutputChannel chan
 PublishedOutput OutputSession::commit_preview() {
     if (!preview_pending_) { throw std::logic_error("gemma4 output has no preview to commit"); }
     state_ = std::move(staged_);
+    thinking_.commit_preview();
     const bool final = staged_terminal_;
     if (final) { flush_terminal(state_); }
     publish_text(state_, final);
@@ -348,12 +413,7 @@ std::optional<ConstraintObservation> OutputSession::constraint_observation() con
                                                   : ConstraintOutputBranch::Content;
     return result;
 }
-ThinkingBudgetStats OutputSession::thinking_stats() const noexcept {
-    ThinkingBudgetStats stats;
-    stats.configured_budget = setup_.thinking_budget;
-    if (setup_.thinking_budget) { stats.model_thinking_tokens = state_.reasoning_tokens; }
-    return stats;
-}
+ThinkingBudgetStats OutputSession::thinking_stats() const noexcept { return thinking_.stats(); }
 std::optional<std::string> OutputSession::matched_stop_string() const {
     if (!state_.matched_stop) { return {}; }
     return setup_.stop_strings.at(*state_.matched_stop).text;

@@ -100,3 +100,20 @@ infernix_add_test(infernix_gemma4_grammar_test
   NEEDS_SOURCE_DIR
   LIBRARIES infernix_engine infernix_core infernix::json)
 set_tests_properties(infernix_gemma4_grammar_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
+# Thinking control against the real vocabulary: the budget's round license, the control span committed at the cap and
+# the answer after it, the budget message, the capacity check, the reasoning-loop guard, grammar-constrained replies and
+# that an unreached budget changes nothing. CPU only. Skips (77) without INFERNIX_GEMMA4_HF.
+infernix_add_test(infernix_gemma4_thinking_budget_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_thinking_budget.cpp"
+  NEEDS_SOURCE_DIR
+  LIBRARIES infernix_engine infernix_core infernix::json)
+set_tests_properties(infernix_gemma4_thinking_budget_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
+# The thinking budget through the public Engine on a real artifact (INFERNIX_GEMMA4_ARTIFACT): the control span is
+# committed to the resident sequence at the cap with plain and MTP decoding (no round past the cap, the speculative
+# counters consistent around it), a reply whose budget is not reached equals one with none, and a follow-up turn that
+# resumes from the capped reply's cached state equals a cache-off turn.
+infernix_add_test(infernix_gemma4_thinking_budget_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_thinking_budget_real.cpp"
+  LIBRARIES infernix_engine infernix_model_runtime)

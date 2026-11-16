@@ -5,6 +5,7 @@
 #include "models/gemma4/frontend/tool_parser.h"
 #include "runtime/contract/request.h"
 #include "text/grammar.h"
+#include "text/thinking_tracker.h"
 #include <array>
 #include <exception>
 #include <memory>
@@ -55,7 +56,10 @@ private:
     std::vector<ToolCallDelta> tool_calls_;
 };
 
-// Gemma thinking budgets are accounting-only: no Qwen control suffix or stop-token ban.
+// Thinking control: a reply that starts inside its thought channel counts the model's own thinking
+// tokens (ThinkingControlOptions::budget caps them, ::loop watches them for repetition). At the cap
+// the session asks for its control span (a message, then the thought-close token), which the Engine
+// commits to the model's sequence without sampling; the thinking ends there and the model answers.
 // Tool markers never reach normal text. Constrained calls stream canonical JSON argument prefixes;
 // untrusted free calls publish only after parsing and declaration validation.
 class OutputSession {
@@ -68,11 +72,17 @@ public:
     [[nodiscard]] runtime::OutputDecision preview_model(std::span<const TokenId> tokens,
         std::uint32_t total_budget_remaining, FinishReason limit_reason);
     [[nodiscard]] std::uint32_t model_token_budget_remaining(std::uint32_t remaining) const noexcept {
-        return remaining;
+        return thinking_.model_token_budget_remaining(remaining);
     }
-    [[nodiscard]] std::span<const TokenId> pending_control_tokens() const noexcept { return {}; }
-    [[nodiscard]] runtime::OutputDecision preview_control(std::span<const TokenId>, std::uint32_t);
-    void validate_generation_capacity(std::uint32_t) const noexcept {}
+    // The control span while the thinking budget (or the reasoning-loop guard) has asked for it.
+    [[nodiscard]] std::span<const TokenId> pending_control_tokens() const noexcept {
+        if (!thinking_.control_pending() || !setup_.thinking_control) { return {}; }
+        return *setup_.thinking_control;
+    }
+    [[nodiscard]] runtime::OutputDecision preview_control(std::span<const TokenId> tokens, std::uint32_t remaining);
+    void validate_generation_capacity(std::uint32_t effective_output_tokens) const {
+        thinking_.validate_generation_capacity(effective_output_tokens, control_size());
+    }
     [[nodiscard]] runtime::OutputDecision preview_terminal(FinishReason reason);
     [[nodiscard]] PublishedOutput commit_preview();
     void discard_preview() noexcept;
@@ -123,7 +133,10 @@ private:
         std::vector<StopString> stop_strings;
         bool publish_stop = false;
         bool starts_in_reasoning = false;
-        std::optional<std::uint32_t> thinking_budget;
+        ThinkingControlOptions thinking;
+        // The span committed when the budget (or the loop guard's conclude) ends the thinking: the
+        // message and the thought-close token (Frontend builds it once at startup).
+        std::shared_ptr<const std::vector<TokenId>> thinking_control;
         OutputOptions output;
         TokenId channel_open = -1;
         TokenId channel_close = -1;
@@ -141,6 +154,11 @@ private:
     };
     OutputSession(std::shared_ptr<const Tokenizer> tokenizer, Setup setup);
     [[nodiscard]] bool is_stop(TokenId token) const noexcept;
+    // Whether the token takes the reply out of its thinking: the thought-close token, or a tool-call opener.
+    [[nodiscard]] bool ends_thinking(TokenId token) const noexcept;
+    [[nodiscard]] std::size_t control_size() const noexcept {
+        return setup_.thinking_control ? setup_.thinking_control->size() : 0U;
+    }
     void consume(State& state, TokenId token) const;
     static void append_text(State& state, std::string bytes);
     static void close_reasoning(State& state);
@@ -154,6 +172,7 @@ private:
     Setup setup_;
     State state_;
     State staged_;
+    text::ThinkingTracker thinking_;
     std::uint32_t staged_tokens_ = 0;
     bool staged_terminal_ = false;
     bool preview_pending_ = false;

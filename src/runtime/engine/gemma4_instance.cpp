@@ -124,9 +124,6 @@ void validate_gemma4_options(const EngineOptions& options) {
                                     "(other than --no-fast-path free-cache-resume), embedding-host and YaRN overrides "
                                     "are unsupported");
     }
-    if (!options.thinking_budget_message.empty()) {
-        throw std::invalid_argument("Gemma4 thinking budgets are accounting-only; a budget-control message is unsupported");
-    }
     if (options.logits_dtype != LogitsDtype::BF16) {
         throw std::invalid_argument("Gemma4 preserves its native BF16 head; select --logits-dtype bf16 (unrounded FP32 logits are unsupported)");
     }
@@ -137,7 +134,8 @@ Gemma4Instance::Gemma4Instance(std::unique_ptr<models::gemma4::Model> source,
     : model(std::move(source)), parameters(*model, device.stream),
       frontend(model->resources(), {.max_context = options.max_context,
                                     .chat_template_path = options.chat_template_path,
-                                    .grammar_cache_bytes = options.grammar_cache_bytes}),
+                                    .grammar_cache_bytes = options.grammar_cache_bytes,
+                                    .thinking_budget_message = options.thinking_budget_message}),
       capacity(options.max_context) {}
 
 Gemma4Instance::~Gemma4Instance() = default;

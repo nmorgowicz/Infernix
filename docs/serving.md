@@ -799,11 +799,16 @@ thinking closes after 9,109 rather than running to the end of the context. Below
 is as set, and `--no-thinking-answer-room` lets thinking use all of the output limit again. The
 request log's `thinking_budget` shows the budget a request ran with.
 
-At the cap boundary, Engine first honors a natural `</think>`, stop condition, cancellation, or
-total output/context limit. If thinking remains open, it commits Qwen's canonical early-close
-guidance and close marker to the same model sequence without sampling, streams the guidance as a
-reasoning delta, and continues normal content or tool-call generation. `--thinking-budget-message S`
-replaces that guidance with `S`, appending the close marker when `S` lacks it. Inserted tokens count in
+At the cap boundary, Engine first honors a natural thinking close, stop condition, cancellation, or
+total output/context limit. If thinking remains open, it commits the model's control span to the same
+model sequence without sampling, streams the notice in it as a reasoning delta, and continues normal
+content or tool-call generation. The span is a short notice followed by the model's own thinking close:
+on Qwen, [its canonical early-close guidance](https://github.com/QwenLM/Qwen3/blob/main/docs/source/getting_started/thinking_budget.md)
+and `</think>`; on Gemma 4, "Considering the limited thinking time, I have to give my answer now,
+based on my thinking so far." after a blank line, then a line break and `<channel|>`. On Gemma the budget
+counts the model's tokens in the thought channel its prompt opened, from the first thought token to
+`<channel|>`. `--thinking-budget-message S` replaces the notice with `S`, appending the close (`\n</think>\n\n`
+on Qwen, `\n<channel|>` on Gemma 4) when `S` lacks it. Inserted tokens count in
 completion usage and the request's `max_tokens`/`max_output_tokens` budget. If the effective output
 capacity extends past the cap but cannot fit the complete tokenizer-derived control suffix plus one
 post-close model token, preparation is rejected with HTTP 400 code
@@ -830,8 +835,8 @@ penalties do not catch because every pass varies a little.
   Qwen3.8-Flash-Next: the longest chain 0-56 characters in normal thinking, 203-1,569 in degenerate
   runs).
 - **`stop`** ends the reply there with `finish_reason` `length` (Anthropic `max_tokens`).
-- **`conclude`** commits the same control span a reached thinking budget does (Qwen's early-close
-  guidance, or `--thinking-budget-message`, plus `</think>`), so the model answers from the thinking
+- **`conclude`** commits the same control span a reached thinking budget does (the model's notice, or
+  `--thinking-budget-message`, plus its thinking close), so the model answers from the thinking
   it has; no prompt is read again. When the remaining output budget cannot hold the span and one
   more token, it stops instead.
 - The console line and the request log (`reasoning_loop_detected`, `reasoning_loop_thinking_tokens`,
@@ -1945,7 +1950,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--default-max-tokens N` | output limit when omitted by a request; startup logs an `output limit` note when `--max-context` is at least four times it | `8192` |
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests, lowered by the answer room where it would leave the answer less | unset |
 | `--no-thinking-answer-room` | thinking may use all of the output limit (by default, from an output limit of 1,024, it closes early enough to leave a quarter for the answer: with no budget, under `--default-thinking-budget`, or with a request budget at or above the limit; the limit is `max_tokens` or the context the prompt leaves, whichever is less) | answer room on |
-| `--thinking-budget-message S` | text committed when a thinking budget ends thinking, replacing Qwen's early-close guidance; the close marker is appended when `S` lacks it, and `S` may contain `</think>` only as that final close and no `<tool_call>` token | Qwen guidance |
+| `--thinking-budget-message S` | text committed when a thinking budget ends thinking, replacing the model's built-in notice; the thinking close is appended when `S` lacks it, and `S` may contain that close only as its final close and no tool-call marker (on Gemma 4 no other control token either) | the model's built-in notice |
 | `--reasoning-loop MODE` | `off`, `stop` or `conclude`: reasoning-loop guard for thinking requests without a token constraint (details under [OpenAI Chat Completions](#openai-chat-completions)) | `off` |
 | `--end-in-thinking MODE` | `refuse` or `allow`: whether a reply may end, or with tools open a call, while its thinking is open (`refuse`: the end-of-turn tokens, and `<tool_call>` when tools are declared, get no probability until the thinking closes; details under [OpenAI Chat Completions](#openai-chat-completions)) | `refuse` |
 | `--vision` | enable media input and load Vision GPU allocations | off |

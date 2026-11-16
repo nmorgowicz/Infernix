@@ -98,10 +98,11 @@ as the nearest one it accepts (see [serving](serving.md)). `--greedy` selects ex
 decoding independently.
 
 `--thinking-budget N` places a positive upper bound on accepted model-origin tokens while the
-new-turn Qwen thinking block remains open. If the model has not emitted `</think>` at that exact
-boundary, Engine appends [Qwen's canonical early-close guidance](https://github.com/QwenLM/Qwen3/blob/main/docs/source/getting_started/thinking_budget.md)
-and `</think>` to the same resident sequence without sampling, publishes the guidance through the
-reasoning stream, then resumes ordinary generation from the updated context. A natural thinking
+new-turn thinking block remains open. If the model has not closed its thinking at that exact
+boundary, Engine appends the model's control span to the same resident sequence without sampling: on
+Qwen [its canonical early-close guidance](https://github.com/QwenLM/Qwen3/blob/main/docs/source/getting_started/thinking_budget.md)
+and `</think>`, on Gemma 4 a short notice and `<channel|>`. The guidance is published through the
+reasoning stream, then ordinary generation resumes from the updated context. A natural thinking
 close, stop condition, cancellation, or total output/context limit at the boundary takes priority
 and suppresses this insertion. The option cannot be combined with `--no-thinking`, but it can be
 combined with `--reasoning-effort`.

@@ -21,6 +21,15 @@ using Json = nlohmann::ordered_json;
 constexpr std::string_view kReasoningStart = "<|channel>thought\n";
 constexpr std::string_view kCallPrefix = "call:";
 constexpr std::string_view kTurnEnd = "<turn|>\n";
+// A reply's thinking ends with a line break and the close token, as the chat template renders a reply's
+// reasoning in history; a reply that reaches its thinking budget is closed the same way.
+constexpr std::string_view kThoughtClose = "<channel|>";
+constexpr std::string_view kCanonicalThoughtClose = "\n<channel|>";
+// What the model reads when its thinking budget ends its thinking: part of the thinking, in the first
+// person like it, then the close. `--thinking-budget-message` replaces the text before the close.
+constexpr std::string_view kDefaultThinkingControl =
+    "\n\nConsidering the limited thinking time, I have to give my answer now, based on my thinking so far.\n<channel|>";
+static_assert(kDefaultThinkingControl.ends_with(kCanonicalThoughtClose));
 // Gemma 4 serves the whole 64-candidate sampler range; Qwen stays 20.
 constexpr std::int32_t kMaxTopK = 64;
 
@@ -238,6 +247,40 @@ SamplingPreset sampling_preset(const Json& values, SamplingPreset preset) {
     }
     return preset;
 }
+
+// The tokens a reached thinking budget (or the reasoning-loop guard's conclude) commits: the message, a line
+// break and the thought-close token, tokenized once at startup. The span must read back as written and close the
+// thought exactly once, at its end: a terminal token would end the reply, and any other control token (a
+// channel or tool marker, a turn boundary) would reopen or leave the thinking some other way.
+std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens(
+    const Tokenizer& tokenizer, std::string_view message, TokenId close, const std::vector<TokenId>& terminals) {
+    std::string suffix(kDefaultThinkingControl);
+    std::string subject = "canonical thinking control suffix";
+    if (!message.empty()) {
+        subject = "thinking budget message";
+        suffix = message;
+        if (!suffix.ends_with(kCanonicalThoughtClose)) { suffix += kCanonicalThoughtClose; }
+    }
+    std::vector<TokenId> tokens = tokenizer.encode(suffix);
+    if (tokens.empty() || tokens.back() != close || tokenizer.decode(tokens, false) != suffix) {
+        throw std::invalid_argument("gemma4 tokenizer cannot present the " + subject);
+    }
+    for (const TokenId token : tokens) {
+        if (std::find(terminals.begin(), terminals.end(), token) != terminals.end()) {
+            throw std::invalid_argument(subject + " contains a default terminal token");
+        }
+    }
+    for (std::size_t i = 0; i + 1 < tokens.size(); ++i) {
+        if (tokens[i] == close) {
+            throw std::invalid_argument(subject + " may contain " + std::string(kThoughtClose) +
+                " only as its final close");
+        }
+        if (tokenizer.is_special(tokens[i])) {
+            throw std::invalid_argument(subject + " contains a control token");
+        }
+    }
+    return std::make_shared<const std::vector<TokenId>>(std::move(tokens));
+}
 } // namespace
 
 struct Frontend::Impl {
@@ -253,6 +296,7 @@ struct Frontend::Impl {
     TokenId tool_call_close;
     TokenId turn_open;
     TokenId turn_close;
+    std::shared_ptr<const std::vector<TokenId>> thinking_control;
     std::size_t grammar_cache_bytes;
     mutable std::once_flag grammar_once;
     mutable std::unique_ptr<text::GrammarCompiler> grammar_compiler;
@@ -320,6 +364,8 @@ struct Frontend::Impl {
             sampling.thinking = sampling_preset(presets.at("thinking"), preset);
             sampling.non_thinking = sampling_preset(presets.at("non_thinking"), preset);
         }
+        thinking_control = thinking_control_tokens(*tokenizer, options.thinking_budget_message, channel_close,
+                                                   stop.token_ids);
     }
 
     void check_length(std::size_t size) const {
@@ -507,12 +553,6 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt, const 
     if (choice.mode == ToolChoiceMode::Required && !prompt.forced_call_) {
         throw std::invalid_argument("gemma4 required tool choice was not applied to the prompt");
     }
-    if (thinking.budget && *thinking.budget == 0) {
-        throw std::invalid_argument("gemma4 thinking budget must be positive");
-    }
-    if (thinking.loop != ReasoningLoopAction::Off) {
-        throw std::invalid_argument("gemma4 does not support the reasoning-loop guard");
-    }
     if (output.tolerant_tool_calls) {
         throw std::invalid_argument("gemma4 does not support tolerant tool calls");
     }
@@ -533,7 +573,8 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt, const 
     setup.stop_strings = caller.strings;
     setup.publish_stop = caller.publish_stop_token;
     setup.starts_in_reasoning = prompt.summary().starts_in_reasoning;
-    setup.thinking_budget = thinking.budget;
+    setup.thinking = thinking;
+    setup.thinking_control = impl_->thinking_control;
     setup.output = output;
     setup.channel_open = impl_->channel_open;
     setup.channel_close = impl_->channel_close;

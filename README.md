@@ -704,7 +704,11 @@ system block) makes every turn a full prefill.
 **Thinking is on by default**, as for every infernix chat template that has a reasoning channel: replies carry
 `reasoning_content` beside `content`, and a request that sets a small `max_tokens` can spend all of it thinking. Send
 `enable_thinking: false` (or `reasoning_effort: none`) per request, or start the server with `--no-thinking`, for direct
-answers.
+answers. A thinking budget ends a long thought: when the model's thinking reaches the budget (by default early enough
+to leave the answer a quarter of `max_tokens`, from 1,024 tokens up; or `--default-thinking-budget`, or the request's
+own), the server commits a short notice and `<channel|>` to the sequence and the model answers from the thinking it has.
+`--thinking-budget-message` replaces the notice, and `--reasoning-loop conclude` closes a thought that keeps repeating
+itself the same way ([serving](docs/serving.md)).
 
 ```bat
 set INFERNIX_TMP_Q4_EXACT=1
@@ -719,7 +723,7 @@ plainly. Native full-vocabulary KL, the HTTP tail, MTP and soak campaigns and th
 in [Gemma4 benchmark tools](docs/maintainer/gemma4-benchmarks.md).
 
 Not enabled: other speculation and ngram sessions, prefix-cache persistence and the SSD tier, concurrency above 1,
-reproducible/lossless/reference math, media (the vision tower is not served) and reasoning-loop budgets. Unsupported
+reproducible/lossless/reference math and media (the vision tower is not served). Unsupported
 requests refuse rather than silently selecting a Qwen implementation.
 
 ### Qwen3.8-Flash-Next

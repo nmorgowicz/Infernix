@@ -257,6 +257,11 @@ iq3-xxs 154/166. Excluding the roleplay turns (all 16-turn conversations complet
 `best-medium`, so loops are partly prompt-specific; the sampler loops were at other prompts. These counts are small and no
 significance test was run.
 
+Cause of the `thinking 8,192/6,144` rows: in the measured binary Gemma's thinking budget was accounting only, so the budget the
+server computed was logged and never enforced. Later builds enforce it (the control span, the budget message and
+`--reasoning-loop` as on Qwen, see [serving](../serving.md#openai-chat-completions)); the rows above are the unenforced
+behaviour and were not re-measured.
+
 **Part D, item-1's degeneracy condition under the roleplay sampler** (thinking off, three ~122k prompts from the long-context
 baseline, cap 8192, seeds 5001-5003): `best-small` 1/3, `iq3-xs` 2/3 and `iq3-xxs` 2/3 generated until the 8,192 cap in a
 degenerate low-vocabulary token loop (the same prompt on all three tiers); the other runs stopped on their own at
