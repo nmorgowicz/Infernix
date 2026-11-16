@@ -42,6 +42,12 @@ bool ggml_a8() {
     return enabled;
 }
 
+// INFERNIX_TMP_GGML_DECODE_A8: GGUF projections at decode widths add the 8-bit activation route.
+ops::LinearRoutes ggml_narrow_routes() {
+    static const bool a8 = temporary_switches::flag("INFERNIX_TMP_GGML_DECODE_A8");
+    return a8 ? kGgmlRoutes | ops::LinearRoutes::GgmlA8 : kGgmlRoutes;
+}
+
 // The FP8_E4M3FN_ROW_BF16 descriptor of `rows` x `k` codes at `payload` with the row multipliers at the
 // format's scale plane offset (the layout fp8_row_geometry checks).
 Weight fp8_row_weight(void* payload, int rows, int k) {
@@ -113,7 +119,7 @@ void project(const Tensor& x, const Weight& weight, const GgmlProjection& ggml, 
         ops::cast_fp32_to_bf16(partials, out, stream);
         return;
     }
-    ops::ggml_linear(x, ggml.segments, out, ggml.input_perm, ggml.perm_block, workspace, stream, kGgmlRoutes);
+    ops::ggml_linear(x, ggml.segments, out, ggml.input_perm, ggml.perm_block, workspace, stream, ggml_narrow_routes());
 }
 
 DownA8 prepare_down_a8(WorkspaceArena& workspace, int rows, int tokens) {
