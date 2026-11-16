@@ -69,6 +69,10 @@ constexpr Registration kSwitches[] = {
     // Gemma trunk shapes to the exact route (E4M3 codes, FP32 group scales; deterministic) from 128 tokens
     // instead of the fused/baked row-scaled routes. The scoring A/B arm; the default is unchanged.
     {"INFERNIX_TMP_Q4_EXACT", Scope::Gemma4, Kind::Flag},
+    // Gemma GGUF-block projections at prefill widths (models/gemma4/execution/projection.cpp): =1 widens the
+    // blocks to E4M3 rows (ops::ggml_widen_e4m3) and runs the FP8 A8 GEMM, as q4's baked route does, instead of
+    // the dense BF16 A16 route. Experiment arm (lossy: E4M3 weights, 8-bit activations); the default is unchanged.
+    {"INFERNIX_TMP_GGML_A8", Scope::Gemma4, Kind::Flag},
     // Gemma D512 prefill split-K diagnostic: 0 keeps wave-aware selection; 1..13
     // forces the segment count (ops/launcher/gemma4_attention_mma_d512.cu).
     {"INFERNIX_TMP_GEMMA4_ATTN_SPLIT_K", Scope::Gemma4, Kind::Value},

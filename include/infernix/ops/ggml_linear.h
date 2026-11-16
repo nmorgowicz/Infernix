@@ -58,6 +58,17 @@ void ggml_dequantize_bf16(std::span<const GgmlSegment> segments, std::int32_t k,
                           const std::int32_t* col_perm, std::int32_t perm_block, cudaStream_t stream);
 
 /**
+ * A GGUF projection's weights as E4M3 rows with one BF16 multiplier per row (the FP8_E4M3FN_ROW_BF16 contract of
+ * the FP8 A8 GEMM, as q4's baked prefill bakes its codes): for row n with values v (binary32: exact for IQ2_S/IQ3_XXS/
+ * IQ3_S, the exact value rounded once otherwise) and m = max |v|, row_scales[n] = bf16_ru(fl32(m / 448)) (1 for an
+ * all-zero row) and codes[n, c] = e4m3_rn_satfinite(fl32(v * fl32(1 / row_scales[n]))). codes is U8 [K, N] (row n's
+ * K codes contiguous), row_scales BF16 [N]; segments and `col_perm` as ggml_dequantize_bf16. LOSSY: E4M3 holds 4
+ * significant bits, so it rounds the IQ grid x scale values a second time.
+ */
+void ggml_widen_e4m3(std::span<const GgmlSegment> segments, std::int32_t k, Tensor& codes, Tensor& row_scales,
+                     const std::int32_t* col_perm, std::int32_t perm_block, cudaStream_t stream);
+
+/**
  * The segments of a projection whose rows [0, N) are split among several outputs: output i takes
  * rows [bounds[i], bounds[i + 1]) (bounds ascending, bounds[0] = 0). Each segment (its out_offset
  * within [0, N)) is cut at the bounds into segments of whole rows, each with its output index and

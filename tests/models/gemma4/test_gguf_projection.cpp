@@ -253,6 +253,70 @@ void dense_decode(QType q, int rows, int k, const std::vector<std::int32_t>& per
                           std::to_string(got.size()) + " values differ from the oracle rounded once to BF16");
 }
 
+// E4M3 (FN, satfinite) of a binary32 value, rounded to nearest with ties to the even code: the nearest of the
+// 127 finite magnitudes, independent of the device conversion.
+std::uint8_t e4m3_from_float(float v) {
+    static const std::vector<double> magnitudes = [] {
+        std::vector<double> out;
+        for (int code = 0; code < 0x7F; ++code) {
+            const int e = code >> 3, m = code & 7;
+            out.push_back(e == 0 ? std::ldexp(m, -9) : std::ldexp(8 + m, e - 10));
+        }
+        return out;
+    }();
+    const double a = std::fabs(static_cast<double>(v));
+    int best = 0;
+    for (int code = 1; code < 0x7F; ++code) {
+        const double d = std::fabs(magnitudes[static_cast<std::size_t>(code)] - a), b = std::fabs(magnitudes[static_cast<std::size_t>(best)] - a);
+        if (d < b || (d == b && (code & 1) == 0)) { best = code; }
+    }
+    return static_cast<std::uint8_t>(best | (std::signbit(v) ? 0x80 : 0));
+}
+
+// ops::ggml_widen_e4m3 against the documented contract evaluated on the host from the oracle's values.
+void widen(QType q, int rows, int k, const std::vector<std::int32_t>& perm, std::mt19937& rng) {
+    const auto stored = random_rows(q, rows, k, rng);
+    const auto exact  = decode(q, stored, rows, k);
+    DeviceBuffer dw(stored.size()), dcodes(static_cast<std::size_t>(rows) * k), dscales(static_cast<std::size_t>(rows) * 2),
+        dperm(std::max<std::size_t>(perm.size(), 1) * 4);
+    dw.copy_from_host(stored.data(), stored.size());
+    if (!perm.empty()) { dperm.copy_from_host(perm.data(), perm.size() * 4); }
+    const ops::GgmlSegment segment{q, static_cast<const std::uint8_t*>(dw.p), rows, 0, 0, ops::GgmlLayout::Rows};
+    Tensor codes(dcodes.p, DType::U8, {k, rows});
+    Tensor scales(dscales.p, DType::BF16, {rows});
+    ops::ggml_widen_e4m3(std::span<const ops::GgmlSegment>(&segment, 1), k, codes, scales,
+                         perm.empty() ? nullptr : static_cast<const std::int32_t*>(dperm.p),
+                         g4::execution::kGlobalOutputPermBlock, nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<std::uint8_t> got(static_cast<std::size_t>(rows) * k);
+    std::vector<std::uint16_t> got_scales(static_cast<std::size_t>(rows));
+    dcodes.copy_to_host(got.data(), got.size());
+    dscales.copy_to_host(got_scales.data(), got_scales.size() * 2);
+    const int block = g4::execution::kGlobalOutputPermBlock;
+    std::size_t bad_codes = 0, bad_scales = 0;
+    for (int r = 0; r < rows; ++r) {
+        float largest = 0;
+        for (int c = 0; c < k; ++c) { largest = std::max(largest, std::fabs(static_cast<float>(exact[static_cast<std::size_t>(r) * k + c]))); }
+        std::uint16_t scale = 0x3F80; // 1.0
+        if (largest > 0) {
+            const float q448 = largest / 448.0F;
+            std::uint32_t u  = 0;
+            std::memcpy(&u, &q448, 4);
+            scale = static_cast<std::uint16_t>((u >> 16) + ((u & 0xFFFF) != 0 ? 1 : 0)); // round up (positive)
+        }
+        bad_scales += got_scales[static_cast<std::size_t>(r)] != scale;
+        const float inverse = 1.0F / static_cast<float>(bf16_value(scale));
+        for (int c = 0; c < k; ++c) {
+            const float v = static_cast<float>(exact[static_cast<std::size_t>(r) * k + c]);
+            const int to = perm.empty() ? c : perm[static_cast<std::size_t>(c / block)] * block + c % block;
+            bad_codes += got[static_cast<std::size_t>(r) * k + to] != e4m3_from_float(v * inverse);
+        }
+    }
+    require(bad_scales == 0 && bad_codes == 0, "E4M3 widening " + std::to_string(static_cast<int>(q)) + ": " +
+                                                   std::to_string(bad_scales) + " row multipliers and " +
+                                                   std::to_string(bad_codes) + " codes differ from the contract");
+}
+
 // --bench: the dense route's two steps timed apart on the Gemma 4 31B trunk shapes (IQ3_S blocks, T columns).
 void bench(int columns) {
     std::mt19937 rng(7);
@@ -316,6 +380,8 @@ int main(int argc, char** argv) {
                               QType::GGML_IQ3_XXS, QType::GGML_IQ3_S, QType::GGML_IQ4_XS, QType::GGML_IQ4_NL}) {
             dense_decode(q, 24, k, {}, rng);
             dense_decode(q, 24, k, perm, rng);
+            widen(q, 24, k, {}, rng);
+            widen(q, 24, k, perm, rng);
         }
         for (const int columns : {1, 4, 40, 64, 300}) {
             const std::string width = " T=" + std::to_string(columns);

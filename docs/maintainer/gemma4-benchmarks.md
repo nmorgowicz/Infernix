@@ -61,6 +61,21 @@ Cold prefill at 32k is 4,178-4,303 tok/s on the default route against 3,450-3,45
 (about -18%), and at 100k 2,393-2,436 against 2,123-2,162 (about -11%). For reference, best-small (g256)
 decodes 121.35 / 120.76 / 108.75 / 86.75 tok/s at the same four lengths.
 
+### Prefill of GGUF-block artifacts (IQ3_XS import)
+
+`infernix_bench -p 8192`, FP8 KV, BF16 logits, no MTP, 3 reps after a warmup, against an absmax `q4_g256_fp16` build of
+the same model (W4A8 fused/baked routes), tok/s by `--prefill-chunk`:
+
+| Route | 128 | 512 | 1024 | 2048 |
+|---|---:|---:|---:|---:|
+| q4_g256 (W4A8) | 3,655 | 4,681 | 5,535 | 6,049 |
+| GGUF, dense BF16 + cuBLAS (default from 64 columns) | 1,198 | 2,182 | 2,436 | 2,529 |
+| GGUF, `INFERNIX_TMP_GGML_A8=1` (E4M3 rows + FP8 A8 GEMM) | 2,146 | 4,498 | 5,300 | 5,922 |
+
+Native KL (plain model, Q8_0 reference, chunk 128): the dense BF16 route equals the exact GGUF route (IQ3_XS 0.163,
+paired 0.000 [−0.001, +0.001]); the A8 switch costs +0.013 [+0.008, +0.018] on IQ3_XS (0.176) and +0.010 [+0.005,
+0.015] on IQ3_XXS (0.228). The switch is an experiment arm and not a default.
+
 ## Native full-vocabulary KL
 
 `infernix-perplexity --full-vocab-reference-write CACHE` creates the

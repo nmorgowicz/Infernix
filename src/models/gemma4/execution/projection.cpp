@@ -1,5 +1,6 @@
 #include "models/gemma4/execution/projection.h"
 
+#include "core/temporary_switches.h"
 #include "infernix/ops/cast.h"
 
 #include <algorithm>
@@ -35,6 +36,39 @@ std::size_t aligned(std::size_t bytes) {
     return (bytes + kAlignment - 1) / kAlignment * kAlignment;
 }
 
+// INFERNIX_TMP_GGML_A8: GGUF projections at prefill widths widen to E4M3 rows and take the FP8 A8 GEMM.
+bool ggml_a8() {
+    static const bool enabled = temporary_switches::flag("INFERNIX_TMP_GGML_A8");
+    return enabled;
+}
+
+// The FP8_E4M3FN_ROW_BF16 descriptor of `rows` x `k` codes at `payload` with the row multipliers at the
+// format's scale plane offset (the layout fp8_row_geometry checks).
+Weight fp8_row_weight(void* payload, int rows, int k) {
+    const std::size_t scale_offset = aligned(checked_bytes(rows, k, 1));
+    Weight w;
+    w.qtype = QType::FP8_E4M3FN_ROW_BF16;
+    w.layout = QuantLayout::RowScale;
+    w.scale_dtype = DType::BF16;
+    w.payload = payload;
+    w.payload_bytes = scale_offset + checked_bytes(rows, 1, 2);
+    w.qdata = payload;
+    w.scales = static_cast<std::uint8_t*>(payload) + scale_offset;
+    w.n = rows;
+    w.k = k;
+    w.group = k;
+    w.group_size = static_cast<std::uint32_t>(k);
+    w.ndim = 2;
+    w.shape[0] = w.padded_shape[0] = rows;
+    w.shape[1] = w.padded_shape[1] = k;
+    w.shape[2] = w.shape[3] = w.padded_shape[2] = w.padded_shape[3] = 1;
+    w.scale_ne[0] = rows;
+    w.scale_ne[1] = w.scale_ne[2] = w.scale_ne[3] = 1;
+    w.scale_nb[0] = 2;
+    w.scale_nb[1] = w.scale_nb[2] = w.scale_nb[3] = static_cast<std::size_t>(rows) * 2;
+    return w;
+}
+
 } // namespace
 
 void project(const Tensor& x, const Weight& weight, ops::LinearPolicy policy, Tensor& out,
@@ -54,6 +88,19 @@ void project(const Tensor& x, const Weight& weight, const GgmlProjection& ggml, 
     }
     if (policy != ops::LinearPolicy::A16Only) {
         throw std::invalid_argument("Gemma4 projection: GGUF blocks run on 16-bit activations (A16Only)");
+    }
+    if (x.ne[1] >= kGgmlDenseMinTokens && out.dtype == DType::BF16 && ggml_a8()) {
+        // Experiment (INFERNIX_TMP_GGML_A8): E4M3 rows with BF16 row multipliers, then the FP8 A8 GEMM.
+        auto scope = workspace.scope();
+        const auto payload = workspace.alloc_bytes(aligned(checked_bytes(weight.n, weight.k, 1)) +
+                                                       checked_bytes(weight.n, 1, 2),
+                                                   kAlignment);
+        const Weight fp8 = fp8_row_weight(payload.data, weight.n, weight.k);
+        Tensor codes(const_cast<void*>(fp8.qdata), DType::U8, {weight.k, weight.n});
+        Tensor scales(const_cast<void*>(fp8.scales), DType::BF16, {weight.n});
+        ops::ggml_widen_e4m3(ggml.segments, weight.k, codes, scales, ggml.input_perm, ggml.perm_block, stream);
+        ops::linear(x, fp8, out, ops::LinearPolicy::AllowA8, workspace, stream);
+        return;
     }
     if (x.ne[1] >= kGgmlDenseMinTokens && out.dtype == DType::BF16) {
         // Prefill: decode the blocks once into a dense BF16 matrix (global output columns already in the attention
@@ -109,6 +156,15 @@ std::size_t projection_bytes(const Weight& weight, const GgmlProjection& ggml, o
     if (tokens >= kGgmlDenseMinTokens) {
         bytes = std::max(bytes, aligned(checked_bytes(weight.n, weight.k, 2)) +
                                     aligned(checked_bytes(weight.n, tokens, 4)) + 2 * kAlignment);
+        // The INFERNIX_TMP_GGML_A8 arm (Gemma trunk shapes): E4M3 rows and multipliers, then the FP8 A8 GEMM's own
+        // workspace.
+        if (ggml_a8()) {
+            bytes = std::max(bytes, aligned(aligned(checked_bytes(weight.n, weight.k, 1)) + checked_bytes(weight.n, 1, 2)) +
+                                        ops::linear_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16, weight.n,
+                                                                             weight.k, ops::LinearPolicy::AllowA8,
+                                                                             kGgmlDenseMinTokens, tokens) +
+                                        2 * kAlignment);
+        }
     }
     return bytes;
 }
