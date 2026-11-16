@@ -104,7 +104,7 @@ PRESETS: dict[str, Preset] = {
     "iq3-xs": Preset(
         "iq3-xs", "gguf", "llama.cpp IQ3_XS, own imatrix",
         "About 3 GB smaller than best-small: IQ3_XS blocks with 8-bit activations; check runtime VRAM capacity.",
-        "smaller", 13.91, 0.176, "about 2 h", 0, False, "ggml_iq3_s", 100, 120, 14,
+        "smaller", 13.91, 0.1762, "about 2 h", 0, False, "ggml_iq3_s", 100, 120, 14,
         {"calibration-source": 1, "calibration-render": 1, "gguf-bf16": 15, "gguf-q8": 8, "imatrix": 25,
          "gguf-quantize": 45, "convert": 6, "receipt-check": 0.5, "finalize": 0.5},
         "IQ3_XS",
@@ -112,7 +112,7 @@ PRESETS: dict[str, Preset] = {
     "iq3-xxs": Preset(
         "iq3-xxs", "gguf", "llama.cpp IQ3_XXS, own imatrix",
         "The smallest, about 1 GB below iq3-xs, at a visible quality cost.",
-        "smallest", 13.03, 0.228, "about 2 h", 0, False, "ggml_iq3_xxs", 100, 120, 13,
+        "smallest", 13.03, 0.2273, "about 2 h", 0, False, "ggml_iq3_xxs", 100, 120, 13,
         {"calibration-source": 1, "calibration-render": 1, "gguf-bf16": 15, "gguf-q8": 8, "imatrix": 25,
          "gguf-quantize": 45, "convert": 6, "receipt-check": 0.5, "finalize": 0.5},
         "IQ3_XXS",

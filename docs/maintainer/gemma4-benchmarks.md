@@ -81,6 +81,48 @@ route, paired 0.000 [−0.001, +0.001]); AllowA8 prefill +0.013 [+0.008, +0.018]
 0.015] (IQ3_XXS 0.228). The 8-bit decode route against the exact one, scored at prefill chunk 16 (every projection
 on its narrow route) against the exact run's own cache: KL 0.0035 [0.0027, 0.0043], dNLL −0.001 [−0.003, +0.001].
 
+#### Combined-default IQ3 imports, real Gemma serving (2026-11-16)
+
+Fresh artifacts store `AllowA8` on the GGUF projection Uses and the same FP8 MTP assistant. No temporary
+activation environment switches are set. Native full-vocabulary KL uses the model variant's own Q8_0
+reference: 47 English windows / 13,728 positions, context 512, stride 256, prefill chunk 128, FP8 KV,
+BF16 QK/logits. Paired differences reuse the corresponding exact-A16 reports:
+
+| Model / tier | Mean KL [95% CI] | ΔNLL | Top-1 disagreement | Paired default − A16 KL [95% CI] |
+|---|---:|---:|---:|---:|
+| plain IQ3_XS | 0.1762 [0.1534, 0.1996] | +0.0662 | 12.63% | +0.0129 [+0.0084, +0.0175] |
+| plain IQ3_XXS | 0.2273 [0.1984, 0.2589] | +0.0826 | 14.40% | +0.0095 [+0.0050, +0.0146] |
+| diode IQ3_XS | 0.2256 [0.1971, 0.2547] | +0.0786 | 14.03% | +0.0159 [+0.0119, +0.0196] |
+| diode IQ3_XXS | 0.3154 [0.2711, 0.3701] | +0.1585 | 16.84% | +0.0120 [+0.0070, +0.0175] |
+
+The cost is measurable: all paired KL intervals exclude zero despite overlapping marginal intervals.
+Causal scoring at chunk 128 predominantly exercises wide projections; it is not generated-output KL.
+
+Real HTTP MTP: RTX 5090, FP8 KV/QK, BF16 logits, same assistant, draft depth 1, automatic prefill,
+32,768 maximum context, no prefix reuse, greedy top-k 20 / seed 1234, **thinking explicitly disabled**.
+Each length has an excluded warmup and three timed repetitions with identical cross-arm natural English
+prompts tokenized by Gemma. Generation is capped at 256 tokens; actual prompt counts are 986–987 and
+15,983–15,987. Rates are server timings, not wire TTFT; brackets are repetition ranges, not confidence intervals.
+The q4 baseline is absmax q4_g256, a performance/format baseline, not quality-matched GPTQ.
+
+| Arm | Prompt | Auto chunk | Prefill tok/s | Decode median [range] tok/s | Accepted / drafted |
+|---|---:|---:|---:|---:|---:|
+| q4 | ~1k | 2048 | 6,583 | 121.2 [117.7, 124.6] | 320 / 444 |
+| IQ3_XS | ~1k | 2048 | 6,407 | 120.7 [119.2, 122.7] | 322 / 441 |
+| IQ3_XXS | ~1k | 2048 | 6,331 | 125.5 [116.2, 127.2] | 315 / 448 |
+| q4 | ~16k | 2048 | 5,502 | 115.9 [115.9, 116.4] | 327 / 436 |
+| IQ3_XS | ~16k | 2048 | 5,390 | 112.4 [112.0, 114.7] | 321 / 441 |
+| IQ3_XXS | ~16k | 2048 | 5,380 | 117.2 [116.6, 119.8] | 326 / 436 |
+
+Observed prefill reaches 96.2–98.0% of q4. Strict median MTP decode parity is **not met by IQ3_XS**:
+99.5% / 97.0% of q4 at ~1k / ~16k. IQ3_XXS reaches 103.5% / 101.1% on these prompts, with overlapping
+short-run ranges. These measurements do not qualify every prompt length, thinking-enabled throughput or
+smaller-card capacity. All four plain/diode default imports also passed loopback model-list and chat probes.
+The canonical generated-launcher `serve-check` also passed all six checks on each of the four imports (24/24),
+using the default 131072-context / FP8 KV/QK / auto-chunk / MTP d1 / 8192 MiB host-cache profile with only
+host/port changed to development loopback. Those checks did not override the template's default thinking setting.
+
+
 ## Native full-vocabulary KL
 
 `infernix-perplexity --full-vocab-reference-write CACHE` creates the

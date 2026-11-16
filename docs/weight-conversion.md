@@ -512,8 +512,8 @@ is needed. Source weights are read-only, outputs are never overwritten, and a fa
 | `best-small` (recommended) | GPTQ, group 256 | `q4_g256_fp16` | 16.85 GB | 0.1213 |
 | `best-medium` | GPTQ, group 32 | `q4_g32_fp16` | 18.41 GB | 0.0845 |
 | `draft` | uncalibrated absmax, group 32 | `q4_g32_fp16` | 18.41 GB | 0.2654 |
-| `iq3-xs` | own-model imatrix, IQ3_XS allocation | GGUF IQ3_S / IQ3_XXS / Q6_K blocks | about 13.9 GB | see IQ3 qualification below |
-| `iq3-xxs` | own-model imatrix, IQ3_XXS allocation | GGUF IQ3_XXS / IQ2_S / IQ3_S blocks | about 13.0 GB | see IQ3 qualification below |
+| `iq3-xs` | own-model imatrix, IQ3_XS allocation | GGUF IQ3_S / IQ3_XXS / Q6_K blocks | about 13.9 GB | 0.1762 (own-model Q8_0 ref) |
+| `iq3-xxs` | own-model imatrix, IQ3_XXS allocation | GGUF IQ3_XXS / IQ2_S / IQ3_S blocks | about 13.0 GB | 0.2273 (own-model Q8_0 ref) |
 
 The q4 KL figures are the author's (one fine-tune, English text, FP8-row reference). File sizes include MTP.
 The two-level 6-bit scale format `q4_g32_s6_fp16` and calibrated round-to-nearest `lite-*` presets are not built here; asking for one
@@ -581,11 +581,12 @@ prefill (64 columns and more) widens the blocks once per call to E4M3 rows with 
 (`ops::ggml_widen_e4m3`) and runs the FP8 A8 GEMM. `--weights q4_g32_a16` keeps them on 16-bit activations
 (A16Only): the exact A16 route at decode widths, and from 64 columns the blocks decoded into a dense BF16 matrix and
 run as one cuBLAS GEMM. Existing artifacts keep their stored policies: loading an A16Only artifact does not
-silently opt it into A8. There are no temporary GGUF activation environment switches. Separate prefill/decode
-quality and timing measurements are in `docs/maintainer/gemma4-benchmarks.md`; they are not a combined-default
-serving or quality claim.
-The vocabulary, norms, layer scalars and the MTP assistant come from `--model` as usual (FP8
-vocabulary). Global-layer query and key rows are reordered as whole rows; the global output projection keeps the
+silently opt it into A8. There are no temporary GGUF activation environment switches. Combined-default
+qualification and the earlier separate-route measurements are in `docs/maintainer/gemma4-benchmarks.md`.
+The measured A8 policy adds about 0.010–0.016 KL versus A16 on the measured model variants; the smaller file
+does not imply equal quality. Vocabulary, norms and layer scalars come from `--model` (FP8 vocabulary),
+and MTP comes from the explicit BF16 `--mtp-assistant` source.
+Global-layer query and key rows are reordered as whole rows; the global output projection keeps the
 GGUF's column order and the text config records `global_output_order: "source"`, so the runtime reads the
 attention output through a permutation of 64-element blocks. A 256-element block cannot be split, so this is the
 only exact way to keep those tensors. `--gguf-source` excludes `--gptq-source`, scale searches, imatrix,
