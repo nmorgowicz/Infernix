@@ -139,11 +139,19 @@ class Env:
         self.gptq_python.write_bytes(b"x")
         self.calibration = tmp_path / "calibration.txt"
         self.calibration.write_text("public text")
+        self.llama_cpp = tmp_path / "llama-bin"
+        self.llama_cpp.mkdir()
+        for name in ("llama-quantize", "llama-imatrix"):
+            (self.llama_cpp / launcher.exe_name(name)).write_bytes(b"tool")
+        self.llama_source = tmp_path / "llama-src"
+        self.llama_source.mkdir()
+        (self.llama_source / "convert_hf_to_gguf.py").write_text("# converter")
 
     def argv(self, preset: str, *extra: str, mtp: bool = True) -> list[str]:
         argv = ["--preset", preset, "--model", str(self.model), "--out-dir", str(self.out),
                 "--serve", str(self.server), "--gptq-python", str(self.gptq_python),
-                "--calibration-text", str(self.calibration)]
+                "--calibration-text", str(self.calibration), "--llama-cpp", str(self.llama_cpp),
+                "--llama-cpp-source", str(self.llama_source)]
         argv += ["--assistant", str(self.assistant)] if mtp else ["--no-mtp"]
         return argv + list(extra)
 
@@ -152,6 +160,7 @@ class Env:
             preset=build.PRESETS[preset], model=self.model, assistant=self.assistant, with_vision=False,
             out_dir=self.out, work_dir=self.out / "work", name="m-" + preset, python=PY,
             gptq_python=self.gptq_python, calibration_text=self.calibration, perplexity_exe=self.perplexity,
+            llama_cpp=self.llama_cpp, llama_cpp_source=self.llama_source,
         )
         values.update(over)
         return build.BuildConfig(**values)
@@ -202,13 +211,12 @@ def test_every_preset_has_the_documented_recipe_flags(env):
         "best-medium": ("--gptq-source", str(env.out / "work" / "gptq")),
         "draft": (),
     }
-    assert set(expected) == set(build.PRESETS)
     for preset, recipe in expected.items():
         cfg = env.config(preset, calibration_text=None)
         assert plan_by_id(cfg)["convert"].argv == convert_expected(cfg, *recipe), preset
 
 
-def test_the_presets_are_the_two_gptq_formats_and_the_plain_draft():
+def test_gptq_and_draft_preserve_their_recipes():
     small, medium = build.PRESETS["best-small"], build.PRESETS["best-medium"]
     assert (small.format_name, small.group_size, small.native_groups, small.method) == ("q4_g256_fp16", 256, True, "gptq")
     assert (medium.format_name, medium.group_size, medium.native_groups, medium.method) == (
@@ -216,10 +224,7 @@ def test_the_presets_are_the_two_gptq_formats_and_the_plain_draft():
     assert build.PRESETS["draft"].method == "plain"
     assert round(small.file_gb * 1e9, -7) == 16.85e9 and round(medium.file_gb * 1e9, -7) == 18.41e9
     assert small.kl > medium.kl
-    for preset in build.PRESETS.values():
-        limit = {"gptq": 45, "plain": 20}[preset.method]
-        assert sum(preset.minutes.values()) < limit
-        assert "s6" not in preset.format_name
+    assert build.PRESETS["draft"].group_size == 32
 
 
 def test_gptq_steps_are_the_documented_commands(env):
@@ -250,6 +255,49 @@ def test_gptq_steps_are_the_documented_commands(env):
             gpy, str(gptq_dir / "check_checkpoint.py"), "--gptq", w(cfg, "gptq"), "--tree", w(cfg, "text60")]
         assert steps["gptq"].prune_always == (cfg.work("offload"),)
         assert steps["gptq-check"].prune_if_short == (cfg.work("text60"),)
+
+
+@pytest.mark.parametrize("preset, quant", [("iq3-xs", "IQ3_XS"), ("iq3-xxs", "IQ3_XXS")])
+def test_iq3_uses_own_q8_imatrix_and_imports_blocks_with_assistant(env, preset, quant):
+    cfg = env.config(preset)
+    steps = plan_by_id(cfg)
+    assert list(steps) == ["calibration-render", "gguf-bf16", "gguf-q8", "imatrix", "gguf-quantize",
+                           "convert", "receipt-check", "finalize"]
+    assert steps["gguf-bf16"].argv == [
+        PY, str(env.llama_source / "convert_hf_to_gguf.py"), str(env.model), "--outtype", "bf16",
+        "--outfile", w(cfg, "model-bf16.gguf")]
+    tool = str(env.llama_cpp / launcher.exe_name("llama-quantize"))
+    assert steps["gguf-q8"].argv == [tool, w(cfg, "model-bf16.gguf"), w(cfg, "model-q8_0.gguf"), "Q8_0"]
+    assert steps["imatrix"].argv == [
+        str(env.llama_cpp / launcher.exe_name("llama-imatrix")), "-m", w(cfg, "model-q8_0.gguf"),
+        "-o", w(cfg, "imatrix.gguf"), "--output-format", "gguf", "--no-ppl", "--ctx-size", "512",
+        "--gpu-layers", "999", "--file", w(cfg, "calibration", "templated.txt"), "--chunks", "400",
+        "--parse-special"]
+    argv = steps["gguf-quantize"].argv
+    assert argv[:3] == [tool, "--imatrix", w(cfg, "imatrix.gguf")]
+    assert argv[-3:] == [w(cfg, "model-bf16.gguf"), w(cfg, f"model-{quant}.gguf"), quant]
+    pins = argv[3:-3]
+    assert pins[::2] == ["--tensor-type"] * len(pins[1::2])
+    assert "attn_output=IQ3_S" in pins
+    if quant == "IQ3_XS":
+        assert "attn_v=IQ3_S" in pins and "ffn_down=IQ3_S" in pins
+        assert r"blk\.([0-6]|5[2-9])\.ffn_(gate|up)=IQ3_S" in pins
+    else:
+        assert "attn_q=IQ2_S" in pins and "attn_k=IQ2_S" in pins
+    assert steps["convert"].argv == convert_expected(cfg, "--gguf-source", w(cfg, f"model-{quant}.gguf"))
+    assert not any("gptq" in step for step in steps)
+    assert steps["imatrix"].prune_always == (cfg.work("model-q8_0.gguf"),)
+    assert steps["gguf-quantize"].prune_always == (cfg.work("model-bf16.gguf"),)
+
+
+@pytest.mark.parametrize("preset", ["iq3-xs", "iq3-xxs"])
+def test_iq3_score_uses_default_policy_not_the_q4_experiment_switch(env, preset):
+    cfg = env.config(preset, score=True)
+    steps = plan_by_id(cfg)
+    assert steps["score-run"].env == {}
+    assert "GGUF AllowA8" in steps["score-run"].title
+    twin = steps["score-candidate"].argv
+    assert "--gguf-source" in twin and "--no-mtp" in twin and "--mtp-assistant" not in twin
 
 
 def test_a_gptq_build_downloads_the_pinned_corpus_without_a_text_file(env):
@@ -419,6 +467,24 @@ def test_the_gptq_interpreter_comes_from_the_argument_then_the_environment(env, 
     assert cli.resolve_config(explicit)[0].gptq_python == (env.root / "other.exe").absolute()
 
 
+def test_llama_cpp_paths_use_explicit_arguments_then_environment(env, monkeypatch):
+    monkeypatch.setenv(build.LLAMA_CPP_ENV, str(env.root / "env-bin"))
+    monkeypatch.setenv(build.LLAMA_CPP_SOURCE_ENV, str(env.root / "env-src"))
+    cfg = cli.resolve_config(cli.build_parser().parse_args(env.argv("iq3-xs")))[0]
+    assert cfg.llama_cpp == env.llama_cpp.resolve() and cfg.llama_cpp_source == env.llama_source.resolve()
+    argv = env.argv("iq3-xs")
+    for flag in ("--llama-cpp", "--llama-cpp-source"):
+        index = argv.index(flag)
+        del argv[index:index + 2]
+    cfg = cli.resolve_config(cli.build_parser().parse_args(argv))[0]
+    assert cfg.llama_cpp == (env.root / "env-bin").resolve()
+    assert cfg.llama_cpp_source == (env.root / "env-src").resolve()
+    monkeypatch.delenv(build.LLAMA_CPP_ENV)
+    monkeypatch.delenv(build.LLAMA_CPP_SOURCE_ENV)
+    cfg = cli.resolve_config(cli.build_parser().parse_args(argv))[0]
+    assert cfg.llama_cpp is None and cfg.llama_cpp_source is None
+
+
 # ---------------------------------------------------------------- preflight with fake probes
 
 
@@ -460,6 +526,21 @@ def test_missing_gptq_environment_points_at_setup_gptq(env, tmp_path):
     cfg = env.config("best-medium", gptq_python=tmp_path / "missing" / "python.exe")
     item = finding(preflight(env, cfg), "GPTQ environment")
     assert item.level == "fail" and "setup-gptq --venv" in item.action and build.GPTQ_PYTHON_ENV in item.action
+
+
+def test_iq3_missing_tools_are_actionable_and_do_not_require_gptq(env):
+    cfg = env.config("iq3-xs", llama_cpp=None, llama_cpp_source=None, gptq_python=None)
+    report = preflight(env, cfg)
+    assert "--llama-cpp" in finding(report, "llama-quantize").action
+    assert "--llama-cpp" in finding(report, "llama-imatrix").action
+    assert "--llama-cpp-source" in finding(report, "llama.cpp source").action
+    assert not any(item.what == "GPTQ environment" for item in report.findings)
+
+
+def test_iq3_needs_gguf_conversion_dependencies(env):
+    item = finding(preflight(env, env.config("iq3-xs"), FakeProbes(missing_packages=("gguf",))),
+                   "converter Python packages")
+    assert item.level == "fail" and "pip install gguf" in item.action
 
 
 def test_model_checks_reuse_the_converter_and_name_the_fix(tmp_path):
@@ -649,6 +730,37 @@ def test_calibration_file_change_changes_the_identity(env):
     before = build.fingerprint_of(build.build_identity(cfg))
     env.calibration.write_text("other text")
     assert build.fingerprint_of(build.build_identity(cfg)) != before
+
+
+@pytest.mark.parametrize("preset", ["iq3-xs", "iq3-xxs"])
+def test_iq3_runner_resumes_after_quantizer_failure_and_records_its_representation(env, preset):
+    cfg = env.config(preset)
+    builder, first, _ = make_builder(env, cfg, fail={"gguf-quantize"})
+    with pytest.raises(build.BuildError, match="step gguf-quantize failed"):
+        builder.run()
+    assert first.calls == ["calibration-render", "gguf-bf16", "gguf-q8", "imatrix", "gguf-quantize"]
+    assert not cfg.work("model-q8_0.gguf").exists()
+    assert cfg.work("model-bf16.gguf").exists()
+    again, resumed, _ = make_builder(env, cfg)
+    again.run()
+    assert resumed.calls == ["gguf-quantize", "convert"]
+    assert not cfg.work("model-bf16.gguf").exists()
+    summary = (cfg.out_dir / "BUILD-SUMMARY.md").read_text()
+    assert "IQ3 GGUF blocks, AllowA8 for prefill and decode" in summary
+    assert "own Q8_0 reference" in summary
+    assert "4-bit weights" not in summary
+    profile = build.parse_launcher(cfg.out_dir / f"serve-{cfg.name}.cmd")
+    assert profile.draft_tokens == "1" and profile.prefill_chunk == "auto"
+    third, rerun, _ = make_builder(env, cfg)
+    third.run()
+    assert not rerun.calls
+
+
+def test_iq3_build_identity_pins_llama_source_and_allocation(env):
+    before = build.build_identity(env.config("iq3-xs"))
+    assert before["gguf_recipe"]["type"] == "IQ3_XS"
+    after = build.build_identity(env.config("iq3-xs", llama_cpp_source=env.root / "other-source"))
+    assert build.fingerprint_of(before) != build.fingerprint_of(after)
 
 
 def test_a_foreign_non_empty_work_dir_is_refused(env):

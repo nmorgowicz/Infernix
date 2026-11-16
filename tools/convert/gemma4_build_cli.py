@@ -14,6 +14,8 @@ from .gemma4_build import (
     CALIBRATION_REPO,
     CALIBRATION_REVISION,
     GPTQ_PYTHON_ENV,
+    LLAMA_CPP_ENV,
+    LLAMA_CPP_SOURCE_ENV,
     PRESETS,
     REPO_ROOT,
     SERVE_CHECK_ACTIONS,
@@ -38,20 +40,23 @@ METHODS = {
     "best-small": "GPTQ g256",
     "best-medium": "GPTQ g32",
     "draft": "absmax g32, no calibration",
+    "iq3-xs": "IQ3_XS, own imatrix",
+    "iq3-xxs": "IQ3_XXS, own imatrix",
 }
 NEEDS = {
     "gptq": "GPU with 12 GiB free, 64 GiB RAM, about 75 GB disk, the GPTQ environment (setup-gptq)",
     "plain": "nothing extra",
+    "gguf": "llama.cpp binaries and source (--llama-cpp, --llama-cpp-source); own-model imatrix",
 }
 EPILOG = f"""\
-presets (measured on one model, text only, W4A8, FP8 MTP assistant; KL is mean KL from the near-lossless reference,
-lower is better):
+presets (measured on one model, text only, 8-bit prompt activations; KL is mean KL from the near-lossless
+reference for q4, or the model's Q8_0 reference for IQ3; lower is better):
 
 {{table}}
 
-Recommended: best-small for most people (best quality per byte); best-medium for the highest quality. draft is a quick
+Recommended: best-small for most people (best quality per byte); best-medium for the highest quality.
+iq3-xs and iq3-xxs trade quality for smaller files and collect their own importance matrix; draft is a quick
 test build only. The calibrated-RTN presets and the two-level 6-bit scale format (q4_g32_s6_fp16) are not built here.
-
 other commands:
   python -m tools.convert.gemma4_build setup-gptq --venv DIR     create the pinned GPTQ environment
   python -m tools.convert.gemma4_build launcher --artifact F --out FILE.cmd   write a launcher for an existing file
@@ -134,15 +139,14 @@ def serve_kwargs(args: argparse.Namespace) -> dict:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m tools.convert.gemma4_build",
-        description="Build a Gemma 4 31B 4-bit .ninfer for infernix-serve from a BF16 checkpoint in one command "
-        "(W4A8 weights; the launcher serves it with an FP8 KV cache and FP8 attention QK by default): checks, plan, "
-        "calibration, GPTQ, conversion, receipts, launcher.",
+        description="Build a Gemma 4 31B .ninfer for infernix-serve from a BF16 checkpoint in one command "
+        "(q4 or IQ3 weights; FP8 KV cache and attention QK in the launcher): checks, plan, "
+        "calibration, quantization, conversion, receipts, launcher.",
         epilog=EPILOG.format(table=preset_table()),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     add = parser.add_argument
-    add("--preset", help="what to build: best-small, best-medium or draft (see the table below); required for a "
-        "build")
+    add("--preset", help="what to build (see the table below); required for a build")
     add("--list-presets", action="store_true", help="print the preset table and exit")
     add("--model", type=Path, help="BF16 Hugging Face directory of Gemma 4 31B dense or a fine-tune (only read)")
     add("--assistant", type=Path, help="google/gemma-4-31B-it-assistant directory, embedded as the MTP component")
@@ -156,6 +160,10 @@ def build_parser() -> argparse.ArgumentParser:
         "evaluate on (default: download the pinned public English corpus)")
     add("--gptq-python", type=Path, help=f"python.exe of the GPTQ environment (default: ${GPTQ_PYTHON_ENV}, else "
         "<checkout>/.venv-gptq); never the converter's interpreter")
+    add("--llama-cpp", type=Path, help=f"IQ3 presets: directory containing llama-quantize and llama-imatrix "
+        f"(default: ${LLAMA_CPP_ENV})")
+    add("--llama-cpp-source", type=Path, help=f"IQ3 presets: llama.cpp source with convert_hf_to_gguf.py "
+        f"(default: ${LLAMA_CPP_SOURCE_ENV})")
     add("--gptq-max-cpu-gb", type=int, default=32, help="GPTQ host-RAM budget for offloaded weights (default 32, the "
         "measured route; host peak is about this plus 8 GiB; lower it on a machine with less free RAM, the rest "
         "goes to disk and the step runs slower)")
@@ -257,6 +265,8 @@ def resolve_config(args: argparse.Namespace) -> tuple[BuildConfig, ServeSettings
         else launcher_tools.find_server_exe(REPO_ROOT, (preset.format_name,))
     )
     gptq_python = (args.gptq_python or default_gptq_python()).absolute() if preset.method == "gptq" else None
+    llama_cpp = args.llama_cpp or os.environ.get(LLAMA_CPP_ENV)
+    llama_source = args.llama_cpp_source or os.environ.get(LLAMA_CPP_SOURCE_ENV)
     cfg = BuildConfig(
         preset=preset, model=model, assistant=args.assistant.resolve() if args.assistant else None,
         with_vision=args.with_vision, out_dir=out_dir, work_dir=work_dir, name=name, gptq_python=gptq_python,
@@ -264,6 +274,8 @@ def resolve_config(args: argparse.Namespace) -> tuple[BuildConfig, ServeSettings
         calibration_text=args.calibration_text.resolve() if args.calibration_text else None,
         score=args.score, perplexity_exe=launcher_tools.sibling_binary(server, launcher_tools.PERPLEXITY_NAME)
         if args.score and server else None, keep_work=args.keep_work,
+        llama_cpp=Path(llama_cpp).resolve() if llama_cpp else None,
+        llama_cpp_source=Path(llama_source).resolve() if llama_source else None,
     )
     serve = ServeSettings(**kwargs, server_exe=server, cuda_bin=args.cuda_bin, launcher=not args.no_launcher)
     return cfg, serve, server

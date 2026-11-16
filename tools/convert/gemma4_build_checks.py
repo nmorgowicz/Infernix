@@ -22,6 +22,9 @@ from .gemma4_build import (
     GPTQ_PYTHON_ENV,
     REPO_ROOT,
     SCORE_EXTRA_GB,
+    LLAMA_CPP_ENV,
+    LLAMA_CPP_SOURCE_ENV,
+    llama_tool,
     BuildConfig,
     ServeSettings,
     device_of,
@@ -308,6 +311,8 @@ def check_python(report: Report, cfg: BuildConfig, probes) -> None:
     needed = ["torch", "numpy", "safetensors"]
     if cfg.preset.method != "plain":
         needed.append("tokenizers")
+    if cfg.preset.method == "gguf":
+        needed += ["gguf", "transformers", "sentencepiece"]
     if cfg.preset.method != "plain" and cfg.calibration_text is None:
         needed.append("pyarrow")
     info = probes.python_info(cfg.python, tuple(needed), cuda=True)
@@ -355,6 +360,25 @@ def check_gptq_env(report: Report, cfg: BuildConfig, probes) -> None:
     else:
         report.add("ok", "GPTQ environment", f"{python} ({versions_text(info['packages'])}; CUDA visible)")
         report.tool_versions.update({f"gptq env {name}": str(v) for name, v in info["packages"].items() if v})
+
+
+def check_llama_cpp(report: Report, cfg: BuildConfig, probes) -> None:
+    """The IQ3 route uses the caller's existing llama.cpp collector and quantizer, never downloads a build."""
+    for name in ("llama-quantize", "llama-imatrix"):
+        exe = Path(llama_tool(cfg, name))
+        if cfg.llama_cpp is None or not exe.is_file():
+            report.add("fail", name, f"executable not found: {exe}",
+                       f"pass --llama-cpp <binary directory> or set {LLAMA_CPP_ENV}")
+        else:
+            version = probes.tool_version(exe)
+            report.add("ok", name, f"{exe} ({version})")
+            report.tool_versions[name] = version
+    source = cfg.llama_cpp_source
+    if source is None or not (source / "convert_hf_to_gguf.py").is_file():
+        report.add("fail", "llama.cpp source", f"convert_hf_to_gguf.py not found under {source}",
+                   f"pass --llama-cpp-source <llama.cpp checkout> or set {LLAMA_CPP_SOURCE_ENV}")
+    else:
+        report.add("ok", "llama.cpp source", str(source))
 
 
 def check_server(report: Report, cfg: BuildConfig, serve: ServeSettings, server: Path | None, probes) -> None:
@@ -468,6 +492,8 @@ def preflight(
     check_python(report, cfg, probes)
     if cfg.preset.method == "gptq":
         check_gptq_env(report, cfg, probes)
+    elif cfg.preset.method == "gguf":
+        check_llama_cpp(report, cfg, probes)
     check_disk(report, cfg, probes)
     check_server(report, cfg, serve, server, probes)
     if cfg.score:

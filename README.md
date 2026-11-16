@@ -659,9 +659,9 @@ Each repository's model card gives its files, requirements, recommended command,
 
 ### Gemma 4 31B (dense, text)
 
-Serves the operator roleplay profile: grouped-Q4 weights (`q4_g32`/`q4_g128`/`q4_g256`, FP16 scales; W4A8 prefill),
-FP8 global KV with BF16 sliding rings, optional FP8 attention QK, MTP with Google's separate assistant, a host-only
-prefix cache and 131,072 tokens of context on one 32 GB card.
+Serves grouped-Q4 weights (`q4_g32`/`q4_g128`/`q4_g256`, FP16 scales; W4A8 prefill) or imported IQ3 GGUF
+projection blocks (AllowA8 prefill and decode), FP8 global KV with BF16 sliding rings, optional FP8 attention QK,
+MTP with Google's separate assistant, a host-only prefix cache and up to 131,072 tokens on one 32 GB card.
 Text generation and public causal scoring use native Gemma weights, tokenizer/template, sliding rings and global
 attention, not a Qwen model cast. K **and V** of the sliding layers stay BF16, and the head's BF16 rounding is
 preserved, so select `--logits-dtype bf16`; unrounded FP32 head sums are not implemented.
@@ -674,9 +674,13 @@ python -m tools.convert.gemma4_build --preset best-small --model <BF16 Gemma-4-3
 python -m tools.convert.gemma4_build serve-check --launcher <dir>\serve-<name>.cmd
 ```
 
-`best-small` is GPTQ group 256 (about 16.9 GB), `best-medium` GPTQ group 32 (about 18.4 GB, better quality);
-re-running a preset on the same BF16 tree reproduces the previous file object for object. The converter embeds the
-fixed Gemma chat template (`tools/chat_templates/gemma4_fixed.jinja`); `--chat-template FILE` replaces it at serve time.
+`best-small` is GPTQ group 256 (about 16.9 GB), `best-medium` GPTQ group 32 (about 18.4 GB, better quality).
+`iq3-xs` (about 13.9 GB with MTP) and `iq3-xxs` (about 13.0 GB) trade quality for a smaller file. They take
+`--llama-cpp <binary dir> --llama-cpp-source <source dir>`, build BF16 GGUF and a Q8_0 collection copy,
+collect the model's own importance matrix and import the IQ3 blocks; no GPTQ environment is needed.
+See [the builder guide](docs/weight-conversion.md#gemma-4-31b-builder-presets-and-the-self-contained-workflow)
+for dependencies, preflight and quality evidence. The converter embeds the fixed Gemma chat template
+(`tools/chat_templates/gemma4_fixed.jinja`); `--chat-template FILE` replaces it at serve time.
 
 **Serve it.** The generated launcher runs the profile below (`0.0.0.0:8001`, alias `131k`, any model name accepted):
 `--max-context 131072 --kv-dtype fp8 --gemma4-qk fp8 --prefill-chunk auto --logits-dtype bf16 --max-concurrency 1

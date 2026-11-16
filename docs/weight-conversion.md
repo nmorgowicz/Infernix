@@ -501,20 +501,22 @@ element ordering for a component it does claim to cover would not.
 ## Gemma 4 31B: builder presets and the self-contained workflow
 
 `python -m tools.convert.gemma4_build` turns a BF16 Gemma 4 31B dense checkpoint (or a fine-tune of it) into a
-4-bit W4A8 `.ninfer` with the MTP assistant, then writes the receipts, a Windows `infernix-serve` launcher and
-`BUILD-SUMMARY.md`. It only builds command lines and records which step finished; the conversion itself is
-`python -m tools.convert.gemma4_q4 {convert,verify,calibration-text}` and the GPTQ scripts in `tools/gptq/`.
-Nothing outside this checkout is needed. Source weights are only read, outputs are never overwritten, and a
-failed build resumes by rerunning the same command.
+q4 or IQ3 `.ninfer` with the MTP assistant, then writes the receipts, a Windows `infernix-serve` launcher and
+`BUILD-SUMMARY.md`. It builds command lines and records which step finished; conversion is owned by
+`python -m tools.convert.gemma4_q4 {convert,verify,calibration-text}`, GPTQ by `tools/gptq/`, and the IQ3
+collector/quantizer by an existing llama.cpp build supplied explicitly below. No other orchestration repository
+is needed. Source weights are read-only, outputs are never overwritten, and a failed build resumes with the same command.
 
 | preset | method | format | file | mean KL (lower is better) |
 |---|---|---|---|---|
 | `best-small` (recommended) | GPTQ, group 256 | `q4_g256_fp16` | 16.85 GB | 0.1213 |
 | `best-medium` | GPTQ, group 32 | `q4_g32_fp16` | 18.41 GB | 0.0845 |
 | `draft` | uncalibrated absmax, group 32 | `q4_g32_fp16` | 18.41 GB | 0.2654 |
+| `iq3-xs` | own-model imatrix, IQ3_XS allocation | GGUF IQ3_S / IQ3_XXS / Q6_K blocks | about 13.9 GB | see IQ3 qualification below |
+| `iq3-xxs` | own-model imatrix, IQ3_XXS allocation | GGUF IQ3_XXS / IQ2_S / IQ3_S blocks | about 13.0 GB | see IQ3 qualification below |
 
-The KL figures are the author's (one fine-tune, English text, FP8 MTP assistant). The two-level 6-bit scale
-format `q4_g32_s6_fp16` and the calibrated round-to-nearest `lite-*` presets are not built here; asking for one
+The q4 KL figures are the author's (one fine-tune, English text, FP8-row reference). File sizes include MTP.
+The two-level 6-bit scale format `q4_g32_s6_fp16` and calibrated round-to-nearest `lite-*` presets are not built here; asking for one
 is refused with the reason.
 
 GPTQ runs in its own interpreter, pinned by `tools/gptq/requirements.txt`, and never in the converter's: create
@@ -528,9 +530,29 @@ python -m tools.convert.gemma4_build --preset best-small --model <BF16 dir> --as
 python -m tools.convert.gemma4_build --preset best-small --model <BF16 dir> --assistant <assistant dir> --out-dir <dir> --yes
 ```
 
-`--check` runs the preflight only (GPU, RAM, disk, both Python environments, the server binary, the git revision),
-`--dry-run` prints the exact commands, `--score` adds a paired-KL quality check with `infernix-perplexity`
-(about an hour and 60 GB more), and `--calibration-text FILE` replaces the pinned public English corpus.
+For IQ3, pass `--llama-cpp <binary directory>` (containing `llama-quantize` and `llama-imatrix`) and
+`--llama-cpp-source <llama.cpp checkout>` (containing `convert_hf_to_gguf.py`), or set `INFERNIX_LLAMA_CPP`
+and `INFERNIX_LLAMA_CPP_SOURCE`. The builder interpreter needs `gguf`, `transformers` and `sentencepiece`
+in addition to the converter dependencies; GPTQ's environment is not used.
+
+```text
+python -m tools.convert.gemma4_build --preset iq3-xs --model <BF16 dir> --assistant <assistant dir> --llama-cpp <bin dir> --llama-cpp-source <source dir> --out-dir <camp artifact dir> --check
+python -m tools.convert.gemma4_build --preset iq3-xxs --model <BF16 dir> --assistant <assistant dir> --llama-cpp <bin dir> --llama-cpp-source <source dir> --out-dir <camp artifact dir> --yes
+```
+
+Both presets render the same 400 × 512-token calibration corpus, export BF16 GGUF, quantize a Q8_0 collection
+copy, collect an importance matrix from **that model**, and call `llama-quantize` with the measured Gemma
+allocation pins. No publisher/base-model importance matrix is substituted. They then import the quantized
+projection blocks verbatim, encode the BF16 source's vocabulary and the explicit assistant, verify storage,
+and write the ordinary launcher and receipts. Large Q8/BF16 intermediates are removed after their last use.
+Keep the output and scratch directories outside the read-only HF source tree. Repeat `serve-check` on the
+generated launcher before deploying; artifact storage verification is not a runtime or quality qualification.
+
+
+`--check` runs preflight only (GPU, RAM, disk, the required Python environments and tools, server, git revision).
+`--dry-run` prints the exact commands; `--score` adds native full-vocabulary KL against an FP8-row reference
+(about an hour and 60 GB more), preserving the IQ3 artifact's default AllowA8 policies.
+`--calibration-text FILE` replaces the pinned public English corpus.
 
 The launcher runs `infernix-serve` with the operator roleplay profile: `--max-context 131072` (alias `131k`),
 `--kv-dtype fp8`, `--gemma4-qk fp8`, `--prefill-chunk auto`, one lane, `--spec mtp --draft-tokens 1` when the
@@ -558,8 +580,10 @@ q4 trunks do: decode and MTP verification (up to 63 columns) take `ops::ggml_lin
 prefill (64 columns and more) widens the blocks once per call to E4M3 rows with a BF16 row multiplier
 (`ops::ggml_widen_e4m3`) and runs the FP8 A8 GEMM. `--weights q4_g32_a16` keeps them on 16-bit activations
 (A16Only): the exact A16 route at decode widths, and from 64 columns the blocks decoded into a dense BF16 matrix and
-run as one cuBLAS GEMM. On the plain Wicked-Stuff-31B IQ3_XS the 8-bit routes cost +0.013 native KL at prefill and
-about 0.0035 KL at decode against the 16-bit ones, at q4_g256's speed (`docs/maintainer/gemma4-benchmarks.md`).
+run as one cuBLAS GEMM. Existing artifacts keep their stored policies: loading an A16Only artifact does not
+silently opt it into A8. There are no temporary GGUF activation environment switches. Separate prefill/decode
+quality and timing measurements are in `docs/maintainer/gemma4-benchmarks.md`; they are not a combined-default
+serving or quality claim.
 The vocabulary, norms, layer scalars and the MTP assistant come from `--model` as usual (FP8
 vocabulary). Global-layer query and key rows are reordered as whole rows; the global output projection keeps the
 GGUF's column order and the text config records `global_output_order: "source"`, so the runtime reads the

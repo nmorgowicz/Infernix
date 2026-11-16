@@ -7,9 +7,10 @@ the work; this module only builds their command lines, runs them with logs, and 
 GPTQ scripts run in their own interpreter (`tools/gptq/requirements.txt`), never in the converter's. Source weights
 are only read.
 
-Presets: best-small (GPTQ group 256, `q4_g256_fp16`), best-medium (GPTQ group 32, `q4_g32_fp16`) and draft
-(uncalibrated absmax, group 32). The two-level 6-bit scale format `q4_g32_s6_fp16` and the calibrated-RTN presets
-that need llama.cpp statistics are not built here.
+Presets: best-small (GPTQ group 256, `q4_g256_fp16`), best-medium (GPTQ group 32, `q4_g32_fp16`), draft
+(uncalibrated absmax, group 32), and iq3-xs / iq3-xxs (llama.cpp IQ3_XS / IQ3_XXS blocks quantized with the model's own
+importance matrix and imported verbatim; they need a llama.cpp build and its source tree for `convert_hf_to_gguf.py`).
+The two-level 6-bit scale format `q4_g32_s6_fp16` and calibrated round-to-nearest presets are not built here.
 
 Calibration text. Without `--calibration-text` the builder downloads the pinned public English corpus the measured
 quality numbers used (eaddario/imatrix-calibration, combined_en_large.parquet) and exports it byte for byte as the
@@ -53,6 +54,8 @@ CALIBRATION_PARQUET_SHA256 = "8a804421c074713aaa537a35da8bdb12e93b94b44344c09a99
 CALIBRATION_TEXT_SHA256 = "82b7e7804f2486a34c23feef43c5356e542724102321cd53c52e2c4d0c316c8a"
 GPTQ_RECIPE = "gemma4_31b"  # tools/gptq/recipes: sequential targets, ignore patterns and Hessian leaders
 GPTQ_PYTHON_ENV = "INFERNIX_GPTQ_PYTHON"
+LLAMA_CPP_ENV = "INFERNIX_LLAMA_CPP"  # llama.cpp binaries (llama-quantize, llama-imatrix)
+LLAMA_CPP_SOURCE_ENV = "INFERNIX_LLAMA_CPP_SOURCE"  # llama.cpp source tree (convert_hf_to_gguf.py, gguf-py)
 EXACT_ROUTE_ENV = "INFERNIX_TMP_Q4_EXACT"  # Gemma scope temporary switch: exact W4A8 prefill for scoring
 SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -62,12 +65,12 @@ class Preset:
     """A measured conversion recipe. Quality figures are the author's (one model, text only, W4A8, FP8 MTP)."""
 
     id: str
-    method: str  # "gptq" or "plain" (uncalibrated absmax)
+    method: str  # "gptq", "plain" (uncalibrated absmax), or "gguf" (own-imatrix IQ3)
     summary: str
     meaning: str
     size_class: str
     file_gb: float  # text + MTP
-    kl: float  # mean KL from the near-lossless FP8-row reference, English instrument
+    kl: float  # mean KL, English: near-lossless FP8-row reference for q4, own-model Q8_0 for IQ3
     wait: str
     group_size: int
     native_groups: bool
@@ -76,6 +79,7 @@ class Preset:
     work_soft_gb: float  # comfortable free space (adds estimated scratch)
     residual_gb: float  # what stays in the work dir once big intermediates are pruned
     minutes: dict[str, float]  # per step, typical RTX 5090 + NVMe
+    gguf_type: str = ""  # method "gguf": the llama-quantize type (IQ3_XS, IQ3_XXS)
 
 
 PRESETS: dict[str, Preset] = {
@@ -86,16 +90,32 @@ PRESETS: dict[str, Preset] = {
          "gptq-check": 1, "convert": 6, "receipt-check": 0.5, "finalize": 0.5},
     ),
     "best-medium": Preset(
-        "best-medium", "gptq", "GPTQ, group 32", "Highest quality of the three; about 1.6 GB larger than best-small.",
+        "best-medium", "gptq", "GPTQ, group 32", "Highest quality; about 1.6 GB larger than best-small.",
         "medium", 18.41, 0.0845, "about 30 min", 32, False, "q4_g32_fp16", 75, 103, 17,
         {"calibration-source": 1, "calibration-render": 1, "calibration-tokens": 1, "text-tree": 2, "gptq": 18,
          "gptq-check": 1, "convert": 6, "receipt-check": 0.5, "finalize": 0.5},
     ),
     "draft": Preset(
         "draft", "plain", "uncalibrated absmax, group 32 (the old default)",
-        "A quick test build only: nothing to install, but the lowest quality of the three.",
+        "A quick test build only: nothing to install, but lower quality than the calibrated q4 presets.",
         "medium", 18.41, 0.2654, "about 15 min", 32, False, "q4_g32_fp16", 0, 0, 0,
         {"convert": 15, "receipt-check": 0.5, "finalize": 0.5},
+    ),
+    "iq3-xs": Preset(
+        "iq3-xs", "gguf", "llama.cpp IQ3_XS, own imatrix",
+        "About 3 GB smaller than best-small: IQ3_XS blocks with 8-bit activations; check runtime VRAM capacity.",
+        "smaller", 13.91, 0.176, "about 2 h", 0, False, "ggml_iq3_s", 100, 120, 14,
+        {"calibration-source": 1, "calibration-render": 1, "gguf-bf16": 15, "gguf-q8": 8, "imatrix": 25,
+         "gguf-quantize": 45, "convert": 6, "receipt-check": 0.5, "finalize": 0.5},
+        "IQ3_XS",
+    ),
+    "iq3-xxs": Preset(
+        "iq3-xxs", "gguf", "llama.cpp IQ3_XXS, own imatrix",
+        "The smallest, about 1 GB below iq3-xs, at a visible quality cost.",
+        "smallest", 13.03, 0.228, "about 2 h", 0, False, "ggml_iq3_xxs", 100, 120, 13,
+        {"calibration-source": 1, "calibration-render": 1, "gguf-bf16": 15, "gguf-q8": 8, "imatrix": 25,
+         "gguf-quantize": 45, "convert": 6, "receipt-check": 0.5, "finalize": 0.5},
+        "IQ3_XXS",
     ),
 }
 # Presets that are not built by infernix, with the reason a caller gets.
@@ -103,7 +123,7 @@ UNAVAILABLE_PRESETS = {
     "lite-medium": "it needs the q4_g32_s6_fp16 format (two-level 6-bit scales), which infernix has not ported yet; "
                    "use best-small or best-medium",
     "lite-small": "calibrated round-to-nearest from llama.cpp statistics is not part of the infernix builder; "
-                  "use best-small or best-medium",
+                  "use best-small, or iq3-xs for a smaller file",
 }
 SCORE_MINUTES = {
     "score-corpus": 8, "score-reference": 41, "score-reference-write": 5, "score-candidate": 8,
@@ -130,6 +150,8 @@ class BuildConfig:
     score: bool = False
     perplexity_exe: Path | None = None
     keep_work: bool = False
+    llama_cpp: Path | None = None  # method "gguf": directory with llama-quantize and llama-imatrix
+    llama_cpp_source: Path | None = None  # method "gguf": llama.cpp source tree (convert_hf_to_gguf.py)
 
     @property
     def artifact(self) -> Path:
@@ -204,14 +226,57 @@ def default_gptq_python() -> Path:
 
 
 def q4_convert_flags(cfg: BuildConfig, checkpoint: Path | None) -> list[str]:
-    """Recipe flags of `gemma4_q4 convert` for the preset (always the W4A8 route `q4_g32`)."""
+    """Recipe flags of `gemma4_q4 convert` for the preset (always `q4_g32`: W4A8, or 8-bit activations on GGUF
+    blocks)."""
     preset = cfg.preset
     flags = ["--weights", "q4_g32"]
     if preset.method == "gptq":
         flags += ["--gptq-source", str(checkpoint)]
         if preset.native_groups:
             flags.append("--native-groups")
+    elif preset.method == "gguf":
+        flags += ["--gguf-source", str(checkpoint)]
     return flags
+
+
+# llama-quantize --tensor-type pins (regex searched in the tensor name) of the measured IQ3 recipes: the per-tensor
+# types a published imatrix IQ3_XS / IQ3_XXS of Gemma 4 31B uses where they differ from llama.cpp's own mix.
+GGUF_TENSOR_TYPES = {
+    "IQ3_XS": ("attn_output=IQ3_S", "attn_v=IQ3_S", "ffn_down=IQ3_S", r"blk\.([0-6]|5[2-9])\.ffn_(gate|up)=IQ3_S"),
+    "IQ3_XXS": ("attn_q=IQ2_S", "attn_k=IQ2_S", "attn_output=IQ3_S"),
+}
+
+
+def llama_tool(cfg: BuildConfig, name: str) -> str:
+    return str(Path(cfg.llama_cpp or ".") / (f"{name}.exe" if os.name == "nt" else name))
+
+
+def gguf_steps(cfg: BuildConfig, templated: Path, quantized: Path) -> list[Step]:
+    """BF16 GGUF, Q8_0 copy for the importance matrix, own imatrix on the rendered calibration text, quantize."""
+    preset = cfg.preset
+    minutes = preset.minutes
+    bf16, q8, imatrix = cfg.work("model-bf16.gguf"), cfg.work("model-q8_0.gguf"), cfg.work("imatrix.gguf")
+    quantize = llama_tool(cfg, "llama-quantize")
+    pins = [arg for pin in GGUF_TENSOR_TYPES[preset.gguf_type] for arg in ("--tensor-type", pin)]
+    return [
+        Step("gguf-bf16", "Write a BF16 GGUF of the model with llama.cpp's convert_hf_to_gguf.py (about 62 GB)",
+             minutes["gguf-bf16"],
+             [cfg.python, str(Path(cfg.llama_cpp_source or ".") / "convert_hf_to_gguf.py"), str(cfg.model),
+              "--outtype", "bf16", "--outfile", str(bf16)],
+             outputs=(bf16,)),
+        Step("gguf-q8", "Quantize a Q8_0 copy for the importance matrix (about 33 GB)", minutes["gguf-q8"],
+             [quantize, str(bf16), str(q8), "Q8_0"], outputs=(q8,)),
+        Step("imatrix", f"Collect the importance matrix on the {CALIBRATION_CHUNKS} rendered chunks (GPU)",
+             minutes["imatrix"],
+             [llama_tool(cfg, "llama-imatrix"), "-m", str(q8), "-o", str(imatrix), "--output-format", "gguf",
+              "--no-ppl", "--ctx-size", str(CALIBRATION_CONTEXT), "--gpu-layers", "999", "--file", str(templated),
+              "--chunks", str(CALIBRATION_CHUNKS), "--parse-special"],
+             outputs=(imatrix,), prune_always=(q8,)),
+        Step("gguf-quantize", f"Quantize to {preset.gguf_type} with the importance matrix (CPU, the long step)",
+             minutes["gguf-quantize"],
+             [quantize, "--imatrix", str(imatrix), *pins, str(bf16), str(quantized), preset.gguf_type],
+             outputs=(quantized,), prune_always=(bf16,)),
+    ]
 
 
 def convert_argv(cfg: BuildConfig, out: Path, *, scoring: bool, checkpoint: Path | None) -> list[str]:
@@ -235,7 +300,7 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
     templated = cfg.work("calibration", "templated.txt")
     source = cfg.calibration_text or cfg.work("calibration", "source.txt")
     tokenizer = cfg.model / "tokenizer.json"
-    checkpoint = cfg.work("gptq")
+    checkpoint = cfg.work(f"model-{preset.gguf_type}.gguf") if preset.method == "gguf" else cfg.work("gptq")
     tree = cfg.work("text60")
     steps: list[Step] = []
 
@@ -278,6 +343,8 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
                  [gpy, str(gptq_dir / "check_checkpoint.py"), "--gptq", str(checkpoint), "--tree", str(tree)],
                  prune_if_short=(tree,)),
         ]
+    if preset.method == "gguf":
+        steps += gguf_steps(cfg, templated, checkpoint)
     steps.append(Step(
         "convert", f"Convert to .ninfer ({preset.id}: {preset.summary}; the converter verifies storage itself)",
         minutes["convert"], convert_argv(cfg, cfg.artifact, scoring=False, checkpoint=checkpoint),
@@ -301,8 +368,8 @@ def finalize_outputs(cfg: BuildConfig) -> tuple[Path, ...]:
 
 
 def score_steps(cfg: BuildConfig, checkpoint: Path) -> list[Step]:
-    """FP8-row reference, English corpus, then W4A8 exact scoring of a no-MTP text-only twin, both through the
-    native full-vocabulary KL of `infernix-perplexity` (BF16-rounded logits, the chat prefix, chunk 128)."""
+    """FP8-row reference and no-MTP text-only twin, scored with native full-vocabulary KL.
+    Q4 uses its exact W4A8 scoring route; IQ3 honors its stored AllowA8 Uses at every width."""
     root = cfg.work("score")
     corpus, reference, nklref = root / "corpus", root / "ref-fp8row.ninfer", root / "ref.nklref"
     candidate, run, reference_run = root / "candidate.ninfer", root / "run", root / "ref-run"
@@ -330,10 +397,11 @@ def score_steps(cfg: BuildConfig, checkpoint: Path) -> list[Step]:
         Step("score-candidate", "Convert a no-MTP text-only twin of your recipe for scoring", minutes["score-candidate"],
              convert_argv(cfg, candidate, scoring=True, checkpoint=checkpoint),
              outputs=(candidate, Path(str(candidate) + ".build.json"), Path(str(candidate) + ".conversion.json"))),
-        Step("score-run", f"Paired KL against the reference (W4A8 exact route, {EXACT_ROUTE_ENV}=1)",
+        Step("score-run", "Paired KL against the reference"
+             + (f" (W4A8 exact route, {EXACT_ROUTE_ENV}=1)" if cfg.preset.method != "gguf" else " (GGUF AllowA8)"),
              minutes["score-run"],
              [exe, str(candidate)] + common + ["--full-vocab-reference", str(nklref), "--output", str(run)],
-             env={EXACT_ROUTE_ENV: "1"}, outputs=(run,)),
+             env={EXACT_ROUTE_ENV: "1"} if cfg.preset.method != "gguf" else {}, outputs=(run,)),
         Step("score-report", "Record the score in the build receipt and BUILD-SUMMARY.md", minutes["score-report"],
              call=score_report),
     ]
@@ -476,11 +544,13 @@ def render_summary(info: dict) -> str:
         "",
         f"- Preset: **{p['id']}**: {p['summary']} ({p['size_class']} file).",
         f"- In plain words: {p['meaning']}",
-        f"- Weights: W4A8 (4-bit weights, FP8 activations while reading the prompt); "
-        f"{'with the MTP draft assistant (speculative decoding)' if info['mtp'] else 'no MTP assistant'}; "
+        ("- Weights: IQ3 GGUF blocks, AllowA8 for prefill and decode; "
+         if p["method"] == "gguf" else "- Weights: W4A8 (4-bit weights, FP8 activations while reading the prompt); ")
+        + f"{'with the MTP draft assistant (speculative decoding)' if info['mtp'] else 'no MTP assistant'}; "
         f"{'with the vision tower' if info['vision'] else 'text only'}.",
         f"- Measured on the author's model (one fine-tune, English, text only, RTX 5090): mean KL {p['kl']:.4f} from "
-        "the near-lossless reference (lower is better). A different model can move this number.",
+        + ("the model's own Q8_0 reference" if p["method"] == "gguf" else "the near-lossless FP8-row reference")
+        + " (lower is better). A different model can move this number.",
         "",
         "## Files",
         "",
@@ -521,8 +591,9 @@ def render_summary(info: dict) -> str:
             "", "## Quality check (--score)", "",
             f"- Mean KL vs FP8-row reference: {s['mean_kl']:.4f}; delta NLL {s['mean_delta_nll']:+.3f}; "
             f"top-1 disagreement {s['top1_disagreement']:.4f}; perplexity {s['perplexity']:.3f}",
-            "- Instrument: windows of 512 tokens (English subset), FP8 KV, W4A8 exact route, no MTP, text only, "
-            "native full-vocabulary KL.",
+            "- Instrument: windows of 512 tokens (English subset), FP8 KV, "
+            + ("GGUF AllowA8" if p["method"] == "gguf" else "W4A8 exact route")
+            + ", no MTP, text only, native full-vocabulary KL.",
         ]
     return "\n".join(parts) + "\n"
 
@@ -699,6 +770,10 @@ def build_identity(cfg: BuildConfig) -> dict:
         "name": cfg.name,
         "out_dir": str(cfg.out_dir.resolve()),
         "calibration": calibration,
+        **({"gguf_recipe": {"type": cfg.preset.gguf_type, "tensor_types": GGUF_TENSOR_TYPES[cfg.preset.gguf_type]},
+            "llama_cpp": str(cfg.llama_cpp.resolve()) if cfg.llama_cpp else None,
+            "llama_cpp_source": str(cfg.llama_cpp_source.resolve()) if cfg.llama_cpp_source else None}
+           if cfg.preset.method == "gguf" else {}),
     }
 
 
