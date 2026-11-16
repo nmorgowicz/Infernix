@@ -29,8 +29,11 @@ struct GgmlProjection {
     [[nodiscard]] bool active() const noexcept { return !segments.empty(); }
 };
 
-// GGUF projections take the exact A16 route at decode widths and BF16 tensor-core tiles from 32 columns.
+// GGUF projections take the exact A16 route at decode widths (and ggml_linear's BF16 tensor-core tiles up to
+// kGgmlDenseMinTokens - 1 columns); from kGgmlDenseMinTokens columns, prefill decodes the blocks into a dense BF16
+// matrix in the workspace and runs one cuBLAS GEMM (Fp8RowCublasContext::gemm_bf16_fp32, FP32 sums).
 inline constexpr ops::LinearRoutes kGgmlRoutes = ops::LinearRoutes::GgmlBf16Wide;
+inline constexpr int kGgmlDenseMinTokens = 64;
 
 // out = weight * x for contiguous BF16 x [K,T]. BF16 uses native ops::linear; wide FP8 A16
 // with BF16 output uses caller-owned cuBLAS resources and per-call widening in the arena; an active

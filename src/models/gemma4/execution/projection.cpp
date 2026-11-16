@@ -1,5 +1,7 @@
 #include "models/gemma4/execution/projection.h"
 
+#include "infernix/ops/cast.h"
+
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
@@ -53,6 +55,17 @@ void project(const Tensor& x, const Weight& weight, const GgmlProjection& ggml, 
     if (policy != ops::LinearPolicy::A16Only) {
         throw std::invalid_argument("Gemma4 projection: GGUF blocks run on 16-bit activations (A16Only)");
     }
+    if (x.ne[1] >= kGgmlDenseMinTokens && out.dtype == DType::BF16) {
+        // Prefill: decode the blocks once into a dense BF16 matrix (global output columns already in the attention
+        // output's order), one cuBLAS GEMM with FP32 sums, one rounding to BF16.
+        auto scope = workspace.scope();
+        Tensor widened = workspace.alloc(DType::BF16, {weight.k, weight.n});
+        ops::ggml_dequantize_bf16(ggml.segments, weight.k, widened, ggml.input_perm, ggml.perm_block, stream);
+        Tensor partials = workspace.alloc(DType::FP32, {weight.n, x.ne[1]});
+        gemm.gemm_bf16_fp32(x, widened, partials, stream);
+        ops::cast_fp32_to_bf16(partials, out, stream);
+        return;
+    }
     ops::ggml_linear(x, ggml.segments, out, ggml.input_perm, ggml.perm_block, workspace, stream, kGgmlRoutes);
 }
 
@@ -88,10 +101,14 @@ std::size_t projection_bytes(const Weight& weight, ops::LinearPolicy policy, int
 std::size_t projection_bytes(const Weight& weight, const GgmlProjection& ggml, ops::LinearPolicy policy, int tokens) {
     if (!ggml.active()) { return projection_bytes(weight, policy, tokens); }
     // ggml_linear's workspace depends on the call's width (encoding batches, wide-route planes): the largest
-    // over every width up to tokens.
+    // over every width it takes; from kGgmlDenseMinTokens the dense route's matrix and FP32 partials.
     std::size_t bytes = 0;
-    for (int columns = 1; columns <= tokens; ++columns) {
+    for (int columns = 1; columns <= std::min(tokens, kGgmlDenseMinTokens - 1); ++columns) {
         bytes = std::max(bytes, ops::ggml_linear_workspace_bytes(weight.k, columns));
+    }
+    if (tokens >= kGgmlDenseMinTokens) {
+        bytes = std::max(bytes, aligned(checked_bytes(weight.n, weight.k, 2)) +
+                                    aligned(checked_bytes(weight.n, tokens, 4)) + 2 * kAlignment);
     }
     return bytes;
 }

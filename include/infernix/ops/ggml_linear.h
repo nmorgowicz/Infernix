@@ -47,6 +47,17 @@ struct GgmlSegment {
 [[nodiscard]] std::size_t ggml_row_bytes(QType format, std::int32_t k);
 
 /**
+ * A GGUF projection's weights as a dense BF16 matrix, for a tensor-core GEMM at prefill widths: out is BF16 [K, N]
+ * (row n's K values contiguous, ne[0] = K) and row s.out_offset + r of it is segment s's row r, every element its
+ * exact value kappa * (d * sub * code - dmin * min_sub) rounded once to BF16 (nearest even). With `col_perm` (device,
+ * K / perm_block entries, perm_block a multiple of 8) source column block j is stored at block col_perm[j], so
+ * out * x is the sum ggml_linear forms with input_perm = col_perm on the same x. Segments are device-visible Rows
+ * segments of output 0; K is whole blocks of every format and a multiple of 8; out is 16-byte aligned.
+ */
+void ggml_dequantize_bf16(std::span<const GgmlSegment> segments, std::int32_t k, Tensor& out,
+                          const std::int32_t* col_perm, std::int32_t perm_block, cudaStream_t stream);
+
+/**
  * The segments of a projection whose rows [0, N) are split among several outputs: output i takes
  * rows [bounds[i], bounds[i + 1]) (bounds ascending, bounds[0] = 0). Each segment (its out_offset
  * within [0, N)) is cut at the bounds into segments of whole rows, each with its output index and
