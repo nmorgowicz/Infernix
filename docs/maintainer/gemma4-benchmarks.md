@@ -84,6 +84,119 @@ For creating either small file from HF BF16, see
 [IQ3 creation](../weight-conversion.md#create-the-smaller-iq3-files-from-hf-bf16). Use this table rather than
 combining the earlier unmatched/route-specific measurements below into a new ranking.
 
+## Long-context baseline (~65k and ~122k prompts in a 131072 context)
+
+Same four artifacts, serving binary (SHA-256 prefix `f0073e790fb9`), fixed `gemma4_fixed.jinja` template and RTX 5090 as the
+[four-tier comparison](#four-tier-comparison), but with the roleplay launcher profile instead of its 32768 / no-cache
+configuration: `--max-context 131072 --kv-capacity auto --vram-headroom-mib 1024 --kv-dtype fp8 --gemma4-qk fp8
+--prefill-chunk auto --logits-dtype bf16 --spec mtp --draft-tokens 1 --host-context-mib 8192`, prefix reuse on, loopback
+host and a dedicated port. Thinking is **off** (`enable_thinking=false`) except the explicitly labelled capped thinking
+rows; greedy temperature 0, top-k 20, seed 1234, streaming with usage. Every timing job ran under the 8 GiB free-RAM
+floor (minimum free RAM observed 27.2 GiB). Rates are server `timings`; wire TTFT is the first nonempty content
+delta seen by the client; whole-device MiB is the maximum of `nvidia-smi` `memory.used` sampled about every 0.4 s
+during each request, **including the 2.1-2.7 GiB the idle desktop already used**, so it is not model-only memory and a
+sampler can miss shorter spikes. This is one 5090 under its software power cap (server throughput lines report
+`limited sw-power-cap`); it says nothing about other cards.
+
+**KV capacity is verified, not read from metadata.** All four starts log
+`capacity | 131,072 tokens of context across all requests (fp8 KV)` with `pages 2,048/2,048`, global FP8 KV 5.04 GiB
+plus BF16 sliding rings 2.34 GiB, and `prefix cache | on | 8.00 GiB in RAM`; `--plan` reports `kv_tokens` 131072 and
+`fits` for each. `--kv-capacity auto` is therefore capped by `--max-context` here (the log labels it `explicit`) and
+the remaining device memory after startup is 2.68 (best-medium), 4.09 (best-small), 6.51 (IQ3_XS) and 9.35 GiB (IQ3_XXS).
+`/v1/models` reports `n_ctx = max_model_len = 131072`, equal to the verified pool in this configuration, and the
+~122k-prompt requests below completed up to 8,192 generated tokens inside it. Nothing above 131072 was attempted:
+that needs a separate start with a larger `--max-context`, which was not run, so no extension claim is made.
+
+**Prompts.** Natural English corpus windows from the pinned pool, byte-identical across tiers: actual prompt counts
+**64,986-64,987** and **121,996-121,998** tokens (not nominal). Each point is one excluded warmup then three timed cold
+requests, each a distinct document (distinct leading reference id, so no prefix reuse between them); the ~122k timed
+requests ask for up to 8,192 tokens, the ~65k ones for 256. Servers log an actual automatic chunk of **2048**
+(`signature gemma4/fp8-kv/qk=fp8/cold/chunk=2048`) with 33 prefill units at ~65k and 61 at ~122k.
+
+**Three runs, because the primary run had a transient.** The primary campaign ran the tiers in the order IQ3_XXS, IQ3_XS,
+best-small, best-medium. Its IQ3_XXS (and, less, IQ3_XS) cold ~65k and ~122k results were 9-21% slower than its best-small
+and best-medium results, while the same tiers at ~16k had matched. A reverse-order control (best-medium first, IQ3_XXS
+last; ~65k and one ~122k request set) and a third run in the primary's order (cold ~65k, continuations of conversations
+that were no longer the latest, and ~122k cold/continuation pairs) did **not** reproduce it: all four tiers cold-prefill ~65k
+at ~3.1k tok/s there. The primary XXS/XS depression is therefore neither a tier property nor a fixed-order effect; it is a
+transient during those primary runs whose cause was not identified [INFERENCE: GPU power/thermal state or other host
+activity; unmeasured]. The primary rows are published as measured, next to the other runs, not replaced. Decode rows
+and MTP counts are deterministic under greedy sampling (identical accepted/drafted counts in every run).
+
+Cold ~65k prefill, thinking off, 256 generated tokens (medians of three timed requests; primary / reverse-order control /
+third run):
+
+| Tier | Prefill tok/s | Decode tok/s | Wire TTFT s | MTP accepted/drafted (3 reps) | Run-peak device MiB (primary / control / third) |
+|---|---|---|---|---|---|
+| `best-medium` | 3098 / 3161 / 3144 | 88.1 / 91 / 89 | 21.16 / 20.76 / 20.83 | 332/432 | 29164 / 29318 / 29300 |
+| `best-small` | 3197 / 3105 / 3186 | 94.7 / 93 / 95 | 20.53 / 21.09 / 20.55 | 323/439 | 27683 / 27945 / 27828 |
+| `iq3-xs` | 2922 / 3101 / 3112 | 82.6 / 88 / 90 | 22.42 / 21.10 / 21.08 | 313/451 | 25483 / 25139 / 25061 |
+| `iq3-xxs` | **2529** / 3153 / 3186 | **72.6** / 93 / 95 | **25.93** / 20.77 / 20.58 | 317/447 | 24608 / 24297 / 24184 |
+
+Primary-run ranges across the three timed requests: prefill 3083-3109, 3187-3219, 2915-2927 and 2480-2554 tok/s;
+decode 85.7-92.1, 92.9-96.3, 80.6-86.0 and 71.6-73.9 tok/s. The prefill drop from ~5.4-5.5k tok/s at ~16k to ~3.1k at
+~65k and ~2.1-2.17k at ~122k is attention cost growing with context. The best-medium / best-small / IQ3 decode spread at
+~65k in the control is within ordinary run-to-run variation (~5%).
+
+Cold ~122k (prompt 121,996-121,998), thinking off. The primary rows ask for 8,192 tokens and stop on their own at
+different lengths, so their decode is an average over different generation lengths; the clean decode-at-122k number is the
+256-token cached continuation in a later table.
+
+| Tier | Prefill tok/s (primary median [range]; control; third-run x122) | Wire TTFT s (primary) | Generated tokens (3 timed requests, finish) | MTP accepted/drafted | Peak device MiB |
+|---|---|---:|---|---|---:|
+| `best-medium` | 2139 [2138-2140]; 2053; 2160 | 57.41 | 4986, 2121, 2502 (stop) | 4175/5432 (76.9%) | 29155 |
+| `best-small` | 2166 [2161-2173]; 2141; 2156 | 56.57 | 5678, 3783, 3295 (stop) | 5457/7297 (74.8%) | 27672 |
+| `iq3-xs` | 1970 [1794-1996]; 2124; 2163 | 62.21 | 3767 (stop), 8192, 8192 (length) | 9652/10495 (92.0%) | 25483 |
+| `iq3-xxs` | 1868 [1826-2023]; 2164; 2167 | 65.73 | 8192, 8192, 8192 (length) | 11946/12624 (94.6%) | 24585 |
+
+(The third run's ~122k column is its 256-token `x122` request; control and third-run values are single measurements.)
+Cold ~122k prefill is ~2.1-2.17k tok/s on all tiers in the runs without the transient, ~57 s to first token.
+
+**Greedy long generations degenerate on the IQ3 tiers at ~122k.** Five of the six IQ3 ~122k timed generations (iq3-xs
+2 of 3, iq3-xxs 3 of 3) ended in a degenerate repetition loop of a few tokens (`l' l' l' ...`, ` la la la ...`) until the
+8,192 cap (tail compressibility 0.003-0.005, against 0.42-0.48 for all six best-medium/best-small replies, which each
+ended naturally with `stop`). The control run's single ~122k request per tier reproduced the primary run's length exactly
+(best-medium 4,986, best-small 5,678, iq3-xs 3,767 `stop`; iq3-xxs 8,192 loop with an identical tail). The 92-95% MTP
+acceptance of the looping runs is the loop being trivially predictable, not healthy speculation. This is greedy sampling
+on one prompt set, not the launcher's sampler and not a quality metric; it is nevertheless a measured difference between
+tiers at this length.
+
+Cached continuation of the **most recent** conversation (the previous user turn, a fixed short assistant message, a new
+user turn; 256 generated tokens, thinking off; primary / control TTFT):
+
+| Tier | ~65k: cached / computed tokens, TTFT s | ~65k decode tok/s | ~122k: cached / computed tokens, TTFT s | ~122k decode tok/s |
+|---|---|---|---|---|
+| `best-medium` | 64,982-64,983 / 47, 0.34 / 0.38 | 87 | 121,989-121,991 / 50, 0.74 / 0.66 | 72 |
+| `best-small` | 64,982-64,983 / 47, 0.35 / 0.42 | 90 | 121,989-121,991 / 50, 0.68 / 0.72 | 77 |
+| `iq3-xs` | 64,982-64,983 / 47, **0.88 / 0.88** | 82 | 121,989-121,991 / 50, **1.25 / 1.26** | 69 |
+| `iq3-xxs` | 64,982-64,983 / 47, **1.05 / 0.84** | 72 | 121,989-121,991 / 50, **1.19 / 1.26** | 68 |
+
+The ~65k resume is `lane_resident` (the Gemma lane continued its own state, 99.9% of the prompt cached) and the ~122k one
+`hybrid_snapshot`. The IQ3 tiers take 1.8-3x the q4 tiers' time on the ~47-50 token tail (reproduced in the reverse-order
+control); both are under 1.3 s against 20-57 s cold. The cause was not isolated. Server throughput lines during
+prefill also show the IQ3 tiers' exposed host-side time at ~14% against ~1.3% on the q4 tiers.
+
+**Resuming a conversation that is not the latest was a full miss on every tier.** In 32 attempts (16 in the primary
+campaign: three ~65k continuations after ~122k traffic and one ~122k per tier; 16 in the third run: three ~65k
+continuations after two other ~65k conversations and one ~122k after one other ~122k conversation, per tier) the
+continuation reused **0** tokens and re-prefilled at roughly the cold rate (~3.1k tok/s at ~65k, ~2.1k tok/s at ~122k,
+i.e. ~21 s and ~57 s to first token); the iq3-xxs third-run request log records `prefix_miss` `kind: diverged`,
+`lost_reuse_tokens: 64,982` and no snapshot or Host restores. That run's server counters show the 8,192 MiB Host tier at
+8,588,881,920 of 8,588,881,920 bytes, 41 snapshot images written, 37 Host snapshot evictions, 10,956 Device blocks
+evicted, 10,885 Host slabs reclaimed as unreachable and 0 Host block or image restores (best-small: 39 / 37 / 10,956 /
+10,229 / 0). No tier kept a resumable ~65k or ~122k history across even one intervening conversation with this Host
+budget. [INFERENCE] A larger `--host-context-mib` (or the SSD tier) might change this; it was not varied, so no claim is made.
+
+Capped thinking at ~65k (`enable_thinking=true`, cap 256, three timed requests, prompts 64,991-64,992): every one of the 12
+responses streamed nonempty reasoning and reported 256 reasoning / 256 total tokens with `finish_reason=length`
+and no final answer, so decode includes reasoning only. Decode median [range] tok/s: best-medium 93.0 [90.5-95.0],
+best-small 99.8 [97.5-100.1], iq3-xs 93.0 [91.5-93.0], iq3-xxs 100.8 [75.3-102.0] (the wide XXS range is the primary-run
+transient); MTP accepted/drafted 352/410, 344/420, 354/409 and 342/420. This does not measure a completed thought, answer
+quality, or the 8,192-token total budget of long-thinking roleplay.
+
+Not measured: sampling other than greedy, any prompt beyond 131072, a larger Host tier, concurrency above one, cold
+prefill with a different chunk, and quality at these lengths (no KL or retrieval score exists for them).
+
 ## Route-specific measurements
 
 ### MTP selecting-logit evidence
