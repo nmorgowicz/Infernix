@@ -658,6 +658,35 @@ Camp evidence: `iq3xs-20261115/konly-20261117/` (drivers, raw requests/responses
 The rebuild (a sine and cosine per rotated pair and key) costs more than the halved V read saves at these lengths;
 outputs differ from K==V FP8 (a different lossy V) but are identical across AB and BA runs of the same arm.
 
+## Five-bit text projections: quality (2026-11-17, speed not yet measured)
+
+Explicit alternatives to best-medium, not defaults. Each arm is scored on the pinned full-vocabulary protocol
+(context 512, stride 256, chunk 128, chat prefix, BF16 QK, FP8 KV, BF16 logits; 47 windows, 13,728 positions)
+against the Q8_0 reference of its **own** model; plain-HF rows and additive-diode rows are never compared with each
+other. Artifacts include the FP8 vocabulary and FP8 MTP assistant. Routes: own-imatrix `llama-quantize` Q5_K_S/Q5_K_M
+imported verbatim (A8 default), and native GPTQ group-64 INT5 (`--weights q5_g64_a16` stays A16; `--weights q5_g64`
+permits the wide-prefill (T >= 64) transient row-E4M3 bake into the FP8 A8 GEMM, decode/MTP stay A16).
+
+| Arm | Artifact | Bytes | Mean KL [95% CI] | dNLL | Top-1 disagr. |
+|---|---|---:|---|---:|---:|
+| diode | actual best-medium (Q4 g32, A8) | 18,405,559,556 | 0.0941 [0.0803, 0.1099] | +0.0316 | 0.0905 |
+| diode | Q5_K_S import | 22,066,330,628 | 0.0403 [0.0348, 0.0468] | +0.0180 | 0.0587 |
+| diode | Q5_K_M import | 22,600,064,004 | 0.0370 [0.0323, 0.0424] | +0.0091 | 0.0575 |
+| plain | GPTQ Q4 g32, A8 (matched best-medium analogue) | 18,405,489,668 | 0.0687 [0.0587, 0.0803] | +0.0167 | 0.0798 |
+| plain | GPTQ Q4 g32, A16 | 18,405,489,668 | 0.0591 [0.0499, 0.0702] | +0.0076 | 0.0718 |
+| plain | Q5_K_S import | 22,066,330,628 | 0.0244 [0.0211, 0.0277] | +0.0058 | 0.0458 |
+| plain | Q5_K_M import | 22,600,064,004 | 0.0236 [0.0204, 0.0269] | +0.0073 | 0.0474 |
+| plain | GPTQ5 g64, A16 | 21,151,120,388 | 0.0199 [0.0173, 0.0225] | -0.0008 | 0.0442 |
+| plain | GPTQ5 g64, A8 | 21,151,120,388 | 0.0296 [0.0260, 0.0332] | +0.0027 | 0.0543 |
+
+Same weights, A8 minus A16 (paired): GPTQ5 +0.0097 [+0.0080, +0.0115] KL, GPTQ4 +0.0096 [+0.0072, +0.0121]. Key-only
+KV changes short-context KL by no measurable amount on the same artifact (GPTQ4 A8 paired -0.0014 [-0.0035, +0.0007];
+GPTQ5 A8 +0.0002 [-0.0014, +0.0019]); that says nothing about long context. The same GGUF blocks scored through
+libllama give about half the native-import KL (plain Q5_K_S 0.0117), so roughly 0.012 KL comes from the native
+serving path rather than the K-quant weights. The native projection tests are `infernix_linear_gemma4_q5_a16_test`,
+`infernix_linear_q5_widen_e4m3_test` and `infernix_gemma4_q5_projection_test`. Serving speed, the 32 GB capacity
+frontier and chat-prefixed long-context KL are not measured for these artifacts; do not infer them from the table.
+
 ## Route-specific measurements
 
 ### MTP selecting-logit evidence
