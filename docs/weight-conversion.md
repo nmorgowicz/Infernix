@@ -721,32 +721,36 @@ python -m tools.convert.gemma4_build --profile memory-16gb --model "<BF16-dir>" 
 python -m tools.convert.gemma4_build launcher --profile memory-16gb --artifact "<IQ3_XXS.ninfer>" --serve "<absolute-infernix-serve-path>" --out "<camp>/serve-16gb.cmd"
 ```
 
-Run the resulting `serve-16gb.cmd`. For less VRAM use `launcher ... --no-mtp`; this omits the assistant
-from residency, not from the artifact. Thinking stays enabled. The profile emits `--max-context auto
---kv-capacity auto --gemma4-key-only-kv --kv-dtype fp8 --gemma4-qk fp8 --prefill-chunk 128`, BF16 logits,
-one lane, a host-only 8192 MiB prefix cache, 1024 MiB VRAM headroom, and one MTP draft when enabled.
-The default alias is `gemma4-16gb`; host/port retain `0.0.0.0:8001` (use `--host 127.0.0.1` for local-only).
+Run the resulting `serve-16gb.cmd`. It plans with the MTP assistant first (`--plan`, no GPU work) and starts without it
+when only that fits (`echo` notice on stderr; the artifact keeps the assistant). `launcher ... --no-mtp` always omits it, which
+buys context: the explicit ladder fits 24,576 tokens without it against 20,480 (the highest tried) with it at 14,767 MiB usable and zero headroom. Thinking stays enabled.
+The profile emits `--max-context auto --kv-capacity auto --gemma4-key-only-kv --kv-dtype fp8 --gemma4-qk fp8 --prefill-chunk 128`,
+BF16 logits, one lane, a host-only 8192 MiB prefix cache, 64 MiB VRAM headroom (`--vram-headroom-mib`, any value from 0) and one
+MTP draft when enabled. The default alias is `gemma4-16gb`; host/port retain `0.0.0.0:8001` (use `--host 127.0.0.1` for local-only).
 No environment variable enables key-only KV.
 
-The Engine, not the launcher generator, fits context at each launch using the actual free resident VRAM
-and its complete weights/KV/workspace/graphs plan, checks again after upload, and reports the resolved
-limit in `/v1/models` and startup logs. It never assumes that every 16 GB desktop can hold 65k.
-Automatic context is page-aligned, capped at 131072/native positions, and refuses below 9216 tokens
-(room for a roughly 1k prompt plus an 8192-token output cap). Auto requires `--kv-capacity auto` and a
-physical-free reading; Gemma refuses `--vram-past-budget`. An explicit `--context N` is never silently
-reduced. Other programs can still consume memory after startup: headroom is not a VRAM reservation
-against future desktop activity, and no profile guarantees complete answers or the absence of loops.
-Auto keeps 192 MiB beyond the 1024 MiB headroom for what the plan does not name (Parameters, kernel
-modules loaded at first use, CUDA Graph state; 128 MiB measured past the plan with this artifact, chunk
-128 and MTP) and re-checks the headroom after startup, so a start that cannot keep it is refused. Measured
-on an RTX 5090 with the ballast method of the [16 GB envelope](maintainer/gemma4-benchmarks.md#16-gb-profile-qualification)
-(not a physical 16 GB card): the headless envelope (15,791 MiB usable) resolves **14,464 tokens with MTP**
-and **37,568 tokens with `--no-mtp`**; the nominal desktop envelope (14,767 MiB) and the conservative one
-(13,743 MiB, [INFERENCE]: less than nominal) are refused with the 9216-token message, not started and not paged.
-Which tokens a 16 GB card holds depends on its other VRAM use; read `/v1/models` after startup.
+The Engine, not the launcher generator, fits context at each launch from the actual free resident VRAM (NVML free less the WDDM
+budget gap latched at the first reading) and its complete weights/KV/workspace/graphs plan, checks again after upload and after
+startup, and reports the resolved limit in `/v1/models` and startup logs. It never assumes that every 16 GB desktop can hold 65k, and it adapts
+to whatever other programs hold at launch (a desktop idling at 1.9-2.7 GiB, a video app already open). Rule: automatic context is page-aligned,
+capped at 131072/native positions, the largest context whose reservation, plus 4 KiB per token and 160 MiB for what the plan does
+not name, fits beside `--vram-headroom-mib` free; below **9216 tokens** (about 1k of prompt plus an 8192-token output cap) it refuses and
+states the shortfall in MiB, never paging, shrinking an explicit `--context` or starting with less than the headroom after startup.
+Auto requires `--kv-capacity auto` and a physical-free reading; Gemma refuses `--vram-past-budget`. When a refusal is short by a few
+tens of MiB lower `--vram-headroom-mib` (0 gives the 1.9 GiB desktop 16,192 tokens instead of a refusal), close programs holding VRAM,
+or use `--no-mtp`.
 
-Profile overrides permit chunks `128`, `256`, `512`, at least 1024 MiB headroom, and one MTP draft only;
-larger chunks trade context for prompt speed. FP8 KV and BF16 logits are required. Key-only KV is
+Measured on an RTX 5090 with the ballast method of the [16 GB envelopes](maintainer/gemma4-benchmarks.md#16-gb-profile-qualification)
+(not a physical 16 GB card; rates are the 5090's): headless 15,791 MiB usable resolves **58,752 tokens with MTP**; a 14,767 MiB desktop (1.5 GiB
+reserved) **11,392-13,248 tokens with MTP** (115-121 tok/s) or, [INFERENCE] from the explicit ladder, about 20k without; a ~1.9 GiB-idle desktop (14,357 MiB) **13,184 tokens without
+MTP**, 16,192 with `--vram-headroom-mib 0`; a 2.5 GiB-reserve desktop (13,743 MiB) is **refused**, 9,216 tokens being short by about 253 MiB with
+no headroom (512 MiB at the default). Context is bytes-limited, so the same card reads differently with a video app open: read `/v1/models` after startup.
+Other programs opening after launch did not slow or page decode in the one test (80-83 tok/s with up to 2.3 GiB more taken), because
+Windows demotes idle allocations first; the headroom setting protects the next startup, not a later spike, and no profile guarantees
+complete answers or the absence of loops.
+
+Profile overrides permit chunks `128`, `256`, `512` (larger chunks trade context for prompt speed: 1,081 / 1,381 MiB of ring plus KV at
+chunk 128 / 512), any non-negative headroom, and one MTP draft only. FP8 KV and BF16 logits are required. Key-only KV is
 experimental and changes attention arithmetic; sliding layers remain BF16. Its historical numerical
 and long-context speed costs remain in the [key-only measurements](maintainer/gemma4-benchmarks.md#key-only-global-kv-cache-experimental-off-by-default).
 

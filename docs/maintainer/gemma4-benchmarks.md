@@ -413,33 +413,72 @@ no KL was scored for it).
 
 ## 16 GB profile qualification
 
-**Setup (2026-11-17, RTX 5090, simulated capacity, not a physical 16 GB card).** The generated `--profile memory-16gb`
-launcher (`launcher --profile memory-16gb`, the actual CMD file) of the diode IQ3_XXS text+MTP artifact, chunk 128, one fresh
-process per cell under the ballast method of the envelope section above (headless 15,791 MiB, nominal 14,767 MiB usable;
-ballast set to usable + 1,161 MiB; whole-device peak must stay within 31,419 MiB). Sampler temperature 1.0, top_p 0.95,
-top_k 64, min_p 0.03; thinking on; output cap 8192 including reasoning; seeds 4100, 4101, 4200. Two ~1k prompts exercise
-prefix reuse; a third has `resolved context - 8320` tokens; an over-context request and an explicit `--max-context 131072`
-start must be refused. Camp evidence: `iq3xs-20261115/preset16-20261117/` (`qualify.py`, per-cell raw SSE, server logs, `results.json`).
+**Setup (2026-11-17, RTX 5090, simulated capacity, not a physical 16 GB card).** The diode IQ3_XXS text+MTP artifact, key-only
+FP8 KV, chunk 128, `--kv-dtype fp8 --gemma4-qk fp8`, under the ballast method of the envelope section (ballast set to usable + 1,161 MiB;
+the Windows budget line is 31,419 MiB; a desktop idles at 1.9-2.7 GiB on this machine, so the envelopes are headless 15,791,
+nominal 14,767, ~1.9 GiB reserve 14,357 and conservative 13,743 MiB usable). Camp evidence: `iq3xs-20261115/preset16-20261117/`
+(`ladder.py`, `appopen.py`, `qualify.py`, per-cell logs/SSE/`results.json`, plan breakdown `plan-chunks.json`).
 
-| Envelope | MTP | Resolved context (`/v1/models`) | Whole-device peak / server added (MiB) | Result |
+**Footprint (added MiB, headless MTP, 9,216 tokens).** Weights 12,385 (11,921 without MTP); sliding ring plus key-only KV 1,081 (ring 900
+at chunk 128, KV 0.0197 MiB per token); prefill workspace 274; graph allowance 64; state 3; planned 13,808 (13,343 without MTP). Measured
+server-added 14,176. The engine's ledger shows 103-146 MiB past the plan at startup (modules loaded at first use, graph state)
+plus about 3 KiB per context token (23.2 against 20.2 MiB per 1k tokens). Scaling with chunk (plan, 9,216 tokens): ring+KV 1,081 / 1,181 /
+1,381 / 1,781 MiB and workspace 274 / 306 / 370 / 765 MiB at chunk 128 / 256 / 512 / 1024, so minimum reservation 1,264 / 1,400 / 1,672 / 2,482 MiB.
+Chunks are multiples of 128: 64 is not supported. No existing option reduces the sliding ring below its chunk-128 size (sliding K/V stay BF16);
+`--no-cuda-graph` saves the 24 MiB graph state at about -15-20 % decode.
+
+**Context ladder** (explicit context and KV capacity, headroom 0, 48-token request at near-capacity prompt; `fit` = starts, answers, no spill;
+cell value = MiB below the 31,419 MiB budget line at peak, so including a ~385 MiB gap between that line and the engine's own resident reading):
+
+| Envelope | MTP | fitting contexts (spare MiB) | refused |
+|---|---|---|---|
+| nominal 14,767 | d1 | 4,096 (653), 8,192 (587), 9,216 (594), 12,288 (535), 16,384 (423), 20,480 (347) | not run above |
+| nominal 14,767 | off | 9,216 (1,021), 16,384 (885), 24,576 (717), 40,960 (396) | 32,768 (spill, free left 72 MiB), 49,152 (short 22 MiB) |
+| ~1.9 GiB 14,357 | d1 | none | 4,096: short 8 MiB |
+| ~1.9 GiB 14,357 | off | 4,096 (620), 8,192 (534), 9,216 (515), 12,288 (467), 16,384 (366), 20,480 (272) | 24,576 (short 64 MiB) |
+| conservative 13,743 | d1 / off | none | 2,048: short 569 / 124 MiB |
+
+**Safe-fit criterion.** The earlier `fit` line (whole-device peak within 31,419 MiB) is a budget line, not a safe rule. Startup spills
+(`Gemma4 runtime spilled into host memory`) occurred in explicit starts that left 72-287 MiB free, and a graph-preparation check measured
+327 MiB where another program had allocated meanwhile; both are free-memory drift of other programs, which the engine now separates
+from this process's own usage (per-process DXGI usage for graphs; a shortfall with this process's shared-memory use unchanged is not a
+weights spill). The rule the profile uses is in engine terms: after startup the resident free memory (NVML free less the budget gap latched at the
+first reading) must stay at least `--vram-headroom-mib` (profile default 64), and auto context additionally keeps 160 MiB plus 4 KiB per token
+for what the plan does not name. Refusals report the shortfall in MiB.
+
+**A program opening after launch** (nominal, no MTP, 16,384 context, headroom 0; a second process allocates 256-2,300 MiB more, up to the
+physical card, while the server serves cached 8k-token requests): decode stayed 80-83 tok/s against 82 tok/s before, no errors, no device
+memory recoveries, whole-device used reached 32,093 of 32,607 MiB; after the program exits the server's whole-device use had dropped by
+~1.3 GiB (WDDM demoted idle allocations) and decode stayed 78-82 tok/s. So an app opening later did not page the weights or slow decode in
+this test; this was a cached-prefix workload on the cells above and no new prefill of a long prompt, and one run per pressure level.
+Headroom therefore protects the next startup and spill-guard noise, not a promised later spike.
+
+**Profile qualification** (generated launcher CMD, default MTP-first with fallback, thinking on, output cap 8192, sampler 1.0/0.95/64/0.03,
+seeds 4100/4101/4200; two ~1k prompts exercise prefix reuse, a third fills the resolved context less 8,320 tokens; over-context request must
+return HTTP 400 and an explicit `--max-context 131072` start must be refused; all cells below did):
+
+| Envelope | launcher result | resolved context | decode tok/s | requests |
 |---|---|---:|---|---|
-| headless 15,791 MiB | d1 | **14,464** | 29,980 / 14,330 | 3/3 requests finished (`stop`); over-context HTTP 400, explicit 131072 start refused |
-| headless 15,791 MiB | off | **37,568** | 29,943 / 14,275 | 3/3 requests finished (`stop`); both refusals hold |
-| nominal 14,767 MiB | d1 or off | none | not started (242 MiB) | refused: cannot fit 9,216 tokens beside 1,024 MiB headroom |
+| headless 15,791 | MTP | 58,752 | 119-121 short, 92 at a 50,422-token prompt | 3/3 `stop`, TTFT 29.7 s at 50k |
+| nominal 14,767 | MTP | 11,392 / 13,248 (two runs) | 115-121 | 3/3 `stop` each |
+| nominal 14,767 | third run | refused (short 24 MiB, another program held ~450 MiB more) | - | clean refusal, nothing paged |
+| ~1.9 GiB 14,357 | no MTP (fallback) | 13,184 | 82-83 | 3/3 `stop` |
+| ~1.9 GiB 14,357 | `--vram-headroom-mib 0` | 16,192 | 81-83 | 3/3 `stop` |
+| conservative 13,743 | refused | - | - | 9,216 tokens short by 512 MiB at the default |
 
-Requests (headless, MTP d1 / off): 992-token prompt, 1,401-1,419 output tokens (797-806 reasoning), second identical-prefix request
-cached 986 of 992 prompt tokens; 6,133-token (d1) / 29,238-token (off) prompt, 1,381 / 1,506 output tokens. Decode 114-116 tok/s
-(d1, accepted/drafted 546-571/829-847) and 77-84 tok/s (off) on the RTX 5090: **no 16 GB card throughput claim**. No request reached
-the 8192-token cap, so the cap itself was not exercised to exhaustion here; loop flags were false for all six; no quality rating follows.
+Outputs were 1,310-1,482 tokens (697-864 reasoning) and ended with `stop`; no request reached the 8192-token cap, loop flags were false and
+no quality rating follows. Rates belong to the RTX 5090.
 
-**What the numbers mean.** The 9,216-token minimum fits only barely headless: the planned reservation at 9,216 tokens
-is 1,264 MiB (weights 12,385 MiB with MTP), so 2,737 MiB free after weights leaves ~449 MiB for context before the 1,024 MiB
-headroom. Automatic sizing also keeps 192 MiB for allocations the plan does not name; a first run without it resolved 21,504 tokens
-and then failed the post-startup headroom check at 960 MiB free (64 MiB short). Because the profile never lowers headroom below
-1,024 MiB and never pages, the nominal desktop envelope is refused although a non-profile launch with explicit context and the default headroom was
-recorded as `fit` in the envelope section (that criterion is the 31,419 MiB budget line, not 1,024 MiB of remaining free VRAM). Sampling
-whole-device memory can miss brief spikes. Retained process finding: the Windows OS budget shrinks to usage plus free memory as device
-memory fills (31,419 MiB at open, 17,154 MiB after the weights under the ballast), so resident sizing latches the budget gap at the first reading.
+**What does not fit, and why.** Conservative (13,743 MiB): without MTP 9,216 tokens need 1,422 MiB beside the 11,921 MiB of weights
+(the engine plan with ring, workspace and graphs), 1,169 MiB are available after weights: **short by about 253 MiB** with no headroom and no
+margin, 512 MiB at the profile default; MTP adds 464 MiB of weights (short about 717 MiB). Ranked options, none started here: (1) sliding-window K/V stored as FP8 instead of
+BF16: the 900 MiB ring would roughly halve ([INFERENCE]: about 440 MiB, needs a kernel and a quality study); (2) a smaller weight tier than IQ3_XXS (about 1 GiB per
+IQ3 to IQ2-class step is [INFERENCE]; needs a new quantization and KL study); (3) chunk 64 saves roughly 50 MiB of ring and ~16 MiB of workspace
+([INFERENCE], unsupported); (4) `--no-cuda-graph` saves 24 MiB at about -15-20 % decode; (5) a physical card with the desktop on the iGPU.
+The vocabulary/output head (FP8, ~1.3 GiB) cannot leave the device without paging.
+
+Retained process finding: the Windows OS budget shrinks to usage plus free memory as device memory fills (31,419 MiB at open, 17,154 MiB after the
+weights under the ballast), so resident sizing latches the budget gap at the first reading.
 
 ## Final-layer early exit in intermediate prefill chunks (2026-11-16)
 
