@@ -1080,7 +1080,8 @@ def parse_launcher(path: Path) -> LauncherCommand:
         pending = ""
     if pending:
         logical.append(pending.strip())
-    command = next((line for line in logical if line.startswith('"')), "")
+    # The memory-16gb launcher plans first (`--plan` to a temp file); the command after it is the one that serves.
+    command = next((line for line in logical if line.startswith('"') and " --plan " not in line), "")
     words = _launcher_words(command)
     if len(words) < 2:
         raise ValueError(f"no quoted \"<server>\" \"<artifact>\" command line found in {path}")

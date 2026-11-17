@@ -3,6 +3,7 @@
 #include "core/arena.h"
 #include "core/decode_graph.h"
 #include "core/startup.h"
+#include "core/vram_budget.h"
 #include "models/gemma4/execution/parameters.h"
 #include "models/gemma4/program/kv_layout.h"
 #include "infernix/types.h"
@@ -472,13 +473,19 @@ struct ProgramImpl {
         try {
             if (options.use_cuda_graph) {
                 StartupPhaseScope graph_phase(options.startup_observer, StartupPhase::CudaGraphPrepare);
+                // Prefer this process's own device usage (DXGI): the whole device's free delta also counts other programs
+                // allocating meanwhile (a desktop under 2 GiB of other use tripped the guard at 327 MiB), so it stays the
+                // fallback where the OS reports no per-process usage. Gross excess only is an error either way.
+                const auto probe = open_vram_budget_source(device.device, false, false);
+                const auto usage_before = probe->query();
                 const auto free_before = device_free_bytes();
                 prepare_graphs();
                 const auto free_after = device_free_bytes();
-                graph_measured_bytes = free_before > free_after ? free_before - free_after : 0;
-                // The delta is the whole device's free memory: another process allocating during capture (the desktop, a
-                // browser) inflates it, so a run with 0-19 MiB of graphs can read as 64+. The KV pool was sized with slack
-                // beside the allowance and the serve log warns when the allowance is exceeded, so only a gross excess is an error.
+                const auto usage_after = probe->query();
+                graph_measured_bytes = usage_before.has_local_usage && usage_after.has_local_usage
+                    ? (usage_after.local_usage > usage_before.local_usage
+                           ? static_cast<std::size_t>(usage_after.local_usage - usage_before.local_usage) : 0U)
+                    : (free_before > free_after ? free_before - free_after : 0U);
                 if (graph_measured_bytes > plan.graph_allowance + kGraphGuardMargin) {
                     throw std::runtime_error("Gemma4 CUDA graph preparation exceeded its planned device allowance (" +
                         std::to_string(graph_measured_bytes >> 20) + " MiB measured, " +

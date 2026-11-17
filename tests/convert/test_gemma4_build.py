@@ -1436,9 +1436,10 @@ def test_memory_profile_reuses_iq3_xxs_builder_and_does_not_change_default(env):
     assert cfg.preset is build.PRESETS["iq3-xxs"]
     assert profile.context == "auto" and profile.prefill_chunk == "128"
     assert profile.gemma4_key_only_kv and profile.model_id == "gemma4-16gb"
+    assert profile.vram_headroom_mib == 64 and profile.mtp_fallback
     default = cli.resolve_config(cli.build_parser().parse_args(env.argv("iq3-xxs")))[1]
     assert default.context == 131072 and default.prefill_chunk == "auto"
-    assert not default.gemma4_key_only_kv
+    assert not default.gemma4_key_only_kv and default.vram_headroom_mib == 1024 and not default.mtp_fallback
 
 
 @pytest.mark.parametrize("extra, message", [
@@ -1449,7 +1450,6 @@ def test_memory_profile_reuses_iq3_xxs_builder_and_does_not_change_default(env):
     (["--context", "8192"], "at least 9216"),
     (["--kv-dtype", "bf16"], "--kv-dtype fp8"),
     (["--draft-tokens", "3"], "--draft-tokens 1"),
-    (["--vram-headroom-mib", "512"], "--vram-headroom-mib 1024"),
 ])
 def test_memory_profile_refuses_outside_qualified_settings(env, extra, message):
     args = cli.build_parser().parse_args(env.argv("iq3-xxs", "--profile", "memory-16gb", *extra))
@@ -1475,3 +1475,25 @@ def test_memory_profile_generated_launcher_roundtrip(tmp_path, monkeypatch):
     assert cli.main(["launcher", "--artifact", str(artifact), "--serve", str(server), "--out", str(wrong),
                      "--profile", "memory-16gb"]) == 1
     assert not wrong.exists()
+
+
+def test_memory_profile_launcher_plans_with_mtp_then_falls_back_without_it(tmp_path, monkeypatch):
+    server, artifact = tmp_path / "s.exe", tmp_path / "iq3.ninfer"
+    server.write_bytes(b"x")
+    artifact.write_bytes(b"x")
+    monkeypatch.setattr(launcher, "artifact_info", lambda path: launcher.ArtifactInfo(True, False, 262144, True))
+    out = tmp_path / "memory.cmd"
+    assert cli.main(["launcher", "--artifact", str(artifact), "--serve", str(server), "--out", str(out),
+                     "--profile", "memory-16gb"]) == 0
+    text = out.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    plan_at = next(i for i, line in enumerate(lines) if " --plan " in line)
+    assert lines[plan_at].endswith(">nul 2>nul") and "--spec" in " ".join(lines[:plan_at + 1])
+    assert "if errorlevel 1 goto :no_mtp" in lines and ":no_mtp" in lines
+    after = " ".join(lines[lines.index(":no_mtp"):])
+    assert "--spec" not in after and "--max-context auto" in after and "--vram-headroom-mib 64" in after
+    parsed = build.parse_launcher(out)
+    assert "--plan" not in parsed.flags and parsed.draft_tokens == "1" and not parsed.env
+    assert cli.main(["launcher", "--artifact", str(artifact), "--serve", str(server), "--out", str(tmp_path / "off.cmd"),
+                     "--profile", "memory-16gb", "--no-mtp"]) == 0
+    assert ":no_mtp" not in (tmp_path / "off.cmd").read_text(encoding="utf-8")

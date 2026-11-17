@@ -132,8 +132,8 @@ def add_serve_arguments(parser: argparse.ArgumentParser, *, prefix: str) -> None
     add("--host-context-mib", type=int, default=launcher_tools.DEFAULT_HOST_CONTEXT_MIB,
         help="pinned host prefix-cache pool in MiB (default %(default)s); the launcher gives Gemma no device "
         "snapshot slots")
-    add("--vram-headroom-mib", type=int, default=launcher_tools.DEFAULT_VRAM_HEADROOM_MIB,
-        help="VRAM in MiB the KV sizing leaves free for the display and other programs (default %(default)s)")
+    add("--vram-headroom-mib", type=int, default=None,
+        help="VRAM in MiB the KV sizing leaves free for the display and other programs (default 1024; memory-16gb: 64)")
     add("--top-k", type=int, help="process-level top-k, 0..64 for Gemma (default: no flag; the artifact's sampling "
         "preset applies)")
     add("--chat-template", type=Path, help="Jinja chat template file that replaces the artifact's (--chat-template)")
@@ -150,6 +150,8 @@ def add_serve_arguments(parser: argparse.ArgumentParser, *, prefix: str) -> None
 def serve_kwargs(args: argparse.Namespace) -> dict:
     """`ServeProfile` fields from parsed arguments."""
     small = args.profile == "memory-16gb"
+    headroom = args.vram_headroom_mib if args.vram_headroom_mib is not None else (
+        launcher_tools.SMALL_VRAM_HEADROOM_MIB if small else launcher_tools.DEFAULT_VRAM_HEADROOM_MIB)
     context = args.context if args.context is not None else ("auto" if small else launcher_tools.DEFAULT_CONTEXT)
     chunk = args.prefill_chunk if args.prefill_chunk is not None else ("128" if small else launcher_tools.DEFAULT_PREFILL_CHUNK)
     if small:
@@ -161,17 +163,15 @@ def serve_kwargs(args: argparse.Namespace) -> dict:
             raise ValueError("--profile memory-16gb needs --context auto or at least 9216 tokens")
         if args.draft_tokens != "1":
             raise ValueError("--profile memory-16gb supports --draft-tokens 1 only; use --no-mtp for more context")
-        if args.vram_headroom_mib < 1024:
-            raise ValueError("--profile memory-16gb requires at least --vram-headroom-mib 1024")
     return {
         "host": args.host, "port": args.port, "alias": args.alias, "context": context,
         "kv_dtype": args.kv_dtype, "model_match": args.model_match, "gemma4_qk": args.gemma4_qk,
         "prefill_chunk": chunk, "draft_tokens": args.draft_tokens, "logits_dtype": args.logits_dtype,
-        "host_context_mib": args.host_context_mib, "vram_headroom_mib": args.vram_headroom_mib,
+        "host_context_mib": args.host_context_mib, "vram_headroom_mib": headroom,
         "top_k": args.top_k, "chat_template": args.chat_template.resolve() if args.chat_template else None,
         "default_thinking_budget": args.default_thinking_budget,
         "thinking_budget_message": args.thinking_budget_message, "reasoning_loop": args.reasoning_loop,
-        "gemma4_key_only_kv": small or args.gemma4_key_only_kv,
+        "gemma4_key_only_kv": small or args.gemma4_key_only_kv, "mtp_fallback": small,
     }
 
 

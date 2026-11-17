@@ -98,6 +98,9 @@ public:
     void begin() { before_ = source_.query(); }
     // After a step that allocated `bytes`: the bytes not placed in device memory (0: resident).
     [[nodiscard]] std::uint64_t end(std::uint64_t bytes);
+    // `end` for a step that page-locks no host memory: a shortfall with this process's shared system memory use
+    // unchanged (where the source reads it) is another program's free-memory drift, not a spill.
+    [[nodiscard]] std::uint64_t end_without_host_allocation(std::uint64_t bytes);
     // The last step's readings, for its failure: free device memory before and after a step of
     // `bytes`, and where the source reads it (Windows, WSL2) this process's shared system memory use,
     // which a real sysmem fallback raises and a misread free-memory figure does not.

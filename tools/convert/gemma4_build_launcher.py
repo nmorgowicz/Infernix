@@ -34,6 +34,7 @@ DEFAULT_LOGITS_DTYPE = "bf16"
 DEFAULT_DRAFT_TOKENS = "1"
 DEFAULT_HOST_CONTEXT_MIB = 8192
 DEFAULT_VRAM_HEADROOM_MIB = 1024
+SMALL_VRAM_HEADROOM_MIB = 64  # memory-16gb default; any value >= 0 (docs/weight-conversion.md, 16 GB profile)
 SERVE_PROFILES = ("default", "memory-16gb")
 MAX_TOP_K = 64  # Gemma4's sampler ceiling (Qwen stays at 20)
 REASONING_LOOPS = ("stop", "conclude")  # --reasoning-loop; "off" is the server default and emits no flag
@@ -85,6 +86,7 @@ class ServeProfile:
     thinking_budget_message: str | None = None
     reasoning_loop: str | None = None
     gemma4_key_only_kv: bool = False
+    mtp_fallback: bool = False  # memory-16gb: plan with MTP first, start without it when only that does not fit
 
     @property
     def model_id(self) -> str:
@@ -202,6 +204,14 @@ def _cmd_word(word: str) -> str:
     return f'"{word}"' if any(char.isspace() or char in "&|<>^()" for char in word) else word
 
 
+def _command_lines(server: str, artifact: str, groups: list[list[str]], suffix: str = "") -> list[str]:
+    lines = [f'"{server}" "{artifact}" ^']
+    for index, group in enumerate(groups):
+        last = index == len(groups) - 1
+        lines.append("  " + " ".join(_cmd_word(word) for word in group) + (suffix if last else " ^"))
+    return lines
+
+
 def launcher_lines(
     server: str,
     artifact: str,
@@ -240,10 +250,18 @@ def launcher_lines(
                      "(infernix docs/serving.md, --gemma4-qk).")
     if cuda_bin:
         lines.append(f'set "PATH={cuda_bin};%PATH%"')
-    lines.append(f'"{server}" "{artifact}" ^')
-    for index, group in enumerate(groups):
-        last = index == len(groups) - 1
-        lines.append("  " + " ".join(_cmd_word(word) for word in group) + ("" if last else " ^"))
+    if mtp and profile.mtp_fallback:
+        plan = f'"%TEMP%\\infernix-memory-16gb-plan.json"'
+        lines.append("rem The MTP assistant needs about 464 MiB more VRAM: the server plans with it first (no GPU work) and")
+        lines.append("rem starts without it when only that fits. Neither fitting is the server's refusal; nothing is paged.")
+        lines.extend(_command_lines(server, artifact, groups, f" --plan {plan} >nul 2>nul"))
+        lines.append("if errorlevel 1 goto :no_mtp")
+        lines.extend(_command_lines(server, artifact, groups))
+        lines.append("exit /b %errorlevel%")
+        lines.append(":no_mtp")
+        lines.append("echo The MTP assistant does not fit in the free VRAM; starting without it. 1>&2")
+        groups = serve_groups(profile, mtp=False, vision=vision, chat_template=chat_template)
+    lines.extend(_command_lines(server, artifact, groups))
     lines.extend(["exit /b %errorlevel%", ""])
     return lines
 

@@ -102,10 +102,20 @@ std::uint32_t resolve_gemma4_auto_context(
             });
         if (index) { return minimum + (*index - 1U) * page; }
     }
+    std::string detail;
+    if (upper >= minimum) {
+        const auto mib = [](std::size_t bytes) { return std::to_string(bytes >> 20) + " MiB"; };
+        const std::size_t need = reservation(minimum);
+        const std::size_t room = available > headroom ? available - headroom : 0;
+        detail = " [" + std::to_string(minimum) + " tokens need " + mib(need) + " beside the weights; " + mib(room) +
+                 " remain after weights, headroom and startup margin: short by " +
+                 mib(need > room ? need - room : 0) + "]";
+    }
     throw std::runtime_error(
         "Gemma4 --max-context auto cannot fit the minimum usable 9216 tokens (1024 prompt + "
         "8192 output) within the artifact/131072 ceiling, resident VRAM and headroom; free GPU "
-        "memory or use a smaller artifact/chunk. Host-paged startup is not permitted");
+        "memory, lower --vram-headroom-mib or use a smaller artifact/chunk. Host-paged startup is not permitted" +
+        detail);
 }
 
 void validate_gemma4_options(const EngineOptions& options) {
@@ -263,14 +273,17 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& supplied, DeviceContext&
         };
         if (options.max_context_auto) {
             // Parameters, kernel modules loaded at first use and CUDA Graph state allocate after this reading
-            // (128 MiB past the plan on the IQ3 artifact at chunk 128 with MTP, one measured startup); auto keeps this
-            // margin so the final headroom check holds after startup instead of failing it.
-            constexpr std::size_t kAutoStartupMargin = 192ULL << 20;
+            // (103-146 MiB past the plan in IQ3 startups at chunk 128, the most with MTP), and the device
+            // grows about 3 KiB per context token beyond the plan (ledger: 23.2 against 20.2 MiB per 1k tokens at
+            // key-only, chunk 128); auto keeps both so the final headroom check holds after startup instead of failing it.
+            constexpr std::size_t kAutoStartupMargin = 160ULL << 20;
+            constexpr std::size_t kAutoUnplannedBytesPerToken = 4096;
             options.max_context = resolve_gemma4_auto_context(
                 options.max_context, available, headroom + kAutoStartupMargin,
                 [&](std::uint32_t context) {
                     // Maximize context first; then choose the widest chunk that fits it.
-                    return reservation(context, options.prefill_chunk_auto ? 128U : options.prefill_chunk);
+                    return reservation(context, options.prefill_chunk_auto ? 128U : options.prefill_chunk) +
+                           static_cast<std::size_t>(context) * kAutoUnplannedBytesPerToken;
                 });
         }
         if (options.prefill_chunk_auto) {
@@ -331,7 +344,7 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& supplied, DeviceContext&
         guard.begin();
         model = models::gemma4::materialize_model(models::gemma4::plan_load(reader, load_options), device,
                                                   &options.startup_observer);
-        if (guard.end(model->storage_stats().device_capacity_bytes) != 0) {
+        if (guard.end_without_host_allocation(model->storage_stats().device_capacity_bytes) != 0) {
             throw std::runtime_error("Gemma4 weights spilled into host memory: " +
                                      guard.readings(model->storage_stats().device_capacity_bytes));
         }

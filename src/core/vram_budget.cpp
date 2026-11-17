@@ -342,6 +342,17 @@ std::uint64_t SpillGuard::end(std::uint64_t bytes) {
     return spill_shortfall(before_.device_free, after_.device_free, bytes);
 }
 
+std::uint64_t SpillGuard::end_without_host_allocation(std::uint64_t bytes) {
+    const auto shortfall = end(bytes);
+    // A step that page-locks no host memory leaves this process's shared system memory use flat unless the
+    // driver really placed device allocations there; other programs drifting free memory do not move it.
+    if (shortfall != 0 && before_.shared_system != 0 && after_.shared_system != 0 &&
+        after_.nonlocal_usage <= before_.nonlocal_usage + kSpillToleranceBytes) {
+        return 0;
+    }
+    return shortfall;
+}
+
 std::string SpillGuard::readings(std::uint64_t bytes) const {
     const auto mib = [](std::uint64_t value) { return std::to_string(value >> 20) + " MiB"; };
     std::string out = "free device memory " + mib(before_.device_free) + " before and " + mib(after_.device_free) +
