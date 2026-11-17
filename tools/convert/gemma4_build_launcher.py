@@ -34,6 +34,7 @@ DEFAULT_LOGITS_DTYPE = "bf16"
 DEFAULT_DRAFT_TOKENS = "1"
 DEFAULT_HOST_CONTEXT_MIB = 8192
 DEFAULT_VRAM_HEADROOM_MIB = 1024
+SERVE_PROFILES = ("default", "memory-16gb")
 MAX_TOP_K = 64  # Gemma4's sampler ceiling (Qwen stays at 20)
 REASONING_LOOPS = ("stop", "conclude")  # --reasoning-loop; "off" is the server default and emits no flag
 # Libraries infernix binaries load from their own directory: FFmpeg (vcpkg) and the staged cuBLAS.
@@ -57,6 +58,7 @@ class ArtifactInfo:
     mtp: bool
     vision: bool
     max_context: int
+    iq3_xxs: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,7 +68,7 @@ class ServeProfile:
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
     alias: str | None = None
-    context: int = DEFAULT_CONTEXT
+    context: int | str = DEFAULT_CONTEXT
     kv_dtype: str = "fp8"
     model_match: str = DEFAULT_MODEL_MATCH
     gemma4_qk: str = DEFAULT_GEMMA4_QK
@@ -82,10 +84,11 @@ class ServeProfile:
     default_thinking_budget: int | None = None
     thinking_budget_message: str | None = None
     reasoning_loop: str | None = None
+    gemma4_key_only_kv: bool = False
 
     @property
     def model_id(self) -> str:
-        return self.alias or default_alias(self.context)
+        return self.alias or ("gemma4-16gb" if self.context == "auto" else default_alias(self.context))
 
 
 def exe_name(base: str) -> str:
@@ -116,12 +119,14 @@ def check_serve_settings(profile: ServeProfile) -> None:
         raise ValueError(
             f"--alias {profile.model_id!r}: use letters, digits, '.', '_' and '-' only (no spaces, quotes or %)"
         )
-    if profile.context < 1:
-        raise ValueError("--context must be positive")
+    if profile.context != "auto" and (not isinstance(profile.context, int) or profile.context < 1):
+        raise ValueError("--context must be positive or 'auto'")
     if profile.kv_dtype not in KV_DTYPES:
         raise ValueError(f"--kv-dtype must be one of {KV_DTYPES} (fp8 is the qualified setting)")
     if profile.model_match not in MODEL_MATCHES:
         raise ValueError(f"--model-match must be one of {MODEL_MATCHES}")
+    if profile.gemma4_key_only_kv and profile.kv_dtype != "fp8":
+        raise ValueError("--gemma4-key-only-kv needs --kv-dtype fp8")
     if profile.gemma4_qk not in GEMMA4_QKS:
         raise ValueError(f"--gemma4-qk must be bf16 or fp8, got {profile.gemma4_qk!r}")
     if profile.gemma4_qk == "fp8" and profile.kv_dtype != "fp8":
@@ -164,6 +169,7 @@ def serve_groups(
         + (["--any-model-name"] if profile.model_match == "any" else []),
         ["--max-context", str(profile.context), "--kv-capacity", "auto", "--vram-headroom-mib",
          str(profile.vram_headroom_mib), "--kv-dtype", profile.kv_dtype]
+        + (["--gemma4-key-only-kv"] if profile.gemma4_key_only_kv else [])
         + (["--gemma4-qk", "fp8"] if profile.gemma4_qk == "fp8" else []),
         ["--max-concurrency", "1", "--prefill-chunk", profile.prefill_chunk, "--logits-dtype", profile.logits_dtype]
         + (["--top-k", str(profile.top_k)] if profile.top_k is not None else [])
@@ -225,6 +231,10 @@ def launcher_lines(
         "rem Prefix cache is host-only: no device snapshot slots, "
         f"{profile.host_context_mib} MiB of pinned host context.",
     ]
+    if profile.gemma4_key_only_kv:
+        lines.append("rem Experimental key-only global FP8 KV; sliding KV stays BF16. Default launches do not enable it.")
+    if profile.context == "auto":
+        lines.append("rem Context is fitted at startup to available VRAM; refuses below 9216 tokens. Read /v1/models for the resolved limit.")
     if profile.gemma4_qk == "fp8":
         lines.append("rem Gemma attention QK in FP8: faster long prompts, measurably lower fidelity "
                      "(infernix docs/serving.md, --gemma4-qk).")
@@ -250,6 +260,8 @@ def artifact_info(path: Path) -> ArtifactInfo:
         return ArtifactInfo(
             mtp="mtp" in components,
             vision="vision" in components,
+            iq3_xxs=sum(obj.bytes for obj in artifact.objects if getattr(obj, "format", None) == "ggml_iq3_xxs")
+            > sum(obj.bytes for obj in artifact.objects if getattr(obj, "format", None) == "ggml_iq3_s"),
             max_context=int(config["max_position_embeddings"]),
         )
 
@@ -276,7 +288,7 @@ def write_launcher(
     if out.exists() and not overwrite:
         raise FileExistsError(f"Launcher already exists: {out}")
     info = info or artifact_info(artifact)
-    if profile.context > info.max_context:
+    if profile.context != "auto" and profile.context > info.max_context:
         raise ValueError(f"--context {profile.context} exceeds the artifact's position limit {info.max_context}")
     lines = launcher_lines(
         cmd_path(server),

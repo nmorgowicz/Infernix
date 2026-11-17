@@ -531,6 +531,94 @@ python -m tools.convert.gemma4_build --preset best-small --model <BF16 dir> --as
 python -m tools.convert.gemma4_build --preset best-small --model <BF16 dir> --assistant <assistant dir> --out-dir <dir> --yes
 ```
 
+### Native GPTQ5 group64, explicit A16/A8 permissions
+
+These are explicit conversion alternatives, **not builder presets or new defaults**. Every target
+text-layer projection uses the existing `q5_g64_fp16` format. `q5_g64_a16` keeps `A16Only` Uses;
+`q5_g64` explicitly permits A8 on target text projections only. Quality, speed and VRAM must be
+measured separately for both activation policies against same-model Q4 and GGUF Q5_K_S/Q5_K_M
+artifacts; five bits alone establish no winner.
+
+Start with a complete unquantized Gemma 4 **31B dense** BF16 HF checkpoint, its tokenizer and the
+converter environment (Python 3.11 with torch/numpy/safetensors). GPTQ uses the separate pinned
+environment in `tools/gptq/requirements.txt` (Python 3.13; compressed-tensors **0.18.0**, LLM
+Compressor 0.13.0), not the converter interpreter. Supply absolute interpreter paths below.
+Use fresh output/scratch directories outside the read-only HF source, with room for the text-only
+BF16 tree, disk-offloaded weights, packed checkpoint and final artifact.
+
+Render disjoint public calibration text with the matching tokenizer/template using
+`gemma4_q4 calibration-text` first, or reuse an existing token tensor only after establishing its
+source/tokenizer/chat-prefix identity. Matching `400 x 512` dimensions alone do not establish this.
+Create a full text-only tree (omitting `--layers` keeps all 60 layers); the runner does not consume
+the multimodal tree directly:
+
+```text
+"<converter-python-3.11>" tools/gptq/make_text_tree.py --model "<BF16-dir>" --out "<work>/text60"
+"<gptq-python>" tools/gptq/make_calib.py --text "<matching-chat-prefixed-calibration.txt>" --tokenizer "<BF16-dir>/tokenizer.json" --out "<work>/calib.pt"
+"<gptq-python>" tools/gptq/run_gptq.py --recipe gemma4_31b --tree "<work>/text60" --calib "<work>/calib.pt" --bits 5 --group-size 64 --max-cpu-gb 32 --offload-dir "<work>/offload5" --out "<work>/gptq5-g64"
+"<converter-python-3.11>" tools/gptq/check_checkpoint.py --bits 5 --gptq "<work>/gptq5-g64" --tree "<work>/text60"
+"<converter-python-3.11>" -m tools.convert.gemma4_q4 convert --model "<BF16-dir>" --text-only --no-mtp --weights q5_g64_a16 --gptq-source "<work>/gptq5-g64" --out "<out>/gemma4-gptq5-g64-a16.ninfer"
+"<converter-python-3.11>" -m tools.convert.gemma4_q4 verify --artifact "<out>/gemma4-gptq5-g64-a16.ninfer"
+```
+
+To permit the separate wide-prefill A8 route, import that **same** GPTQ5 checkpoint into a new
+artifact with `--weights q5_g64` instead of `q5_g64_a16`:
+
+```text
+"<converter-python-3.11>" -m tools.convert.gemma4_q4 convert --model "<BF16-dir>" --text-only --no-mtp --weights q5_g64 --gptq-source "<work>/gptq5-g64" --out "<out>/gemma4-gptq5-g64-a8.ninfer"
+```
+
+The stored Q5 codes/scales are identical; the difference is the target projection Uses:
+
+| Explicit weights recipe | Target projection Uses | Execution permission |
+|---|---|---|
+| `q5_g64_a16` | `A16Only` | Native Q5 with 16-bit activations at every width |
+| `q5_g64` | `AllowA8` | Wide prefill (64 columns and above) may bake Q5 to FP8-row for FP8 GEMM; narrower calls stay native Q5 A16 |
+
+Vocabulary, assistant and other non-target-projection Uses do not acquire `AllowA8`. Loading
+an existing `A16Only` artifact never opts it into A8. There is no Q5 narrow/decode A8 route.
+
+The Q5 wide-prefill bake uses **actual decoded values**, not the Q4 scale-order bound.
+For each stored signed five-bit code `q` and binary16 scale `d`, decode
+`v = FP32_RN(q * d)` first (this finite product is exact), with no intermediate BF16
+weight cast. Set `m = max(abs(v))` over the logical row, then the row multiplier
+`s = BF16_round_toward_positive_infinity(FP32_RN(m / 448))`; a zero row uses `s = 1`.
+Compute `r = FP32_RN(1 / FP32(s))` and encode
+`E4M3FN_RN_ties_even_satfinite(FP32_RN(v * r))`. The represented baked weight is that
+E4M3FN value times `FP32(s)`. In particular, this is **not** Q4's
+`q * FP32_RN(d * r)` ordering, nor a BF16-rounded weight maximum. The FP8 activation
+encoder/GEMM is then reused for allowed wide calls. This is a distinct approximate
+execution path, not a hidden precision mode or a guarantee of native-A16 numerical identity.
+Its quality/performance require separate measurements; the A16 artifact retains its own path.
+
+The converter requires a clean tracked checkout for its revision receipt. Replace `--no-mtp` with
+`--mtp-assistant "<assistant-BF16-dir>"` to include the separate assistant: its layer projections
+default to FP8, its outer projections stay BF16, and its head stays FP8 as before. GPTQ supplies
+**only target text projections**; the tied vocabulary is still FP8-row from `--model`, and norms,
+frontend resources and optional components retain their existing explicit HF/BF16-source policy.
+
+The [pinned compressor](https://github.com/vllm-project/compressed-tensors/blob/0.18.0/src/compressed_tensors/compressors/pack_quantized/helpers.py)
+supports native five-bit compression with **dense cross-word offset-binary packing**: code `j`
+starts at bit `5*j`, words have shape `[N, ceil(K*5/32)]`, and codes may straddle int32 words.
+This is **not** six codes per word (`floor(32/5)`). The runner proves its installed compressor's
+layout against an independent fixed bitstream before loading the model and refuses unsupported
+compression instead of inventing a repacker. Its config records the actual compressor version,
+bit width and packing; conversion receipts retain those facts. Other packing shapes, zero points,
+activation-ordered groups, non-group64 INT5 and mismatched bit widths are refused.
+
+Import copies every signed code and binary16-exact scale without dequantization/requantization
+or scale rerounding. Global q/k reorder complete rows. Global o's rotary permutation moves
+complete **64-wide** groups, so it too stays native `q5_g64_fp16`; a split group is an error,
+not a fallback format. Scales not exactly representable in binary16 are refused.
+
+Both `q5_g64` and `q5_g64_a16` fix native group64: do not add Q4 `--group-size`,
+`--region-group`, `--native-groups` or scale-search flags. Without `--gptq-source` either
+explicit recipe uses uncalibrated group64 RTN from HF BF16; that is a separate quality arm, not GPTQ.
+Existing Q4 conversion and `run_gptq.py` defaults remain four-bit/group32. For a matched GPTQ4
+baseline rerun with `--bits 4 --group-size 32`, the **same** text tree/calibration tensor and
+separate fresh output/offload directories; import with `--weights q4_g32_a16` for A16 or the
+unchanged `--weights q4_g32` for its separate W4A8 performance arm.
+
 ### Create the smaller IQ3 files from HF BF16
 
 Start with the complete local BF16 Gemma 4 **31B dense** HF tree (including its tokenizer/config files), a clean
@@ -619,6 +707,38 @@ python -m tools.convert.gemma4_build serve-check --launcher <serve.cmd>
 `serve-check` starts the server the launcher runs, checks `/v1/models` and chat requests with the launcher's
 model id, another model name (200 with `--any-model-name`, 404 without), no model field (400) and an arbitrary
 bearer key, stops the server and writes a JSON receipt with the launcher's effective profile.
+
+### Opt-in 16 GB memory profile
+
+`--profile memory-16gb` extends the same builder and launcher machinery; it is not a new converter.
+For a build it selects `iq3-xxs` when `--preset` is omitted and refuses any other recipe or vision.
+The normal profile and all four artifact tiers are unchanged.
+
+```text
+python -m tools.convert.gemma4_build --profile memory-16gb --model "<BF16-dir>" --assistant "<assistant-dir>" --llama-cpp "<llama-bin-dir>" --llama-cpp-source "<llama-source-dir>" --out-dir "<camp>/iq3-xxs" --yes
+python -m tools.convert.gemma4_build launcher --profile memory-16gb --artifact "<IQ3_XXS.ninfer>" --serve "<absolute-infernix-serve-path>" --out "<camp>/serve-16gb.cmd"
+```
+
+Run the resulting `serve-16gb.cmd`. For less VRAM use `launcher ... --no-mtp`; this omits the assistant
+from residency, not from the artifact. Thinking stays enabled. The profile emits `--max-context auto
+--kv-capacity auto --gemma4-key-only-kv --kv-dtype fp8 --gemma4-qk fp8 --prefill-chunk 128`, BF16 logits,
+one lane, a host-only 8192 MiB prefix cache, 1024 MiB VRAM headroom, and one MTP draft when enabled.
+The default alias is `gemma4-16gb`; host/port retain `0.0.0.0:8001` (use `--host 127.0.0.1` for local-only).
+No environment variable enables key-only KV.
+
+The Engine, not the launcher generator, fits context at each launch using the actual free resident VRAM
+and its complete weights/KV/workspace/graphs plan, checks again after upload, and reports the resolved
+limit in `/v1/models` and startup logs. It never assumes that every 16 GB desktop can hold 65k.
+Automatic context is page-aligned, capped at 131072/native positions, and refuses below 9216 tokens
+(room for a roughly 1k prompt plus an 8192-token output cap). Auto requires `--kv-capacity auto` and a
+physical-free reading; Gemma refuses `--vram-past-budget`. An explicit `--context N` is never silently
+reduced. Other programs can still consume memory after startup: headroom is not a VRAM reservation
+against future desktop activity, and no profile guarantees complete answers or the absence of loops.
+
+Profile overrides permit chunks `128`, `256`, `512`, at least 1024 MiB headroom, and one MTP draft only;
+larger chunks trade context for prompt speed. FP8 KV and BF16 logits are required. Key-only KV is
+experimental and changes attention arithmetic; sliding layers remain BF16. Its historical numerical
+and long-context speed costs remain in the [key-only measurements](maintainer/gemma4-benchmarks.md#key-only-global-kv-cache-experimental-off-by-default).
 
 ### Gemma 4 31B from a llama.cpp GGUF quant (IQ3_XS, IQ3_XXS, ...)
 

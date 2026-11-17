@@ -88,11 +88,23 @@ def default_venv_python(venv: Path) -> Path:
     return venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 
+def context_value(text: str) -> int | str:
+    if text == "auto":
+        return text
+    try:
+        return int(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("context must be a positive token count or 'auto'") from error
+
+
 def add_serve_arguments(parser: argparse.ArgumentParser, *, prefix: str) -> None:
     """The launcher flags shared by a build and the `launcher` subcommand; `prefix` names the command in help."""
     add = parser.add_argument
-    add("--context", type=int, default=launcher_tools.DEFAULT_CONTEXT,
-        help=f"{prefix} --max-context (default {launcher_tools.DEFAULT_CONTEXT})")
+    add("--profile", choices=launcher_tools.SERVE_PROFILES, default="default",
+        help="launcher profile: default (unchanged 131k roleplay), or memory-16gb (IQ3_XXS, experimental key-only "
+        "FP8, chunk 128, context fitted at startup to actual free VRAM; refuses below 9216 tokens)")
+    add("--context", type=context_value,
+        help=f"{prefix} --max-context: positive tokens or auto (default 131072; memory-16gb: auto)")
     add("--alias", help=f"{prefix} --model-id, the name /v1/models reports and requests must use unless "
         "--model-match any (default <context/1000>k, for example 131k)")
     add("--host", default=launcher_tools.DEFAULT_HOST, help=f"{prefix} --host (default {launcher_tools.DEFAULT_HOST}, "
@@ -107,7 +119,9 @@ def add_serve_arguments(parser: argparse.ArgumentParser, *, prefix: str) -> None
     add("--gemma4-qk", choices=launcher_tools.GEMMA4_QKS, default=launcher_tools.DEFAULT_GEMMA4_QK,
         help="Gemma attention QK precision: fp8 (default: faster long-prompt prefill, measurably lower fidelity; "
         "needs --kv-dtype fp8) or bf16 (no flag, the engine default)")
-    add("--prefill-chunk", default=launcher_tools.DEFAULT_PREFILL_CHUNK,
+    add("--gemma4-key-only-kv", action="store_true",
+        help="experimental global key-only FP8 KV (default off; memory-16gb enables it); sliding KV stays BF16")
+    add("--prefill-chunk",
         help="prefill chunk: auto (default: the server picks the largest of 2048/1024/512/256/128 that fits the "
         "full context after the weights load) or a multiple of 128 up to 16384")
     add("--draft-tokens", default=launcher_tools.DEFAULT_DRAFT_TOKENS,
@@ -135,14 +149,29 @@ def add_serve_arguments(parser: argparse.ArgumentParser, *, prefix: str) -> None
 
 def serve_kwargs(args: argparse.Namespace) -> dict:
     """`ServeProfile` fields from parsed arguments."""
+    small = args.profile == "memory-16gb"
+    context = args.context if args.context is not None else ("auto" if small else launcher_tools.DEFAULT_CONTEXT)
+    chunk = args.prefill_chunk if args.prefill_chunk is not None else ("128" if small else launcher_tools.DEFAULT_PREFILL_CHUNK)
+    if small:
+        if args.kv_dtype != "fp8" or args.logits_dtype != "bf16":
+            raise ValueError("--profile memory-16gb requires --kv-dtype fp8 and --logits-dtype bf16")
+        if chunk not in ("128", "256", "512"):
+            raise ValueError("--profile memory-16gb supports --prefill-chunk 128, 256 or 512 (default 128)")
+        if context != "auto" and context < 9216:
+            raise ValueError("--profile memory-16gb needs --context auto or at least 9216 tokens")
+        if args.draft_tokens != "1":
+            raise ValueError("--profile memory-16gb supports --draft-tokens 1 only; use --no-mtp for more context")
+        if args.vram_headroom_mib < 1024:
+            raise ValueError("--profile memory-16gb requires at least --vram-headroom-mib 1024")
     return {
-        "host": args.host, "port": args.port, "alias": args.alias, "context": args.context,
+        "host": args.host, "port": args.port, "alias": args.alias, "context": context,
         "kv_dtype": args.kv_dtype, "model_match": args.model_match, "gemma4_qk": args.gemma4_qk,
-        "prefill_chunk": args.prefill_chunk, "draft_tokens": args.draft_tokens, "logits_dtype": args.logits_dtype,
+        "prefill_chunk": chunk, "draft_tokens": args.draft_tokens, "logits_dtype": args.logits_dtype,
         "host_context_mib": args.host_context_mib, "vram_headroom_mib": args.vram_headroom_mib,
         "top_k": args.top_k, "chat_template": args.chat_template.resolve() if args.chat_template else None,
         "default_thinking_budget": args.default_thinking_budget,
         "thinking_budget_message": args.thinking_budget_message, "reasoning_loop": args.reasoning_loop,
+        "gemma4_key_only_kv": small or args.gemma4_key_only_kv,
     }
 
 
@@ -156,7 +185,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     add = parser.add_argument
-    add("--preset", help="what to build (see the table below); required for a build")
+    add("--preset", help="what to build (see the table below); required except with --profile memory-16gb (iq3-xxs)")
     add("--list-presets", action="store_true", help="print the preset table and exit")
     add("--model", type=Path, help="BF16 Hugging Face directory of Gemma 4 31B dense or a fine-tune (only read)")
     add("--assistant", type=Path, help="google/gemma-4-31B-it-assistant directory, embedded as the MTP component")
@@ -248,6 +277,12 @@ def serve_check_parser() -> argparse.ArgumentParser:
 
 def resolve_config(args: argparse.Namespace) -> tuple[BuildConfig, ServeSettings, Path | None]:
     """Turn flags into a config; every argument-only mistake is refused here, before any probe."""
+    if args.preset is None and args.profile == "memory-16gb":
+        args.preset = "iq3-xxs"
+    if args.profile == "memory-16gb" and args.preset != "iq3-xxs":
+        raise ValueError("--profile memory-16gb builds --preset iq3-xxs only")
+    if args.profile == "memory-16gb" and args.with_vision:
+        raise ValueError("--profile memory-16gb is text-only; omit --with-vision")
     if args.preset is None:
         raise ValueError("--preset is required (see --list-presets)")
     if args.preset in UNAVAILABLE_PRESETS:
@@ -391,11 +426,15 @@ def run_launcher(args: argparse.Namespace) -> int:
         raise ValueError("no infernix-serve found in apps/Release or build*/apps/Release; build it "
                          "(build_native.bat) or pass --serve")
     profile = launcher_tools.ServeProfile(**serve_kwargs(args))
+    info = launcher_tools.artifact_info(args.artifact.resolve())
+    if args.profile == "memory-16gb" and (not info.iq3_xxs or info.vision):
+        raise ValueError("--profile memory-16gb requires a text-only IQ3_XXS artifact; build with "
+                         "--profile memory-16gb or select its IQ3_XXS .ninfer")
     info = launcher_tools.write_launcher(
-        args.out.resolve(), args.artifact.resolve(), server, profile, no_mtp=args.no_mtp, cuda_bin=args.cuda_bin,
+        args.out.resolve(), args.artifact.resolve(), server, profile, no_mtp=args.no_mtp, cuda_bin=args.cuda_bin, info=info,
     )
     print(f"Wrote {args.out}: server {server}; MTP {'on' if info.mtp and not args.no_mtp else 'off'}; "
-          f"vision {'on' if info.vision else 'off'}; --model-id {profile.model_id}; context {args.context}; "
+          f"vision {'on' if info.vision else 'off'}; --model-id {profile.model_id}; context {profile.context}; "
           f"KV {args.kv_dtype}; QK {args.gemma4_qk}; http://{args.host}:{args.port}")
     return 0
 

@@ -1426,3 +1426,52 @@ def test_serve_check_stops_the_child_process(tmp_path):
     while process_alive(pid) and time.monotonic() < deadline:
         time.sleep(0.1)
     assert not process_alive(pid), f"child {pid} still runs after serve-check"
+
+
+def test_memory_profile_reuses_iq3_xxs_builder_and_does_not_change_default(env):
+    argv = env.argv("iq3-xxs", "--profile", "memory-16gb")
+    index = argv.index("--preset")
+    del argv[index:index + 2]
+    cfg, profile, _ = cli.resolve_config(cli.build_parser().parse_args(argv))
+    assert cfg.preset is build.PRESETS["iq3-xxs"]
+    assert profile.context == "auto" and profile.prefill_chunk == "128"
+    assert profile.gemma4_key_only_kv and profile.model_id == "gemma4-16gb"
+    default = cli.resolve_config(cli.build_parser().parse_args(env.argv("iq3-xxs")))[1]
+    assert default.context == 131072 and default.prefill_chunk == "auto"
+    assert not default.gemma4_key_only_kv
+
+
+@pytest.mark.parametrize("extra, message", [
+    (["--preset", "best-small"], "iq3-xxs only"),
+    (["--with-vision"], "text-only"),
+    (["--prefill-chunk", "auto"], "--prefill-chunk"),
+    (["--prefill-chunk", "1024"], "--prefill-chunk"),
+    (["--context", "8192"], "at least 9216"),
+    (["--kv-dtype", "bf16"], "--kv-dtype fp8"),
+    (["--draft-tokens", "3"], "--draft-tokens 1"),
+    (["--vram-headroom-mib", "512"], "--vram-headroom-mib 1024"),
+])
+def test_memory_profile_refuses_outside_qualified_settings(env, extra, message):
+    args = cli.build_parser().parse_args(env.argv("iq3-xxs", "--profile", "memory-16gb", *extra))
+    with pytest.raises(ValueError, match=message):
+        cli.resolve_config(args)
+
+
+def test_memory_profile_generated_launcher_roundtrip(tmp_path, monkeypatch):
+    server, artifact = tmp_path / "s.exe", tmp_path / "iq3.ninfer"
+    server.write_bytes(b"x")
+    artifact.write_bytes(b"x")
+    monkeypatch.setattr(launcher, "artifact_info", lambda path: launcher.ArtifactInfo(True, False, 262144, True))
+    out = tmp_path / "memory.cmd"
+    assert cli.main(["launcher", "--artifact", str(artifact), "--serve", str(server), "--out", str(out),
+                     "--profile", "memory-16gb", "--no-mtp"]) == 0
+    plan = build.parse_launcher(out)
+    assert plan.context == "auto" and plan.prefill_chunk == "128"
+    assert plan.gemma4_key_only_kv and plan.effective_profile()["gemma4_key_only_kv"]
+    assert "--gemma4-key-only-kv" in plan.flags and "--spec" not in plan.flags
+    assert not plan.env
+    wrong = tmp_path / "wrong.cmd"
+    monkeypatch.setattr(launcher, "artifact_info", lambda path: launcher.ArtifactInfo(True, False, 262144, False))
+    assert cli.main(["launcher", "--artifact", str(artifact), "--serve", str(server), "--out", str(wrong),
+                     "--profile", "memory-16gb"]) == 1
+    assert not wrong.exists()

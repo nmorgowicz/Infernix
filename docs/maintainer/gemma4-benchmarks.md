@@ -479,7 +479,7 @@ driver and summaries are in `prefill-earlyexit-20261116/default-20261117/`.
 
 ## Key-only global KV cache (experimental, off by default)
 
-`INFERNIX_TMP_GEMMA4_KEY_ONLY_KV=1` (a temporary switch; unset or `0` keeps the default K==V FP8 layout) stores only the
+`--gemma4-key-only-kv` (explicit opt-in; omission keeps the default K==V FP8 layout) stores only the
 FP8 K codes and scales of the global (D512) layers and rebuilds V in attention. It requires `--kv-dtype fp8`; other
 formats are refused. Sliding layers keep BF16 K and V.
 
@@ -509,7 +509,10 @@ V against BF16 K/V from the same writer input). `infernix_gemma4_key_only_real_t
 refusals, K bytes equal to the K==V cache through the first global layer, K-planes-only accounting, deterministic
 generation, root replay and Host snapshot restore equal to the cold key-only run with MTP off and on.
 
-**Measured (2026-11-17, RTX 5090, diode IQ3_XXS with its MTP assistant, one build, switch unset against `=1`).**
+**Historical measurement setup (2026-11-17, RTX 5090, diode IQ3_XXS with its MTP assistant, one build):**
+the retained campaign compared `INFERNIX_TMP_GEMMA4_KEY_ONLY_KV` unset against `=1`. That temporary
+environment interface is removed; current commands use `--gemma4-key-only-kv`. The measured results
+below retain their original build/setup identity, rather than being relabelled as new-CLI qualification.
 Camp evidence: `iq3xs-20261115/konly-20261117/` (drivers, raw requests/responses, server logs, `results.json`).
 
 - Op level, same writer input, attention error against BF16 K/V (stored FP8 / key-only): decode 0.0379 / 0.0379,

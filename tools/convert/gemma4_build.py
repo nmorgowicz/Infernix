@@ -1021,13 +1021,14 @@ class LauncherCommand:
     alias: str | None  # --model-id; None when the launcher omits it (the server names the model itself)
     model_match: str  # "any" only when the launcher passes --any-model-name; the server default is exact
     kv_dtype: str | None
-    context: int | None  # --max-context
+    context: int | str | None  # --max-context, including explicit "auto"
     gemma4_qk: str  # "bf16" when the launcher omits --gemma4-qk (the engine default)
     prefill_chunk: str | None
     draft_tokens: str | None  # None without --spec mtp
     logits_dtype: str | None
     host_context_mib: int | None
     device_snapshot_slots: int | None
+    gemma4_key_only_kv: bool = False
     env: dict[str, str] = field(default_factory=dict)  # `set NAME=VALUE` lines; PATH is prepended, not replaced
 
     def effective_profile(self) -> dict[str, object]:
@@ -1038,6 +1039,7 @@ class LauncherCommand:
             "prefill_chunk": self.prefill_chunk, "draft_tokens": self.draft_tokens,
             "logits_dtype": self.logits_dtype, "host_context_mib": self.host_context_mib,
             "device_snapshot_slots": self.device_snapshot_slots,
+            **({"gemma4_key_only_kv": True} if self.gemma4_key_only_kv else {}),
         }
 
 
@@ -1096,10 +1098,11 @@ def parse_launcher(path: Path) -> LauncherCommand:
         host=value("--host", launcher_tools.SERVER_DEFAULT_HOST),
         port=int(value("--port", launcher_tools.SERVER_DEFAULT_PORT)),
         alias=value("--model-id"), model_match="any" if "--any-model-name" in flags else "exact",
-        kv_dtype=value("--kv-dtype"), context=number("--max-context"),
+        kv_dtype=value("--kv-dtype"), context="auto" if value("--max-context") == "auto" else number("--max-context"),
         gemma4_qk=value("--gemma4-qk", "bf16"), prefill_chunk=value("--prefill-chunk"),
         draft_tokens=value("--draft-tokens") if value("--spec") == "mtp" else None,
         logits_dtype=value("--logits-dtype"), host_context_mib=number("--host-context-mib"),
+        gemma4_key_only_kv="--gemma4-key-only-kv" in flags,
         device_snapshot_slots=number("--device-snapshot-slots"), env=env,
     )
 
