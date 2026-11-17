@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -76,6 +77,14 @@ public:
         return memory.total - memory.reserved;
     }
 
+    [[nodiscard]] std::optional<std::uint64_t> free_bytes() const {
+        if (device_ == nullptr || memory_ == nullptr) { return std::nullopt; }
+        MemoryV2 memory{};
+        memory.version = static_cast<unsigned>(sizeof(MemoryV2)) | (2U << 24U);
+        if (memory_(device_, &memory) != 0 || memory.free > memory.total) { return std::nullopt; }
+        return memory.free;
+    }
+
     // 1 active, 0 inactive, -1 unknown.
     [[nodiscard]] int display_active() const {
         if (device_ == nullptr) { return -1; }
@@ -118,7 +127,8 @@ private:
 
 class DeviceSource final : public VramBudgetSource {
 public:
-    DeviceSource(int device, bool past_budget) : device_(device) {
+    DeviceSource(int device, bool past_budget, bool resident_only)
+        : device_(device), resident_only_(resident_only) {
         if (cudaGetDeviceProperties(&props_, device) != cudaSuccess) {
             throw std::runtime_error("VRAM budget: cannot read the device's properties");
         }
@@ -168,6 +178,8 @@ public:
         }
         out.device_free  = free_bytes;
         out.device_total = total_bytes;
+        out.cuda_free = free_bytes;
+        if (resident_only_) { out.physical_free = nvml_->free_bytes(); }
 #ifdef _WIN32
         // An adapter's output list is a snapshot of its factory: recreate both after a hot-plug.
         if (factory_ != nullptr && !factory_->IsCurrent()) {
@@ -222,6 +234,7 @@ public:
         } else {
             out.display = DisplayState::Unknown;
         }
+        if (resident_only_) { out.device_free = static_cast<std::size_t>(resident_vram_free(out)); }
         return out;
     }
 
@@ -284,6 +297,7 @@ private:
     std::unique_ptr<DxcoreAdapter> dxcore_; // WSL2 only
 #endif
     int device_ = 0;
+    bool resident_only_ = false;
     std::uint64_t allowance_ = 0; // past the budget (measured at open); 0: the OS budget as reported
     bool several_devices_ =
         false; // more than one CUDA device visible (Windows: free memory from DXGI)
@@ -294,11 +308,17 @@ private:
 
 class FakeSource final : public VramBudgetSource {
 public:
-    explicit FakeSource(std::function<VramSnapshot()> fake) : fake_(std::move(fake)) {}
-    VramSnapshot query() override { return fake_(); }
+    FakeSource(std::function<VramSnapshot()> fake, bool resident_only)
+        : fake_(std::move(fake)), resident_only_(resident_only) {}
+    VramSnapshot query() override {
+        auto out = fake_();
+        if (resident_only_) { out.device_free = static_cast<std::size_t>(resident_vram_free(out)); }
+        return out;
+    }
 
 private:
     std::function<VramSnapshot()> fake_;
+    bool resident_only_ = false;
 };
 
 } // namespace
@@ -328,12 +348,28 @@ std::string SpillGuard::readings(std::uint64_t bytes) const {
     return out;
 }
 
-std::unique_ptr<VramBudgetSource> open_vram_budget_source(int device, bool past_budget) {
+std::uint64_t resident_vram_free(const VramSnapshot& snapshot) noexcept {
+    auto free = snapshot.cuda_free.value_or(snapshot.device_free);
+    auto physical = snapshot.physical_free;
+    if (snapshot.has_budget) {
+        const auto budget = snapshot.local_budget > snapshot.budget_allowance
+                                ? snapshot.local_budget - snapshot.budget_allowance : 0;
+        free = std::min(free, budget > snapshot.local_usage ? budget - snapshot.local_usage : 0);
+        // WDDM's process budget is smaller than the card. Keep that withheld gap physically
+        // free too: budget-free alone misses ballast, while raw NVML free includes the gap.
+        const auto withheld = snapshot.device_total > budget ? snapshot.device_total - budget : 0;
+        if (physical) { *physical = *physical > withheld ? *physical - withheld : 0; }
+    }
+    if (physical) { free = std::min(free, *physical); }
+    return free;
+}
+
+std::unique_ptr<VramBudgetSource> open_vram_budget_source(int device, bool past_budget, bool resident_only) {
     {
         const std::lock_guard<std::mutex> lock(fake_mutex());
-        if (fake_source()) { return std::make_unique<FakeSource>(fake_source()); }
+        if (fake_source()) { return std::make_unique<FakeSource>(fake_source(), resident_only); }
     }
-    return std::make_unique<DeviceSource>(device, past_budget);
+    return std::make_unique<DeviceSource>(device, past_budget, resident_only);
 }
 
 namespace testing {

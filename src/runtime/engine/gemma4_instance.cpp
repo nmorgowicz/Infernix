@@ -3,7 +3,6 @@
 #include "artifact/formats.h"
 #include "artifact/reader.h"
 #include "core/device.h"
-#include "core/temporary_switches.h"
 #include "core/host_memory.h"
 #include "core/startup.h"
 #include "core/vram_budget.h"
@@ -29,10 +28,9 @@ using Clock = std::chrono::steady_clock;
 using models::gemma4::Program;
 using models::gemma4::ProgramOptions;
 
-// INFERNIX_TMP_GEMMA4_KEY_ONLY_KV=1 selects the experimental key-only global layout (default off).
-models::gemma4::KvStorageModel global_kv_storage() {
-    return temporary_switches::flag("INFERNIX_TMP_GEMMA4_KEY_ONLY_KV") ? models::gemma4::KvStorageModel::KeyOnly
-                                                                       : models::gemma4::KvStorageModel::KeyEqualsValue;
+models::gemma4::KvStorageModel global_kv_storage(const EngineOptions& options) {
+    return options.gemma4_key_only_kv ? models::gemma4::KvStorageModel::KeyOnly
+                                     : models::gemma4::KvStorageModel::KeyEqualsValue;
 }
 
 ProgramOptions program_options(const EngineOptions& options, std::uint64_t host_bytes) {
@@ -43,7 +41,7 @@ ProgramOptions program_options(const EngineOptions& options, std::uint64_t host_
     out.kv_capacity_tokens = options.kv_capacity.mode == KvCapacityMode::Automatic ? 0U :
         ((options.kv_capacity.explicit_tokens + 63U) / 64U) * 64U;
     out.kv_cache = options.kv_cache;
-    out.global_kv_storage = global_kv_storage();
+    out.global_kv_storage = global_kv_storage(options);
     out.qk_mode = options.gemma4_qk;
     out.causal_scoring = options.purpose == EnginePurpose::CausalScoring;
     out.draft_tokens = options.speculative.backend == SpeculativeBackend::Mtp ? options.speculative.draft_tokens : 0U;
@@ -88,6 +86,27 @@ ModelMetadata metadata(const models::gemma4::Model& model) {
 
 } // namespace
 
+std::uint32_t resolve_gemma4_auto_context(
+    std::uint32_t upper, std::size_t available, std::size_t headroom,
+    const std::function<std::size_t(std::uint32_t)>& reservation) {
+    constexpr std::uint32_t page = ops::kGemma4KvPageTokens;
+    constexpr std::uint32_t minimum = 9216;
+    upper = std::min(upper, 131072U) / page * page;
+    if (upper >= minimum && available >= headroom) {
+        // Search page indices relative to the usable floor, not tiny contexts whose ring curve
+        // may not exist. Every candidate asks Program::plan_device for its own full reservation.
+        const auto index = largest_fitting_context((upper - minimum) / page + 1U, 1U,
+            [&](std::uint32_t candidate) {
+                return reservation(minimum + (candidate - 1U) * page) <= available - headroom;
+            });
+        if (index) { return minimum + (*index - 1U) * page; }
+    }
+    throw std::runtime_error(
+        "Gemma4 --max-context auto cannot fit the minimum usable 9216 tokens (1024 prompt + "
+        "8192 output) within the artifact/131072 ceiling, resident VRAM and headroom; free GPU "
+        "memory or use a smaller artifact/chunk. Host-paged startup is not permitted");
+}
+
 void validate_gemma4_options(const EngineOptions& options) {
     if (!options.fast_paths || options.lossless || options.reference) {
         throw std::invalid_argument("Gemma4 does not support --reproducible, --lossless or --reference");
@@ -104,6 +123,16 @@ void validate_gemma4_options(const EngineOptions& options) {
     }
     (void)models::gemma4::gemma4_kv_format(options.kv_cache);
     validate_gemma4_qk(options.gemma4_qk, true, options.kv_cache);
+    if (options.gemma4_key_only_kv && options.kv_cache != KvCacheStorage::Fp8E4M3Row256) {
+        throw std::invalid_argument("--gemma4-key-only-kv requires --kv-dtype fp8");
+    }
+    if (options.max_context_auto && options.vram_past_budget) {
+        throw std::invalid_argument("Gemma4 --max-context auto refuses --vram-past-budget; startup must remain resident");
+    }
+    if (options.max_context_auto && options.kv_capacity.mode != KvCapacityMode::Automatic) {
+        throw std::invalid_argument(
+            "Gemma4 --max-context auto requires --kv-capacity auto; an explicit KV capacity stays fixed");
+    }
     const auto& spec = options.speculative;
     if (spec.backend_auto || (spec.backend != SpeculativeBackend::None && spec.backend != SpeculativeBackend::Mtp) ||
         spec.ngram_draft_tokens != 0 || spec.ngram_draft_tokens_auto || spec.ngram_archive_bytes != 0 ||
@@ -154,15 +183,32 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& supplied, DeviceContext&
     const auto start = Clock::now();
     const artifact::Reader reader(options.artifact_path);
     auto load_options = models::load_options(options, models::Architecture::Gemma4);
-    const auto budget = open_vram_budget_source(device.device, options.vram_past_budget);
+    const auto budget = open_vram_budget_source(device.device, options.vram_past_budget, true);
     const auto before = budget->query();
     const std::size_t headroom = static_cast<std::size_t>(
         expert_offload::display_headroom(before.display, false, options.vram_headroom_bytes));
+    const auto require_auto_readings = [&](const VramSnapshot& reading) {
+        if (!options.max_context_auto) { return; }
+        if (!reading.physical_free) {
+            throw std::runtime_error(
+                "Gemma4 --max-context auto needs an NVML physical free-VRAM reading; ensure nvml.dll/"
+                "libnvidia-ml.so.1 is available and the NVIDIA driver can report memory");
+        }
+#ifdef _WIN32
+        if (!reading.has_budget) {
+            throw std::runtime_error(
+                "Gemma4 --max-context auto needs the Windows per-process VRAM budget from DXGI; "
+                "cannot guarantee a resident startup without it");
+        }
+#endif
+    };
 
     auto cold_plan = models::gemma4::plan_load(reader, load_options);
     const std::uint64_t weight_bytes = cold_plan.device_bytes();
     auto geometry = models::gemma4::plan_model(std::move(cold_plan));
-    if (options.max_context > geometry->config().text.max_position_embeddings) {
+    if (options.max_context_auto) {
+        options.max_context = std::min({options.max_context, 131072U, geometry->config().text.max_position_embeddings});
+    } else if (options.max_context > geometry->config().text.max_position_embeddings) {
         throw std::invalid_argument("Gemma4 --max-context exceeds the artifact's native position capacity");
     }
     // The prefix cache's Host tier: explicit --host-context-mib, or auto like Qwen3.8-Flash-Next
@@ -190,7 +236,7 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& supplied, DeviceContext&
                              static_cast<int>(text.kv_heads_of(kind))});
         }
         const auto tier = models::gemma4::prefix_cache_geometry(facts, text.sliding_window, options.kv_cache,
-                                                                global_kv_storage());
+                                                                global_kv_storage(options));
         if (prefix_bytes < tier.host_floor_bytes) {
             const std::uint64_t mib = (tier.host_floor_bytes + (1ULL << 20) - 1) >> 20;
             const std::string refusal =
@@ -205,57 +251,73 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& supplied, DeviceContext&
             return {};
         }
     }
-    const auto available = planned_free_after_weights(before.device_free, weight_bytes);
-    if (options.prefill_chunk_auto) {
-        try {
+    const auto resolve_options = [&](const models::gemma4::Model& model, std::size_t available) {
+        const auto reservation = [&](std::uint32_t context, std::uint32_t chunk) {
+            auto candidate = program_options(options, prefix_bytes);
+            candidate.max_context = context;
+            candidate.prefill_chunk = chunk;
+            candidate.kv_capacity_tokens = ((context + 63U) / 64U) * 64U;
+            const auto curve = Program::plan_device(model, candidate, model.config().text.vocab_size).capacity_curve();
+            return curve.reservation_bytes(candidate.kv_capacity_tokens / curve.main_page_tokens);
+        };
+        if (options.max_context_auto) {
+            options.max_context = resolve_gemma4_auto_context(
+                options.max_context, available, headroom,
+                [&](std::uint32_t context) {
+                    // Maximize context first; then choose the widest chunk that fits it.
+                    return reservation(context, options.prefill_chunk_auto ? 128U : options.prefill_chunk);
+                });
+        }
+        if (options.prefill_chunk_auto) {
             options.prefill_chunk = models::gemma4::auto_prefill_chunk(
                 options.max_context, available, headroom,
-                [&](std::uint32_t chunk, std::uint32_t capacity) {
-                    auto candidate = program_options(options, prefix_bytes);
-                    candidate.prefill_chunk = chunk;
-                    candidate.kv_capacity_tokens = capacity;
-                    const auto curve = Program::plan_device(
-                        *geometry, candidate, geometry->config().text.vocab_size).capacity_curve();
-                    return curve.reservation_bytes(capacity / curve.main_page_tokens);
+                [&](std::uint32_t chunk, std::uint32_t) {
+                    return reservation(options.max_context, chunk);
                 });
-        } catch (const std::runtime_error& error) {
-            if (!planned) { throw; }
-            planned->architecture = "Gemma4ForCausalLM";
-            plan_readings(*planned, device.props.name, before, host_memory_snapshot(), options);
-            planned->vram.weights_bytes = weight_bytes;
-            plan_refuse(*planned, error.what());
-            return {};
         }
-    }
-    const auto request_plan = Program::plan_device(*geometry, program_options(options, prefix_bytes),
-                                                   geometry->config().text.vocab_size);
-    const auto curve = request_plan.capacity_curve();
-    KvCapacityResolution resolution;
+        return Program::plan_device(model, program_options(options, prefix_bytes), model.config().text.vocab_size);
+    };
     if (planned) {
         planned->architecture = "Gemma4ForCausalLM";
         plan_readings(*planned, device.props.name, before, host_memory_snapshot(), options);
         planned->vram.weights_bytes = weight_bytes;
-        planned->vram.workspace_bytes = request_plan.workspace;
-        planned->vram.graph_allowance_bytes = request_plan.graph_allowance;
-        const auto fitted = plan_capacity(*planned, options.kv_capacity, curve, available, headroom);
-        if (!fitted) { return {}; }
-        resolution = *fitted;
-        if (resolution.resolved_tokens < options.max_context) {
-            plan_refuse(*planned, "Gemma4 KV capacity cannot hold --max-context");
-            return {};
+        const auto available = planned_free_after_weights(before.device_free, weight_bytes);
+        try {
+            require_auto_readings(before);
+            const auto request_plan = resolve_options(*geometry, available);
+            planned->vram.workspace_bytes = request_plan.workspace;
+            planned->vram.graph_allowance_bytes = request_plan.graph_allowance;
+            const auto fitted = plan_capacity(*planned, options.kv_capacity, request_plan.capacity_curve(),
+                                               available, headroom);
+            if (!fitted) { return {}; }
+            if (fitted->resolved_tokens < options.max_context) {
+                plan_refuse(*planned, "Gemma4 KV capacity cannot hold --max-context");
+                return {};
+            }
+            auto resolved_options = program_options(options, prefix_bytes);
+            resolved_options.kv_capacity_tokens = fitted->resolved_tokens;
+            planned->vram.kv_bytes = Program::plan_device(
+                *geometry, resolved_options, geometry->config().text.vocab_size).kv;
+            if (options.max_context_auto) { planned->max_context = options.max_context; }
+            plan_ram_totals(*planned, geometry->storage_stats().retained_host_bytes);
+        } catch (const std::exception& error) {
+            plan_refuse(*planned, error.what());
         }
-        auto resolved_options = program_options(options, prefix_bytes);
-        resolved_options.kv_capacity_tokens = resolution.resolved_tokens;
-        const auto final_plan = Program::plan_device(*geometry, resolved_options, geometry->config().text.vocab_size);
-        planned->vram.kv_bytes = final_plan.kv;
-        plan_ram_totals(*planned, geometry->storage_stats().retained_host_bytes);
         return {};
     }
-    resolution = resolve_kv_capacity(options.kv_capacity, curve, available, headroom);
-    if (resolution.resolved_tokens < options.max_context) {
+    require_auto_readings(before);
+    // Cold feasibility refuses a startup that cannot keep even the weights/minimum context
+    // resident, but never freezes auto's ceiling: resolve again after the actual upload.
+    const auto ceiling = options.max_context;
+    const auto requested_chunk = options.prefill_chunk;
+    const auto available = planned_free_after_weights(before.device_free, weight_bytes);
+    const auto cold_request = resolve_options(*geometry, available);
+    const auto fitted = resolve_kv_capacity(options.kv_capacity, cold_request.capacity_curve(), available, headroom);
+    if (fitted.resolved_tokens < options.max_context) {
         throw std::runtime_error("Gemma4 KV capacity cannot hold --max-context; reduce context/chunk or free device memory");
     }
-    options.kv_capacity = KvCapacityPolicy::explicit_capacity(resolution.resolved_tokens);
+    if (options.max_context_auto) { options.max_context = ceiling; }
+    if (options.prefill_chunk_auto) { options.prefill_chunk = requested_chunk; }
     geometry.reset();
     std::unique_ptr<models::gemma4::Model> model;
     {
@@ -270,13 +332,25 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& supplied, DeviceContext&
         }
         upload.complete();
     }
+    const auto actual = budget->query();
+    require_auto_readings(actual);
+    const auto request_plan = resolve_options(*model, actual.device_free);
+    const auto curve = request_plan.capacity_curve();
+    auto resolution = resolve_kv_capacity(options.kv_capacity, curve, actual.device_free, headroom);
+    if (resolution.resolved_tokens < options.max_context) {
+        throw std::runtime_error("Gemma4 KV capacity cannot hold --max-context; reduce context/chunk or free device memory");
+    }
+    SpillGuard runtime_guard(*budget);
+    runtime_guard.begin();
     auto instance = std::make_unique<Gemma4Instance>(std::move(model), options, device);
-    const auto resident_plan = Program::plan_device(*instance->model, program_options(options, prefix_bytes),
-                                                    instance->model->config().text.vocab_size);
-    // Parameters already owns these planned bytes. Add them back to the free reading
-    // while resolving the curve that includes them, rather than charging them twice.
-    const std::size_t runtime_room = budget->query().device_free + instance->parameters.derived_device_bytes();
-    resolution = resolve_kv_capacity(options.kv_capacity, resident_plan.capacity_curve(), runtime_room, headroom);
+    // Parameters already owns these planned bytes. Add them back instead of charging twice.
+    const auto after_parameters = budget->query();
+    require_auto_readings(after_parameters);
+    const std::size_t runtime_room = after_parameters.device_free + instance->parameters.derived_device_bytes();
+    resolution = resolve_kv_capacity(options.kv_capacity, curve, runtime_room, headroom);
+    if (resolution.resolved_tokens < options.max_context) {
+        throw std::runtime_error("Gemma4 resident VRAM changed during startup; cannot hold --max-context and headroom");
+    }
     instance->kv_capacity_resolution = resolution;
     {
         StartupPhaseScope construct(options.startup_observer, StartupPhase::ProgramInitialize);
@@ -284,7 +358,19 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& supplied, DeviceContext&
         construct.complete();
     }
     device.synchronize();
-    instance->kv_capacity_resolution.available_after_startup_bytes = budget->query().device_free;
+    const auto memory = instance->program->memory_summary();
+    const auto allocated = request_plan.fixed_bytes() - request_plan.graph_allowance + memory.cuda_graph_measured_bytes;
+    if (runtime_guard.end(allocated) != 0) {
+        throw std::runtime_error("Gemma4 runtime spilled into host memory: " + runtime_guard.readings(allocated));
+    }
+    const auto after_startup = budget->query();
+    require_auto_readings(after_startup);
+    if (options.max_context_auto && after_startup.device_free < headroom) {
+        throw std::runtime_error(
+            "Gemma4 resident VRAM changed during startup; required headroom is no longer free. "
+            "Free GPU memory and restart; host-paged startup is not permitted");
+    }
+    instance->kv_capacity_resolution.available_after_startup_bytes = after_startup.device_free;
     // The Engine and the request log report the tier actually resolved (--host-context-mib auto).
     if (prefix_auto) { options.context_cache.host_capacity_bytes = prefix_bytes; }
 
@@ -294,7 +380,7 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& supplied, DeviceContext&
     summary.model_name = instance->model->info().name;
     summary.prefill_signature = std::string("gemma4/") +
         (options.kv_cache == KvCacheStorage::Fp8E4M3Row256 ? "fp8" : "bf16") + "-kv" +
-        (global_kv_storage() == models::gemma4::KvStorageModel::KeyOnly ? "/k-only" : "") + "/qk=" +
+        (global_kv_storage(options) == models::gemma4::KvStorageModel::KeyOnly ? "/k-only" : "") + "/qk=" +
         gemma4_qk_name(options.gemma4_qk) + "/cold/chunk=" + std::to_string(options.prefill_chunk);
     std::set<std::string> formats;
     for (const auto& weight : instance->model->weight_data()) {

@@ -45,6 +45,36 @@ int check(bool condition, const char* message) {
 
 int run_tests() {
     int failures      = 0;
+    const auto auto_context = parse({"infernix-cli", "model.ninfer", "--prompt", "x",
+                                     "--max-context", "auto", "--gemma4-key-only-kv"});
+    failures += check(auto_context.max_context_auto && auto_context.max_context == 131072 &&
+                          auto_context.kv_capacity.mode == infernix::KvCapacityMode::Automatic &&
+                          auto_context.gemma4_key_only_kv,
+                      "CLI automatic context/key-only KV options were not retained");
+    const auto numeric_context = parse({"infernix-cli", "model.ninfer", "--prompt", "x",
+                                        "--max-context", "auto", "--max-context", "16384"});
+    failures += check(!numeric_context.max_context_auto && numeric_context.max_context == 16384 &&
+                          !parse({"infernix-cli", "model.ninfer", "--prompt", "x"}).max_context_auto &&
+                          !parse({"infernix-cli", "model.ninfer", "--prompt", "x"}).gemma4_key_only_kv,
+                      "numeric context/defaults must not enable Gemma-only memory choices");
+    const auto memory_config = write_config(
+        "max-context = \"auto\"\ngemma4-key-only-kv = true\n");
+    const auto configured_memory = parse(
+        {"infernix-cli", "model.ninfer", "--prompt", "x", "--config", memory_config});
+    failures += check(configured_memory.max_context_auto && configured_memory.gemma4_key_only_kv,
+                      "CLI config did not carry Gemma memory choices");
+    std::filesystem::remove(memory_config);
+    failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--max-context", "16384",
+                              "--max-context", "auto"}).max_context_auto,
+                      "last automatic context must replace numeric state");
+    failures += check(rejects([] {
+                          (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x",
+                                       "--max-context", "auto", "--kv-capacity", "131072"});
+                      }), "automatic context must refuse fixed explicit KV capacity");
+    failures += check(rejects([] {
+                          (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x",
+                                       "--gemma4-key-only-kv=1"});
+                      }), "key-only KV must be a valueless opt-in flag");
     const auto auto_chunk = parse({"infernix-cli", "model.ninfer", "--prompt", "x",
                                     "--prefill-chunk", "auto"});
     failures += check(auto_chunk.prefill_chunk_auto && auto_chunk.prefill_chunk == 0 &&

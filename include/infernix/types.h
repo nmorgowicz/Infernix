@@ -760,6 +760,13 @@ struct EngineOptions {
     EnginePurpose purpose              = EnginePurpose::Generation;
     int device                         = 0;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
+    // Gemma4 only (--max-context auto): max_context is the upper ceiling (at most 131072/native).
+    // Requires automatic KV capacity. Startup resolves from resident free VRAM, page aligned,
+    // or refuses below 9216 tokens.
+    // Engine::options() reports that resolved max_context; numeric contexts never shrink.
+    bool max_context_auto = false;
+    // Gemma4 only, opt-in: global FP8 K planes alone; reconstruct V from K. Sliding KV stays BF16.
+    bool gemma4_key_only_kv = false;
     // Startup-fixed runtime YaRN override, finite [1,4]; 1 preserves native RoPE.
     // Extends only the allowed ceiling, never max_context itself or artifact metadata.
     float rope_yarn_factor             = 1.0F;

@@ -58,6 +58,14 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
     if (options.max_context == 0) {
         throw std::invalid_argument("Engine max_context must be nonzero");
     }
+    if (architecture != models::Architecture::Gemma4) {
+        if (options.max_context_auto) {
+            throw std::invalid_argument("--max-context auto is supported only for Gemma4");
+        }
+        if (options.gemma4_key_only_kv) {
+            throw std::invalid_argument("--gemma4-key-only-kv is supported only for Gemma4");
+        }
+    }
     switch (options.kv_capacity.mode) {
     case KvCapacityMode::Explicit:
         if (options.kv_capacity.explicit_tokens == 0) {
@@ -462,7 +470,8 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     case EnginePurpose::CausalScoring:
         options.max_concurrency      = 1;
         options.max_pending_requests = 1;
-        options.kv_capacity         = KvCapacityPolicy::explicit_capacity(options.max_context);
+        options.kv_capacity         = options.max_context_auto ? KvCapacityPolicy::automatic()
+                                                               : KvCapacityPolicy::explicit_capacity(options.max_context);
         options.speculative          = {};
         options.enable_vision        = false;
         options.use_cuda_graph       = false;

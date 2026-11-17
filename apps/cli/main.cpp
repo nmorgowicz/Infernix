@@ -410,6 +410,8 @@ int main(int argc, char** argv) {
         engine_options.expert_pin_bytes         = cli.expert_pin_bytes;
         engine_options.device                   = cli.device;
         engine_options.max_context              = cli.max_context;
+        engine_options.max_context_auto         = cli.max_context_auto;
+        engine_options.gemma4_key_only_kv        = cli.gemma4_key_only_kv;
         engine_options.rope_yarn_factor         = cli.rope_yarn_factor;
         engine_options.kv_capacity              = cli.kv_capacity;
         engine_options.vram_headroom_bytes      = cli.vram_headroom_bytes;

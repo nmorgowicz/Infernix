@@ -98,6 +98,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--expert-csf", false},
     ServeOptionArity{"--kv-dtype"},
     ServeOptionArity{"--gemma4-qk"},
+    ServeOptionArity{"--gemma4-key-only-kv", false},
     ServeOptionArity{"--logits-dtype"},
     ServeOptionArity{"--spec"},
     ServeOptionArity{"--draft-tokens"},
@@ -297,7 +298,10 @@ std::string serve_usage_text(const char* argv0) {
            "                             plan's error says why), 1 no plan could be made\n"
            "\n"
            "MODEL & CONTEXT\n"
-           "  --max-context N            max context tokens per request (default 8192)\n"
+           "  --max-context N|auto       max context tokens per request (default 8192)\n"
+           "                             numeric stays fixed; Gemma4 auto fits resident VRAM\n"
+           "                             less headroom, page aligned, 9216..131072/native;\n"
+           "                             needs --kv-capacity auto\n"
            "  --max-concurrency N        max concurrent sequences, 1-8 (default 1)\n"
            "  --prefill-chunk N|auto     positive multiple of 128; auto is Gemma4-only\n"
            "                             (default: Gemma4 128, offloaded Qwen 16384, other Qwen 1024)\n"
@@ -492,6 +496,8 @@ std::string serve_usage_text(const char* argv0) {
            "  --gemma4-qk M              bf16 (default) | fp8: Gemma4 global-layer attention QK\n"
            "                             precision; fp8 needs --kv-dtype fp8 on a Gemma4\n"
            "                             artifact and is refused for other model families\n"
+           "  --gemma4-key-only-kv       Gemma4 only: global FP8 K alone, reconstruct V\n"
+           "                             (approximate, default off; needs --kv-dtype fp8)\n"
            "  --logits-dtype T           fp32 (default) | bf16: the head's logits the sampler,\n"
            "                             greedy choice, draft acceptance and constraints read;\n"
            "                             bf16 rounds each once, as Transformers returns them\n"
@@ -833,8 +839,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.rope_yarn_factor =
                 parse_float_in(require_value("--rope-yarn-factor"), "rope-yarn-factor", 1.0F, 4.0F);
         } else if (arg == "--max-context") {
-            options.max_context = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--max-context"), "max-context"));
+            const auto context = require_value("--max-context");
+            options.max_context_auto = std::string_view(context) == "auto";
+            options.max_context = options.max_context_auto ? 131072U : static_cast<std::uint32_t>(
+                parse_nonnegative_int(context, "max-context"));
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(require_value("--kv-capacity"));
             kv_capacity_explicit = true;
@@ -1131,6 +1139,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
         } else if (arg == "--gemma4-qk") {
             options.gemma4_qk = parse_gemma4_qk(require_value("--gemma4-qk"));
+        } else if (arg == "--gemma4-key-only-kv") {
+            options.gemma4_key_only_kv = true;
         } else if (arg == "--logits-dtype") {
             options.logits_dtype = product::parse_logits_dtype(require_value("--logits-dtype"));
         } else if (arg == "--spec") {
@@ -1291,7 +1301,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         // The prefix cache turns every Device page no active request holds into block cache,
         // so it sizes the KV pool to free VRAM unless a capacity is given. Without a prefix cache
         // pages beyond the active requests would sit unused.
-        options.kv_capacity = options.allow_prefix_reuse
+        options.kv_capacity = options.allow_prefix_reuse || options.max_context_auto
                                   ? KvCapacityPolicy::automatic()
                                   : KvCapacityPolicy::explicit_capacity(options.max_context);
     }
@@ -1352,7 +1362,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--port must be in [1,65535]");
     }
     if (options.max_context == 0) { throw std::invalid_argument("--max-context must be positive"); }
-    if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
+    if (options.max_context_auto && options.kv_capacity.mode != KvCapacityMode::Automatic) {
+        throw std::invalid_argument("--max-context auto requires --kv-capacity auto");
+    }
+    if (!options.max_context_auto && options.kv_capacity.mode == KvCapacityMode::Explicit &&
         options.kv_capacity.explicit_tokens < options.max_context) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }

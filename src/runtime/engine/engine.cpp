@@ -944,7 +944,8 @@ DeviceMemoryReading Engine::device_memory() const {
         return {};
     }
     if (impl_->vram_source == nullptr) {
-        impl_->vram_source = open_vram_budget_source(impl_->options.device, impl_->options.vram_past_budget);
+        impl_->vram_source = open_vram_budget_source(impl_->options.device, impl_->options.vram_past_budget,
+                                                    impl_->architecture == models::Architecture::Gemma4);
     }
     const VramSnapshot reading = impl_->vram_source->query();
     DeviceMemoryReading out;

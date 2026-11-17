@@ -51,6 +51,40 @@ SequenceCapacityCurve curve_for(std::uint32_t context, std::uint32_t lanes) {
 int main() {
     int failures = 0;
 
+    // Gemma4 resident room: CUDA and NVML device-wide free, OS budget-free and the withheld
+    // total-vs-budget gap all bind. The legacy source keeps its device_free policy unchanged.
+    {
+        VramSnapshot snapshot;
+        snapshot.device_total = 32607;
+        snapshot.device_free = 31419;
+        snapshot.cuda_free = 31419;
+        snapshot.physical_free = 16000;
+        snapshot.has_budget = true;
+        snapshot.local_budget = 31419;
+        failures += check(resident_vram_free(snapshot) == 14812,
+                          "ballast must reduce physical room, including the WDDM withheld gap");
+        snapshot.local_usage = 20000;
+        failures += check(resident_vram_free(snapshot) == 11419, "OS process budget-free must also bind");
+        snapshot.cuda_free = 4000;
+        failures += check(resident_vram_free(snapshot) == 4000, "raw CUDA free must also bind");
+        snapshot.cuda_free = 31419;
+        snapshot.local_usage = 0;
+        snapshot.local_budget += 640;
+        snapshot.budget_allowance = 640;
+        failures += check(resident_vram_free(snapshot) == 14812, "past-budget allowance must not enable paging");
+        snapshot.physical_free = 100;
+        failures += check(resident_vram_free(snapshot) == 0, "withheld gap must saturate, not wrap");
+        snapshot.physical_free.reset();
+        snapshot.has_budget = false;
+        failures += check(resident_vram_free(snapshot) == 31419, "unknown NVML/OS facts retain CUDA's bound");
+        snapshot.physical_free = 12000;
+        infernix::testing::set_vram_budget_source([snapshot] { return snapshot; });
+        failures += check(open_vram_budget_source(0)->query().device_free == 31419 &&
+                              open_vram_budget_source(0, false, true)->query().device_free == 12000,
+                          "resident-only source policy must not change other families' defaults");
+        infernix::testing::set_vram_budget_source({});
+    }
+
     // ---- an automatic capacity that fits: the start's resolution, and the device totals ----
     {
         EnginePlan plan;

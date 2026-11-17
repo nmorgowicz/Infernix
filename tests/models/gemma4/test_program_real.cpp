@@ -470,9 +470,57 @@ void public_fp8(const char* artifact) {
     const auto memory = engine.memory_summary();
     require(memory.kv_cache == KvCacheStorage::Fp8E4M3Row256 && memory.gemma4_kv.has_value() &&
             memory.gemma4_kv->qk_mode == ops::Gemma4QkMode::Fp8, "the Engine memory summary lost the FP8 settings");
+    require(!memory.gemma4_kv->global_key_only && !engine.options().max_context_auto,
+            "default numeric FP8 route silently enabled an opt-in memory choice");
     require(engine.load_summary().prefill_signature.find("fp8-kv/qk=fp8") != std::string::npos,
             "the load summary does not identify the FP8 KV and QK route");
     std::puts("PASS public FP8 KV/FP8-QK Engine and QK refusal");
+}
+
+void public_auto_context(const char* artifact) {
+    EngineOptions options;
+    options.artifact_path = artifact;
+    options.max_context = 16384;
+    options.max_context_auto = true;
+    options.kv_capacity = KvCapacityPolicy::automatic();
+    options.gemma4_key_only_kv = true;
+    options.prefill_chunk = 128;
+    options.kv_cache = KvCacheStorage::Fp8E4M3Row256;
+    options.gemma4_qk = ops::Gemma4QkMode::Fp8;
+    options.logits_dtype = LogitsDtype::BF16;
+    options.context_cache.enabled = false;
+    options.vram_headroom_bytes = 1ULL << 30;
+    const auto plan = Engine::plan(options);
+    require(plan.fits && plan.max_context && *plan.max_context >= 9216 &&
+                *plan.max_context <= options.max_context && *plan.max_context % 64 == 0,
+            "auto-context plan did not resolve a page-aligned usable resident context");
+    {
+        Engine engine(options);
+        const auto resolved = engine.options().max_context;
+        const auto memory = engine.memory_summary();
+        require(resolved >= 9216 && resolved <= options.max_context && resolved % 64 == 0 &&
+                    memory.max_context == resolved && memory.kv_capacity == resolved,
+                "Engine/frontend/Program did not publish the resolved automatic context");
+        require(memory.gemma4_kv && memory.gemma4_kv->global_key_only &&
+                    engine.load_summary().prefill_signature.find("/k-only/") != std::string::npos,
+                "explicit public key-only option did not select/report the native layout");
+        require(!engine.generate(engine.prepare_tokens(tokens(257, 21)), request()).generated_token_ids.empty(),
+                "automatic key-only Engine generated nothing");
+        bool refused = false;
+        try { (void)engine.prepare_tokens(tokens(resolved + 1U, 21)); }
+        catch (const RequestError& error) {
+            refused = error.kind() == RequestErrorKind::ContextLengthExceeded &&
+                       error.context_length() && error.context_length()->max_context == resolved;
+        }
+        require(refused, "context-length refusal did not carry the resolved automatic limit");
+    }
+    // Numeric context retains fail-closed semantics, even when an automatic KV pool would fit a
+    // smaller context. An impossible headroom forces the plan's existing refusal route.
+    options.max_context_auto = false;
+    options.vram_headroom_bytes = static_cast<std::size_t>(-1);
+    const auto refused = Engine::plan(options);
+    require(!refused.fits && !refused.error.empty(), "explicit numeric context silently shrank to fit");
+    std::puts("PASS public automatic resident context, explicit key-only KV, publication and fixed-context refusal");
 }
 // G7: FP8 KV at capacity 131072 with a 124,905-token prompt (61 chunks of 2048), for both QK modes. A
 // partial forward in a late prefill chunk or in the first decode at depth, and an aborted pending decode,
@@ -559,6 +607,7 @@ int main() {
         public_recovery(artifact);
         fp8_kv_program(artifact);
         public_fp8(artifact);
+        public_auto_context(artifact);
         const char* deep = std::getenv("INFERNIX_GEMMA4_DEEP");
         if (deep != nullptr && std::string(deep) == "1") { deep_fp8(artifact); }
         return 0;

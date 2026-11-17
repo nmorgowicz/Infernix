@@ -66,6 +66,8 @@ struct ServeOptions {
     std::filesystem::path route_trace;            // empty => no trace written
     float rope_yarn_factor             = 1.0F;
     std::uint32_t max_context          = 8192;
+    bool max_context_auto = false; // Gemma4 only; max_context is the upper ceiling
+    bool gemma4_key_only_kv = false;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(8192);
     std::optional<std::size_t> vram_headroom_bytes; // empty: the model's automatic headroom
     bool vram_past_budget = false;

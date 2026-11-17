@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace infernix {
@@ -23,6 +24,9 @@ struct VramSnapshot {
     // several CUDA devices visible, the budget less this process's usage instead.
     std::size_t device_free  = 0;
     std::size_t device_total = 0;
+    // Unmodified CUDA and physical NVML free readings. Optional: absent in synthetic/older sources.
+    std::optional<std::uint64_t> cuda_free;
+    std::optional<std::uint64_t> physical_free;
     // Windows WDDM: this process's local-memory budget and usage (DXGI QueryVideoMemoryInfo).
     bool has_budget            = false;
     std::uint64_t local_budget = 0;
@@ -68,7 +72,11 @@ public:
 // effective budget by the same amount. Memory past the budget may be demoted to system memory
 // when another program needs VRAM. Without DXGI or NVML the allowance is 0.
 inline constexpr std::uint64_t kPastBudgetMargin = 128ULL << 20;
-[[nodiscard]] std::unique_ptr<VramBudgetSource> open_vram_budget_source(int device, bool past_budget = false);
+// resident_only keeps device_free below CUDA, physical NVML (less the total-vs-OS-budget gap)
+// and the unextended OS budget's free bytes. Ballast counts; pageable allowance never does.
+[[nodiscard]] std::uint64_t resident_vram_free(const VramSnapshot& snapshot) noexcept;
+[[nodiscard]] std::unique_ptr<VramBudgetSource> open_vram_budget_source(
+    int device, bool past_budget = false, bool resident_only = false);
 
 // A device allocation step that the driver placed partly in system memory (the Windows WDDM sysmem
 // fallback) lowers device free memory by less than it allocated. The bytes of a step of `bytes`

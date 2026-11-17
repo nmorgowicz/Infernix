@@ -108,6 +108,7 @@ constexpr std::array kCliOptions{
     CliOption{"--expert-csf", false},
     CliOption{"--kv-dtype"},
     CliOption{"--gemma4-qk"},
+    CliOption{"--gemma4-key-only-kv", false},
     CliOption{"--logits-dtype"},
     CliOption{"--spec"},
     CliOption{"--draft-tokens"},
@@ -184,7 +185,7 @@ ReasoningEffort parse_reasoning_effort(std::string_view text) {
 std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.infernix> (--prompt <text>|--messages <messages.json>)\n"
-           "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N|auto] [--max-new N]\n"
+           "       [--max-context N|auto] [--kv-capacity N|auto] [--prefill-chunk N|auto] [--max-new N]\n"
            "       [--device N]\n"
            "       [--kv-dtype bf16|bf16p|int8|fp8|nvfp4|k8v4|vq2|k4v2] [--logits-dtype fp32|bf16]\n"
            "       [--gemma4-qk bf16|fp8]\n"
@@ -225,7 +226,9 @@ std::string usage_text(const char* argv0) {
            "                           line override the file\n"
            "\n"
            "CONTEXT\n"
-           "  --max-context N          max context tokens (default 2048)\n"
+           "  --max-context N|auto     max context tokens (default 2048); numeric stays fixed\n"
+           "                           Gemma4 auto fits resident VRAM less headroom, page\n"
+           "                           aligned, 9216..131072/native; needs --kv-capacity auto\n"
            "  --rope-yarn-factor F     startup-fixed YaRN, finite [1,4] (default 1);\n"
            "                           extends allowed ceiling only, not --max-context\n"
            "  --prefill-chunk N|auto   positive multiple of 128; auto is Gemma4-only\n"
@@ -288,6 +291,8 @@ std::string usage_text(const char* argv0) {
            "  --gemma4-qk M            bf16 (default) | fp8: Gemma4 global-layer attention QK\n"
            "                           precision; fp8 needs --kv-dtype fp8 on a Gemma4 artifact\n"
            "                           and is refused for other model families\n"
+           "  --gemma4-key-only-kv     Gemma4 only: store global FP8 K alone, reconstruct V\n"
+           "                           (approximate, default off; needs --kv-dtype fp8)\n"
            "  --logits-dtype T         fp32 (default) | bf16: the head's logits the sampler,\n"
            "                           greedy choice, draft acceptance and scoring read;\n"
            "                           bf16 rounds each once, as Transformers returns them\n"
@@ -490,7 +495,9 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--rope-yarn-factor") {
             options.rope_yarn_factor = parse_float(value(arg), "rope-yarn-factor", 1.0F, 4.0F);
         } else if (arg == "--max-context") {
-            options.max_context = parse_u32(value(arg), "max-context");
+            const auto context = value(arg);
+            options.max_context_auto = std::string_view(context) == "auto";
+            options.max_context = options.max_context_auto ? 131072U : parse_u32(context, "max-context");
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(value(arg));
             kv_capacity_explicit = true;
@@ -554,6 +561,8 @@ Options parse_options(int argc, char** argv) {
             options.kv_cache = parse_kv_cache(value(arg));
         } else if (arg == "--gemma4-qk") {
             options.gemma4_qk = parse_gemma4_qk(value(arg));
+        } else if (arg == "--gemma4-key-only-kv") {
+            options.gemma4_key_only_kv = true;
         } else if (arg == "--logits-dtype") {
             options.logits_dtype = product::parse_logits_dtype(value(arg));
         } else if (arg == "--spec") {
@@ -706,7 +715,8 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("select only one of --grammar-file, --json-object, "
                                     "--json-schema-file, --regex or --choice");
     if (!kv_capacity_explicit) {
-        options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
+        options.kv_capacity = options.max_context_auto ? KvCapacityPolicy::automatic()
+                                                      : KvCapacityPolicy::explicit_capacity(options.max_context);
     }
 
     const bool has_prompt   = !options.prompt.empty();
@@ -720,7 +730,10 @@ Options parse_options(int argc, char** argv) {
     if (options.prefill_split_workspace_mib > kMaximumPrefillSplitWorkspaceMiB) {
         throw std::invalid_argument("--prefill-split-workspace-mib must be in [0,16384]");
     }
-    if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
+    if (options.max_context_auto && options.kv_capacity.mode != KvCapacityMode::Automatic) {
+        throw std::invalid_argument("--max-context auto requires --kv-capacity auto");
+    }
+    if (!options.max_context_auto && options.kv_capacity.mode == KvCapacityMode::Explicit &&
         options.kv_capacity.explicit_tokens < options.max_context) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }

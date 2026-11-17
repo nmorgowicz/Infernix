@@ -365,6 +365,8 @@ infernix::EngineOptions make_engine_options(const ServeOptions& options, Startup
     engine_options.route_trace_path        = options.route_trace;
     engine_options.device                   = options.device;
     engine_options.max_context              = options.max_context;
+    engine_options.max_context_auto         = options.max_context_auto;
+    engine_options.gemma4_key_only_kv        = options.gemma4_key_only_kv;
     engine_options.rope_yarn_factor          = options.rope_yarn_factor;
     engine_options.kv_capacity              = options.kv_capacity;
     engine_options.vram_headroom_bytes      = options.vram_headroom_bytes;
@@ -416,6 +418,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     : options_(std::move(options)) {
     engine_ = std::make_unique<infernix::Engine>(
         make_engine_options(options_, std::move(startup_observer), std::move(diagnostic_observer)));
+    options_.max_context = engine_->options().max_context;
     if (!options_.request_log_jsonl.empty()) {
         // The bytes, not the validated text: a window starts and ends on a token, so its first and
         // last character are usually cut, and the tracker replaces those bytes itself.

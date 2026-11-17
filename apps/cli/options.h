@@ -38,6 +38,8 @@ struct Options {
     std::uint32_t max_new        = 128;
     float rope_yarn_factor       = 1.0F;
     std::uint32_t max_context    = 2048;
+    bool max_context_auto = false; // Gemma4 only; max_context is the upper ceiling
+    bool gemma4_key_only_kv = false;
     KvCapacityPolicy kv_capacity = KvCapacityPolicy::explicit_capacity(2048);
     std::optional<std::size_t> vram_headroom_bytes; // empty: the model's automatic headroom
     bool vram_past_budget = false;

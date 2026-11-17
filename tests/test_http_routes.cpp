@@ -28,6 +28,16 @@ class AliasBackend final : public infernix::serve::test::LoopbackBackend {
 public:
     AliasBackend() : LoopbackBackend("artifact-gemma") {}
 
+    const infernix::EngineOptions& engine_options() const override {
+        static const auto resolved = [] {
+            infernix::EngineOptions options;
+            options.max_context_auto = true;
+            options.max_context = 32768;
+            return options;
+        }();
+        return resolved;
+    }
+
     infernix::serve::PreparedRequest prepare(
         const infernix::serve::GenerationRequest& request,
         infernix::serve::GenerationConsumerMode mode,
@@ -58,6 +68,8 @@ int test_model_aliases() {
         AliasBackend backend;
         infernix::serve::ServeOptions options;
         options.model_id_override = "131k";
+        options.max_context_auto = true;
+        options.max_context = 131072;
         options.any_model_name = any_name;
         options.log_stats_interval_ms = 0;
         options.log_stats_panel = false;
@@ -77,6 +89,13 @@ int test_model_aliases() {
                               Json::parse(catalog->body).at("data").size() == 1 &&
                               Json::parse(catalog->body).at("data")[0].at("id") == "131k",
                           "model catalog must list only the public alias");
+        failures += check(catalog && catalog->status == 200 &&
+                              Json::parse(catalog->body).at("data")[0].at("max_model_len") == 32768,
+                          "model catalog must publish resolved runtime context, not the requested auto ceiling");
+        const auto public_model = client.Get("/v1/models/131k");
+        failures += check(public_model && public_model->status == 200 &&
+                              Json::parse(public_model->body).at("max_model_len") == 32768,
+                          "single-model discovery must publish resolved runtime context");
         const auto private_model = client.Get("/v1/models/artifact-gemma");
         failures += check(private_model && private_model->status == 404,
                           "model catalog must not expose the artifact name behind an alias");

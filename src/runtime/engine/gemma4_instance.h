@@ -7,6 +7,7 @@
 #include "infernix/types.h"
 #include "runtime/contract/resources.h"
 
+#include <functional>
 #include <memory>
 
 namespace infernix { struct DeviceContext; }
@@ -40,6 +41,12 @@ struct ConstructedGemma4 {
 
 // P5 is a real cold-cache, single-lane route with BF16 or FP8 global KV. Other routes must fail before loading.
 void validate_gemma4_options(const EngineOptions& options);
+
+// Page-aligned largest context, rebuilding the native reservation for each candidate (workspace,
+// tables and rings included). The callback returns bytes for the complete candidate context.
+[[nodiscard]] std::uint32_t resolve_gemma4_auto_context(
+    std::uint32_t upper, std::size_t available, std::size_t headroom,
+    const std::function<std::size_t(std::uint32_t)>& reservation);
 
 // Planning uses the same model-aware reservation curve without uploading weights or
 // constructing Parameters/Program. A memory refusal populates plan.fits/error.

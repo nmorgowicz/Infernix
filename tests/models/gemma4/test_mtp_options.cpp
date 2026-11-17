@@ -1,3 +1,4 @@
+#include "core/temporary_switches.h"
 #include "runtime/engine/gemma4_instance.h"
 #include "runtime/engine/model_instance.h"
 
@@ -46,6 +47,75 @@ int refuses(EngineOptions options, const char* message) {
 
 int run() {
     int failures = 0;
+
+    failures += check(!EngineOptions{}.max_context_auto && !EngineOptions{}.gemma4_key_only_kv,
+                      "Gemma4 memory choices must remain opt-in");
+    {
+        bool removed = false;
+        try { (void)infernix::temporary_switches::flag("INFERNIX_TMP_GEMMA4_KEY_ONLY_KV"); }
+        catch (const std::logic_error&) { removed = true; }
+        failures += check(removed, "the obsolete key-only environment switch is still registered");
+    }
+    {
+        auto options = mtp_options();
+        options.gemma4_key_only_kv = true;
+        failures += refuses(options, "key-only KV accepted BF16 globals");
+        options.kv_cache = infernix::KvCacheStorage::Fp8E4M3Row256;
+        failures += check(normalize(options).gemma4_key_only_kv, "normalization dropped explicit key-only KV");
+        options.max_context_auto = true;
+        options.max_context = 131072;
+        failures += refuses(options, "automatic context accepted an explicit KV capacity");
+        options.kv_capacity = infernix::KvCapacityPolicy::automatic();
+        failures += check(normalize(options).max_context_auto, "normalization dropped automatic context");
+        options.vram_past_budget = true;
+        failures += refuses(options, "automatic context allowed pageable past-budget startup");
+    }
+    for (const auto architecture : {infernix::models::Architecture::Qwen3_5,
+                                    infernix::models::Architecture::Qwen4Exp}) {
+        for (const bool automatic : {false, true}) {
+            auto options = mtp_options();
+            options.artifact_path = "unused.infernix";
+            options.max_context_auto = automatic;
+            options.gemma4_key_only_kv = !automatic;
+            bool refused = false;
+            try { infernix::runtime::validate_engine_options(options, architecture); }
+            catch (const std::invalid_argument&) { refused = true; }
+            failures += check(refused, "a non-Gemma family accepted a Gemma-only memory choice");
+        }
+    }
+    // Non-affine context-dependent reservation: workspace/table steps belong to each candidate,
+    // not to one high-ceiling curve reused with a smaller KV count.
+    const auto reservation = [](std::uint32_t context) {
+        return std::size_t{2000} + context * 3ULL + ((context + 4095U) / 4096U) * 700ULL;
+    };
+    for (const auto boundary : {9216U, 12288U, 12352U, 32768U, 131072U}) {
+        std::uint32_t calls = 0;
+        const auto resolved = infernix::runtime::resolve_gemma4_auto_context(
+            262144, reservation(boundary) + 1000, 1000,
+            [&](std::uint32_t candidate) {
+                ++calls;
+                failures += check(candidate >= 9216 && candidate <= 131072 && candidate % 64 == 0,
+                                  "auto context planned outside the page-aligned usable range");
+                return reservation(candidate);
+            });
+        failures += check(resolved == boundary && calls <= 15,
+                          "auto context did not find the exact bounded-search resident fit");
+    }
+    failures += check(infernix::runtime::resolve_gemma4_auto_context(
+                          12345, reservation(131072), 0, reservation) == 12288,
+                      "native/explicit upper ceiling must round down to a page");
+    for (const auto available : {std::size_t{999}, static_cast<std::size_t>(reservation(9216) + 999)}) {
+        bool refused = false;
+        try { (void)infernix::runtime::resolve_gemma4_auto_context(131072, available, 1000, reservation); }
+        catch (const std::runtime_error&) { refused = true; }
+        failures += check(refused, "auto context shrank below 9216 or consumed required headroom");
+    }
+    {
+        bool refused = false;
+        try { (void)infernix::runtime::resolve_gemma4_auto_context(9215, reservation(131072), 0, reservation); }
+        catch (const std::runtime_error&) { refused = true; }
+        failures += check(refused, "auto context accepted an artifact ceiling below the usable minimum");
+    }
 
     for (std::uint32_t width = 1; width <= 7; ++width) {
         auto options = mtp_options();
