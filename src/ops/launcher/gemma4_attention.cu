@@ -300,6 +300,10 @@ void gemma4_attention_launch(const Tensor& q, const Gemma4CacheView& cache,
                                             stats, stream);
         return;
     }
+    if (cache.value_source == Gemma4ValueSource::Key) {
+        throw std::invalid_argument(
+            "gemma4_attention: key-derived values need the D=512 decode (group <= 8) or tensor-core kernel");
+    }
     if (q.ne[0] == 256) {
         launch<256, Gemma4KvFormat::BFloat16>(q, cache, positions, window, scale, out, partial,
                                               stats, stream);

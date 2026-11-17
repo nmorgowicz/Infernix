@@ -152,5 +152,54 @@ __device__ __forceinline__ void gemma4_expand_quant_stage(
     }
 }
 
+// Gemma4ValueSource::Key: expands a prefetched tile of K codes (keys k0 .. k0 + Bc - 1) as the V
+// tile, with gemma4_expand_quant_stage's barriers and swizzled layout. Each value is FP32(code) x
+// FP32(scale); dimensions [0, 128) pair d with d + 64 and are turned back by gemma4_unrope_pair at
+// the key's position (`frequency` holds the 64 pair frequencies); every value is then multiplied by
+// value_scale and rounded once to BF16. Chunk c holds dimensions 8 (c % 64) ..; its partner chunk
+// (d +/- 64) is c ^ 8, i.e. lane ^ 8 of the same warp, so every lane joins the exchange.
+template <int Bc, int Threads>
+__device__ __forceinline__ void gemma4_expand_key_values(
+    const Gemma4QuantStage<512, Bc, Threads>& stage, __nv_bfloat16* dst, int k0,
+    const float* frequency, float value_scale, int tid) {
+    static_assert(Threads % 64 == 0, "a row's chunks must map onto whole warps");
+#pragma unroll
+    for (int i = 0; i < Gemma4QuantStage<512, Bc, Threads>::Chunks; ++i) {
+        const int chunk = tid + i * Threads;
+        const int key   = chunk / 64;
+        const int d     = (chunk % 64) * 8;
+        const uint2 partner_codes{__shfl_xor_sync(0xffffffffU, stage.codes[i].x, 8),
+                                  __shfl_xor_sync(0xffffffffU, stage.codes[i].y, 8)};
+        const float row_scale = stage.valid[i] ? __half2float(stage.scale[i]) : 0.0f;
+        const auto* own   = reinterpret_cast<const std::uint8_t*>(&stage.codes[i]);
+        const auto* other = reinterpret_cast<const std::uint8_t*>(&partner_codes);
+        float values[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            __nv_fp8_e4m3 code;
+            code.__x = own[j];
+            values[j] = __fmul_rn(static_cast<float>(code), row_scale);
+        }
+        if (d < kGemma4KeyValueRotaryDim) {
+            const bool first = d < kGemma4KeyValueRotaryDim / 2;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                __nv_fp8_e4m3 code;
+                code.__x = other[j];
+                const float partner = __fmul_rn(static_cast<float>(code), row_scale);
+                float a, b;
+                gemma4_unrope_pair(first ? values[j] : partner, first ? partner : values[j], k0 + key,
+                                   frequency[(d % (kGemma4KeyValueRotaryDim / 2)) + j], a, b);
+                values[j] = first ? a : b;
+            }
+        }
+        alignas(16) __nv_bfloat16 out[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { out[j] = __float2bfloat16_rn(__fmul_rn(values[j], value_scale)); }
+        __nv_bfloat16* p = dst + key * 512 + causal_swizzle(key, d);
+        store_vec(p, stage.valid[i] ? *reinterpret_cast<const int4*>(out) : make_int4(0, 0, 0, 0));
+    }
+}
+
 
 } // namespace infernix::ops::detail

@@ -28,6 +28,9 @@ namespace infernix::ops {
  * using FP16-rounded bounded scales before reciprocal/encoding. A row-half containing
  * any nonfinite value stores canonical NaN codes with unit scale (including infinities);
  * finite rows are the supported domain. q_out stays BF16 [D,Hq,T]. No workspace.
+ * With Gemma4ValueSource::Key the op writes K only (no V planes exist); it then requires v_from_k
+ * and the cache's rotary_dim/rope_theta equal to these, and the caller guarantees that k_norm is
+ * one constant c with cache.value_scale == 1 / c (the condition under which V = unrope(K) / c).
  */
 void gemma4_qkv_prep(const Tensor& qkv, const Tensor& q_norm, const Tensor& k_norm,
                      const Tensor& positions, int rotary_dim, float theta, float eps, bool v_from_k,

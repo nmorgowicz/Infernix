@@ -55,7 +55,8 @@ struct BlockLayout {
 };
 
 [[nodiscard]] BlockLayout plan_block_layout(std::span<const KvLayerFact> layers,
-                                            KvCacheStorage global_format);
+                                            KvCacheStorage global_format,
+                                            KvStorageModel global_storage);
 
 struct ImagePart {
     std::uint32_t group      = 0; // sliding layer ordinal

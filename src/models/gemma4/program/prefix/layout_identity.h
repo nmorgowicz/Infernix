@@ -30,7 +30,7 @@ struct LayoutIdentity {
     DType code_dtype = DType::BF16;
     std::uint32_t scale_group_columns = 0;                        // grp (kGemma4KvFp8Group when scaled)
     std::uint32_t scale_element_bytes = 0;                        // scale width (2 for FP16)
-    // Storage model (K==V today; the value-only flag makes a future layout its own identity).
+    // Storage model: K==V, the opt-in key-only global layout, or the unimplemented value-only one.
     KvStorageModel storage = KvStorageModel::KeyEqualsValue;
     // QK mode of the global layers (sliding layers always retain BF16 QK).
     ops::Gemma4QkMode qk_mode = ops::Gemma4QkMode::BFloat16;
@@ -93,7 +93,9 @@ struct LayoutIdentity {
     [[nodiscard]] std::string describe() const {
         return "kv=" + std::to_string(static_cast<int>(kv_format)) +
                (scale_group_columns != 0 ? "/row" + std::to_string(scale_group_columns) : "") +
-               (storage == KvStorageModel::KeyEqualsValue ? "" : "/value-only") +
+               (storage == KvStorageModel::KeyEqualsValue ? ""
+                : storage == KvStorageModel::KeyOnly      ? "/key-only"
+                                                          : "/value-only") +
                "/qk=" + std::to_string(static_cast<int>(qk_mode)) +
                "/global=" + std::to_string(global_layers) + "x" + std::to_string(global_kv_heads) +
                "x" + std::to_string(global_head_dim) +
@@ -107,13 +109,14 @@ struct LayoutIdentity {
 
 // The identity of the cache this process builds: every field comes from the per-layer facts (the
 // same ones prefix_cache_geometry sums), the window, the prefill chunk and the requested global
-// KV format and QK mode. Global layers must agree on heads and head dimension, and so must the
-// sliding layers (they share one block and one ring layout each); a model that breaks that has
-// no single identity and the cache refuses it.
+// KV format, storage model and QK mode. Global layers must agree on heads and head dimension, and
+// so must the sliding layers (they share one block and one ring layout each); a model that breaks
+// that has no single identity and the cache refuses it.
 [[nodiscard]] inline LayoutIdentity make_layout_identity(std::span<const KvLayerFact> layers,
                                                          std::uint32_t window,
                                                          std::uint32_t prefill_chunk,
                                                          KvCacheStorage global_format,
+                                                         KvStorageModel global_storage,
                                                          ops::Gemma4QkMode qk_mode) {
     LayoutIdentity id;
     id.qk_mode = qk_mode;
@@ -123,7 +126,7 @@ struct LayoutIdentity {
     for (const auto& layer : layers) {
         const auto layout = require_implemented_storage(kv_layer_layout(
             layer.global ? global_format : KvCacheStorage::BFloat16, layer.global, layer.head_dim,
-            layer.kv_heads));
+            layer.kv_heads, global_storage));
         const auto heads = static_cast<std::uint32_t>(layer.kv_heads);
         const auto dim = static_cast<std::uint32_t>(layer.head_dim);
         if (layer.global) {
@@ -149,7 +152,7 @@ struct LayoutIdentity {
             ++id.sliding_layers;
         }
     }
-    const auto geometry = prefix_cache_geometry(layers, window, global_format);
+    const auto geometry = prefix_cache_geometry(layers, window, global_format, global_storage);
     id.block_bytes = geometry.block_bytes;
     id.image_bytes = geometry.image_bytes;
     return id;

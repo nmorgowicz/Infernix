@@ -137,6 +137,55 @@ __device__ __forceinline__ void store_row(const RawRow<Fmt>& raw, uint4* row, in
     }
 }
 
+// Gemma4ValueSource::Key: this warp's staged FP8 K row turned into its BF16 V row, in store_row's
+// shared layout. Lane l holds dimensions 16 l .. 16 l + 15, so lanes 0..3 and 4..7 hold the rotated
+// pairs (d, d + 64), d < 64, and exchange their codes (every lane takes part; lanes 0..15 share the
+// first group's scale). Each value is FP32(code) x FP32(scale), turned back by gemma4_unrope_pair
+// on the rotated prefix, times value_scale, rounded once to BF16.
+__device__ __forceinline__ void store_value_from_key(const RawRow<Gemma4KvFormat::Fp8E4m3Row256>& raw,
+                                                     uint4* row, int lane, int position,
+                                                     const float* frequency, float value_scale) {
+    const std::uint32_t own[4]{raw.code[0].x, raw.code[0].y, raw.code[0].z, raw.code[0].w};
+    float k[kPerLane];
+    float other[kPerLane];
+#pragma unroll
+    for (int word = 0; word < 4; ++word) {
+        const std::uint32_t partner = __shfl_xor_sync(0xffffffffU, own[word], 4);
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const auto bits = [&](std::uint32_t w) {
+                return static_cast<__nv_fp8x2_storage_t>((w >> (16 * half)) & 0xffffU);
+            };
+            const float2 mine = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(bits(own[word]), __NV_E4M3)));
+            const float2 theirs = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(bits(partner), __NV_E4M3)));
+            const int d = 4 * word + 2 * half;
+            k[d]         = __fmul_rn(mine.x, raw.scale);
+            k[d + 1]     = __fmul_rn(mine.y, raw.scale);
+            other[d]     = __fmul_rn(theirs.x, raw.scale);
+            other[d + 1] = __fmul_rn(theirs.y, raw.scale);
+        }
+    }
+    if (lane < 8) {
+        const bool first = lane < 4;
+#pragma unroll
+        for (int d = 0; d < kPerLane; ++d) {
+            float a, b;
+            gemma4_unrope_pair(first ? k[d] : other[d], first ? other[d] : k[d], position,
+                               frequency[(lane & 3) * kPerLane + d], a, b);
+            k[d] = first ? a : b;
+        }
+    }
+    std::uint32_t words[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const __nv_bfloat162 pair = __floats2bfloat162_rn(__fmul_rn(k[2 * i], value_scale),
+                                                          __fmul_rn(k[2 * i + 1], value_scale));
+        words[i] = *reinterpret_cast<const std::uint32_t*>(&pair);
+    }
+    row[lane]      = uint4{words[0], words[1], words[2], words[3]};
+    row[32 + lane] = uint4{words[4], words[5], words[6], words[7]};
+}
+
 // Physical row index of `key`, or false when the key is outside the chunk or its page is not
 // mapped (such keys do not take part in the softmax, as in the original kernel).
 __device__ __forceinline__ bool key_row(int key, int end, int kvh, int kv_heads,
@@ -174,7 +223,9 @@ __device__ __forceinline__ bool key_row(int key, int end, int kvh, int kv_heads,
 // With one chunk the block writes the BF16 output; otherwise it writes its normalized FP32
 // result and (max, sum) for gemma4_decode_d512_combine_kernel, with the contract of
 // gemma4_attention_combine_kernel. An empty chunk writes max = -inf, sum = 0 and no partial.
-template <Gemma4KvFormat Fmt>
+// KeyValues (Gemma4ValueSource::Key) reads no V plane: each staged K row also becomes its V row
+// (store_value_from_key), so a key costs one 512 B row read instead of two.
+template <Gemma4KvFormat Fmt, bool KeyValues = false>
 __global__ void __launch_bounds__(kThreads, kBlocksPerSm) gemma4_decode_d512_kernel(
     const __nv_bfloat16* __restrict__ q, const void* __restrict__ k_pages,
     const void* __restrict__ v_pages, const __half* __restrict__ k_scales,
@@ -182,11 +233,19 @@ __global__ void __launch_bounds__(kThreads, kBlocksPerSm) gemma4_decode_d512_ker
     const std::int32_t* __restrict__ positions, __nv_bfloat16* __restrict__ out,
     float* __restrict__ partial, float* __restrict__ partial_stats, std::int32_t q_heads,
     std::int32_t kv_heads, int group, int chunks, int window, float scale,
-    std::int32_t logical_pages, std::int32_t physical_pages) {
+    std::int32_t logical_pages, std::int32_t physical_pages, float value_scale, float rope_theta) {
+    static_assert(!KeyValues || Fmt == Gemma4KvFormat::Fp8E4m3Row256);
     __shared__ __align__(16) uint4 k_tile[2][kTile][kD / 8];
     __shared__ __align__(16) uint4 v_tile[2][kTile][kD / 8];
     __shared__ unsigned char key_valid[2][kTile];
-
+    __shared__ float frequency[KeyValues ? kGemma4KeyValueRotaryDim / 2 : 1];
+    if constexpr (KeyValues) {
+        if (threadIdx.x < kGemma4KeyValueRotaryDim / 2) {
+            frequency[threadIdx.x] = gemma4_rope_frequency(static_cast<int>(threadIdx.x),
+                                                           kGemma4KeyValueRotaryDim, rope_theta);
+        }
+        __syncthreads();
+    }
     const int token = blockIdx.x;
     const int kvh   = blockIdx.y;
     const int chunk = blockIdx.z;
@@ -227,15 +286,17 @@ __global__ void __launch_bounds__(kThreads, kBlocksPerSm) gemma4_decode_d512_ker
 
     RawRow<Fmt> k_raw;
     RawRow<Fmt> v_raw;
+    int fetched_key = 0;
     // Issues the global loads of the key this warp stages for `tile`; returns whether it is
     // a live key. The result is uniform across the warp.
     const auto fetch = [&](int tile) {
         std::int64_t row = 0;
-        const bool valid = key_row(begin + tile * kTile + warp, end, kvh, kv_heads, block_table,
+        fetched_key = begin + tile * kTile + warp;
+        const bool valid = key_row(fetched_key, end, kvh, kv_heads, block_table,
                                    logical_pages, physical_pages, row);
         if (valid) {
             load_raw<Fmt>(k_raw, k_pages, k_scales, row, lane);
-            load_raw<Fmt>(v_raw, v_pages, v_scales, row, lane);
+            if constexpr (!KeyValues) { load_raw<Fmt>(v_raw, v_pages, v_scales, row, lane); }
         }
         return valid;
     };
@@ -245,7 +306,11 @@ __global__ void __launch_bounds__(kThreads, kBlocksPerSm) gemma4_decode_d512_ker
         uint4* v_row = v_tile[buffer][warp];
         if (valid) {
             store_row<Fmt>(k_raw, k_row, lane);
-            store_row<Fmt>(v_raw, v_row, lane);
+            if constexpr (KeyValues) {
+                store_value_from_key(k_raw, v_row, lane, fetched_key, frequency, value_scale);
+            } else {
+                store_row<Fmt>(v_raw, v_row, lane);
+            }
         } else {
             const uint4 zero{0U, 0U, 0U, 0U};
             k_row[lane]      = zero;
@@ -438,7 +503,7 @@ int device_sm_count() {
     return sm_count;
 }
 
-template <Gemma4KvFormat Fmt>
+template <Gemma4KvFormat Fmt, bool KeyValues = false>
 void launch(const Tensor& q, const Gemma4CacheView& cache, const Tensor& positions, int window,
             float scale, Tensor& out, float* partial, float* partial_stats, cudaStream_t stream) {
     constexpr bool Quantized = Fmt != Gemma4KvFormat::BFloat16;
@@ -454,14 +519,15 @@ void launch(const Tensor& q, const Gemma4CacheView& cache, const Tensor& positio
     }
     const dim3 grid(static_cast<unsigned>(tokens), static_cast<unsigned>(kv_heads),
                     static_cast<unsigned>(chunks));
-    gemma4_decode_d512_kernel<Fmt><<<grid, kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(q.data), k_pages.data, cache.v_pages->data,
+    gemma4_decode_d512_kernel<Fmt, KeyValues><<<grid, kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(q.data), k_pages.data,
+        KeyValues ? nullptr : cache.v_pages->data,
         Quantized ? static_cast<const __half*>(cache.k_scales->data) : nullptr,
-        Quantized ? static_cast<const __half*>(cache.v_scales->data) : nullptr,
+        Quantized && !KeyValues ? static_cast<const __half*>(cache.v_scales->data) : nullptr,
         static_cast<const std::int32_t*>(block_table.data),
         static_cast<const std::int32_t*>(positions.data), static_cast<__nv_bfloat16*>(out.data),
         partial, partial_stats, q_heads, kv_heads, group, chunks, window, scale, block_table.ne[0],
-        k_pages.ne[3]);
+        k_pages.ne[3], cache.value_scale, cache.rope_theta);
     CUDA_CHECK(cudaGetLastError());
     if (chunks == 1) { return; }
     gemma4_decode_d512_combine_kernel<<<static_cast<unsigned>(tokens * q_heads),
@@ -497,7 +563,10 @@ void gemma4_attention_decode_d512_launch(const Tensor& q, const Gemma4CacheView&
     if (q.ne[0] != kD || q.ne[1] / cache.k_pages->ne[2] > kGemma4DecodeD512MaxGroup) {
         throw std::invalid_argument("gemma4_attention: decode kernel needs D=512, group <= 8");
     }
-    if (cache.format == Gemma4KvFormat::Fp8E4m3Row256) {
+    if (cache.value_source == Gemma4ValueSource::Key) {
+        launch<Gemma4KvFormat::Fp8E4m3Row256, true>(q, cache, positions, window, scale, out, partial,
+                                                    partial_stats, stream);
+    } else if (cache.format == Gemma4KvFormat::Fp8E4m3Row256) {
         launch<Gemma4KvFormat::Fp8E4m3Row256>(q, cache, positions, window, scale, out, partial,
                                               partial_stats, stream);
     } else {

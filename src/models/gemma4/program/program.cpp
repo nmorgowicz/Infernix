@@ -104,6 +104,28 @@ void validate_options(const Model& model, const ProgramOptions& o, std::uint32_t
     }
     (void)gemma4_kv_format(o.kv_cache);
     validate_gemma4_qk(o.qk_mode, true, o.kv_cache);
+    if (o.global_kv_storage == KvStorageModel::ValueOnly) {
+        (void)require_implemented_storage(KvLayerLayout{.storage = KvStorageModel::ValueOnly});
+    }
+    if (o.global_kv_storage == KvStorageModel::KeyOnly) {
+        // V = unrope(K) / c needs FP8 D512 global layers rotating the 128-wide prefix, and every
+        // global layer's key-norm weight one finite nonzero constant c (the converter records it;
+        // the Program checks the loaded weights again).
+        if (o.kv_cache != KvCacheStorage::Fp8E4M3Row256) {
+            throw std::invalid_argument("Gemma4 key-only global KV requires --kv-dtype fp8");
+        }
+        if (c.global_head_dim != 512 || c.prope_rotary_dim != static_cast<std::uint32_t>(ops::kGemma4KeyValueRotaryDim)) {
+            throw std::invalid_argument("Gemma4 key-only global KV requires D512 global layers rotating 128 dimensions");
+        }
+        for (std::uint32_t layer = 0; layer < c.layer_types.size(); ++layer) {
+            if (c.layer_types[layer] != LayerKind::Global) { continue; }
+            const auto scalar = c.global_k_norm_scalar.find(layer);
+            if (scalar == c.global_k_norm_scalar.end() || !std::isfinite(scalar->second) || scalar->second == 0.0F) {
+                throw std::invalid_argument("Gemma4 key-only global KV: global layer " + std::to_string(layer) +
+                                            " has no constant finite nonzero key-norm weight, so V is not unrope(K) / c");
+            }
+        }
+    }
     if (model.config().mtp ? o.draft_tokens == 0 || o.draft_tokens > kMaxDraftTokens : o.draft_tokens != 0) {
         throw std::invalid_argument(model.config().mtp
             ? "Gemma4 MTP drafts 1.." + std::to_string(kMaxDraftTokens) + " tokens per round"
@@ -137,7 +159,8 @@ ProgramDevicePlan Program::plan_device(const Model& model, const ProgramOptions&
         // Global layers follow the requested format (FP8 codes plus FP16 scales); rings stay BF16.
         const std::uint64_t bytes =
             require_implemented_storage(
-                kv_layer_layout(options.kv_cache, layer.global_layer, layer.head_dim, layer.kv_heads))
+                kv_layer_layout(options.kv_cache, layer.global_layer, layer.head_dim, layer.kv_heads,
+                                options.global_kv_storage))
                 .page_bytes();
         (layer.global_layer ? global_page_bytes : sliding_page_bytes) += bytes;
         plan.workspace = std::max<std::uint64_t>(plan.workspace,
@@ -393,39 +416,54 @@ struct ProgramImpl {
         caches.reserve(layers);
         for (const auto& layer : p.layers) {
             const auto pages = layer.global_layer ? plan.kv_pages : ring_count;
-            const auto layout = kv_layer_layout(options.kv_cache, layer.global_layer, layer.head_dim, layer.kv_heads);
+            const auto layout = kv_layer_layout(options.kv_cache, layer.global_layer, layer.head_dim, layer.kv_heads,
+                                                options.global_kv_storage);
             const auto code_bytes = layout.code_page_bytes * pages;
             (layer.global_layer ? global_payload_bytes : sliding_payload_bytes) += layout.page_bytes() * pages;
-            // Never-written rows must read as finite zeros (code 0, scale 0), including after recovery.
-            keys.emplace_back(code_bytes); values.emplace_back(code_bytes);
-            keys.back().fill(0); values.back().fill(0);
             const std::initializer_list<std::int32_t> shape{
                 layer.head_dim, static_cast<int>(kPage), layer.kv_heads, static_cast<int>(pages)};
+            const std::initializer_list<std::int32_t> scale_shape{
+                layout.scale_groups, static_cast<int>(kPage), layer.kv_heads, static_cast<int>(pages)};
+            // Never-written rows must read as finite zeros (code 0, scale 0), including after recovery.
+            keys.emplace_back(code_bytes); keys.back().fill(0);
             key_views.emplace_back(keys.back().p, layout.code_dtype, shape);
-            value_views.emplace_back(values.back().p, layout.code_dtype, shape);
-            key_scales.emplace_back(); value_scales.emplace_back();
-            key_scale_views.emplace_back(); value_scale_views.emplace_back();
+            key_scales.emplace_back(); key_scale_views.emplace_back();
             if (layout.scale_groups != 0) {
-                const auto scale_bytes = layout.scale_page_bytes * pages;
-                key_scales.back() = DeviceBuffer(scale_bytes); value_scales.back() = DeviceBuffer(scale_bytes);
-                key_scales.back().fill(0); value_scales.back().fill(0);
-                const std::initializer_list<std::int32_t> scale_shape{
-                    layout.scale_groups, static_cast<int>(kPage), layer.kv_heads, static_cast<int>(pages)};
+                key_scales.back() = DeviceBuffer(layout.scale_page_bytes * pages); key_scales.back().fill(0);
                 key_scale_views.back() = Tensor(key_scales.back().p, DType::FP16, scale_shape);
-                value_scale_views.back() = Tensor(value_scales.back().p, DType::FP16, scale_shape);
+            }
+            // A key-only layer keeps no V planes; its value views stay empty.
+            values.emplace_back(); value_views.emplace_back();
+            value_scales.emplace_back(); value_scale_views.emplace_back();
+            if (layout.stores_value()) {
+                values.back() = DeviceBuffer(code_bytes); values.back().fill(0);
+                value_views.back() = Tensor(values.back().p, layout.code_dtype, shape);
+                if (layout.scale_groups != 0) {
+                    value_scales.back() = DeviceBuffer(layout.scale_page_bytes * pages); value_scales.back().fill(0);
+                    value_scale_views.back() = Tensor(value_scales.back().p, DType::FP16, scale_shape);
+                }
             }
         }
         // Every reserve() above is complete; the descriptors now point at stable Tensor storage.
         for (std::size_t i = 0; i < layers; ++i) {
-            const bool global = p.layers[i].global_layer;
+            const auto& layer = p.layers[i];
+            const bool global = layer.global_layer;
             const bool scaled = key_scale_views[i].data != nullptr;
+            const bool stored = value_views[i].data != nullptr;
             caches.push_back({.format = scaled ? ops::Gemma4KvFormat::Fp8E4m3Row256 : ops::Gemma4KvFormat::BFloat16,
-                .k_pages = &key_views[i], .v_pages = &value_views[i],
+                .k_pages = &key_views[i], .v_pages = stored ? &value_views[i] : nullptr,
                 .k_scales = scaled ? &key_scale_views[i] : nullptr,
-                .v_scales = scaled ? &value_scale_views[i] : nullptr,
+                .v_scales = scaled && stored ? &value_scale_views[i] : nullptr,
                 .block_table = global ? &global_table : &ring_table,
                 // Sliding descriptors retain BF16 QK.
                 .qk_mode = global ? options.qk_mode : ops::Gemma4QkMode::BFloat16});
+            if (!stored) {
+                auto& cache = caches.back();
+                cache.value_source = ops::Gemma4ValueSource::Key;
+                cache.value_scale = key_value_scale(i);
+                cache.rope_theta = layer.rope_theta;
+                cache.rotary_dim = layer.rotary_dim;
+            }
         }
         if (options.prefix_cache) { create_prefix_cache(); }
         if (p.derived_device_bytes() != plan.prepared_row_scales) {
@@ -450,6 +488,25 @@ struct ProgramImpl {
         catch (...) { (void)settle_after_memory_exhausted(); throw; }
     }
     const TextConfig& config() const noexcept { return parameters.model.config().text; }
+    // Key-only global layers: 1 / c for global layer `layer`, after checking on the loaded weights
+    // that its key-norm weight is one finite nonzero BF16 constant c equal to the converter's
+    // global_k_norm_scalar. Then k_norm(x) = c v_norm(x) element for element (both use the same
+    // rms factor in gemma4_qkv_prep), so V = unrope(K) / c.
+    float key_value_scale(std::size_t layer) const {
+        const auto& weights = parameters.layers[layer];
+        std::vector<std::uint16_t> host(static_cast<std::size_t>(weights.head_dim));
+        CUDA_CHECK(cudaMemcpy(host.data(), weights.k_norm, host.size() * sizeof(std::uint16_t),
+                              cudaMemcpyDeviceToHost));
+        const auto constant = std::all_of(host.begin(), host.end(), [&](std::uint16_t bits) { return bits == host[0]; });
+        const float c = std::bit_cast<float>(static_cast<std::uint32_t>(host[0]) << 16);
+        const auto recorded = config().global_k_norm_scalar.find(static_cast<std::uint32_t>(layer));
+        if (host.empty() || !constant || !std::isfinite(c) || c == 0.0F ||
+            recorded == config().global_k_norm_scalar.end() || recorded->second != c) {
+            throw std::invalid_argument("Gemma4 key-only global KV: layer " + std::to_string(layer) +
+                                        "'s loaded key-norm weight is not the recorded finite nonzero constant");
+        }
+        return 1.0F / c;
+    }
     static std::size_t device_free_bytes() {
         std::size_t free = 0, total = 0;
         CUDA_CHECK(cudaMemGetInfo(&free, &total));
@@ -698,22 +755,27 @@ struct ProgramImpl {
         for (const auto& layer : parameters.layers) {
             facts.push_back({layer.global_layer, layer.head_dim, layer.kv_heads});
         }
-        const auto geometry = prefix_cache_geometry(facts, c.sliding_window, options.kv_cache);
+        const auto geometry = prefix_cache_geometry(facts, c.sliding_window, options.kv_cache, options.global_kv_storage);
         const auto identity = prefix::make_layout_identity(facts, c.sliding_window, options.prefill_chunk,
-                                                           options.kv_cache, options.qk_mode);
+                                                           options.kv_cache, options.global_kv_storage,
+                                                           options.qk_mode);
         std::vector<std::vector<prefix::DevicePlane>> global, sliding;
         for (std::size_t i = 0; i < parameters.layers.size(); ++i) {
             const auto& layer = parameters.layers[i];
-            const auto layout = kv_layer_layout(options.kv_cache, layer.global_layer, layer.head_dim, layer.kv_heads);
-            // KvLayerLayout::planes() order: K codes, K scales (when scaled), V codes, V scales.
+            const auto layout = kv_layer_layout(options.kv_cache, layer.global_layer, layer.head_dim, layer.kv_heads,
+                                                options.global_kv_storage);
+            // KvLayerLayout::planes() order: K codes, K scales (when scaled), then V codes and V
+            // scales unless the layer is key-only.
             std::vector<prefix::DevicePlane> planes;
             planes.push_back({static_cast<std::byte*>(keys[i].p), layout.code_page_bytes});
             if (layout.scale_page_bytes != 0) {
                 planes.push_back({static_cast<std::byte*>(key_scales[i].p), layout.scale_page_bytes});
             }
-            planes.push_back({static_cast<std::byte*>(values[i].p), layout.code_page_bytes});
-            if (layout.scale_page_bytes != 0) {
-                planes.push_back({static_cast<std::byte*>(value_scales[i].p), layout.scale_page_bytes});
+            if (layout.stores_value()) {
+                planes.push_back({static_cast<std::byte*>(values[i].p), layout.code_page_bytes});
+                if (layout.scale_page_bytes != 0) {
+                    planes.push_back({static_cast<std::byte*>(value_scales[i].p), layout.scale_page_bytes});
+                }
             }
             (layer.global_layer ? global : sliding).push_back(std::move(planes));
         }
@@ -723,7 +785,7 @@ struct ProgramImpl {
         cache.cost.chunk_tokens = options.prefill_chunk;
         cache.cost.token_seconds = kCacheTokenSeconds;
         prefix_cache = std::make_unique<prefix::PrefixCache>(
-            cache, geometry, identity, prefix::plan_block_layout(facts, options.kv_cache),
+            cache, geometry, identity, prefix::plan_block_layout(facts, options.kv_cache, options.global_kv_storage),
             prefix::plan_state_image(facts, c.sliding_window, options.kv_cache), std::move(global),
             std::move(sliding), ring_pages_, options.host_bytes, stream);
     }
@@ -1879,7 +1941,8 @@ MemorySummary Program::memory_summary() const noexcept {
     result.kv_cache = p.options.kv_cache;
     result.gemma4_kv = Gemma4KvMemorySummary{
         .requested = p.options.kv_cache, .global = p.options.kv_cache, .sliding = KvCacheStorage::BFloat16,
-        .qk_mode = p.options.qk_mode, .global_payload_bytes = p.global_payload_bytes,
+        .qk_mode = p.options.qk_mode, .global_key_only = p.options.global_kv_storage == KvStorageModel::KeyOnly,
+        .global_payload_bytes = p.global_payload_bytes,
         .sliding_payload_bytes = p.sliding_payload_bytes};
     result.kv_payload_bytes = p.global_payload_bytes + p.sliding_payload_bytes;
     result.sequence.capacity_bytes = static_cast<std::size_t>(p.plan.kv + p.plan.io);

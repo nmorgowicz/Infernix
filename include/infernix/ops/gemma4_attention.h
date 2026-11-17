@@ -46,6 +46,9 @@ namespace infernix::ops {
  * of dot(Q_codes[g], K_codes[g]) * (Q_scale[g] * K_scale[g]), accumulated in FP32;
  * scale multiplies that score. V retains the BF16 expansion described above.
  * For T < 64, QK uses the BF16 query and expanded K even when FP8 QK is selected.
+ * Gemma4ValueSource::Key (no V planes) rebuilds each V row from the cached K codes and scales as
+ * Gemma4CacheView describes, rounding it once to BF16 before PV; K and QK are unchanged. It is
+ * served by the D=512 decode kernel (query group <= 8) and the tensor-core kernel only.
  *
  * block_table maps absolute key position j to physical page block_table[j/64],
  * slot j%64. Keys beyond the logical table, or in negative/out-of-range physical

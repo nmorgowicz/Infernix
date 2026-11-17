@@ -20,6 +20,31 @@ __device__ __forceinline__ __nv_bfloat16 gemma4_fp8_expand(std::uint8_t code, __
     return __float2bfloat16_rn(__fmul_rn(static_cast<float>(value), __half2float(scale)));
 }
 
+// The RoPE frequency of pair i (dimensions i and i + rotary_dim / 2). gemma4_qkv_prep rotates by the
+// FP32 angle position x this value, and key-derived V readers form that same FP32 angle.
+__device__ __forceinline__ float gemma4_rope_frequency(int pair, int rotary_dim, float theta) {
+    const float exponent = -2.0F * static_cast<float>(pair) / static_cast<float>(rotary_dim);
+    return powf(theta, exponent);
+}
+
+// Turns a rotated pair back (Gemma4ValueSource::Key): RoPE wrote a' = a c - b s, b' = b c + a s at
+// the FP32 angle position x frequency, so a = a' c + b' s and b = b' c - a' s. The angle is reduced
+// to [-pi, pi] (|error| about 2e-7 rad below 2^18 rad) before the hardware sine/cosine, whose
+// absolute error there is about 4e-7: the inverse rotation is exact to ~1e-6 relative, far below
+// the BF16 rounding the rebuilt V then takes.
+__device__ __forceinline__ void gemma4_unrope_pair(float rotated_a, float rotated_b, int position,
+                                                   float frequency, float& a, float& b) {
+    constexpr float kTwoPiHigh = 6.28318548202514648f;      // float(2 pi)
+    constexpr float kTwoPiLow  = -1.74845553146951529e-7f;  // 2 pi - float(2 pi)
+    const float angle = static_cast<float>(position) * frequency;
+    const float turns = rintf(angle * 0.159154943091895336f);
+    const float reduced = fmaf(-turns, kTwoPiLow, fmaf(-turns, kTwoPiHigh, angle));
+    float s, c;
+    __sincosf(reduced, &s, &c);
+    a = fmaf(rotated_a, c, rotated_b * s);
+    b = fmaf(rotated_b, c, -rotated_a * s);
+}
+
 // One warp owns BF16 pairs lane + 32*s. Each D512 half spans four slots.
 // Nonfinite policy is explicit: any NaN or infinity poisons its complete row-half
 // with canonical E4M3 NaNs and unit scale; never silently turn it into a zero row.

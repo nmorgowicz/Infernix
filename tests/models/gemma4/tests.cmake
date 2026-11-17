@@ -31,6 +31,16 @@ infernix_add_test(infernix_gemma4_prefill_earlyexit_real_test
 set_tests_properties(infernix_gemma4_prefill_earlyexit_real_test
   PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
+# The experimental key-only global KV cache on an explicit MTP artifact: refusals, writer bytes equal
+# to the K==V FP8 cache through the first global layer, K-planes-only accounting, deterministic
+# generation, root replay and Host snapshot restore equal to the cold key-only run with MTP off/on.
+# METRIC lines report V, logits, token and causal-score differences against K==V FP8 and BF16 K/V.
+infernix_add_test(infernix_gemma4_key_only_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_key_only_real.cpp"
+  LIBRARIES infernix_engine infernix_model_runtime)
+set_tests_properties(infernix_gemma4_key_only_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+
 # Tool-call body grammar (`call:NAME{k:v}`, `<|"|>` strings); CPU only, no model.
 infernix_add_test(infernix_gemma4_tool_parser_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_tool_parser.cpp"

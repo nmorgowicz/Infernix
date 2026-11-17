@@ -652,6 +652,7 @@ std::string format_server_start_json(
                  {"sliding", kv_cache_json_name(kv.sliding)},
                  {"qk_mode", infernix::gemma4_qk_name(kv.qk_mode)},
                  {"qk_scope", infernix::gemma4_qk_scope(kv.qk_mode)},
+                 {"global_key_only", kv.global_key_only},
                  {"global_payload_bytes", kv.global_payload_bytes},
                  {"sliding_payload_bytes", kv.sliding_payload_bytes}};
     }

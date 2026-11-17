@@ -385,7 +385,8 @@ std::uint64_t expected_global_payload(const g4::execution::Parameters& parameter
     std::uint64_t bytes = 0;
     for (const auto& layer : parameters.layers) {
         if (layer.global_layer) {
-            bytes += g4::kv_layer_layout(storage, true, layer.head_dim, layer.kv_heads).page_bytes() * pages;
+            bytes += g4::kv_layer_layout(storage, true, layer.head_dim, layer.kv_heads,
+                                         g4::KvStorageModel::KeyEqualsValue).page_bytes() * pages;
         }
     }
     return bytes;

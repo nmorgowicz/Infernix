@@ -88,12 +88,13 @@ std::ptrdiff_t distance_between(const std::byte* a, const std::byte* b) noexcept
 
 // ---- layouts ---------------------------------------------------------------------------------
 
-BlockLayout plan_block_layout(std::span<const KvLayerFact> layers, KvCacheStorage global_format) {
+BlockLayout plan_block_layout(std::span<const KvLayerFact> layers, KvCacheStorage global_format,
+                              KvStorageModel global_storage) {
     BlockLayout out;
     for (const auto& layer : layers) {
         if (!layer.global) { continue; }
         const auto layout = require_implemented_storage(
-            kv_layer_layout(global_format, true, layer.head_dim, layer.kv_heads));
+            kv_layer_layout(global_format, true, layer.head_dim, layer.kv_heads, global_storage));
         const auto planes = layout.planes();
         for (std::uint32_t plane = 0; plane < layout.plane_count(); ++plane) {
             out.parts.push_back({out.global_layers, plane, out.record_bytes, planes[plane].page_bytes});
@@ -114,7 +115,8 @@ StateImageLayout plan_state_image(std::span<const KvLayerFact> layers, std::uint
     for (const auto& layer : layers) {
         if (layer.global) { continue; }
         const auto layout = require_implemented_storage(
-            kv_layer_layout(KvCacheStorage::BFloat16, false, layer.head_dim, layer.kv_heads));
+            kv_layer_layout(KvCacheStorage::BFloat16, false, layer.head_dim, layer.kv_heads,
+                            KvStorageModel::KeyEqualsValue));
         const auto planes = layout.planes();
         out.group_begin.push_back(static_cast<std::uint32_t>(out.parts.size()));
         const std::size_t heads = static_cast<std::size_t>(layer.kv_heads);

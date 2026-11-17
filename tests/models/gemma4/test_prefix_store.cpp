@@ -52,6 +52,8 @@ constexpr std::uint32_t kWindow = 1024;          // W
 constexpr std::uint32_t kKept   = kWindow - 1;   // an image keeps W-1 tokens
 constexpr auto kFp8 = infernix::KvCacheStorage::Fp8E4M3Row256;
 constexpr auto kBf16 = infernix::KvCacheStorage::BFloat16;
+constexpr auto kKeyValue = infernix::models::gemma4::KvStorageModel::KeyEqualsValue;
+constexpr auto kKeyOnly = infernix::models::gemma4::KvStorageModel::KeyOnly;
 constexpr std::uint32_t kEmulatedSliding = 2; // sliding layers in the ring emulation (groups > 1)
 
 struct Shape {
@@ -87,9 +89,9 @@ struct Descriptor {
 
 Descriptor describe(const Shape& s) {
     Descriptor d{s, layer_facts(s.global_layers, s.global_heads, s.sliding_layers, s.sliding_heads), {}, {}, {}};
-    d.geometry = g4::prefix_cache_geometry(d.full, kWindow, kFp8);
+    d.geometry = g4::prefix_cache_geometry(d.full, kWindow, kFp8, kKeyValue);
     d.want = expected_geometry(s.global_layers, s.global_heads, s.sliding_layers, s.sliding_heads, kWindow);
-    d.identity = g4p::make_layout_identity(d.full, kWindow, s.chunk, kFp8, ops::Gemma4QkMode::BFloat16);
+    d.identity = g4p::make_layout_identity(d.full, kWindow, s.chunk, kFp8, kKeyValue, ops::Gemma4QkMode::BFloat16);
     return d;
 }
 
@@ -121,7 +123,7 @@ void test_layouts(const Descriptor& d) {
     check(g4p::plan_state_image(d.full, kWindow, kBf16).image_bytes == image.image_bytes,
           label(s, "image bytes do not depend on the global format"));
 
-    const g4p::BlockLayout block = g4p::plan_block_layout(d.full, kFp8);
+    const g4p::BlockLayout block = g4p::plan_block_layout(d.full, kFp8, kKeyValue);
     const std::size_t code = static_cast<std::size_t>(kPage) * s.global_heads * 512U;
     const std::size_t scale = static_cast<std::size_t>(kPage) * s.global_heads * (512U / 256U) * 2U;
     check(block.global_layers == s.global_layers && block.parts.size() == 4U * s.global_layers,
@@ -138,12 +140,27 @@ void test_layouts(const Descriptor& d) {
         at += p.bytes;
     }
     check(block_ok && at == block.record_bytes, label(s, "block parts: layer-major, K codes/scales then V"));
-    const g4p::BlockLayout bf16 = g4p::plan_block_layout(d.full, kBf16);
-    const g4::PrefixCacheGeometry bf16_geometry = g4::prefix_cache_geometry(d.full, kWindow, kBf16);
+    const g4p::BlockLayout bf16 = g4p::plan_block_layout(d.full, kBf16, kKeyValue);
+    const g4::PrefixCacheGeometry bf16_geometry = g4::prefix_cache_geometry(d.full, kWindow, kBf16, kKeyValue);
     check(bf16.parts.size() == 2U * s.global_layers &&
               bf16.record_bytes == bf16_geometry.global_bytes_per_token * kPage &&
               bf16.record_bytes == s.global_layers * 2U * code * 2U,
           label(s, "BF16 block record has two planes per global layer"));
+    // The key-only record keeps each global layer's K codes and scales: half the K==V record.
+    const g4p::BlockLayout key_only = g4p::plan_block_layout(d.full, kFp8, kKeyOnly);
+    const g4::PrefixCacheGeometry key_only_geometry = g4::prefix_cache_geometry(d.full, kWindow, kFp8, kKeyOnly);
+    bool key_only_ok = key_only.parts.size() == 2U * s.global_layers && 2U * key_only.record_bytes == block.record_bytes &&
+                       key_only.record_bytes == key_only_geometry.global_bytes_per_token * kPage &&
+                       key_only_geometry.image_bytes == d.geometry.image_bytes;
+    at = 0;
+    for (std::size_t i = 0; i < key_only.parts.size(); ++i) {
+        const g4p::BlockPart& p = key_only.parts[i];
+        key_only_ok = key_only_ok && p.layer == i / 2 && p.plane == i % 2 && p.offset == at &&
+                      p.bytes == (i % 2 == 0 ? code : scale);
+        at += p.bytes;
+    }
+    check(key_only_ok && at == key_only.record_bytes,
+          label(s, "key-only block record: K codes then K scales per global layer, half the K==V bytes"));
 
     // The identity is the geometry, never a literal.
     const g4p::LayoutIdentity& id = d.identity;
@@ -155,13 +172,16 @@ void test_layouts(const Descriptor& d) {
               id.scale_group_columns == 256 && id.scale_element_bytes == 2 &&
               id.storage == g4::KvStorageModel::KeyEqualsValue,
           label(s, "make_layout_identity carries the geometry"), id.describe());
-    check(g4p::make_layout_identity(d.full, kWindow, s.chunk, kFp8, ops::Gemma4QkMode::Fp8).fingerprint() !=
+    check(g4p::make_layout_identity(d.full, kWindow, s.chunk, kFp8, kKeyValue, ops::Gemma4QkMode::Fp8).fingerprint() !=
               id.fingerprint(),
           label(s, "QK mode is part of the identity"));
+    check(g4p::make_layout_identity(d.full, kWindow, s.chunk, kFp8, kKeyOnly, ops::Gemma4QkMode::BFloat16)
+                  .fingerprint() != id.fingerprint(),
+          label(s, "the storage model is part of the identity"));
     auto ragged = d.full;
     ragged.push_back({true, 512, static_cast<int>(s.global_heads) + 1});
     check(throws<std::invalid_argument>([&] {
-              (void)g4p::make_layout_identity(ragged, kWindow, s.chunk, kFp8, ops::Gemma4QkMode::BFloat16);
+              (void)g4p::make_layout_identity(ragged, kWindow, s.chunk, kFp8, kKeyValue, ops::Gemma4QkMode::BFloat16);
           }),
           label(s, "global layers of unequal heads have no single identity"));
 }
@@ -208,6 +228,17 @@ void test_headers(const Descriptor& a, const Descriptor& b) {
           label(a.shape, "value-only flag is refused against K==V in both directions"));
     check(g4p::read_state_image_header(value_only, header_bytes(value_only, h).data()).ok(),
           label(a.shape, "a value-only identity round-trips its own header"));
+    // Key-only images never restore into K==V or value-only caches, nor the reverse.
+    const g4p::LayoutIdentity key_only = g4p::make_layout_identity(a.full, kWindow, a.shape.chunk, kFp8, kKeyOnly,
+                                                                   ops::Gemma4QkMode::BFloat16);
+    bool key_only_refused = true;
+    for (const g4p::LayoutIdentity* other : {&a.identity, static_cast<const g4p::LayoutIdentity*>(&value_only)}) {
+        key_only_refused = key_only_refused &&
+            g4p::read_state_image_header(key_only, header_bytes(*other, h).data()).status == g4p::HeaderStatus::Identity &&
+            g4p::read_state_image_header(*other, header_bytes(key_only, h).data()).status == g4p::HeaderStatus::Identity;
+    }
+    check(key_only_refused && g4p::read_state_image_header(key_only, header_bytes(key_only, h).data()).ok(),
+          label(a.shape, "a key-only identity refuses K==V and value-only headers and round-trips its own"));
     // Every other identity field refuses; a packing version refuses by its own status.
     const std::pair<const char*, std::function<void(g4p::LayoutIdentity&)>> mutations[] = {
         {"qk_mode", [](g4p::LayoutIdentity& i) { i.qk_mode = ops::Gemma4QkMode::Fp8; }},
@@ -313,8 +344,9 @@ void test_window_runs() {
 void test_ring_transfers(const Shape& s) {
     const auto facts = layer_facts(s.global_layers, s.global_heads, kEmulatedSliding, s.sliding_heads);
     const g4p::StateImageLayout layout = g4p::plan_state_image(facts, kWindow, kFp8);
-    const g4::PrefixCacheGeometry geometry = g4::prefix_cache_geometry(facts, kWindow, kFp8);
-    const g4p::LayoutIdentity id = g4p::make_layout_identity(facts, kWindow, s.chunk, kFp8, ops::Gemma4QkMode::BFloat16);
+    const g4::PrefixCacheGeometry geometry = g4::prefix_cache_geometry(facts, kWindow, kFp8, kKeyValue);
+    const g4p::LayoutIdentity id = g4p::make_layout_identity(facts, kWindow, s.chunk, kFp8, kKeyValue,
+                                                             ops::Gemma4QkMode::BFloat16);
     const std::uint32_t ring_pages = ring_pages_for(s.chunk), capacity = ring_pages * kPage;
     Slabs slabs(geometry.slab_bytes, geometry.image_slabs);
     Rings live(layout, ring_pages), restored(layout, ring_pages), want(layout, ring_pages);
@@ -522,9 +554,10 @@ void test_plan_copy_ops() {
 }
 
 // A block's DtoH/HtoD (PrefixCache::append_block_pieces): plane-major, block-minor over consecutive pages.
-void test_block_copies(const Descriptor& d, infernix::KvCacheStorage format, const char* what) {
+void test_block_copies(const Descriptor& d, infernix::KvCacheStorage format, g4::KvStorageModel storage,
+                       const char* what) {
     const Shape& s = d.shape;
-    const g4p::BlockLayout layout = g4p::plan_block_layout(d.full, format);
+    const g4p::BlockLayout layout = g4p::plan_block_layout(d.full, format, storage);
     constexpr std::uint32_t pages = 5, first_page = 3; // pages 3..7 of the sequence, written to records 0..4
     std::size_t slab_bytes = g4::align_bytes(layout.record_bytes, 4096);
     std::vector<Bytes> device(layout.parts.size());
@@ -702,8 +735,9 @@ int main() {
         test_host_floor(*d);
         test_ring_transfers(d->shape);
         test_ring_copy_shape(d->shape);
-        test_block_copies(*d, kFp8, "FP8");
-        test_block_copies(*d, kBf16, "BF16");
+        test_block_copies(*d, kFp8, kKeyValue, "FP8");
+        test_block_copies(*d, kFp8, kKeyOnly, "FP8 key-only");
+        test_block_copies(*d, kBf16, kKeyValue, "BF16");
     }
     test_headers(big, small);
     test_headers(small, big);

@@ -3,6 +3,7 @@
 #include "artifact/formats.h"
 #include "artifact/reader.h"
 #include "core/device.h"
+#include "core/temporary_switches.h"
 #include "core/host_memory.h"
 #include "core/startup.h"
 #include "core/vram_budget.h"
@@ -28,6 +29,12 @@ using Clock = std::chrono::steady_clock;
 using models::gemma4::Program;
 using models::gemma4::ProgramOptions;
 
+// INFERNIX_TMP_GEMMA4_KEY_ONLY_KV=1 selects the experimental key-only global layout (default off).
+models::gemma4::KvStorageModel global_kv_storage() {
+    return temporary_switches::flag("INFERNIX_TMP_GEMMA4_KEY_ONLY_KV") ? models::gemma4::KvStorageModel::KeyOnly
+                                                                       : models::gemma4::KvStorageModel::KeyEqualsValue;
+}
+
 ProgramOptions program_options(const EngineOptions& options, std::uint64_t host_bytes) {
     ProgramOptions out;
     out.max_context = options.max_context;
@@ -36,6 +43,7 @@ ProgramOptions program_options(const EngineOptions& options, std::uint64_t host_
     out.kv_capacity_tokens = options.kv_capacity.mode == KvCapacityMode::Automatic ? 0U :
         ((options.kv_capacity.explicit_tokens + 63U) / 64U) * 64U;
     out.kv_cache = options.kv_cache;
+    out.global_kv_storage = global_kv_storage();
     out.qk_mode = options.gemma4_qk;
     out.causal_scoring = options.purpose == EnginePurpose::CausalScoring;
     out.draft_tokens = options.speculative.backend == SpeculativeBackend::Mtp ? options.speculative.draft_tokens : 0U;
@@ -181,7 +189,8 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& supplied, DeviceContext&
                              static_cast<int>(text.head_dim_of(kind)),
                              static_cast<int>(text.kv_heads_of(kind))});
         }
-        const auto tier = models::gemma4::prefix_cache_geometry(facts, text.sliding_window, options.kv_cache);
+        const auto tier = models::gemma4::prefix_cache_geometry(facts, text.sliding_window, options.kv_cache,
+                                                                global_kv_storage());
         if (prefix_bytes < tier.host_floor_bytes) {
             const std::uint64_t mib = (tier.host_floor_bytes + (1ULL << 20) - 1) >> 20;
             const std::string refusal =
@@ -284,7 +293,8 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& supplied, DeviceContext&
     summary.architecture = "Gemma4ForCausalLM";
     summary.model_name = instance->model->info().name;
     summary.prefill_signature = std::string("gemma4/") +
-        (options.kv_cache == KvCacheStorage::Fp8E4M3Row256 ? "fp8" : "bf16") + "-kv/qk=" +
+        (options.kv_cache == KvCacheStorage::Fp8E4M3Row256 ? "fp8" : "bf16") + "-kv" +
+        (global_kv_storage() == models::gemma4::KvStorageModel::KeyOnly ? "/k-only" : "") + "/qk=" +
         gemma4_qk_name(options.gemma4_qk) + "/cold/chunk=" + std::to_string(options.prefill_chunk);
     std::set<std::string> formats;
     for (const auto& weight : instance->model->weight_data()) {

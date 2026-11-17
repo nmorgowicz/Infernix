@@ -604,9 +604,9 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
         const infernix::Gemma4KvMemorySummary& kv = *memory.gemma4_kv;
         logger_->info("Gemma QK | requested {} | resolved {} | {}", infernix::gemma4_qk_name(engine.gemma4_qk),
                       infernix::gemma4_qk_name(kv.qk_mode), infernix::gemma4_qk_scope(kv.qk_mode));
-        logger_->info("Gemma KV | requested {} | global {} ({}) | sliding {} ({})",
+        logger_->info("Gemma KV | requested {} | global {}{} ({}) | sliding {} ({})",
                       infernix::kv_cache_cli_name(kv.requested), infernix::kv_cache_cli_name(kv.global),
-                      product::format_pretty_bytes(kv.global_payload_bytes),
+                      kv.global_key_only ? " key-only" : "", product::format_pretty_bytes(kv.global_payload_bytes),
                       infernix::kv_cache_cli_name(kv.sliding),
                       product::format_pretty_bytes(kv.sliding_payload_bytes));
     }

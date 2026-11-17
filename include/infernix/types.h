@@ -2094,6 +2094,8 @@ struct Gemma4KvMemorySummary {
     KvCacheStorage global             = KvCacheStorage::BFloat16;
     KvCacheStorage sliding            = KvCacheStorage::BFloat16;
     ops::Gemma4QkMode qk_mode         = ops::Gemma4QkMode::BFloat16;
+    // The experimental key-only global layout: V planes are absent and attention rebuilds V from K.
+    bool global_key_only              = false;
     std::uint64_t global_payload_bytes  = 0;
     std::uint64_t sliding_payload_bytes = 0;
 };

@@ -9,6 +9,7 @@
 #include "models/gemma4/frontend/frontend.h"
 #include "models/gemma4/frontend/output_session.h"
 #include "models/gemma4/frontend/prompt.h"
+#include "models/gemma4/program/kv_layout.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
 #include "runtime/prefix_cache/persist_result.h"
@@ -211,6 +212,10 @@ struct ProgramOptions {
     std::uint32_t prefill_chunk = 1024;
     std::uint32_t kv_capacity_tokens = 0;
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
+    // Global-layer storage model. KeyOnly (experimental, FP8 only) stores no V planes and rebuilds
+    // V = unrope(K) / c in attention; the Program refuses it unless every global layer's key-norm
+    // weight is one finite nonzero constant c (checked on the loaded weights).
+    KvStorageModel global_kv_storage = KvStorageModel::KeyEqualsValue;
     ops::Gemma4QkMode qk_mode = ops::Gemma4QkMode::BFloat16;
     bool causal_scoring = false;
     // MTP drafts per round (1..kMaxDraftTokens) with the assistant loaded; 0 decodes plainly.

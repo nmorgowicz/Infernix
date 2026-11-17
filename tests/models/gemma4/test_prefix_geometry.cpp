@@ -2,8 +2,9 @@
 // descriptors — 31B-like (10 global x 4 KV heads x D512 FP8; 50 sliding x 16 x D256; W=1024) and
 // 26B-A4B-like (5 x 2 x D512 FP8; 50 x 8 x D256; W=1024, C=512) — assert the contract-1 byte
 // formulas (block, image, slab count, host floor) against independent arithmetic, the identity
-// fingerprint's stability and per-field sensitivity, and the value-only storage flag's carry and
-// refusal. CPU only: no GPU, no artifact, no model types.
+// fingerprint's stability and per-field sensitivity, the value-only storage flag's carry and
+// refusal, and the key-only layout's halved global bytes and distinct identity. CPU only: no GPU,
+// no artifact, no model types.
 
 #include "models/gemma4/program/kv_layout.h"
 #include "models/gemma4/program/prefix/layout_identity.h"
@@ -30,7 +31,7 @@ void assert_geometry(const char* label, std::size_t global_layers, std::size_t g
     const auto facts = layer_facts(global_layers, global_heads, sliding_layers, sliding_heads);
     const g4::PrefixCacheGeometry g =
         g4::prefix_cache_geometry(facts, static_cast<std::uint32_t>(window),
-                                  infernix::KvCacheStorage::Fp8E4M3Row256);
+                                  infernix::KvCacheStorage::Fp8E4M3Row256, g4::KvStorageModel::KeyEqualsValue);
     const GeometryExpectation want =
         expected_geometry(global_layers, global_heads, sliding_layers, sliding_heads, window);
     const auto sized = [](std::size_t value) { return std::to_string(value); };
@@ -90,7 +91,8 @@ int main() {
     // the derivation above and the implementation.
     {
         const auto g31 = g4::prefix_cache_geometry(layer_facts(10, 4, 50, 16), 1024,
-                                                   infernix::KvCacheStorage::Fp8E4M3Row256);
+                                                   infernix::KvCacheStorage::Fp8E4M3Row256,
+                                                   g4::KvStorageModel::KeyEqualsValue);
         check(g31.global_bytes_per_token == 41280, "31B-like global 41,280 B/token",
               std::to_string(g31.global_bytes_per_token));
         check(g31.sliding_bytes_per_token == 819200, "31B-like sliding 819,200 B/token",
@@ -104,7 +106,8 @@ int main() {
     }
     {
         const auto g26 = g4::prefix_cache_geometry(layer_facts(5, 2, 50, 8), 1024,
-                                                   infernix::KvCacheStorage::Fp8E4M3Row256);
+                                                   infernix::KvCacheStorage::Fp8E4M3Row256,
+                                                   g4::KvStorageModel::KeyEqualsValue);
         check(g26.global_bytes_per_token == 10320, "26B-like global 10,320 B/token",
               std::to_string(g26.global_bytes_per_token));
         check(g26.sliding_bytes_per_token == 409600, "26B-like sliding 409,600 B/token",
@@ -154,8 +157,8 @@ int main() {
     // The value-only flag rides the layout and the identity (a different format, never a smaller
     // alias) and the forward path refuses it while P7 implements K==V only.
     {
-        const g4::KvLayerLayout layout =
-            g4::kv_layer_layout(infernix::KvCacheStorage::Fp8E4M3Row256, true, 512, 2);
+        const g4::KvLayerLayout layout = g4::kv_layer_layout(infernix::KvCacheStorage::Fp8E4M3Row256, true, 512, 2,
+                                                             g4::KvStorageModel::KeyEqualsValue);
         check(layout.storage == g4::KvStorageModel::KeyEqualsValue && layout.plane_count() == 4 &&
                   layout.page_bytes() == 132096,
               "the K==V FP8 bundle carries four planes", std::to_string(layout.page_bytes()));
@@ -184,6 +187,57 @@ int main() {
         try { (void)g4::require_implemented_storage(layout); }
         catch (const std::invalid_argument&) { accepted = false; }
         check(accepted, "K==V storage passes require_implemented_storage");
+    }
+
+    // The key-only layout keeps the global layers' K codes and scales alone: half the global
+    // bytes (sliding rings untouched), its own identity, refused for BF16 globals, and accepted by
+    // require_implemented_storage.
+    {
+        const auto key_only = g4::kv_layer_layout(infernix::KvCacheStorage::Fp8E4M3Row256, true, 512, 2,
+                                                  g4::KvStorageModel::KeyOnly);
+        const auto planes = key_only.planes();
+        check(key_only.storage == g4::KvStorageModel::KeyOnly && key_only.plane_count() == 2 &&
+                  key_only.page_bytes() == 66048 && !key_only.stores_value() &&
+                  planes[0].dtype == infernix::DType::U8 && planes[0].page_bytes == 65536 &&
+                  planes[1].dtype == infernix::DType::FP16 && planes[1].page_bytes == 512,
+              "the key-only FP8 bundle carries K codes and K scales only", std::to_string(key_only.page_bytes()));
+        bool accepted = true;
+        try { (void)g4::require_implemented_storage(key_only); }
+        catch (const std::invalid_argument&) { accepted = false; }
+        check(accepted, "key-only storage passes require_implemented_storage");
+        const auto sliding = g4::kv_layer_layout(infernix::KvCacheStorage::Fp8E4M3Row256, false, 256, 16,
+                                                 g4::KvStorageModel::KeyOnly);
+        check(sliding.storage == g4::KvStorageModel::KeyEqualsValue && sliding.plane_count() == 2 &&
+                  sliding.format == ops::Gemma4KvFormat::BFloat16,
+              "sliding layers keep BF16 K==V under the key-only global layout");
+        bool bf16_refused = false;
+        try {
+            (void)g4::kv_layer_layout(infernix::KvCacheStorage::BFloat16, true, 512, 4, g4::KvStorageModel::KeyOnly);
+        } catch (const std::invalid_argument&) { bf16_refused = true; }
+        check(bf16_refused, "key-only storage refuses BF16 global layers");
+        const auto g31 = g4::prefix_cache_geometry(layer_facts(10, 4, 50, 16), 1024,
+                                                   infernix::KvCacheStorage::Fp8E4M3Row256, g4::KvStorageModel::KeyOnly);
+        check(g31.global_bytes_per_token == 20640, "31B-like key-only global 20,640 B/token",
+              std::to_string(g31.global_bytes_per_token));
+        check(g31.sliding_bytes_per_token == 819200 && g31.image_bytes == 838041856,
+              "the key-only layout leaves the sliding rings and the image unchanged");
+        check(g31.block_bytes == 1323008 && g31.image_slabs == 634 && g31.host_floor_bytes == 841433088,
+              "31B-like key-only block 1,323,008 B, 634 image slabs, floor 841,433,088 B",
+              std::to_string(g31.block_bytes) + "/" + std::to_string(g31.image_slabs) + "/" +
+                  std::to_string(g31.host_floor_bytes));
+        const auto facts = layer_facts(10, 4, 50, 16);
+        const auto stored = g4p::make_layout_identity(facts, 1024, 128, infernix::KvCacheStorage::Fp8E4M3Row256,
+                                                      g4::KvStorageModel::KeyEqualsValue, ops::Gemma4QkMode::Fp8);
+        const auto derived = g4p::make_layout_identity(facts, 1024, 128, infernix::KvCacheStorage::Fp8E4M3Row256,
+                                                       g4::KvStorageModel::KeyOnly, ops::Gemma4QkMode::Fp8);
+        check(derived.storage == g4::KvStorageModel::KeyOnly && derived.block_bytes == 1323008 &&
+                  derived.fingerprint() != stored.fingerprint() &&
+                  derived.describe().find("/key-only") != std::string::npos &&
+                  stored.describe().find("/key-only") == std::string::npos,
+              "the key-only layout is its own identity", derived.describe());
+        g4p::LayoutIdentity value_only = derived;
+        value_only.storage = g4::KvStorageModel::ValueOnly;
+        check(value_only.fingerprint() != derived.fingerprint(), "key-only and value-only identities differ");
     }
 
     // describe() carries the fields a refusal message needs to tell the layouts apart.

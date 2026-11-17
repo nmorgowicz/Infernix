@@ -3,6 +3,7 @@
 #include "core/tensor.h"
 #include "infernix/ops/gemma4_cache.h"
 
+#include <cmath>
 #include <stdexcept>
 #include <string>
 
@@ -13,7 +14,11 @@ inline void validate_gemma4_cache(const Gemma4CacheView& cache, int head_dim, bo
     const auto fail = [&](const char* reason) {
         throw std::invalid_argument(std::string(op) + ": " + reason);
     };
-    if (!cache.k_pages || !cache.v_pages || !cache.block_table) {
+    if (cache.value_source != Gemma4ValueSource::Stored && cache.value_source != Gemma4ValueSource::Key) {
+        fail("unknown value source");
+    }
+    const bool derived = cache.value_source == Gemma4ValueSource::Key;
+    if (!cache.k_pages || !cache.block_table || (!derived && !cache.v_pages)) {
         fail("cache requires k/v pages and block_table");
     }
     const bool fp8 = cache.format == Gemma4KvFormat::Fp8E4m3Row256;
@@ -27,15 +32,33 @@ inline void validate_gemma4_cache(const Gemma4CacheView& cache, int head_dim, bo
     if (cache.qk_mode == Gemma4QkMode::Fp8 && (!fp8 || head_dim != 512 || !global)) {
         fail("FP8 QK requires D512 global FP8 cache");
     }
+    if (derived) {
+        if (!fp8) { fail("key-derived values require a D512 global FP8 cache"); }
+        if (cache.v_pages || cache.v_scales) { fail("key-derived values take no V planes"); }
+        if (cache.rotary_dim != kGemma4KeyValueRotaryDim || !std::isfinite(cache.rope_theta) ||
+            !(cache.rope_theta > 0.0f) || !std::isfinite(cache.value_scale) || cache.value_scale == 0.0f) {
+            fail("key-derived values need rotary_dim 128, a positive finite RoPE base and a finite "
+                 "nonzero value scale");
+        }
+    } else if (cache.value_scale != 0.0f || cache.rope_theta != 0.0f || cache.rotary_dim != 0) {
+        fail("stored values take no key-derivation parameters");
+    }
     const Tensor& k = *cache.k_pages;
-    const Tensor& v = *cache.v_pages;
     const DType dtype = fp8 ? DType::U8 : DType::BF16;
-    if (k.dtype != dtype || v.dtype != dtype || !k.is_contiguous() || !v.is_contiguous() ||
-        !k.data || !v.data) { fail("cache pages must have matching contiguous non-null storage"); }
-    if (k.ne[0] != head_dim || k.ne[1] != kGemma4KvPageTokens || k.ne[2] <= 0 ||
-        k.ne[3] <= 0 || v.ne[0] != k.ne[0] || v.ne[1] != k.ne[1] ||
-        v.ne[2] != k.ne[2] || v.ne[3] != k.ne[3]) {
+    if (k.dtype != dtype || !k.is_contiguous() || !k.data) {
+        fail("cache pages must have matching contiguous non-null storage");
+    }
+    if (k.ne[0] != head_dim || k.ne[1] != kGemma4KvPageTokens || k.ne[2] <= 0 || k.ne[3] <= 0) {
         fail("k/v pages must be matching [D,64,Hkv,pages]");
+    }
+    if (!derived) {
+        const Tensor& v = *cache.v_pages;
+        if (v.dtype != dtype || !v.is_contiguous() || !v.data) {
+            fail("cache pages must have matching contiguous non-null storage");
+        }
+        if (v.ne[0] != k.ne[0] || v.ne[1] != k.ne[1] || v.ne[2] != k.ne[2] || v.ne[3] != k.ne[3]) {
+            fail("k/v pages must be matching [D,64,Hkv,pages]");
+        }
     }
     const Tensor& table = *cache.block_table;
     if (table.dtype != DType::I32 || !table.is_contiguous() || !table.data || table.ne[0] <= 0 ||
@@ -46,8 +69,9 @@ inline void validate_gemma4_cache(const Gemma4CacheView& cache, int head_dim, bo
         if (cache.k_scales || cache.v_scales) { fail("BF16 cache must not have scale planes"); }
         return;
     }
-    if (!cache.k_scales || !cache.v_scales) { fail("FP8 cache requires both scale planes"); }
+    if (!cache.k_scales || (!derived && !cache.v_scales)) { fail("FP8 cache requires both scale planes"); }
     for (const Tensor* scales : {cache.k_scales, cache.v_scales}) {
+        if (scales == nullptr) { continue; }
         if (scales->dtype != DType::FP16 || !scales->is_contiguous() || !scales->data ||
             scales->ne[0] != head_dim / kGemma4KvFp8Group ||
             scales->ne[1] != kGemma4KvPageTokens || scales->ne[2] != k.ne[2] ||

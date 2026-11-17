@@ -59,6 +59,13 @@ void gemma4_qkv_prep(const Tensor& qkv, const Tensor& q_norm, const Tensor& k_no
     if (!(std::isfinite(theta) && theta > 0.0f) || !(std::isfinite(eps) && eps > 0.0f)) {
         throw std::invalid_argument("gemma4_qkv_prep: theta and eps must be positive and finite");
     }
+    // Readers turn the stored K back with the cache's RoPE; it must be the rotation applied here,
+    // and V must be the normed raw key (K == V layers) for unrope(K) / c to be V.
+    if (cache.value_source == Gemma4ValueSource::Key &&
+        (!v_from_k || rotary_dim != cache.rotary_dim || theta != cache.rope_theta)) {
+        throw std::invalid_argument(
+            "gemma4_qkv_prep: key-derived values need a K == V layer rotated by the cache's RoPE");
+    }
     detail::gemma4_qkv_prep_launch(qkv, q_norm, k_norm, positions, rotary_dim, theta, eps, v_from_k,
                                    q_out, cache, stream);
 }

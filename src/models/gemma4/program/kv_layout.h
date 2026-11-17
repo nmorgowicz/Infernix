@@ -24,10 +24,12 @@ namespace infernix::models::gemma4 {
     }
 }
 
-// How one layer's page bundle stores K relative to V. P7 implements KeyEqualsValue only;
-// ValueOnly (addendum E3's derived-key layout) is carried in the descriptor and the identity so a
-// future layout is a different format, never a smaller alias of a K==V cache.
-enum class KvStorageModel : std::uint8_t { KeyEqualsValue, ValueOnly };
+// How one layer's page bundle stores K relative to V. KeyEqualsValue keeps both sides. KeyOnly
+// (global FP8 layers only, opt-in) keeps K's planes alone: attention rebuilds V from K
+// (ops::Gemma4ValueSource::Key). ValueOnly (addendum E3's derived-key layout) is carried in the
+// descriptor and the identity but not implemented. Each model is its own identity, never a smaller
+// alias of a K==V cache.
+enum class KvStorageModel : std::uint8_t { KeyEqualsValue, ValueOnly, KeyOnly };
 
 // One plane of a page bundle: its element type and per-page byte size.
 struct KvPlane {
@@ -45,7 +47,9 @@ struct KvLayerLayout {
 
     // The page bundle as a plane-descriptor list: K's planes, then V's (codes, then their scales).
     // FP8-row256: K codes U8, K scales FP16, V codes U8, V scales FP16 (four planes). BF16: two
-    // BF16 planes. A value-only bundle keeps only the V planes (documented; refused at runtime).
+    // BF16 planes. A key-only bundle keeps only the K planes; a value-only bundle (documented;
+    // refused at runtime) only the V planes.
+    [[nodiscard]] bool stores_value() const noexcept { return storage != KvStorageModel::KeyOnly; }
     [[nodiscard]] std::size_t plane_count() const noexcept {
         const auto sides = storage == KvStorageModel::KeyEqualsValue ? 2U : 1U;
         return sides * (scale_page_bytes != 0 ? 2U : 1U);
@@ -62,16 +66,16 @@ struct KvLayerLayout {
     }
 
     [[nodiscard]] std::size_t page_bytes() const noexcept {
-        // KeyEqualsValue stores two code planes (+ two scale planes when scaled). ValueOnly keeps
-        // only the V side's planes — half these bytes — and is its own identity.
+        // KeyEqualsValue stores two code planes (+ two scale planes when scaled). KeyOnly and
+        // ValueOnly keep one side's planes — half these bytes — and are their own identities.
         const auto sides = storage == KvStorageModel::KeyEqualsValue ? 2U : 1U;
         return sides * (code_page_bytes + scale_page_bytes);
     }
 };
 
-// Refuses a layout P7 does not implement, with the message a value-only descriptor earns.
+// Refuses a layout this runtime does not implement, with the message a value-only descriptor earns.
 [[nodiscard]] inline const KvLayerLayout& require_implemented_storage(const KvLayerLayout& layout) {
-    if (layout.storage != KvStorageModel::KeyEqualsValue) {
+    if (layout.storage == KvStorageModel::ValueOnly) {
         throw std::invalid_argument(
             "Gemma4 value-only global KV storage is not implemented; its layout identity is a "
             "different format, never a K==V alias");
@@ -79,15 +83,21 @@ struct KvLayerLayout {
     return layout;
 }
 
-// Sliding layers always retain BF16, independently of the requested global format.
+// Sliding layers always retain BF16 K==V storage, independently of the requested global format
+// and storage model. KeyOnly applies to global FP8 layers only.
 [[nodiscard]] inline KvLayerLayout kv_layer_layout(KvCacheStorage requested, bool global,
-                                                    int head_dim, int kv_heads) {
+                                                    int head_dim, int kv_heads,
+                                                    KvStorageModel global_storage) {
     const auto requested_format = gemma4_kv_format(requested);
     if (head_dim <= 0 || kv_heads <= 0) {
         throw std::invalid_argument("Gemma4 KV cache geometry is invalid");
     }
     KvLayerLayout layout;
     layout.format = global ? requested_format : ops::Gemma4KvFormat::BFloat16;
+    layout.storage = global ? global_storage : KvStorageModel::KeyEqualsValue;
+    if (layout.storage == KvStorageModel::KeyOnly && layout.format != ops::Gemma4KvFormat::Fp8E4m3Row256) {
+        throw std::invalid_argument("Gemma4 key-only global KV requires --kv-dtype fp8");
+    }
     const auto rows = static_cast<std::size_t>(ops::kGemma4KvPageTokens) * kv_heads;
     if (layout.format == ops::Gemma4KvFormat::Fp8E4m3Row256) {
         if (head_dim != 512) {
@@ -132,7 +142,8 @@ struct PrefixCacheGeometry {
 
 [[nodiscard]] inline PrefixCacheGeometry prefix_cache_geometry(std::span<const KvLayerFact> layers,
                                                                std::uint32_t window,
-                                                               KvCacheStorage global_format) {
+                                                               KvCacheStorage global_format,
+                                                               KvStorageModel global_storage) {
     constexpr std::size_t kHeaderBytes = 256;
     constexpr std::size_t kPartAlignment = 256;
     constexpr std::size_t kSlabAlignment = 4096;
@@ -143,7 +154,7 @@ struct PrefixCacheGeometry {
     for (const auto& layer : layers) {
         const auto layout = require_implemented_storage(kv_layer_layout(
             layer.global ? global_format : KvCacheStorage::BFloat16, layer.global,
-            layer.head_dim, layer.kv_heads));
+            layer.head_dim, layer.kv_heads, global_storage));
         const auto per_token = layout.page_bytes() / page_tokens;
         if (layer.global) {
             out.global_bytes_per_token += per_token;
@@ -153,8 +164,8 @@ struct PrefixCacheGeometry {
         // The image carries each sliding layer's window as its own K part then V part.
         const auto code_share  = layout.code_page_bytes / page_tokens;
         const auto scale_share = layout.scale_page_bytes / page_tokens;
-        // K==V storage keeps both sides (value-only is refused above), so every sliding layer
-        // contributes a K part then a V part, each its own 256-aligned codes (+ scales) run.
+        // Sliding layers always keep K==V, so every sliding layer contributes a K part then a V
+        // part, each its own 256-aligned codes (+ scales) run.
         for (int side = 0; side < 2; ++side) {
             out.image_bytes += align_bytes(window_tokens * code_share, kPartAlignment);
             if (layout.scale_page_bytes != 0) {

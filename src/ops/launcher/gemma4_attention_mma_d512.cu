@@ -53,7 +53,9 @@ constexpr std::size_t shared_bytes() {
 // halves. The arithmetic per row and column is the same as a 4-warp CTA per output half, so
 // the result does not depend on the split. With segments > 1 each CTA writes FP32 partials
 // and (max, sum) stats for gemma4_attention_d512_combine_kernel instead of the final rows.
-template <Gemma4KvFormat Fmt, bool Fp8Qk = false>
+// KeyValues (Gemma4ValueSource::Key) stages the V tile from the K pages and expands it with
+// gemma4_expand_key_values; QK is unchanged.
+template <Gemma4KvFormat Fmt, bool Fp8Qk = false, bool KeyValues = false>
 __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
     const __nv_bfloat16* __restrict__ q, const void* __restrict__ k_pages,
     const void* __restrict__ v_pages, const __half* __restrict__ k_scales,
@@ -61,11 +63,12 @@ __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
     const std::int32_t* __restrict__ positions, __nv_bfloat16* __restrict__ out, int tokens,
     int q_heads, int kv_heads, int window, float scale, std::int32_t logical_pages,
     std::int32_t physical_pages, float* __restrict__ partial,
-    float* __restrict__ partial_stats) {
+    float* __restrict__ partial_stats, float value_scale, float rope_theta) {
     constexpr unsigned FullMask = 0xffffffffu;
 
     extern __shared__ __align__(1024) __nv_bfloat16 gemma4_d512_smem[]; // Preserve the qualified module's alignment.
     static_assert(!Fp8Qk || Fmt == Gemma4KvFormat::Fp8E4m3Row256);
+    static_assert(!KeyValues || Fmt == Gemma4KvFormat::Fp8E4m3Row256);
     __nv_bfloat16* q_s = gemma4_d512_smem;
     auto* q_fp8 = reinterpret_cast<std::uint8_t*>(q_s);
     auto* k_fp8 = q_fp8 + kRows * kD;
@@ -74,6 +77,9 @@ __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
     __shared__ __align__(4) __half q_scale_s[Fp8Qk ? kRows * 2 : 1];
     __shared__ __align__(4) __half k_scale_s[Fp8Qk ? kBc * 2 : 1];
     __shared__ int range[3]; // first visible key, highest position, lowest position
+    __shared__ float frequency[KeyValues ? kGemma4KeyValueRotaryDim / 2 : 1];
+    const void* value_pages        = KeyValues ? k_pages : v_pages;
+    const __half* value_scale_rows = KeyValues ? k_scales : v_scales;
 
     // Later tiles see more keys; start them first.
     const int q0       = (static_cast<int>(gridDim.x) - 1 - static_cast<int>(blockIdx.x)) * kRows;
@@ -90,6 +96,12 @@ __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
         range[0] = INT_MAX;
         range[1] = -1;
         range[2] = INT_MAX;
+    }
+    if constexpr (KeyValues) {
+        // Published by the barrier below, long before the first V tile expands.
+        if (tid < kGemma4KeyValueRotaryDim / 2) {
+            frequency[tid] = gemma4_rope_frequency(tid, kGemma4KeyValueRotaryDim, rope_theta);
+        }
     }
     __syncthreads();
     if (tid < rows) {
@@ -209,14 +221,19 @@ __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
                 last_key, 0, tid);
         }
     };
-    const auto expand = [&](__nv_bfloat16* dst, const __half* scales, int mapped, int k0) {
+    const auto expand = [&](__nv_bfloat16* dst, const __half* scales, int mapped, int k0, bool values) {
         Gemma4QuantStage<kD, kBc, kThreads> staged;
 
             gemma4_load_quant_stage<kD, kBc, kThreads, kGemma4KvFp8Group, 2>(
                 staged, dst, scales, kv_heads, kvh, mapped, k0, last_key, tid);
 
         __syncthreads();
-
+        if constexpr (KeyValues) {
+            if (values) {
+                gemma4_expand_key_values<kBc, kThreads>(staged, dst, k0, frequency, value_scale, tid);
+                return;
+            }
+        }
             gemma4_expand_quant_stage<kD, kBc, kThreads, std::uint8_t>(staged, dst, 0, tid);
 
     };
@@ -243,10 +260,10 @@ __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
         cp_wait<0>();
         __syncthreads();
         if constexpr (kQuantKv && !Fp8Qk) {
-            expand(k_s, k_scales, physical, k0);
+            expand(k_s, k_scales, physical, k0, false);
             __syncthreads();
         }
-        stage(v_s, v_pages, v_scales, physical, k0);
+        stage(v_s, value_pages, value_scale_rows, physical, k0);
 
         cp_commit();
 
@@ -313,7 +330,7 @@ __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
             __syncthreads();
         }
         if constexpr (kQuantKv) {
-            expand(v_s, v_scales, physical, k0);
+            expand(v_s, value_scale_rows, physical, k0, true);
             __syncthreads();
         }
         if (block + 1 < seg_end) {
@@ -587,7 +604,7 @@ int d512_segment_count(std::int32_t tokens, std::int32_t q_heads, std::int32_t p
     return static_cast<int>(std::max<std::int64_t>(segments, 1));
 }
 
-template <Gemma4KvFormat Fmt, bool Fp8Qk = false>
+template <Gemma4KvFormat Fmt, bool Fp8Qk = false, bool KeyValues = false>
 void launch_d512(const Tensor& q, const Gemma4CacheView& cache, const Tensor& positions,
                   int window, float scale, Tensor& out, float* partial, float* partial_stats,
                   cudaStream_t stream) {
@@ -596,7 +613,7 @@ void launch_d512(const Tensor& q, const Gemma4CacheView& cache, const Tensor& po
     const Tensor& block_table = *cache.block_table;
     static bool configured = false;
     if (!configured) {
-        CUDA_CHECK(cudaFuncSetAttribute(gemma4_attention_d512_kernel<Fmt, Fp8Qk>,
+        CUDA_CHECK(cudaFuncSetAttribute(gemma4_attention_d512_kernel<Fmt, Fp8Qk, KeyValues>,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         static_cast<int>(shared_bytes<Fp8Qk>())));
         configured = true;
@@ -608,15 +625,16 @@ void launch_d512(const Tensor& q, const Gemma4CacheView& cache, const Tensor& po
     }
     const dim3 grid(static_cast<unsigned>((tokens + kRows - 1) / kRows),
                     static_cast<unsigned>(q.ne[1]), static_cast<unsigned>(segments));
-    gemma4_attention_d512_kernel<Fmt, Fp8Qk>
+    gemma4_attention_d512_kernel<Fmt, Fp8Qk, KeyValues>
         <<<grid, kThreads, shared_bytes<Fp8Qk>(), stream>>>(
-        static_cast<const __nv_bfloat16*>(q.data), k_pages.data, cache.v_pages->data,
+        static_cast<const __nv_bfloat16*>(q.data), k_pages.data,
+        KeyValues ? nullptr : cache.v_pages->data,
         Quantized ? static_cast<const __half*>(cache.k_scales->data) : nullptr,
-        Quantized ? static_cast<const __half*>(cache.v_scales->data) : nullptr,
+        Quantized && !KeyValues ? static_cast<const __half*>(cache.v_scales->data) : nullptr,
         static_cast<const std::int32_t*>(block_table.data),
         static_cast<const std::int32_t*>(positions.data), static_cast<__nv_bfloat16*>(out.data),
         tokens, q.ne[1], k_pages.ne[2], window, scale, block_table.ne[0], k_pages.ne[3], partial,
-        partial_stats);
+        partial_stats, cache.value_scale, cache.rope_theta);
     if (segments > 1) {
         gemma4_attention_d512_combine_kernel
             <<<static_cast<unsigned>(tokens * q.ne[1]), kD512CombineThreads, 0, stream>>>(
@@ -629,14 +647,16 @@ void launch_d512(const Tensor& q, const Gemma4CacheView& cache, const Tensor& po
 template <typename Visitor>
 decltype(auto) visit_d512(const Gemma4CacheView& cache, Visitor&& visitor) {
     if (cache.format == Gemma4KvFormat::Fp8E4m3Row256) {
-
+        const bool key_values = cache.value_source == Gemma4ValueSource::Key;
         if (cache.qk_mode == Gemma4QkMode::Fp8) {
-            return visitor.template operator()<Gemma4KvFormat::Fp8E4m3Row256, true>();
+            return key_values ? visitor.template operator()<Gemma4KvFormat::Fp8E4m3Row256, true, true>()
+                              : visitor.template operator()<Gemma4KvFormat::Fp8E4m3Row256, true, false>();
         }
-        return visitor.template operator()<Gemma4KvFormat::Fp8E4m3Row256, false>();
+        return key_values ? visitor.template operator()<Gemma4KvFormat::Fp8E4m3Row256, false, true>()
+                          : visitor.template operator()<Gemma4KvFormat::Fp8E4m3Row256, false, false>();
     }
 
-    return visitor.template operator()<Gemma4KvFormat::BFloat16, false>();
+    return visitor.template operator()<Gemma4KvFormat::BFloat16, false, false>();
 }
 
 } // namespace
@@ -647,16 +667,16 @@ int gemma4_attention_mma_d512_segments(std::int32_t tokens, std::int32_t q_heads
 }
 
 Gemma4AttentionD512Resources gemma4_attention_mma_d512_resources(const Gemma4CacheView& cache) {
-    return visit_d512(cache, []<Gemma4KvFormat Fmt, bool Fp8Qk>() {
+    return visit_d512(cache, []<Gemma4KvFormat Fmt, bool Fp8Qk, bool KeyValues>() {
         Gemma4AttentionD512Resources result;
         result.dynamic_shared_bytes = shared_bytes<Fp8Qk>();
         result.threads = kThreads;
-        CUDA_CHECK(cudaFuncSetAttribute(gemma4_attention_d512_kernel<Fmt, Fp8Qk>,
+        CUDA_CHECK(cudaFuncSetAttribute(gemma4_attention_d512_kernel<Fmt, Fp8Qk, KeyValues>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(result.dynamic_shared_bytes)));
         CUDA_CHECK(cudaFuncGetAttributes(
-            &result.attributes, gemma4_attention_d512_kernel<Fmt, Fp8Qk>));
+            &result.attributes, gemma4_attention_d512_kernel<Fmt, Fp8Qk, KeyValues>));
         CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &result.active_blocks_per_sm, gemma4_attention_d512_kernel<Fmt, Fp8Qk>,
+            &result.active_blocks_per_sm, gemma4_attention_d512_kernel<Fmt, Fp8Qk, KeyValues>,
             kThreads, result.dynamic_shared_bytes));
         return result;
     });
@@ -666,8 +686,8 @@ void gemma4_attention_mma_d512_launch(const Tensor& q, const Gemma4CacheView& ca
                                       const Tensor& positions, int window, float scale,
                                       Tensor& out, float* partial, float* partial_stats,
                                       cudaStream_t stream) {
-    visit_d512(cache, [&]<Gemma4KvFormat Fmt, bool Fp8Qk>() {
-        launch_d512<Fmt, Fp8Qk>(
+    visit_d512(cache, [&]<Gemma4KvFormat Fmt, bool Fp8Qk, bool KeyValues>() {
+        launch_d512<Fmt, Fp8Qk, KeyValues>(
             q, cache, positions, window, scale, out, partial, partial_stats, stream);
     });
 }

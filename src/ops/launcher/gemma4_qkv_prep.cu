@@ -76,9 +76,7 @@ __device__ __forceinline__ void rotate(__nv_bfloat162 (&v)[D / 64], int position
         float sn[2];
 #pragma unroll
         for (int j = 0; j < 2; ++j) {
-            const float exponent =
-                -2.0F * static_cast<float>(element + j) / static_cast<float>(rotary_dim);
-            const float frequency = powf(theta, exponent);
+            const float frequency = gemma4_rope_frequency(element + j, rotary_dim, theta);
             const float angle     = static_cast<float>(position) * frequency;
             sincosf(angle, &sn[j], &c[j]);
         }
@@ -95,8 +93,8 @@ __global__ __launch_bounds__(kWarpsPerBlock * 32) void gemma4_qkv_prep_kernel(
     const __nv_bfloat162* k_norm, const std::int32_t* positions, __nv_bfloat162* q_out,
     void* k_pages, void* v_pages, __half* k_scales, __half* v_scales,
     const std::int32_t* block_table, int q_heads,
-    int kv_heads, int rotary_dim, int d, float theta, float eps, bool v_from_k, int logical_pages,
-    int physical_pages) {
+    int kv_heads, int rotary_dim, int d, float theta, float eps, bool v_from_k, bool store_values,
+    int logical_pages, int physical_pages) {
     constexpr int kHeadPairs = D / 2;
     const int lane           = static_cast<int>(threadIdx.x) & 31;
     const int head =
@@ -142,6 +140,8 @@ __global__ __launch_bounds__(kWarpsPerBlock * 32) void gemma4_qkv_prep_kernel(
             static_cast<__nv_bfloat162*>(k_pages)[slot + lane + 32 * s] = out[s];
         }
     }
+    // Key-derived values (Gemma4ValueSource::Key) keep no V planes: readers rebuild V from K.
+    if (!store_values) { return; }
 
     if (!v_from_k) {
         const std::int64_t v_rows = k_rows + static_cast<std::int64_t>(kv_heads) * kHeadPairs;
@@ -176,11 +176,11 @@ void launch(const Tensor& qkv, const Tensor& q_norm, const Tensor& k_norm, const
         static_cast<const __nv_bfloat162*>(q_norm.data),
         static_cast<const __nv_bfloat162*>(k_norm.data),
         static_cast<const std::int32_t*>(positions.data), static_cast<__nv_bfloat162*>(q_out.data),
-        k_pages.data, cache.v_pages->data,
+        k_pages.data, cache.v_pages != nullptr ? cache.v_pages->data : nullptr,
         Quantized ? static_cast<__half*>(cache.k_scales->data) : nullptr,
-        Quantized ? static_cast<__half*>(cache.v_scales->data) : nullptr,
+        Quantized && cache.v_scales != nullptr ? static_cast<__half*>(cache.v_scales->data) : nullptr,
         static_cast<const std::int32_t*>(block_table.data), q_heads, kv_heads, rotary_dim, D, theta,
-        eps, v_from_k, block_table.ne[0], k_pages.ne[3]);
+        eps, v_from_k, cache.value_source == Gemma4ValueSource::Stored, block_table.ne[0], k_pages.ne[3]);
 }
 
 } // namespace

@@ -236,8 +236,8 @@ void print_generation_summary(const infernix::GenerationResult& result,
     if (memory.gemma4_kv) {
         const auto& kv = *memory.gemma4_kv;
         print_metric("requested kv dtype", format_kv_cache(kv.requested));
-        print_metric("global kv dtype", format_kv_cache(kv.global) + ", " +
-                                            format_bytes(kv.global_payload_bytes));
+        print_metric("global kv dtype", format_kv_cache(kv.global) + (kv.global_key_only ? " key-only" : "") +
+                                            ", " + format_bytes(kv.global_payload_bytes));
         print_metric("sliding kv dtype", format_kv_cache(kv.sliding) + ", " +
                                              format_bytes(kv.sliding_payload_bytes));
         print_metric("gemma4 qk", infernix::gemma4_qk_name(kv.qk_mode));
