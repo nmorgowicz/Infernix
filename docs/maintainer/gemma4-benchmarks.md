@@ -477,6 +477,71 @@ the early exit's effect on decode. Historical prefill A/B used eight-token outpu
 The 24 HTTP requests succeeded under the guarded GPU lease (minimum free RAM 29.33 GiB); raw responses, logs,
 driver and summaries are in `prefill-earlyexit-20261116/default-20261117/`.
 
+## Key-only global KV cache (experimental, off by default)
+
+`INFERNIX_TMP_GEMMA4_KEY_ONLY_KV=1` (a temporary switch; unset or `0` keeps the default K==V FP8 layout) stores only the
+FP8 K codes and scales of the global (D512) layers and rebuilds V in attention. It requires `--kv-dtype fp8`; other
+formats are refused. Sliding layers keep BF16 K and V.
+
+**Why V can be rebuilt.** Gemma 4's global layers have no V projection: `gemma4_qkv_prep` forms V as the raw K row after
+the weightless norm, and K as the same row times the key-norm weight, then RoPE on the 128-wide rotated prefix (pairs
+`(i, i + 64)` after the converter's `prope_perm`). When the key-norm weight is one constant `c`, `V = unrope(K) / c`. The
+converter records such constants as `global_k_norm_scalar`; the Program refuses the layout unless every global layer has
+one and the loaded BF16 weights equal it (all ten global layers of the 31B artifacts do, c = 0.0600-0.0654).
+
+**What runs.** `KvStorageModel::KeyOnly` is its own layout identity (`/key-only` in the prefix-cache identity, different
+block and image fingerprints), so its Host blocks and snapshots never restore into a K==V cache or the reverse; block
+records hold K codes and scales only. Cache views carry `Gemma4ValueSource::Key` with `1 / c`, the RoPE base and
+the rotary width. The writer stores K only. The D512 decode kernel turns each staged K row into its V row (no V row is
+read); the tensor-core kernel stages the V tile from the K pages and expands it the same way. Both form the writer's FP32
+angle, reduce it to [-pi, pi] and rotate back, multiply by `1 / c` and round each V element once to BF16. The generic
+SIMT path (query groups above 8) refuses the layout. The MTP assistant reads the same views. The memory summary, the
+startup `Gemma KV` log line (`fp8 key-only`) and the request log's `memory.gemma4_kv.global_key_only` report the layout;
+the load summary's prefill signature carries `/k-only`.
+
+**Bytes.** Global KV per token 41,280 -> 20,640 B on the 31B geometry (10 global layers x 4 KV heads); at 131,072
+tokens 5.04 -> 2.52 GiB. Sliding rings, workspace and prefix images are unchanged.
+
+**Tests.** `infernix_ops_gemma4_attention_test gemma4_key_only_kv` (cache validation; the writer's K planes byte-equal
+to the K==V writer's; `unrope(K_bf16) / c` against the stored BF16 V; decode and tensor-core attention, BF16 and FP8 QK,
+split context and graph replay against an FP64 oracle up to position 262,143; attention error of key-only and stored FP8
+V against BF16 K/V from the same writer input). `infernix_gemma4_key_only_real_test` (`INFERNIX_GEMMA4_ARTIFACT`):
+refusals, K bytes equal to the K==V cache through the first global layer, K-planes-only accounting, deterministic
+generation, root replay and Host snapshot restore equal to the cold key-only run with MTP off and on.
+
+**Measured (2026-11-17, RTX 5090, diode IQ3_XXS with its MTP assistant, one build, switch unset against `=1`).**
+Camp evidence: `iq3xs-20261115/konly-20261117/` (drivers, raw requests/responses, server logs, `results.json`).
+
+- Op level, same writer input, attention error against BF16 K/V (stored FP8 / key-only): decode 0.0379 / 0.0379,
+  prefill 0.0428 / 0.0433, decode at position ~262k 0.0553 / 0.0561, FP8 QK prefill 0.0551 / 0.0554. First global
+  layer of the real model, V error against BF16 V: stored FP8 0.0260, rebuilt 0.0261.
+- Native full-vocabulary KL against the diode Q8 reference (context 512, stride 256, chunk 128, BF16 QK): K==V FP8
+  0.3154030109 (unchanged), key-only 0.3168307746; top-1 disagreement 0.1684 / 0.1658; mean delta NLL 0.1585 / 0.1564.
+- Long context, top-256 KL of key-only against K==V FP8 (context 32768, stride 16384, 12 English/code streams, 809,397
+  positions, chunk 2048, no chat prefix): mean 0.379, top-1 agreement 0.780, NLL 7.872 -> 7.881. By preceding context:
+  0.361 (<1k), 0.356 (1-2k), 0.445 (2-4k), 0.469 (4-8k), 0.473 (8-16k), 0.355 (16-32k): no growth with position. This
+  instrument has no chat prefix and its baseline NLL is near-degenerate (7.9 against 2.6 with the prefix), so these KLs
+  are between two high-entropy distributions; they are not a quality figure on the pinned scale.
+- Needle retrieval (three 7-digit codes at 10/50/90 % depth, greedy, MTP off, ~16k/65k/120k prompts, four each): 36/36
+  for both arms.
+- Capacity (`--plan`, MTP d1): global KV at 131,072 tokens 5.04 -> 2.52 GiB; planned KV 7,560 -> 4,980 MiB (chunk
+  `auto`) and 6,060 -> 3,480 MiB (chunk 128); at 262,144 tokens 12,720 -> 7,560 MiB (`auto`). Serving at 131,072 tokens,
+  whole-device peak 23,243-23,311 -> 20,665-20,693 MiB plain and 23,701-23,745 -> 21,126-21,143 MiB with MTP.
+- Simulated 16 GB-class card (the ballast method of the 16 GB envelope section, headless variant, 15,791 MiB usable;
+  MTP d1, chunk 128, near-capacity prompt plus 256 decode): key-only 40,960 fits (14,820 MiB added), 65,536 fits
+  (15,305), 81,920 tight (15,602). The K==V FP8 ladder there: 40,960 fit, 49,152 marginal.
+- Speed, matched instrument of the early-exit section (131,072 context, FP8 KV/QK, auto chunk, 256 greedy tokens,
+  free-cache-resume off, AB and BA orders; medians of 3 timed requests, K==V FP8 -> key-only):
+
+| Prompt | Prefill tok/s | Plain decode tok/s | MTP d1 decode tok/s (accepted / drafted) |
+|---:|---|---|---|
+| ~1k | 6,294-6,351 -> 6,358-6,463 | 82.6-82.7 -> 83.7-84.0 | 119.8-122.1 -> 123.6-123.8 (312/451 -> 312/452) |
+| ~65k | 3,351-3,386 -> 2,951-2,972 (-12 %) | 71.0-71.2 -> 68.8-69.2 (-3 %) | 96.5-97.7 -> 87.9-88.5 (331/431 -> 306/456) |
+| ~122k | 2,320-2,329 -> 1,979-1,983 (-15 %) | 61.6-62.5 -> 59.7-60.5 (-3 %) | 75.2-75.4 -> 71.6-72.7 (306/457 -> 313/450) |
+
+The rebuild (a sine and cosine per rotated pair and key) costs more than the halved V read saves at these lengths;
+outputs differ from K==V FP8 (a different lossy V) but are identical across AB and BA runs of the same arm.
+
 ## Route-specific measurements
 
 ### MTP selecting-logit evidence
