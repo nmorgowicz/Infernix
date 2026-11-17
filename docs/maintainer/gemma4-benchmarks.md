@@ -411,6 +411,47 @@ card, Linux or a headless driver stack, any reserve other than the three above, 
 `iq3-xs` at the conservative reserve, and quality at the reduced chunk (the chunk changes scheduling, not the stored weights;
 no KL was scored for it).
 
+## Final-layer early exit in intermediate prefill chunks (2026-11-16)
+
+`INFERNIX_TMP_GEMMA4_FINAL_LAYER_EXIT=1` (off by default; [mechanism](engine-architecture.md)) skips the last layer's attention, output
+projection and FFN in prefill forwards whose final hidden state nothing reads, after that layer's K/V is written.
+
+**Equivalence (switch unset against `=1`, separate processes, same build).** All of these matched exactly:
+- Native direct calls: every BF16 and global FP8 code/scale plane after full versus KV-only forwards, at intermediate and final boundaries,
+  and final full-vocabulary logits. 32 cells (four diode artifacts x chunk 128/2048 x CUDA graphs off/on x MTP off/on), 160 fingerprints
+  (selecting-distribution, readout, token, MTP counters), Host snapshot restore and two-intermediate-chunk root replay equal to cold generation.
+- HTTP: 112 requests (four artifacts, chunk 128 and `auto`, MTP on/off), responses, usage and speculative counters identical.
+- Native full-vocabulary KL at chunk 128 (pinned Q8 reference, BF16 QK, FP8 KV): reports and position sidecars identical
+  (mean KL 0.3154030109 in both arms). Chunk 512 cannot use that reference (the pinned reference guard refuses a chunk other than 128, unchanged), so
+  chunk 512 compares causal NLL and the saved top-256 sidecar of the same input (`diode-IQ3_XXS`): report fields other than timings and
+  the sidecar path, and the 28,171,234-byte sidecar, are identical. No Q8 KL was scored at chunk 512.
+
+**Cold-prefill timing.** RTX 5090, one build (`build-infernix-prefill-earlyexit-cuda13.5`, `infernix-serve.exe`), serialized, default 8 GiB RAM
+floor, one fresh server per arm, FP8 KV and FP8 QK, BF16 logits, MTP d1, thinking off, greedy, 8 output tokens, max context 131072, 4096 MiB
+Host tier, prompts byte-identical across arms. `--no-fast-path free-cache-resume` is set in both arms (otherwise six common opener tokens
+are reused from the live lane even for distinct prompts) and every timed request reported `cached_tokens` 0 with equal prompt and computed counts.
+**This is a changed timing profile**: the earlier mixed-cache instrument is not comparable to these rates. Each cell has one excluded warmup, then
+3 (1k) or 2 (65k, 122k) timed requests per arm; AB and BA orders (BA also reverses tier order) are reported separately. Ranges are repetitions,
+not confidence intervals. Rate = server-reported computed prompt tokens per second.
+
+| Chunk | Prompt (nominal) | Rate change, all four tiers, AB and BA medians | Example (best-medium, A to B tok/s; wire TTFT) |
+|---|---|---|---|
+| 128 | 1k | +0.69% to +2.63% | 3,668 to 3,731 |
+| 128 | 65k | +3.19% to +5.41% | 2,292 to 2,414; 28.5 to 27.1 s |
+| 128 | 122k | +5.19% to +6.88% | 1,673 to 1,787; 73.2 to 68.5 s |
+| 2048 (`auto`) | 1k | -0.56% to +0.71% (no-op; single-chunk prompt) | 6,496 to 6,460 |
+| 2048 (`auto`) | 65k | +6.13% to +6.43% | 3,215 to 3,415; 20.3 to 19.2 s |
+| 2048 (`auto`) | 122k | +7.26% to +8.01% | 2,182 to 2,348; 56.2 to 52.3 s |
+
+All 48 cells (4 tiers x 2 chunks x 3 prompts x 2 orders; 32 server runs) completed with no failure, no cached prefix and identical output
+text, token counts and draft counters between arms. AB and BA gains agree within about one point (largest gap: IQ3_XS chunk 128 at 65k, +3.19%
+against +4.08%). The 1k prompt at chunk 2048 is one chunk whose last call is complete, so no skipping applies and its spread is noise.
+[INFERENCE] The gain growing with prompt length points at the last layer's long-context attention being a larger share of each intermediate chunk than its
+weight-GEMM cost; this was not profiled per layer. Not measured: decode, MTP-round speed, physical 16 GB cards, free-cache-resume equality
+(that route's partition arithmetic differs from cold by contract), and any tier or chunk other than those above.
+
+Full tables, receipts and drivers: the camp's `convert/iq3xs-20261115/prefill-earlyexit-20261116/` (`results.md`, `results.json`, `receipts/`).
+
 ## Route-specific measurements
 
 ### MTP selecting-logit evidence

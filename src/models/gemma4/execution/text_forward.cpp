@@ -101,7 +101,7 @@ namespace {
 void layer_body(Tensor& x, Tensor& hidden_n, const Gemma4LayerWeights& weights,
                 const void* next_input_norm, const Tensor& positions,
                 const ops::Gemma4CacheView& cache, ops::Fp8RowCublasContext& gemm,
-                WorkspaceArena& workspace, cudaStream_t stream) {
+                WorkspaceArena& workspace, cudaStream_t stream, bool kv_only) {
     const int tokens = x.ne[1];
     const int hidden = weights.hidden;
     const int dim = weights.head_dim;
@@ -120,14 +120,15 @@ void layer_body(Tensor& x, Tensor& hidden_n, const Gemma4LayerWeights& weights,
 
     auto qkv = workspace.alloc(DType::BF16, {qkv_rows, tokens});
     auto qn = workspace.alloc(DType::BF16, {q_rows, tokens});
-    auto attn = workspace.alloc(DType::BF16, {q_rows, tokens});
-    auto projected = workspace.alloc(DType::BF16, {hidden, tokens});
 
     project(hidden_n, weights.qkv, weights.qkv_ggml, weights.qkv_policy, qkv, gemm, workspace, stream);
     Tensor qn_heads(qn.data, DType::BF16, {dim, weights.q_heads, tokens});
     ops::gemma4_qkv_prep(qkv, norm_weight(weights.q_norm, dim), norm_weight(weights.k_norm, dim),
                          positions, weights.rotary_dim, weights.rope_theta, weights.rms_eps,
                          weights.global_layer, qn_heads, cache, stream);
+    if (kv_only) { return; } // the layer's K/V is written; nothing downstream reads its output
+    auto attn = workspace.alloc(DType::BF16, {q_rows, tokens});
+    auto projected = workspace.alloc(DType::BF16, {hidden, tokens});
     Tensor attn_heads(attn.data, DType::BF16, {dim, weights.q_heads, tokens});
     ops::gemma4_attention(qn_heads, cache, positions, weights.window, 1.0f, attn_heads,
                           workspace, stream);
@@ -169,13 +170,14 @@ void gemma4_layer(Tensor& x, const Gemma4LayerWeights& weights, const Tensor& po
     auto hidden_n = workspace.alloc(DType::BF16, {weights.hidden, x.ne[1]});
     ops::rmsnorm(x, norm_weight(weights.input_norm, weights.hidden), weights.rms_eps, false,
                  hidden_n, stream);
-    layer_body(x, hidden_n, weights, nullptr, positions, cache, gemm, workspace, stream);
+    layer_body(x, hidden_n, weights, nullptr, positions, cache, gemm, workspace, stream, false);
 }
 
 void gemma4_layers(const Tensor& ids, Tensor& hidden, const Gemma4Embedding& token_embedding,
                    std::span<const Gemma4LayerWeights> layers,
                    std::span<const Gemma4CacheLayer> caches, const Tensor& positions,
-                   ops::Fp8RowCublasContext& gemm, WorkspaceArena& workspace, cudaStream_t stream) {
+                   ops::Fp8RowCublasContext& gemm, WorkspaceArena& workspace, cudaStream_t stream,
+                   bool final_hidden) {
     if (layers.size() != caches.size()) {
         throw std::invalid_argument("gemma4_layers: one cache per layer");
     }
@@ -187,9 +189,10 @@ void gemma4_layers(const Tensor& ids, Tensor& hidden, const Gemma4Embedding& tok
                  hidden_n, stream);
     for (std::size_t layer = 0; layer < layers.size(); ++layer) {
         auto layer_scope = workspace.scope();
-        const void* next = layer + 1 < layers.size() ? layers[layer + 1].input_norm : nullptr;
+        const bool last = layer + 1 == layers.size();
+        const void* next = last ? nullptr : layers[layer + 1].input_norm;
         layer_body(hidden, hidden_n, layers[layer], next, positions, caches[layer], gemm,
-                   workspace, stream);
+                   workspace, stream, last && !final_hidden);
     }
 }
 

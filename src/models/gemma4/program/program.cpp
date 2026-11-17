@@ -3,6 +3,7 @@
 #include "core/arena.h"
 #include "core/decode_graph.h"
 #include "core/startup.h"
+#include "core/temporary_switches.h"
 #include "models/gemma4/execution/parameters.h"
 #include "models/gemma4/program/kv_layout.h"
 #include "infernix/types.h"
@@ -43,6 +44,12 @@ constexpr int kScoreTile = 128;
 constexpr std::array<std::uint32_t, 6> kGraphWidths{32, 64, 128, 256, 512, 1024};
 constexpr std::uint64_t kGraphGuardMargin = 256ULL << 20;
 constexpr std::uint64_t kGraphAllowance = 64ULL << 20;
+// INFERNIX_TMP_GEMMA4_FINAL_LAYER_EXIT (core/temporary_switches.cpp): the last layer's tail is skipped in
+// forwards whose final hidden state nothing reads. Read once; unset keeps every forward complete.
+bool final_layer_exit() {
+    static const bool enabled = temporary_switches::flag("INFERNIX_TMP_GEMMA4_FINAL_LAYER_EXIT");
+    return enabled;
+}
 // MTP rounds: at most kMaxDraftTokens drafts (the CLI's range). One I32 slot block carries a round's
 // device inputs and outputs, so a captured round replays after one upload: the draft position, the
 // anchor and drafts (verify ids), the verify positions, the target argmaxes, the licensed tokens and
@@ -179,6 +186,10 @@ ProgramDevicePlan Program::plan_device(const Model& model, const ProgramOptions&
             }
         }
         if (geometry.draft) { ++plan.graph_bound; } // the round graph
+        if (final_layer_exit() && options.prefill_chunk <= std::min(options.max_context, plan.kv_pages * kPage) &&
+            std::find(kGraphWidths.begin(), kGraphWidths.end(), options.prefill_chunk) != kGraphWidths.end()) {
+            ++plan.graph_bound; // the tail-free prefill graph
+        }
         plan.graph_allowance = kGraphAllowance;
     }
     plan.curve.main_page_tokens = kPage;
@@ -246,6 +257,7 @@ struct ProgramImpl {
     DecodeGraphExecutable decode_graph;
     struct PrefillGraph { DecodeGraphDefinition definition; DecodeGraphExecutable executable; };
     std::array<PrefillGraph, kGraphWidths.size()> prefill_graphs;
+    PrefillGraph partial_prefill_graph; // the full-chunk forward without the last layer's tail
     std::size_t graph_measured_bytes = 0;
     // Sampling pipeline width: the 20-wide path serves requests with top_k <= 20 (every request the
     // fast path served before), the 64-wide path the rest. The decode graph embeds the sampler, so a
@@ -478,13 +490,13 @@ struct ProgramImpl {
     }
     Tensor hidden_columns(int first, int n) const { return hidden.slice(1, first, n); }
     Tensor logits(int n) const { return head.slice(1, 0, n); }
-    void layers_body(std::uint32_t width) {
+    void layers_body(std::uint32_t width, bool final_hidden = true) {
         workspace.reset();
         auto input = ids.slice(0, 0, static_cast<int>(width));
         auto pos = positions.slice(0, 0, static_cast<int>(width));
         auto out = hidden_columns(0, static_cast<int>(width));
         gemma4_layers(input, out, parameters.embedding, parameters.layers, caches, pos,
-            gemm, workspace, stream);
+            gemm, workspace, stream, final_hidden);
     }
     void head_body(int first, int n, int output_first = 0) {
         workspace.reset();
@@ -614,6 +626,14 @@ struct ProgramImpl {
             graph.executable.instantiate(graph.definition);
             graph.executable.upload(stream);
             graph.executable.launch(stream);
+        }
+        if (final_layer_exit() && options.prefill_chunk <= capacity() &&
+            std::find(kGraphWidths.begin(), kGraphWidths.end(), options.prefill_chunk) != kGraphWidths.end()) {
+            // The full-chunk forward whose final hidden state nothing reads (an intermediate prompt chunk).
+            partial_prefill_graph.definition.capture(stream, [this] { layers_body(options.prefill_chunk, false); });
+            partial_prefill_graph.executable.instantiate(partial_prefill_graph.definition);
+            partial_prefill_graph.executable.upload(stream);
+            partial_prefill_graph.executable.launch(stream);
         }
         CUDA_CHECK(cudaStreamSynchronize(stream));
         workspace.reset();
@@ -1119,8 +1139,11 @@ struct ProgramImpl {
         out.held_host_refusals = index.held_host_refusals;
         return out;
     }
+    // final_hidden: whether anything reads this forward's final hidden state (the head, a scored column or
+    // the MTP carry). When nothing does, the INFERNIX_TMP_GEMMA4_FINAL_LAYER_EXIT arm skips the last layer's
+    // tail after its K/V append; hidden then holds no model state, so carry_column is left unset.
     void run_layers(std::span<const TokenId> tokens, std::uint32_t first,
-                    runtime::ExecutionTimingRecorder* timing = nullptr) {
+                    runtime::ExecutionTimingRecorder* timing = nullptr, bool final_hidden = true) {
         if (tokens.empty() || tokens.size() > options.prefill_chunk || first != fed ||
             tokens.size() > capacity() - first) {
             throw std::logic_error("Gemma4 forward exceeds the valid frontier or capacity");
@@ -1130,13 +1153,18 @@ struct ProgramImpl {
         upload_pinned(ids.data, tokens.data(), tokens.size_bytes(), stream);
         upload_pinned(positions.data, host_positions.data(), tokens.size() * sizeof(std::int32_t), stream);
         physical_written = first + static_cast<std::uint32_t>(tokens.size());
+        const bool skip_tail = !final_hidden && final_layer_exit();
         bool graphed = false;
-        for (std::size_t i = 0; i < kGraphWidths.size(); ++i) {
+        bool tail_skipped = false;
+        if (skip_tail && tokens.size() == options.prefill_chunk && partial_prefill_graph.executable.ready()) {
+            partial_prefill_graph.executable.launch(stream); graphed = true; tail_skipped = true;
+        }
+        for (std::size_t i = 0; i < kGraphWidths.size() && !graphed; ++i) {
             if (tokens.size() == kGraphWidths[i] && prefill_graphs[i].executable.ready()) {
                 prefill_graphs[i].executable.launch(stream); graphed = true; break;
             }
         }
-        if (!graphed) { layers_body(static_cast<std::uint32_t>(tokens.size())); }
+        if (!graphed) { layers_body(static_cast<std::uint32_t>(tokens.size()), !skip_tail); tail_skipped = skip_tail; }
         if (timing) { prefill_timer.record_stop(); }
         synchronize(timing);
         if (timing) {
@@ -1145,7 +1173,8 @@ struct ProgramImpl {
             timing->include(gpu);
         }
         fed = physical_written;
-        carry_column = static_cast<std::int32_t>(tokens.size()) - 1;
+        if (tail_skipped) { carry_column.reset(); }
+        else { carry_column = static_cast<std::int32_t>(tokens.size()) - 1; }
     }
     runtime::PendingRowFailure prepare_sample(runtime::TokenMaskProvider* masks, std::uint32_t logical) {
         runtime::PendingRowFailure failure = runtime::PendingRowFailure::None;
@@ -1538,7 +1567,8 @@ ReplayProgress Program::advance_replay(SequenceHandle sequence, runtime::Executi
     try {
         const auto n = std::min(p.options.prefill_chunk, p.replay_target - p.fed);
         const std::uint32_t first = p.fed;
-        p.run_layers(std::span<const TokenId>(p.ledger).subspan(p.fed, n), p.fed, &timing);
+        // The replay's last call leaves the carry the next round starts from; earlier ones only rebuild K/V.
+        p.run_layers(std::span<const TokenId>(p.ledger).subspan(p.fed, n), p.fed, &timing, first + n == p.replay_target);
         p.note_grid_call(first, n);
         p.publish_blocks(p.fed);
         p.replaying = p.fed != p.replay_target;
@@ -1553,7 +1583,9 @@ PrefillProgress Program::advance_prefill(SequenceHandle sequence, runtime::Execu
     try {
         const auto n = std::min(p.options.prefill_chunk, p.next_call_end() - p.fed);
         const std::uint32_t first = p.fed;
-        p.run_layers(std::span<const TokenId>(p.ledger).subspan(p.fed, n), p.fed, &timing);
+        // The prompt's last call is the only one whose final hidden state is read (head, readout, MTP carry).
+        p.run_layers(std::span<const TokenId>(p.ledger).subspan(p.fed, n), p.fed, &timing,
+                     first + n == p.request->summary.prompt_tokens);
         p.note_grid_call(first, n);
         p.after_prefill_call();
         PrefillProgress progress;
@@ -1937,7 +1969,9 @@ ScoreResult Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_t
     try {
         for (std::uint32_t cursor = 0; cursor < n - 1;) {
             const auto width = std::min<std::uint32_t>(p.options.prefill_chunk, static_cast<std::uint32_t>(n - 1) - cursor);
-            p.run_layers(std::span<const TokenId>(tokens).subspan(cursor, width), cursor);
+            // Only a chunk with a predictor reads its final hidden state; an earlier one only feeds K/V.
+            const bool predicts = std::max(cursor, first_target - 1) < cursor + width;
+            p.run_layers(std::span<const TokenId>(tokens).subspan(cursor, width), cursor, nullptr, predicts);
             const auto first = std::max(cursor, first_target - 1);
             for (auto predictor = first; predictor < cursor + width;) {
                 const auto columns = std::min<std::uint32_t>(kScoreTile, cursor + width - predictor);
@@ -2015,7 +2049,8 @@ ScoreResult Program::diagnostic_score_bound(SequenceHandle sequence, std::uint32
             const auto cursor = p.fed;
             const auto width = std::min(p.options.prefill_chunk, p.next_call_end() - cursor);
             if (width == 0) { throw std::logic_error("Gemma4 diagnostic prefill made no progress"); }
-            p.run_layers(std::span<const TokenId>(p.ledger).subspan(cursor, width), cursor);
+            const bool predicts = std::max(cursor, first_target - 1) < std::min(cursor + width, n - 1);
+            p.run_layers(std::span<const TokenId>(p.ledger).subspan(cursor, width), cursor, nullptr, predicts);
             p.note_grid_call(cursor, width);
             p.after_prefill_call();
             for (auto predictor = std::max(cursor, first_target - 1);

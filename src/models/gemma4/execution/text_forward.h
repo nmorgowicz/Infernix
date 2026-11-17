@@ -71,11 +71,16 @@ struct Gemma4Embedding {
 
 using Gemma4CacheLayer = ops::Gemma4CacheView;
 
-// Embed ids into hidden [hidden,T] and run every layer, appending K/V at positions.
+// Embed ids into hidden [hidden,T] and run every layer, appending K/V at positions. With
+// final_hidden == false the last layer only writes its K/V (projection, norm, rope and cache append):
+// its attention, output projection and FFN are skipped, and hidden is then not the model's final
+// hidden state. Every layer's K/V is identical either way, because a layer's K/V depends only on the
+// layer below it. The caller must not read hidden afterwards.
 void gemma4_layers(const Tensor& ids, Tensor& hidden, const Gemma4Embedding& token_embedding,
                    std::span<const Gemma4LayerWeights> layers,
                    std::span<const Gemma4CacheLayer> caches, const Tensor& positions,
-                   ops::Fp8RowCublasContext& gemm, WorkspaceArena& workspace, cudaStream_t stream);
+                   ops::Fp8RowCublasContext& gemm, WorkspaceArena& workspace, cudaStream_t stream,
+                   bool final_hidden = true);
 
 // Final norm, A16-only output head and logit softcap for hidden [hidden,C] into logits [vocab,C].
 // hidden is not modified. The Gemma FP8 vocabulary projection writes BF16 logits.
