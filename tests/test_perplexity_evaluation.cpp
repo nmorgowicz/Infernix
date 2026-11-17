@@ -61,6 +61,24 @@ int main() {
                             "window boundaries match the protocol");
     }
 
+    // Bounded references retain the complete input and select only a suffix of the original
+    // non-overlapping targets. They never turn the window into a shorter-context measurement.
+    for (const std::uint32_t tail : {1U, 2U, 100U}) {
+        const auto bounded = infernix::perplexity::plan_windows(10, 6, 2, tail);
+        failures += require(bounded.size() == planned.size(), "tail preserves window count");
+        for (std::size_t i = 0; i < bounded.size(); ++i) {
+            const auto& actual = bounded[i];
+            const auto& original = planned[i];
+            const auto count = std::min<std::size_t>(tail, original.target_end - original.target_begin);
+            failures += require(actual.input_begin == original.input_begin &&
+                                    actual.input_end == original.input_end &&
+                                    actual.target_end == original.target_end &&
+                                    actual.target_begin == original.target_end - count &&
+                                    actual.first_target == actual.target_begin - actual.input_begin,
+                                "bounded suffix matches independent target arithmetic");
+        }
+    }
+
     const std::vector<float> first{-1.0F, -2.0F};
     const std::vector<float> second{-3.0F};
     infernix::perplexity::ScoreAggregate a;

@@ -108,6 +108,26 @@ without quantiles or buckets), so stream- and window-level paired comparisons ar
 evaluator refuses a reference recorded for a different corpus, mode, context or stride, or whose
 windows hold different tokens.
 
+For chat-tuned models, `--full-vocab-prefix-ids id,id,...` prepends an explicit, unscored chat prefix to
+**every** independent window, including ordinary NLL and `--save-top-tokens` / `--kl-reference` runs.
+The prefix is included in the Engine context allocation and each saved window's token fingerprint;
+a comparison with a different prefix is refused before scoring that window. The report records
+`execution.prefix_ids`, and context buckets count the prefix among the preceding tokens. Use the same
+prefix, chunk, logits precision, KV and QK settings for both arms. Bare-prose measurements are not
+interchangeable with this protocol.
+
+On Gemma 4, `--gemma4-key-only-kv` opts into reconstructing global V from FP8 K. It is a separate lossy
+cache arm, recorded as `execution.gemma4_key_only_kv`; it does not improve weight precision. Compare it
+against ordinary FP8 on the **same artifact**, with the chat prefix retained. A top-token reference
+measures a lower bound on full KL, not the full-vocabulary KL of a `.nklref` reference.
+
+`--score-window-tail N` bounds reference size by scoring only the last `min(N, original target count)`
+targets of each otherwise unchanged window (`0`, the default, retains all targets). It does **not**
+shorten the input or reset the long-context history. Reports identify `execution.score_window_tail` and
+the actual scored/unscored counts. Nonzero tails are also part of the full-vocabulary reference protocol;
+top-token references already bind their target ranges. A tail-only result is a distinct sampled-position
+protocol, never the whole-corpus PPL or a replacement for the ordinary short-context qualification.
+
 `--save-tokens FILE` writes each scored window's input tokens, targets and fingerprint as JSON, so an
 external evaluator can write a `--kl-reference` file for the same windows
 (`tools/flash_next/fp64_kl_reference.py` does so with the FP64 reference forward of

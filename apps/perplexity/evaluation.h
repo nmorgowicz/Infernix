@@ -16,7 +16,7 @@ struct WindowPlan {
 };
 
 [[nodiscard]] std::vector<WindowPlan> plan_windows(std::size_t tokens, std::uint32_t context,
-                                                   std::uint32_t stride);
+                                                   std::uint32_t stride, std::uint32_t score_tail = 0);
 
 struct ScoreAggregate {
     std::uint64_t scored_tokens = 0;

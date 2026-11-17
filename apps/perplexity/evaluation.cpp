@@ -8,7 +8,7 @@
 namespace infernix::perplexity {
 
 std::vector<WindowPlan> plan_windows(std::size_t tokens, std::uint32_t context,
-                                     std::uint32_t stride) {
+                                     std::uint32_t stride, std::uint32_t score_tail) {
     if (tokens < 2) { throw std::invalid_argument("perplexity stream must contain two tokens"); }
     if (context < 2 || stride == 0 || stride >= context) {
         throw std::invalid_argument("perplexity requires context>=2 and 1<=stride<context");
@@ -37,6 +37,13 @@ std::vector<WindowPlan> plan_windows(std::size_t tokens, std::uint32_t context,
             .first_target = static_cast<std::uint32_t>(local_target),
         });
         previous_end = end;
+    }
+    if (score_tail != 0) {
+        for (auto& window : windows) {
+            const auto count = std::min<std::size_t>(score_tail, window.target_end - window.target_begin);
+            window.target_begin = window.target_end - count;
+            window.first_target = static_cast<std::uint32_t>(window.target_begin - window.input_begin);
+        }
     }
     return windows;
 }

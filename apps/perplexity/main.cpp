@@ -70,10 +70,12 @@ struct Options {
     float rope_yarn_factor              = 1.0F;
     std::uint32_t context               = 4096;
     std::uint32_t stride                = 2048;
+    std::uint32_t score_tail = 0;
     std::optional<std::uint32_t> prefill_chunk;
     int device                          = 0;
     infernix::KvCacheStorage kv           = infernix::KvCacheStorage::Fp8E4M3Row256;
     infernix::ops::Gemma4QkMode gemma4_qk = infernix::ops::Gemma4QkMode::BFloat16;
+    bool gemma4_key_only_kv = false;
     infernix::LogitsDtype logits_dtype    = infernix::LogitsDtype::FP32;
     bool quick                          = false;
     bool original_int8_prefill_kernel   = false;
@@ -93,11 +95,14 @@ std::string usage_text() {
     return "usage: infernix-perplexity <model.infernix> "
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
            "       [--context N] [--stride N] [--device N]\n"
+           "       [--score-window-tail N] (score only the last N targets per unchanged window;\n"
+           "        0 scores all targets, default; bounded references are a distinct protocol)\n"
            "       [--prefill-chunk N] (tokens per scoring prefill pass, a multiple of 128;\n"
            "        default the Engine's 1024)\n"
            "       [--rope-yarn-factor F] (startup-fixed, finite [1,4], default 1; ceiling only)\n"
            "       [--kv-dtype bf16|bf16p|int8|fp8|nvfp4|k8v4|vq2|k4v2] (default fp8)\n"
            "       [--gemma4-qk bf16|fp8] (Gemma4 global-layer QK precision; fp8 needs --kv-dtype fp8)\n"
+           "       [--gemma4-key-only-kv] (derive global V from FP8 K; opt-in lossy cache)\n"
            "       [--logits-dtype fp32|bf16] (the head's logits scoring reads; default fp32, bf16\n"
            "        rounds each once, as Transformers returns them, for comparisons)\n"
            "       [--use-original-int8-prefill-kernel (int8 only; default fast kernel)]\n"
@@ -133,7 +138,8 @@ std::string usage_text() {
            "       [--full-vocab-reference-kv-dtype bf16|bf16p|int8|fp8|nvfp4|k8v4|vq2|k4v2]\n"
            "       [--full-vocab-reference-gemma4-qk bf16|fp8] (expected reference configuration;\n"
            "        defaults to this run; token/window protocol must still match exactly)\n"
-           "       [--full-vocab-prefix-ids id,id,...] (prepend these tokens to every native KL window)\n"
+           "       [--full-vocab-prefix-ids id,id,...] (prepend unscored tokens to every window;\n"
+           "        supported for NLL, top-token KL and full-vocabulary KL)\n"
            "       [--expert-stripe <file>] (Qwen3.8-Flash-Next's expert record tails on a second\n"
            "        drive, read beside the artifact by the SSD expert tier)\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n";
@@ -180,6 +186,8 @@ Options parse_options(int argc, char** argv) {
             out.context = parse_integer<std::uint32_t>(value("--context"), "context");
         } else if (option == "--stride") {
             out.stride = parse_integer<std::uint32_t>(value("--stride"), "stride");
+        } else if (option == "--score-window-tail") {
+            out.score_tail = parse_integer<std::uint32_t>(value("--score-window-tail"), "score-window-tail");
         } else if (option == "--prefill-chunk") {
             out.prefill_chunk = parse_integer<std::uint32_t>(value("--prefill-chunk"), "prefill-chunk");
         } else if (option == "--device") {
@@ -238,6 +246,8 @@ Options parse_options(int argc, char** argv) {
             } catch (const std::invalid_argument& error) {
                 usage_error(error.what());
             }
+        } else if (option == "--gemma4-key-only-kv") {
+            out.gemma4_key_only_kv = true;
         } else if (option == "--logits-dtype") {
             try {
                 out.logits_dtype = infernix::product::parse_logits_dtype(value("--logits-dtype"));
@@ -309,9 +319,6 @@ Options parse_options(int argc, char** argv) {
         usage_error("reference configuration overrides require --full-vocab-reference");
     }
     if (out.full_vocab_resamples == 0) { usage_error("--full-vocab-resamples must be positive"); }
-    if (!out.full_vocab_prefix.empty() && !out.full_vocab_reference_write && !out.full_vocab_reference) {
-        usage_error("--full-vocab-prefix-ids requires a full-vocabulary mode");
-    }
     if (out.full_vocab_prefix.size() > std::numeric_limits<std::uint32_t>::max() - out.context) {
         usage_error("context plus full-vocabulary prefix is too large");
     }
@@ -446,6 +453,7 @@ public:
                      {"kv_dtype", kv_name(options.kv)},
                      {"gemma4_qk", infernix::gemma4_qk_name(engine.gemma4_qk)},
                      {"positions", total_positions}};
+        if (options.score_tail != 0) { protocol_["score_window_tail"] = options.score_tail; }
         std::error_code size_error;
         const auto bytes = std::filesystem::file_size(options.artifact, size_error);
         reference_ = {{"artifact",
@@ -693,6 +701,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     if (options.prefill_chunk) { engine_options.prefill_chunk = *options.prefill_chunk; }
     engine_options.kv_cache         = options.kv;
     engine_options.gemma4_qk        = options.gemma4_qk;
+    engine_options.gemma4_key_only_kv = options.gemma4_key_only_kv;
     engine_options.logits_dtype     = options.logits_dtype;
     engine_options.original_int8_prefill_kernel = options.original_int8_prefill_kernel;
     engine_options.original_nvfp4_prefill_kernel = options.original_nvfp4_prefill_kernel;
@@ -728,9 +737,11 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
             throw std::runtime_error("stream tokenized to fewer than two tokens: " + source.id);
         }
         std::vector<WindowPlan> windows =
-            infernix::perplexity::plan_windows(tokens.size(), options.context, options.stride);
+            infernix::perplexity::plan_windows(tokens.size(), options.context, options.stride, options.score_tail);
         total_input_tokens += static_cast<std::uint64_t>(tokens.size());
-        total_scored_tokens += static_cast<std::uint64_t>(tokens.size() - 1);
+        for (const auto& window : windows) {
+            total_scored_tokens += static_cast<std::uint64_t>(window.target_end - window.target_begin);
+        }
         total_windows += static_cast<std::uint64_t>(windows.size());
         streams.push_back(EvaluationStream{.source  = std::move(source),
                                            .tokens  = std::move(tokens),
@@ -878,7 +889,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
                         scored.top_ids[position * own_top_tokens] == reference->top_ids[position * k];
                     // The predicted token at window input index first_target + position follows
                     // that many tokens of context.
-                    window_divergence.add(window.first_target + position,
+                    window_divergence.add(first_target + position,
                                           infernix::perplexity::position_divergence(
                                               reference_top, evaluated_top, top1_match,
                                               reference->target_logprobs[position],
@@ -950,7 +961,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         stream_report["domain"]          = stream.source.domain;
         stream_report["path"]            = stream.source.path.string();
         stream_report["input_tokens"]    = stream.tokens.size();
-        stream_report["unscored_tokens"] = 1;
+        stream_report["unscored_tokens"] = stream.tokens.size() - stream_score.scored_tokens;
         stream_report["seconds"]         = stream_seconds;
         stream_report["windows"]         = std::move(window_reports);
         stream_reports.push_back(std::move(stream_report));
@@ -966,6 +977,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
                      {"mode", corpus.mode},
                      {"context", options.context},
                      {"stride", options.stride},
+                     {"prefix_ids", options.full_vocab_prefix},
                      {"windows", std::move(saved_windows)}}
                     .dump();
         if (!file) { throw std::runtime_error("cannot write " + options.save_tokens->string()); }
@@ -1001,6 +1013,8 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
          {{"purpose", "causal_scoring"},
           {"device", options.device},
           {"context_tokens", options.context},
+          {"prefix_ids", options.full_vocab_prefix},
+          {"score_window_tail", options.score_tail},
           {"rope_yarn_factor", options.rope_yarn_factor},
           {"original_int8_prefill_kernel", options.original_int8_prefill_kernel},
           {"original_nvfp4_prefill_kernel", options.original_nvfp4_prefill_kernel},
@@ -1015,6 +1029,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"score_tile_tokens", 1024},
           {"kv_dtype", kv_name(options.kv)},
           {"gemma4_qk", infernix::gemma4_qk_name(options.gemma4_qk)},
+          {"gemma4_key_only_kv", options.gemma4_key_only_kv},
           {"logits_dtype", infernix::product::logits_dtype_name(options.logits_dtype)}}},
         {"timing",
          {{"load_seconds", load.load_seconds},
