@@ -99,6 +99,8 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--kv-dtype"},
     ServeOptionArity{"--gemma4-qk"},
     ServeOptionArity{"--gemma4-key-only-kv", false},
+    ServeOptionArity{"--allow-shared-memory", false},
+    ServeOptionArity{"--shared-memory-placement"},
     ServeOptionArity{"--logits-dtype"},
     ServeOptionArity{"--spec"},
     ServeOptionArity{"--draft-tokens"},
@@ -498,6 +500,12 @@ std::string serve_usage_text(const char* argv0) {
            "                             artifact and is refused for other model families\n"
            "  --gemma4-key-only-kv       Gemma4 only: global FP8 K alone, reconstruct V\n"
            "                             (approximate, default off; needs --kv-dtype fp8)\n"
+           "  --allow-shared-memory      Gemma4 only: when weights plus runtime do not fit the free\n"
+           "                             VRAM start anyway, the shortfall in shared GPU memory\n"
+           "                             (system RAM over PCIe: much slower; default off = refuse)\n"
+           "  --shared-memory-placement P  runtime (default) | blind: with --allow-shared-memory,\n"
+           "                             keep the KV/ring/workspace resident and spill weights, or\n"
+           "                             leave the placement to the driver\n"
            "  --logits-dtype T           fp32 (default) | bf16: the head's logits the sampler,\n"
            "                             greedy choice, draft acceptance and constraints read;\n"
            "                             bf16 rounds each once, as Transformers returns them\n"
@@ -1141,6 +1149,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.gemma4_qk = parse_gemma4_qk(require_value("--gemma4-qk"));
         } else if (arg == "--gemma4-key-only-kv") {
             options.gemma4_key_only_kv = true;
+        } else if (arg == "--allow-shared-memory") {
+            options.allow_shared_memory = true;
+        } else if (arg == "--shared-memory-placement") {
+            const std::string mode = require_value("--shared-memory-placement");
+            if (mode == "runtime") {
+                options.shared_memory_placement = SharedMemoryPlacement::RuntimeResident;
+            } else if (mode == "blind") {
+                options.shared_memory_placement = SharedMemoryPlacement::Blind;
+            } else {
+                throw std::invalid_argument("--shared-memory-placement must be runtime or blind");
+            }
         } else if (arg == "--logits-dtype") {
             options.logits_dtype = product::parse_logits_dtype(require_value("--logits-dtype"));
         } else if (arg == "--spec") {

@@ -121,6 +121,9 @@ def add_serve_arguments(parser: argparse.ArgumentParser, *, prefix: str) -> None
         "needs --kv-dtype fp8) or bf16 (no flag, the engine default)")
     add("--gemma4-key-only-kv", action="store_true",
         help="experimental global key-only FP8 KV (default off; memory-16gb enables it); sliding KV stays BF16")
+    add("--allow-shared-memory", action="store_true",
+        help="opt in to starting when the model does not fit the free VRAM: the shortfall runs in shared GPU memory "
+        "(system RAM over PCIe, much slower; default off = the server refuses). memory-16gb tries resident starts first")
     add("--prefill-chunk",
         help="prefill chunk: auto (default: the server picks the largest of 2048/1024/512/256/128 that fits the "
         "full context after the weights load) or a multiple of 128 up to 16384")
@@ -171,7 +174,7 @@ def serve_kwargs(args: argparse.Namespace) -> dict:
         "top_k": args.top_k, "chat_template": args.chat_template.resolve() if args.chat_template else None,
         "default_thinking_budget": args.default_thinking_budget,
         "thinking_budget_message": args.thinking_budget_message, "reasoning_loop": args.reasoning_loop,
-        "gemma4_key_only_kv": small or args.gemma4_key_only_kv, "mtp_fallback": small,
+        "gemma4_key_only_kv": small or args.gemma4_key_only_kv, "mtp_fallback": small, "allow_shared_memory": args.allow_shared_memory,
     }
 
 

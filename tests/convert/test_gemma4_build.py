@@ -1497,3 +1497,25 @@ def test_memory_profile_launcher_plans_with_mtp_then_falls_back_without_it(tmp_p
     assert cli.main(["launcher", "--artifact", str(artifact), "--serve", str(server), "--out", str(tmp_path / "off.cmd"),
                      "--profile", "memory-16gb", "--no-mtp"]) == 0
     assert ":no_mtp" not in (tmp_path / "off.cmd").read_text(encoding="utf-8")
+
+
+def test_memory_profile_shared_memory_option_is_the_last_resort_stage(tmp_path, monkeypatch):
+    server, artifact = tmp_path / "s.exe", tmp_path / "iq3.ninfer"
+    server.write_bytes(b"x")
+    artifact.write_bytes(b"x")
+    monkeypatch.setattr(launcher, "artifact_info", lambda path: launcher.ArtifactInfo(True, False, 262144, True))
+    out = tmp_path / "spill.cmd"
+    assert cli.main(["launcher", "--artifact", str(artifact), "--serve", str(server), "--out", str(out),
+                     "--profile", "memory-16gb", "--allow-shared-memory"]) == 0
+    lines = out.read_text(encoding="utf-8").splitlines()
+    shared_at = lines.index(":shared_memory")
+    before, after = " ".join(lines[:shared_at]), " ".join(lines[shared_at:])
+    assert "--allow-shared-memory" not in before and "--allow-shared-memory" in after
+    assert "--spec" in before.split(":no_mtp")[0] and "--spec" not in after
+    assert before.count(" --plan ") == 2 and "WARNING" in after
+    parsed = build.parse_launcher(out)
+    assert "--allow-shared-memory" not in parsed.flags and parsed.draft_tokens == "1"
+    plain = tmp_path / "plain.cmd"
+    assert cli.main(["launcher", "--artifact", str(artifact), "--serve", str(server), "--out", str(plain),
+                     "--profile", "memory-16gb"]) == 0
+    assert "--allow-shared-memory" not in plain.read_text(encoding="utf-8")

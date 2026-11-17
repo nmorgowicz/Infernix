@@ -103,6 +103,28 @@ int main() {
         infernix::testing::set_vram_budget_source({});
     }
 
+    // A weights-style step that page-locks no host memory: a shortfall with this process's shared-memory use
+    // flat is another program's drift, while the same shortfall with that use raised is a real spill.
+    {
+        const std::uint64_t mib = 1ULL << 20;
+        VramSnapshot snapshot;
+        snapshot.device_free = static_cast<std::size_t>(10000 * mib);
+        snapshot.shared_system = 80000 * mib;
+        snapshot.nonlocal_usage = 100;
+        infernix::testing::set_vram_budget_source([&] { return snapshot; });
+        auto budget = open_vram_budget_source(0);
+        SpillGuard guard(*budget);
+        guard.begin();
+        snapshot.device_free = static_cast<std::size_t>(9100 * mib); // 900 MiB dropped for a 1000 MiB step
+        failures += check(guard.end(1000 * mib) == 100 * mib, "the raw guard missed a 100 MiB shortfall");
+        failures += check(guard.end_without_host_allocation(1000 * mib) == 0,
+                          "flat shared-memory use was reported as a spill");
+        snapshot.nonlocal_usage = 100 * mib + 100;
+        failures += check(guard.end_without_host_allocation(1000 * mib) == 100 * mib,
+                          "raised shared-memory use hid a spill");
+        infernix::testing::set_vram_budget_source({});
+    }
+
     // ---- an automatic capacity that fits: the start's resolution, and the device totals ----
     {
         EnginePlan plan;

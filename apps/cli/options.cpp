@@ -109,6 +109,8 @@ constexpr std::array kCliOptions{
     CliOption{"--kv-dtype"},
     CliOption{"--gemma4-qk"},
     CliOption{"--gemma4-key-only-kv", false},
+    CliOption{"--allow-shared-memory", false},
+    CliOption{"--shared-memory-placement"},
     CliOption{"--logits-dtype"},
     CliOption{"--spec"},
     CliOption{"--draft-tokens"},
@@ -293,6 +295,9 @@ std::string usage_text(const char* argv0) {
            "                           and is refused for other model families\n"
            "  --gemma4-key-only-kv     Gemma4 only: store global FP8 K alone, reconstruct V\n"
            "                           (approximate, default off; needs --kv-dtype fp8)\n"
+           "  --allow-shared-memory    Gemma4 only: start even when weights plus runtime do not fit the\n"
+           "                           free VRAM; the shortfall lives in shared GPU memory (much slower)\n"
+           "  --shared-memory-placement P  runtime (default) | blind: which allocations stay resident\n"
            "  --logits-dtype T         fp32 (default) | bf16: the head's logits the sampler,\n"
            "                           greedy choice, draft acceptance and scoring read;\n"
            "                           bf16 rounds each once, as Transformers returns them\n"
@@ -563,6 +568,17 @@ Options parse_options(int argc, char** argv) {
             options.gemma4_qk = parse_gemma4_qk(value(arg));
         } else if (arg == "--gemma4-key-only-kv") {
             options.gemma4_key_only_kv = true;
+        } else if (arg == "--allow-shared-memory") {
+            options.allow_shared_memory = true;
+        } else if (arg == "--shared-memory-placement") {
+            const std::string mode = value(arg);
+            if (mode == "runtime") {
+                options.shared_memory_placement = SharedMemoryPlacement::RuntimeResident;
+            } else if (mode == "blind") {
+                options.shared_memory_placement = SharedMemoryPlacement::Blind;
+            } else {
+                throw std::invalid_argument("--shared-memory-placement must be runtime or blind");
+            }
         } else if (arg == "--logits-dtype") {
             options.logits_dtype = product::parse_logits_dtype(value(arg));
         } else if (arg == "--spec") {
@@ -591,7 +607,7 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--print-token-ids") {
             options.print_token_ids = true;
         } else if (arg == "--log-colours") {
-            const std::string_view mode = value(arg);
+            const std::string mode = value(arg);
             if (mode == "on") {
                 options.log_colours = true;
             } else if (mode == "off") {
@@ -619,7 +635,7 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--vision") {
             options.enable_vision = true;
         } else if (arg == "--vision-offload") {
-            const std::string_view mode = value(arg);
+            const std::string mode = value(arg);
             if (mode == "auto") {
                 options.vision_offload = VisionOffload::Auto;
             } else if (mode == "on") {

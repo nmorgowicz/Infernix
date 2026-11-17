@@ -56,6 +56,8 @@ struct KvCapacityResolution {
     std::size_t runtime_reservation_bytes            = 0;
     std::size_t available_after_weights_bytes        = 0;
     std::size_t available_after_startup_bytes        = 0;
+    std::uint64_t shared_memory_weights_bytes        = 0;
+    std::uint64_t shared_memory_runtime_bytes        = 0;
     std::size_t automatic_headroom_bytes             = 0;
     std::size_t planned_slack_bytes                  = 0;
 };

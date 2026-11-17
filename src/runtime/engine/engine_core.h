@@ -409,6 +409,8 @@ public:
         out.runtime_reservation_bytes          = resolution.runtime_reservation_bytes;
         out.available_after_weights_bytes      = resolution.available_after_weights_bytes;
         out.available_after_startup_bytes      = resolution.available_after_startup_bytes;
+        out.shared_memory_weights_bytes        = resolution.shared_memory_weights_bytes;
+        out.shared_memory_runtime_bytes        = resolution.shared_memory_runtime_bytes;
         out.vram_headroom_bytes                = resolution.automatic_headroom_bytes;
         out.planned_slack_bytes                = resolution.planned_slack_bytes;
         return out;

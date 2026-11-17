@@ -600,6 +600,16 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
     logger_->info("capacity | {} tokens of context across all requests ({} KV)",
                   product::format_pretty_count(memory.kv_capacity),
                   infernix::kv_cache_cli_name(memory.kv_cache));
+    if (engine.allow_shared_memory) {
+        logger_->warn(
+            "SHARED GPU MEMORY ALLOWED (--allow-shared-memory, placement {}): what does not fit the free VRAM runs in "
+            "shared system memory over PCIe; estimated {} of weights and {} of KV/ring/workspace placed there. "
+            "Expect much slower prefill and decode; start without the option to refuse instead.",
+            engine.shared_memory_placement == infernix::SharedMemoryPlacement::RuntimeResident ? "runtime-resident"
+                                                                                               : "blind",
+            product::format_pretty_bytes(memory.shared_memory_weights_bytes),
+            product::format_pretty_bytes(memory.shared_memory_runtime_bytes));
+    }
     if (memory.gemma4_kv) {
         const infernix::Gemma4KvMemorySummary& kv = *memory.gemma4_kv;
         logger_->info("Gemma QK | requested {} | resolved {} | {}", infernix::gemma4_qk_name(engine.gemma4_qk),

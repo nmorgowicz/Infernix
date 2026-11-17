@@ -65,6 +65,9 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
         if (options.gemma4_key_only_kv) {
             throw std::invalid_argument("--gemma4-key-only-kv is supported only for Gemma4");
         }
+        if (options.allow_shared_memory) {
+            throw std::invalid_argument("--allow-shared-memory is supported only for Gemma4");
+        }
     }
     switch (options.kv_capacity.mode) {
     case KvCapacityMode::Explicit:

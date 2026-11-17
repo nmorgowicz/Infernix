@@ -83,6 +83,16 @@ int run() {
             failures += check(refused, "a non-Gemma family accepted a Gemma-only memory choice");
         }
     }
+    for (const auto architecture : {infernix::models::Architecture::Qwen3_5,
+                                    infernix::models::Architecture::Qwen4Exp}) {
+        auto options = mtp_options();
+        options.artifact_path = "unused.infernix";
+        options.allow_shared_memory = true;
+        bool refused = false;
+        try { infernix::runtime::validate_engine_options(options, architecture); }
+        catch (const std::invalid_argument&) { refused = true; }
+        failures += check(refused, "a non-Gemma family accepted shared GPU memory spill");
+    }
     // Non-affine context-dependent reservation: workspace/table steps belong to each candidate,
     // not to one high-ceiling curve reused with a smaller KV count.
     const auto reservation = [](std::uint32_t context) {
@@ -115,6 +125,38 @@ int run() {
         try { (void)infernix::runtime::resolve_gemma4_auto_context(9215, reservation(131072), 0, reservation); }
         catch (const std::runtime_error&) { refused = true; }
         failures += check(refused, "auto context accepted an artifact ceiling below the usable minimum");
+    }
+
+    // --allow-shared-memory: a start that cannot fit resident takes the usable minimum instead of refusing,
+    // while anything that does fit keeps its exact resident size and a ceiling below the minimum still refuses.
+    for (const auto available : {std::size_t{999}, static_cast<std::size_t>(reservation(9216) + 999)}) {
+        failures += check(infernix::runtime::resolve_gemma4_auto_context(131072, available, 1000, reservation, true) == 9216,
+                          "shared-memory auto context did not fall back to the usable minimum");
+    }
+    failures += check(infernix::runtime::resolve_gemma4_auto_context(
+                          262144, reservation(32768) + 1000, 1000, reservation, true) == 32768,
+                      "shared-memory auto context shrank a context that fits resident");
+    {
+        bool refused = false;
+        try { (void)infernix::runtime::resolve_gemma4_auto_context(9215, 0, 0, reservation, true); }
+        catch (const std::runtime_error&) { refused = true; }
+        failures += check(refused, "shared-memory auto context accepted a ceiling below the usable minimum");
+    }
+    {
+        infernix::runtime::SequenceCapacityCurve curve;
+        curve.main_page_tokens = 64;
+        curve.minimum_main_page_groups = 1;
+        curve.maximum_main_page_groups = 4096;
+        curve.minimum_device_reservation_bytes = 5000;
+        curve.bytes_per_additional_main_page_group = 100;
+        const auto needed = curve.reservation_bytes(144) + 77;
+        failures += check(infernix::runtime::gemma4_shared_memory_room(curve, 10, 9216, 77) == needed,
+                          "shared-memory room did not count the reservation of the context plus headroom");
+        failures += check(infernix::runtime::gemma4_shared_memory_room(curve, needed + 1, 9216, 77) == needed + 1,
+                          "shared-memory room reduced free memory that already fits");
+        failures += check(infernix::runtime::gemma4_shared_memory_room(curve, 0, 1U << 30, 0) ==
+                              curve.reservation_bytes(4096),
+                          "shared-memory room did not clamp to the curve's maximum");
     }
 
     for (std::uint32_t width = 1; width <= 7; ++width) {

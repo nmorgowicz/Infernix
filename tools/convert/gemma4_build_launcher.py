@@ -87,6 +87,7 @@ class ServeProfile:
     reasoning_loop: str | None = None
     gemma4_key_only_kv: bool = False
     mtp_fallback: bool = False  # memory-16gb: plan with MTP first, start without it when only that does not fit
+    allow_shared_memory: bool = False  # --allow-shared-memory: start with the shortfall in shared GPU memory (slow)
 
     @property
     def model_id(self) -> str:
@@ -157,7 +158,7 @@ def check_serve_settings(profile: ServeProfile) -> None:
 
 
 def serve_groups(
-    profile: ServeProfile, *, mtp: bool, vision: bool, chat_template: str | None = None
+    profile: ServeProfile, *, mtp: bool, vision: bool, chat_template: str | None = None, shared_memory: bool = False
 ) -> list[list[str]]:
     """The `infernix-serve` flags (after the artifact path), grouped one launcher line each.
 
@@ -189,6 +190,7 @@ def serve_groups(
     if mtp:
         groups.append(["--spec", "mtp", "--draft-tokens", profile.draft_tokens])
     groups.append(["--device-snapshot-slots", "0", "--host-context-mib", str(profile.host_context_mib)]
+                  + (["--allow-shared-memory"] if shared_memory else [])
                   + (["--vision"] if vision else []))
     return groups
 
@@ -224,7 +226,10 @@ def launcher_lines(
 ) -> list[str]:
     """CMD lines; `server`, `artifact`, `cuda_bin` and `chat_template` are already `cmd_path` strings."""
     check_serve_settings(profile)
-    groups = serve_groups(profile, mtp=mtp, vision=vision, chat_template=chat_template)
+    # The memory profile asks for shared GPU memory only after the resident starts (below) do not fit.
+    staged = profile.allow_shared_memory and profile.mtp_fallback
+    groups = serve_groups(profile, mtp=mtp, vision=vision, chat_template=chat_template,
+                          shared_memory=profile.allow_shared_memory and not staged)
     kv = "FP8" if profile.kv_dtype == "fp8" else "BF16"
     qk = "FP8" if profile.gemma4_qk == "fp8" else "BF16"
     lines = [
@@ -250,7 +255,26 @@ def launcher_lines(
                      "(infernix docs/serving.md, --gemma4-qk).")
     if cuda_bin:
         lines.append(f'set "PATH={cuda_bin};%PATH%"')
-    if mtp and profile.mtp_fallback:
+    if staged:
+        plan = '"%TEMP%\\infernix-memory-16gb-plan.json"'
+        lines.append("rem Shared GPU memory was allowed when this launcher was generated: a start that fits resident is never spilled. The server plans (no GPU work) with")
+        lines.append("rem the MTP assistant, then without it, and only when neither fits starts without it WITH shared GPU memory")
+        lines.append("rem (system RAM over PCIe: much slower). Without the option those cases are refused.")
+        if mtp:
+            lines.extend(_command_lines(server, artifact, groups, f" --plan {plan} >nul 2>nul"))
+            lines.append("if errorlevel 1 goto :no_mtp")
+            lines.extend(_command_lines(server, artifact, groups))
+            lines.append("exit /b %errorlevel%")
+            lines.append(":no_mtp")
+            groups = serve_groups(profile, mtp=False, vision=vision, chat_template=chat_template)
+        lines.extend(_command_lines(server, artifact, groups, f" --plan {plan} >nul 2>nul"))
+        lines.append("if errorlevel 1 goto :shared_memory")
+        lines.extend(_command_lines(server, artifact, groups))
+        lines.append("exit /b %errorlevel%")
+        lines.append(":shared_memory")
+        lines.append("echo WARNING: the model does not fit the free VRAM; starting with shared GPU memory (much slower). 1>&2")
+        groups = serve_groups(profile, mtp=False, vision=vision, chat_template=chat_template, shared_memory=True)
+    elif mtp and profile.mtp_fallback:
         plan = f'"%TEMP%\\infernix-memory-16gb-plan.json"'
         lines.append("rem The MTP assistant needs about 464 MiB more VRAM: the server plans with it first (no GPU work) and")
         lines.append("rem starts without it when only that fits. Neither fitting is the server's refusal; nothing is paged.")

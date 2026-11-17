@@ -408,6 +408,8 @@ enum class ProposalHead : std::uint8_t {
 
 // Where the Vision tower's weights live between encodes (--vision-offload).
 enum class VisionOffload : std::uint8_t { Auto, On, Off };
+// --shared-memory-placement: with --allow-shared-memory, which allocations keep the resident VRAM.
+enum class SharedMemoryPlacement : std::uint8_t { RuntimeResident, Blind };
 
 enum class SpeculativeBackend : std::uint8_t {
     None,
@@ -767,6 +769,12 @@ struct EngineOptions {
     bool max_context_auto = false;
     // Gemma4 only, opt-in: global FP8 K planes alone; reconstruct V from K. Sliding KV stays BF16.
     bool gemma4_key_only_kv = false;
+    // Gemma4 only, opt-in (--allow-shared-memory): start even when weights plus runtime do not fit the free resident
+    // VRAM; what does not fit is placed in shared GPU memory (system RAM over PCIe) and the Engine reports how much.
+    // Off: a startup that would spill is refused. shared_memory_placement says which allocations get the resident
+    // memory: the runtime state (ring, KV, workspace) first, or whatever the driver places first (the weights).
+    bool allow_shared_memory = false;
+    SharedMemoryPlacement shared_memory_placement = SharedMemoryPlacement::RuntimeResident;
     // Startup-fixed runtime YaRN override, finite [1,4]; 1 preserves native RoPE.
     // Extends only the allowed ceiling, never max_context itself or artifact metadata.
     float rope_yarn_factor             = 1.0F;
@@ -2173,6 +2181,10 @@ struct MemorySummary {
     std::size_t runtime_reservation_bytes         = 0;
     std::size_t available_after_weights_bytes     = 0;
     std::size_t available_after_startup_bytes     = 0;
+    // --allow-shared-memory: device bytes the driver placed in shared system memory, estimated as allocated bytes
+    // missing from the drop in free VRAM while the weights and then the runtime state were allocated.
+    std::uint64_t shared_memory_weights_bytes     = 0;
+    std::uint64_t shared_memory_runtime_bytes     = 0;
     std::size_t vram_headroom_bytes               = 0;
     std::size_t planned_slack_bytes               = 0;
     std::size_t workspace_logical_peak_bytes      = 0;

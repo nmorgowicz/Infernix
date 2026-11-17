@@ -44,9 +44,16 @@ void validate_gemma4_options(const EngineOptions& options);
 
 // Page-aligned largest context, rebuilding the native reservation for each candidate (workspace,
 // tables and rings included). The callback returns bytes for the complete candidate context.
+// allow_shared_memory (--allow-shared-memory): when nothing fits, the 9216-token minimum is returned
+// (what does not fit then runs in shared GPU memory) instead of refusing.
 [[nodiscard]] std::uint32_t resolve_gemma4_auto_context(
     std::uint32_t upper, std::size_t available, std::size_t headroom,
-    const std::function<std::size_t(std::uint32_t)>& reservation);
+    const std::function<std::size_t(std::uint32_t)>& reservation, bool allow_shared_memory = false);
+
+// --allow-shared-memory: the room a capacity check may count, `free` or, when that is less, what the
+// native reservation of `context` tokens needs plus `headroom`; the shortfall is what spills.
+[[nodiscard]] std::size_t gemma4_shared_memory_room(const SequenceCapacityCurve& curve, std::size_t free,
+                                                    std::uint32_t context, std::size_t headroom);
 
 // Planning uses the same model-aware reservation curve without uploading weights or
 // constructing Parameters/Program. A memory refusal populates plan.fits/error.

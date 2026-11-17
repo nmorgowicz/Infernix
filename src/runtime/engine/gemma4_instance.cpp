@@ -89,7 +89,7 @@ ModelMetadata metadata(const models::gemma4::Model& model) {
 
 std::uint32_t resolve_gemma4_auto_context(
     std::uint32_t upper, std::size_t available, std::size_t headroom,
-    const std::function<std::size_t(std::uint32_t)>& reservation) {
+    const std::function<std::size_t(std::uint32_t)>& reservation, bool allow_shared_memory) {
     constexpr std::uint32_t page = ops::kGemma4KvPageTokens;
     constexpr std::uint32_t minimum = 9216;
     upper = std::min(upper, 131072U) / page * page;
@@ -102,6 +102,7 @@ std::uint32_t resolve_gemma4_auto_context(
             });
         if (index) { return minimum + (*index - 1U) * page; }
     }
+    if (allow_shared_memory && upper >= minimum) { return minimum; }
     std::string detail;
     if (upper >= minimum) {
         const auto mib = [](std::size_t bytes) { return std::to_string(bytes >> 20) + " MiB"; };
@@ -114,8 +115,16 @@ std::uint32_t resolve_gemma4_auto_context(
     throw std::runtime_error(
         "Gemma4 --max-context auto cannot fit the minimum usable 9216 tokens (1024 prompt + "
         "8192 output) within the artifact/131072 ceiling, resident VRAM and headroom; free GPU "
-        "memory, lower --vram-headroom-mib or use a smaller artifact/chunk. Host-paged startup is not permitted" +
+        "memory, lower --vram-headroom-mib or use a smaller artifact/chunk. Host-paged startup is not permitted; "
+        "--allow-shared-memory starts anyway with the shortfall in shared GPU memory (much slower)" +
         detail);
+}
+
+std::size_t gemma4_shared_memory_room(const SequenceCapacityCurve& curve, std::size_t free,
+                                      std::uint32_t context, std::size_t headroom) {
+    const std::uint32_t wanted = (context + curve.main_page_tokens - 1U) / curve.main_page_tokens;
+    const std::uint32_t groups = std::clamp(wanted, curve.minimum_main_page_groups, curve.maximum_main_page_groups);
+    return std::max(free, curve.reservation_bytes(groups) + headroom);
 }
 
 void validate_gemma4_options(const EngineOptions& options) {
@@ -214,6 +223,11 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& supplied, DeviceContext&
 #endif
     };
 
+    // --allow-shared-memory: capacity checks count what the reservation needs when free VRAM falls short.
+    const auto shared_room = [&](const SequenceCapacityCurve& curve, std::size_t free) {
+        return options.allow_shared_memory ? gemma4_shared_memory_room(curve, free, options.max_context, headroom) : free;
+    };
+
     auto cold_plan = models::gemma4::plan_load(reader, load_options);
     const std::uint64_t weight_bytes = cold_plan.device_bytes();
     auto geometry = models::gemma4::plan_model(std::move(cold_plan));
@@ -284,7 +298,7 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& supplied, DeviceContext&
                     // Maximize context first; then choose the widest chunk that fits it.
                     return reservation(context, options.prefill_chunk_auto ? 128U : options.prefill_chunk) +
                            static_cast<std::size_t>(context) * kAutoUnplannedBytesPerToken;
-                });
+                }, options.allow_shared_memory);
         }
         if (options.prefill_chunk_auto) {
             options.prefill_chunk = models::gemma4::auto_prefill_chunk(
@@ -306,7 +320,7 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& supplied, DeviceContext&
             planned->vram.workspace_bytes = request_plan.workspace;
             planned->vram.graph_allowance_bytes = request_plan.graph_allowance;
             const auto fitted = plan_capacity(*planned, options.kv_capacity, request_plan.capacity_curve(),
-                                               available, headroom);
+                                               shared_room(request_plan.capacity_curve(), available), headroom);
             if (!fitted) { return {}; }
             if (fitted->resolved_tokens < options.max_context) {
                 plan_refuse(*planned, "Gemma4 KV capacity cannot hold --max-context");
@@ -330,24 +344,42 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& supplied, DeviceContext&
     const auto requested_chunk = options.prefill_chunk;
     const auto available = planned_free_after_weights(before.device_free, weight_bytes);
     const auto cold_request = resolve_options(*geometry, available);
-    const auto fitted = resolve_kv_capacity(options.kv_capacity, cold_request.capacity_curve(), available, headroom);
+    const auto fitted = resolve_kv_capacity(options.kv_capacity, cold_request.capacity_curve(),
+                                            shared_room(cold_request.capacity_curve(), available), headroom);
     if (fitted.resolved_tokens < options.max_context) {
         throw std::runtime_error("Gemma4 KV capacity cannot hold --max-context; reduce context/chunk or free device memory");
     }
+    const auto cold_context = options.max_context;
     if (options.max_context_auto) { options.max_context = ceiling; }
     if (options.prefill_chunk_auto) { options.prefill_chunk = requested_chunk; }
     geometry.reset();
     std::unique_ptr<models::gemma4::Model> model;
+    std::uint64_t shared_weights_bytes = 0;
     {
         StartupPhaseScope upload(options.startup_observer, StartupPhase::WeightsMaterialize);
         SpillGuard guard(*budget);
+        // --allow-shared-memory with the runtime resident: hold the runtime state's bytes before the weights so that
+        // the driver's overflow lands on the weights, then release them for the Program's own allocations.
+        DeviceBuffer runtime_hold;
+        if (options.allow_shared_memory && options.shared_memory_placement == SharedMemoryPlacement::RuntimeResident) {
+            const auto curve = cold_request.capacity_curve();
+            const auto need = gemma4_shared_memory_room(curve, 0, cold_context, 0);
+            if (before.device_free < weight_bytes + need + headroom) { runtime_hold = DeviceBuffer(need); }
+        }
         guard.begin();
         model = models::gemma4::materialize_model(models::gemma4::plan_load(reader, load_options), device,
                                                   &options.startup_observer);
-        if (guard.end_without_host_allocation(model->storage_stats().device_capacity_bytes) != 0) {
-            throw std::runtime_error("Gemma4 weights spilled into host memory: " +
-                                     guard.readings(model->storage_stats().device_capacity_bytes));
+        const auto weights_shortfall = options.allow_shared_memory
+            ? guard.end(model->storage_stats().device_capacity_bytes)
+            : guard.end_without_host_allocation(model->storage_stats().device_capacity_bytes);
+        if (weights_shortfall != 0) {
+            if (!options.allow_shared_memory) {
+                throw std::runtime_error("Gemma4 weights spilled into host memory: " +
+                                         guard.readings(model->storage_stats().device_capacity_bytes));
+            }
+            shared_weights_bytes = weights_shortfall;
         }
+        runtime_hold = DeviceBuffer();
         upload.complete();
     }
     const auto actual = budget->query();
@@ -365,7 +397,8 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& supplied, DeviceContext&
     }
     const auto& request_plan = *resolved_plan;
     const auto curve = request_plan.capacity_curve();
-    auto resolution = resolve_kv_capacity(options.kv_capacity, curve, actual.device_free, headroom);
+    auto resolution = resolve_kv_capacity(options.kv_capacity, curve,
+                                          shared_room(curve, actual.device_free), headroom);
     if (resolution.resolved_tokens < options.max_context) {
         throw std::runtime_error("Gemma4 KV capacity cannot hold --max-context; reduce context/chunk or free device memory");
     }
@@ -376,7 +409,7 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& supplied, DeviceContext&
     const auto after_parameters = budget->query();
     require_auto_readings(after_parameters);
     const std::size_t runtime_room = after_parameters.device_free + instance->parameters.derived_device_bytes();
-    resolution = resolve_kv_capacity(options.kv_capacity, curve, runtime_room, headroom);
+    resolution = resolve_kv_capacity(options.kv_capacity, curve, shared_room(curve, runtime_room), headroom);
     if (resolution.resolved_tokens < options.max_context) {
         const auto mib = [](std::uint64_t bytes) { return std::to_string(bytes >> 20) + " MiB"; };
         throw std::runtime_error(
@@ -396,12 +429,16 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& supplied, DeviceContext&
     device.synchronize();
     const auto memory = instance->program->memory_summary();
     const auto allocated = request_plan.fixed_bytes() - request_plan.graph_allowance + memory.cuda_graph_measured_bytes;
-    if (runtime_guard.end(allocated) != 0) {
-        throw std::runtime_error("Gemma4 runtime spilled into host memory: " + runtime_guard.readings(allocated));
+    std::uint64_t shared_runtime_bytes = 0;
+    if (const auto runtime_shortfall = runtime_guard.end(allocated); runtime_shortfall != 0) {
+        if (!options.allow_shared_memory) {
+            throw std::runtime_error("Gemma4 runtime spilled into host memory: " + runtime_guard.readings(allocated));
+        }
+        shared_runtime_bytes = runtime_shortfall;
     }
     const auto after_startup = budget->query();
     require_auto_readings(after_startup);
-    if (options.max_context_auto && after_startup.device_free < headroom) {
+    if (options.max_context_auto && !options.allow_shared_memory && after_startup.device_free < headroom) {
         const auto mib = [](std::uint64_t bytes) { return std::to_string(bytes >> 20) + " MiB"; };
         throw std::runtime_error(
             "Gemma4 resident VRAM changed during startup; required headroom is no longer free. "
@@ -412,6 +449,8 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& supplied, DeviceContext&
             std::to_string(options.max_context) + "]");
     }
     instance->kv_capacity_resolution.available_after_startup_bytes = after_startup.device_free;
+    instance->kv_capacity_resolution.shared_memory_weights_bytes = shared_weights_bytes;
+    instance->kv_capacity_resolution.shared_memory_runtime_bytes = shared_runtime_bytes;
     // The Engine and the request log report the tier actually resolved (--host-context-mib auto).
     if (prefix_auto) { options.context_cache.host_capacity_bytes = prefix_bytes; }
 
