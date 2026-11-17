@@ -749,6 +749,14 @@ Other programs opening after launch did not slow or page decode in the one test 
 Windows demotes idle allocations first; the headroom setting protects the next startup, not a later spike, and no profile guarantees
 complete answers or the absence of loops.
 
+**Opt-in: `--allow-shared-memory`.** Users who must run below the refusal line can generate the launcher with
+`launcher --profile memory-16gb --allow-shared-memory` (or add the flag to `infernix-serve`): the CMD still tries resident starts first
+(plan with MTP, plan without it) and only when neither fits starts without MTP with the flag, printing a `WARNING` and a server `SHARED GPU
+MEMORY ALLOWED` line with the estimated bytes in shared memory. Every refusal of the profile names the option. Measured cost on the 2.5 GiB-reserve
+desktop (13,743 MiB usable): none up to 24,576 tokens (72 tok/s), because the shortfall is 0.2-0.5 GiB; beyond about 0.8 GiB short decode
+falls 58-75 % and prefill 57-68 % ([measurements](maintainer/gemma4-benchmarks.md#shared-gpu-memory---allow-shared-memory)). Default behavior
+without the flag is unchanged: refusal, nothing paged.
+
 Profile overrides permit chunks `128`, `256`, `512` (larger chunks trade context for prompt speed: 1,081 / 1,381 MiB of ring plus KV at
 chunk 128 / 512), any non-negative headroom, and one MTP draft only. FP8 KV and BF16 logits are required. Key-only KV is
 experimental and changes attention arithmetic; sliding layers remain BF16. Its historical numerical

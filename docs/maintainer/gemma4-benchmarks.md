@@ -480,6 +480,50 @@ The vocabulary/output head (FP8, ~1.3 GiB) cannot leave the device without pagin
 Retained process finding: the Windows OS budget shrinks to usage plus free memory as device memory fills (31,419 MiB at open, 17,154 MiB after the
 weights under the ballast), so resident sizing latches the budget gap at the first reading.
 
+## Shared GPU memory (`--allow-shared-memory`)
+
+**What it is.** Default behavior is unchanged: a Gemma 4 start that cannot keep weights and runtime resident is refused. With
+`--allow-shared-memory` (opt-in, Gemma only) startup continues: `--max-context auto` takes the 9,216-token minimum when nothing fits,
+explicit contexts are never reduced, capacity checks count the reservation of the requested context, the weights and runtime spill
+guards record instead of throwing, and a WARN line states "SHARED GPU MEMORY ALLOWED", the placement and the estimated bytes in shared
+memory (allocated bytes missing from the drop in free VRAM, weights and KV/ring/workspace separately). The `memory-16gb` launcher generated
+with `--allow-shared-memory` first tries resident starts (plan with MTP, plan without) and only then starts without MTP with the flag. Refusal
+messages name the option.
+
+**Measurement method and its limit (2026-11-17, RTX 5090, no MTP, key-only, chunk 128, 9,216 tokens, 8,501-token prompt then 128 tokens).**
+An idle torch ballast does not create real overcommit: Windows demoted the idle ballast first, so even a 4 GiB estimated shortfall ran at
+77-80 tok/s with whole-device use staying near 32 GB. The cells below therefore use an **active ballast** (every held chunk touched each
+10 ms; `vram_ballast_active.py`), whose baseline is lower because of GPU contention: 72 tok/s decode and 1.74k tok/s prefill with no
+spill. One run per cell, the GPU lease held and no build or quantizer overlapping; a CPU-side conversion of another job may have run
+alongside, so quote the numbers as estimates.
+
+| Usable VRAM | Estimated shortfall (weights / runtime) | Placement | Decode tok/s | Prefill tok/s |
+|---|---|---|---:|---:|
+| 16,000 (no spill) | 0 / 0 | - | 72.2 | 1.74k |
+| 13,743 (2.5 GiB reserve) | 0 / 224 MiB | runtime | 72.2 | 1.73k |
+| 13,743 | 0 / 231 MiB | blind | 72.0 | 1.73k |
+| 13,743, context 16,384 | 0 / 367 MiB | runtime | 73.8 | 1.82k |
+| 13,743, context 24,576 | 0 / 532 MiB | runtime | 72.0 | 1.77k |
+| 12,543 | 108 MiB / 670 MiB | runtime | 23.0 | 677 |
+| 12,543 | 183 MiB / 1.35 GiB | blind | 72.5 | 1.75k |
+| 11,543 | 975 MiB / 703 MiB | runtime | 30.3 | 549 |
+| 11,543 | 1.16 GiB / 1.35 GiB | blind | 28.6 | 744 |
+| 10,543 | 1.91 GiB / 727 MiB | runtime | 22.9 (18.5 repeat) | 576 |
+| 10,543 | 1.91 GiB / 1.35 GiB | blind | 24.9 (17.1 repeat) | 672 |
+
+**Reading.** (1) At the conservative 13,743 MiB envelope the whole shortfall is 0.2-0.5 GiB and the cost is not measurable: 9,216, 16,384
+and 24,576 tokens all run at 72 tok/s, so the 2.5 GiB-reserve desktop that the default refuses is usable with the option (minimum measured
+context 2,048 with 0 B estimated shortfall; the idle-ballast run of the same envelope decoded 84 tok/s). Auto takes only the 9,216-token
+minimum there; pass `--max-context` and `--kv-capacity` explicitly for more. (2) Beyond roughly 0.8 GiB short the driver places hot
+allocations in shared memory and decode falls to 18-30 tok/s (-58 to -75 %) and prefill to 550-750 tok/s (-57 to -68 %); one 12,543 cell
+with a larger estimate was unaffected, so the estimate does not predict the cost and the driver, not the engine, decides which
+allocations spill. (3) Which allocations spill cannot be read per allocation; the estimates split into weights and runtime, and both
+grow with the shortfall. (4) Keeping the runtime resident and spilling weights (`--shared-memory-placement runtime`, the default) was not
+consistently better than `blind` (23 against 72 tok/s at 12,543 and 30 against 29 at 11,543): there is no demonstrated placement win, and
+a placement that spills only cold weights does not exist because every layer's weights are read for every token.
+Launcher end to end (`conservative`, staged launcher, idle ballast): planning with and without MTP failed, the `WARNING` line was printed,
+the server started with the warning, 9,216 tokens and an estimated 237 MiB in shared memory.
+
 ## Final-layer early exit in intermediate prefill chunks (2026-11-16)
 
 The default [mechanism](engine-architecture.md) skips the last layer's attention, output projection and FFN
