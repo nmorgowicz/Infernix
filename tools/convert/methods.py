@@ -476,7 +476,7 @@ def fp8_row_maxabs(request: PrepareRequest) -> PreparedMethod:
 
 _IMPORT_FORMATS = (
     "nvfp4", "nvfp4_mul", "fp8_e4m3fn_row_bf16", "fp8_e4m3fn_row_f32", "fp8_e4m3fn_g32_e8m0", "q8_g32_fp16",
-    "q4_g32_fp16", "q4_g128_fp16", "q4_g256_fp16",
+    "q4_g32_fp16", "q4_g128_fp16", "q4_g256_fp16", "q5_g64_fp16",
 )
 
 

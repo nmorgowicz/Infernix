@@ -1,20 +1,12 @@
-"""compressed-tensors ``pack-quantized`` INT4 (symmetric, static contiguous groups) as encoded ``q4_g32_fp16`` rows.
+"""Exact compressed-tensors ``pack-quantized`` symmetric INT4/INT5 matrix sources.
 
-The source keeps its codes and scales: they are copied, never re-rounded. Layout accepted, per matrix ``<prefix>``:
-
-- ``<prefix>.weight_packed``: int32 ``[N, K/8]``; eight offset-binary 4-bit codes per word, element ``8*w + j`` in
-  bits ``4j..4j+3`` of word ``w`` (``unsigned = code + 8``).
-- ``<prefix>.weight_scale``: BF16/FP16/FP32 ``[N, K/G]`` for the group size ``G`` (32, 64, 128 or 256). Every scale
-  must convert to binary16 without changing its value; a coarse group repeats its scale over its 32-wide subgroups,
-  which decodes to the same values.
-- ``<prefix>.weight_shape``: int64 ``[2]`` equal to ``[N, K]``.
-
-Refused: ``weight_zero_point`` and ``weight_g_idx`` (asymmetric or activation-ordered groups do not map to
-contiguous symmetric groups), a ``K`` that is not a multiple of ``G``, and a ``G`` that is not one of the above.
-
-Converter-side permutations (rows of global q/k, columns of global o) are applied to the encoded words as a row gather
-and a column-group gather (32-wide, or the whole source group for native storage). A column permutation must move
-whole groups, otherwise it is refused.
+INT4 words hold eight offset-binary codes; INT5 uses compressed-tensors 0.18's dense
+cross-word packing: element j starts at bit 5*j, with ceil(K*5/32) int32 words per row.
+Six-codes-per-word INT5 packing (floor(32/5)) is a different layout and is refused.
+Scales must already be exactly binary16-representable; codes and scales are never re-rounded.
+INT4 supports source groups 32/64/128/256, with repeated g32 scales or native g128/g256.
+INT5 requires group64 and stores the existing native ``q5_g64_fp16`` format.
+Row permutations gather complete rows; column permutations must gather complete stored groups.
 """
 
 from __future__ import annotations
@@ -45,11 +37,29 @@ def column_group_index(col_index: torch.Tensor, width: int = 32) -> torch.Tensor
     return first // width
 
 
-def unpack_codes(packed: torch.Tensor) -> torch.Tensor:
-    """int32 ``[R, K/8]`` offset-binary words -> int8 ``[R, K]`` codes in [-8, 7]."""
-    shifts = torch.arange(0, 32, 4, dtype=torch.int32)
-    nibbles = (packed.unsqueeze(-1) >> shifts) & 0xF
-    return (nibbles.reshape(packed.shape[0], -1) - 8).to(torch.int8)
+def unpack_codes(packed: torch.Tensor, bits: int = 4, *, columns: int | None = None) -> torch.Tensor:
+    """Offset-binary int32 words -> signed int8 codes, preserving the source codes exactly."""
+    if bits not in (4, 5):
+        raise ValueError(f"packed import supports 4 or 5 bits, not {bits}")
+    if packed.dtype != torch.int32 or packed.dim() != 2:
+        raise ValueError("packed codes must be a two-dimensional int32 matrix")
+    if bits == 4:
+        shifts = torch.arange(0, 32, 4, dtype=torch.int32, device=packed.device)
+        nibbles = (packed.unsqueeze(-1) >> shifts) & 0xF
+        codes = (nibbles.reshape(packed.shape[0], -1) - 8).to(torch.int8)
+        return codes if columns is None else codes[:, :columns]
+    if columns is None or columns <= 0 or packed.shape[1] != (columns * bits + 31) // 32:
+        raise ValueError(
+            "INT5 requires dense cross-word packing with ceil(K*5/32) int32 words per row; "
+            "six-codes-per-word (floor(32/5)) packing is unsupported"
+        )
+    positions = torch.arange(columns, dtype=torch.int64, device=packed.device) * bits
+    index, shift = positions // 32, positions % 32
+    words = packed.to(torch.int64) & 0xFFFFFFFF
+    # The next word contributes only for a code straddling a word boundary.
+    low = words[:, index] >> shift
+    high = words[:, (index + 1).clamp_max(packed.shape[1] - 1)] << (32 - shift)
+    return (((low | high) & 0x1F) - 16).to(torch.int8)
 
 
 def exact_fp16_scales(scales: torch.Tensor, name: str) -> torch.Tensor:
@@ -68,33 +78,32 @@ def exact_fp16_scales(scales: torch.Tensor, name: str) -> torch.Tensor:
     return narrow
 
 
-def packed_int4_matrix_source(
+def packed_matrix_source(
     store: SafetensorsSource,
     prefix: str,
     shape: tuple[int, int],
     group_size: int,
     *,
     row_index: torch.Tensor | None = None,
+    bits: int = 4,
     col_index: torch.Tensor | None = None,
     native: bool = False,
 ) -> LogicalSource:
-    """Encoded rows of ``shape`` read from the packed matrix at ``prefix``.
-
-    Without ``native`` the format is ``q4_g32_fp16`` (a coarse scale repeated over its 32-wide subgroups). With
-    ``native`` and group size 128 or 256 it is the real ``q4_g128_fp16`` / ``q4_g256_fp16``: the source codes with one
-    scale per source group; a column permutation must then move whole source groups, otherwise it is refused.
-
-    ``row_index[i]`` is the source row of output row ``i``; ``col_index[j]`` the source column of output column ``j``.
-    """
+    """Read exact encoded rows; INT5 requires native group64, INT4 may repeat coarse scales."""
+    if bits not in (4, 5):
+        raise ValueError(f"{prefix}: supported bit widths are 4 and 5, not {bits}")
+    if bits == 5 and (group_size != 64 or not native):
+        raise ValueError(f"{prefix}: INT5 requires group64 and native q5_g64_fp16 storage")
     if group_size not in GROUP_SIZES:
         raise ValueError(f"{prefix}: group size {group_size} is not one of {GROUP_SIZES}")
-    if native and group_size not in (32, *NATIVE_GROUP_SIZES):
+    if bits == 4 and native and group_size not in (32, *NATIVE_GROUP_SIZES):
         raise ValueError(f"{prefix}: native storage exists for group sizes 32, 128 and 256 (no Gemma g64 kernels), not {group_size}")
-    width = group_size if native else 32  # code-plane group width of the stored format
-    target = f"q4_g{width}_fp16"
+    width = group_size if native else 32
+    target = f"q{bits}_g{width}_fp16"
     n, k = shape
     if k % group_size:
         raise ValueError(f"{prefix}: K {k} is not a multiple of the group size {group_size}")
+    packed_k = (k * bits + 31) // 32
     if row_index is not None and (row_index.shape != (n,) or sorted(row_index.tolist()) != list(range(n))):
         raise ValueError(f"{prefix}: the row index must be a permutation of the {n} rows")
     if col_index is not None and (col_index.shape != (k,) or sorted(col_index.tolist()) != list(range(k))):
@@ -104,10 +113,11 @@ def packed_int4_matrix_source(
         if store.has(f"{prefix}.{extra}"):
             raise ValueError(f"{prefix}: {extra} is present; asymmetric or reordered groups are not importable")
     packed_name, scale_name, shape_name = (f"{prefix}.{part}" for part in ("weight_packed", "weight_scale", "weight_shape"))
-    for name, expected, dtype in ((packed_name, (n, k // 8), "I32"), (shape_name, (2,), "I64")):
+    for name, expected, dtype in ((packed_name, (n, packed_k), "I32"), (shape_name, (2,), "I64")):
         info = store.describe(name)
         if info.shape != expected or info.dtype != dtype:
-            raise ValueError(f"{name}: expected {dtype}{expected}, got {info.dtype}{info.shape}")
+            layout = " (INT5 needs dense cross-word ceil(K*5/32) packing)" if bits == 5 else ""
+            raise ValueError(f"{name}: expected {dtype}{expected}, got {info.dtype}{info.shape}{layout}")
     scale_info = store.describe(scale_name)
     if scale_info.shape != (n, k // group_size) or scale_info.dtype not in _SCALE_DTYPES:
         raise ValueError(
@@ -125,13 +135,13 @@ def packed_int4_matrix_source(
             raise ValueError(f"{prefix}: invalid encoded rows [{begin},{end})")
         rows = None if row_index is None else row_index[begin:end]
         low, high = (begin, end) if rows is None else (int(rows.min()), int(rows.max()) + 1)
-        words = store.read_flat(packed_name, low * (k // 8), high * (k // 8)).reshape(high - low, k // 8)
+        words = store.read_flat(packed_name, low * packed_k, high * packed_k).reshape(high - low, packed_k)
         raw = store.read_flat(scale_name, low * (k // group_size), high * (k // group_size)).reshape(
             high - low, k // group_size
         )
         if rows is not None:
             words, raw = words[rows - low], raw[rows - low]
-        codes = unpack_codes(words).reshape(end - begin, k // width, width)
+        codes = unpack_codes(words, bits, columns=k).reshape(end - begin, k // width, width)
         scales = exact_fp16_scales(raw, scale_name).repeat_interleave(subgroups, dim=1)
         if groups is not None:
             codes, scales = codes[:, groups], scales[:, groups]
@@ -148,4 +158,4 @@ def packed_int4_matrix_source(
         values = (words.codes.float() * words.scales.float().unsqueeze(-1)).reshape(last - first, k_pad)[:, :k]
         return values.reshape(-1)[begin - first * k : end - first * k]
 
-    return LogicalSource(shape, f"{store.path}:{prefix} (packed int4 g{group_size})", read, encoded)
+    return LogicalSource(shape, f"{store.path}:{prefix} (packed int{bits} g{group_size})", read, encoded)

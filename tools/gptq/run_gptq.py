@@ -1,4 +1,4 @@
-"""GPTQ W4A16 (symmetric INT4, static contiguous groups, no activation order) of a text tree with LLM Compressor.
+"""GPTQ W4A16/W5A16 (symmetric INT4/INT5, static groups, no activation order) of a text tree with LLM Compressor.
 
 Needs the environment of tools/gptq/requirements.txt (not the converter's own). Run from anywhere:
 
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from importlib.metadata import version
 import threading
 import time
 from pathlib import Path
@@ -26,6 +27,7 @@ import torch
 from compressed_tensors.compressors.pack_quantized.base import PackedQuantizationCompressor
 from compressed_tensors.offload import load_offloaded_model
 from compressed_tensors.utils import align_module_device
+from compressed_tensors.quantization import QuantizationScheme
 from datasets import Dataset
 from llmcompressor import oneshot
 from llmcompressor.modifiers.gptq import GPTQModifier
@@ -122,13 +124,58 @@ def sample_resources(peak: dict, log: Path | None, stop: threading.Event) -> Non
                 handle.write(json.dumps({"t": time.time(), **peak}) + "\n")
 
 
-def main(argv: list[str] | None = None) -> int:
+def validate_compressor(bits: int) -> dict:
+    """Require the native INT5 compressor and prove its dense cross-word packing before loading a model."""
+    facts = {
+        "compressed_tensors_version": version("compressed-tensors"),
+        "num_bits": bits,
+        "packing": "dense_cross_word_int32" if bits == 5 else "eight_codes_per_int32",
+    }
+    if bits == 4:
+        return facts
+    scheme = QuantizationScheme(
+        targets=["Linear"],
+        weights={"num_bits": 5, "type": "int", "symmetric": True, "strategy": "group", "group_size": 64},
+    )
+    codes = list(range(-16, 16)) * 2
+    scale = torch.tensor([[2.0**-10]], dtype=torch.bfloat16)
+    state = {"weight": torch.tensor([codes], dtype=torch.bfloat16) * scale, "weight_scale": scale}
+    try:
+        packed = PackedQuantizationCompressor.compress(state, scheme)
+        stream = sum((code + 16) << (5 * j) for j, code in enumerate(codes))
+        raw = stream.to_bytes(40, "little")
+        expected = torch.tensor(
+            [[int.from_bytes(raw[i:i + 4], "little", signed=True) for i in range(0, 40, 4)]],
+            dtype=torch.int32,
+        )
+        valid = (
+            set(packed) == {"weight_packed", "weight_scale", "weight_shape"}
+            and packed["weight_packed"].dtype == torch.int32
+            and torch.equal(packed["weight_packed"], expected)
+            and torch.equal(packed["weight_scale"], scale)
+            and packed["weight_shape"].tolist() == [1, 64]
+        )
+    except Exception as error:
+        raise RuntimeError(
+            f"compressed-tensors {facts['compressed_tensors_version']} cannot produce native packed INT5 group64: {error}"
+        ) from error
+    if not valid:
+        raise RuntimeError(
+            f"compressed-tensors {facts['compressed_tensors_version']}: unsupported INT5 packing; "
+            "need dense cross-word ceil(K*5/32) int32 words and unchanged scales; no packing workaround is used"
+        )
+    return facts
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--tree", required=True, type=Path, help="text-only tree from make_text_tree.py")
     parser.add_argument("--calib", required=True, type=Path, help="token tensor from make_calib.py")
     parser.add_argument("--out", required=True, type=Path, help="GPTQ checkpoint directory (must not exist)")
     parser.add_argument("--recipe", required=True, choices=recipes.names(),
                         help="model-family recipe: sequential targets, ignore patterns, Hessian leaders, defaults")
+    parser.add_argument("--bits", type=int, choices=(4, 5), default=4,
+                        help="symmetric GPTQ bit width (default: 4); 5 requires --group-size 64")
     parser.add_argument("--observer", choices=OBSERVERS, default=None,
                         help="scale search (default: the recipe's; imatrix_mse, the importance-weighted MSE, is the recommended one)")
     parser.add_argument("--group-size", type=int, default=None, choices=(32, 64, 128, 256),
@@ -149,6 +196,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--share-hessians", choices=("on", "off"), default="on",
                         help="let k/v and up take over the Hessian that q and gate just accumulated from the same input "
                              "tensor (bit-identical; measured 0.8 s of 7.6 s per layer on the calibration pass)")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
     recipe = recipes.get(args.recipe)
     for option in ("observer", "group_size", "dampening", "block_size"):
@@ -158,6 +210,9 @@ def main(argv: list[str] | None = None) -> int:
         raise FileExistsError(f"{args.out} exists; use a fresh directory")
     if (args.max_cpu_gb is None) != (args.offload_dir is None):
         parser.error("--max-cpu-gb and --offload-dir go together")
+    if args.bits == 5 and args.group_size != 64:
+        parser.error("--bits 5 requires --group-size 64")
+    packing = validate_compressor(args.bits)
 
     calib = torch.load(args.calib)
     if args.samples:
@@ -174,7 +229,7 @@ def main(argv: list[str] | None = None) -> int:
     gptq = DumpingGPTQ(
         config_groups={"group_0": {
             "targets": ["Linear"],
-            "weights": {"num_bits": 4, "type": "int", "symmetric": True, "strategy": "group",
+            "weights": {"num_bits": args.bits, "type": "int", "symmetric": True, "strategy": "group",
                         "group_size": args.group_size, "actorder": None, "observer": args.observer},
         }},
         ignore=list(recipe.ignore),
@@ -183,7 +238,7 @@ def main(argv: list[str] | None = None) -> int:
         actorder=None,
         offload_hessians=False,
     )
-    fast_solve.install(args.fused_solve)
+    fast_solve.install(args.fused_solve, bits=args.bits)
     DumpingGPTQ.share_hessians = args.share_hessians == "on"
     DumpingGPTQ.leaders = recipe.hessian_leaders
     load = {"device_map": "cpu"}
@@ -228,12 +283,13 @@ def main(argv: list[str] | None = None) -> int:
         "config_groups": {"group_0": {"targets": ["Linear"], "format": "pack-quantized", "input_activations": None,
                                        "output_activations": None, "weights": DumpingGPTQ.scheme["weights"]}},
     }
+    config["infernix_gptq"] = packing
     (args.out / "config.json").write_text(json.dumps(config, indent=2))
     stop.set()
     peak["rss_gib"] = max(peak["rss_gib"], psutil.Process().memory_info().rss / 2**30)
     peak["gpu_torch_peak_gib"] = max(peak["gpu_torch_peak_gib"], torch.cuda.max_memory_allocated() / 2**30)
     print(json.dumps({"calibration_s": round(seconds, 1), "projections": len(DumpingGPTQ.weight_map) // 3,
-                      "observer": args.observer, "group_size": args.group_size,
+                      "bits": args.bits, "observer": args.observer, "group_size": args.group_size,
                       "shared_hessians": DumpingGPTQ.shared, **peak}), flush=True)
     return 0
 

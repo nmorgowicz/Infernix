@@ -1,4 +1,4 @@
-"""Convert Gemma 4 31B BF16 into a Q4/FP8 artifact, verify it, and render calibration text.
+"""Convert Gemma 4 31B BF16 into a Q4/Q5/FP8 artifact, verify it, and render calibration text.
 
 `python -m tools.convert.gemma4_q4 <command>`; run it from this checkout. `convert` uses the converter's
 Q4 group-32 kernels with an FP8 vocabulary, not QAT recovery or NVFP4 calibration. The MTP assistant
@@ -289,7 +289,7 @@ def calibration_text(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m tools.convert.gemma4_q4", description=__doc__)
     subs = parser.add_subparsers(dest="command", required=True)
-    build = subs.add_parser("convert", help="Read BF16 source and write Q4/FP8 V3 artifact plus receipts")
+    build = subs.add_parser("convert", help="Read BF16 source and write Q4/Q5/FP8 V3 artifact plus receipts")
     build.add_argument("--model", required=True, type=Path)
     build.add_argument("--out", required=True, type=Path)
     build.add_argument("--name", default="")
@@ -300,9 +300,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--weights",
         choices=Q4_WEIGHTS,
         default="q4_g32",
-        help="q4_g32: shipping Q4/W4A8 recipe (default). q4_g32_a16: same Q4 weights with no "
-        "A8 prefill permission (weight-only quality arm). fp8_row: A16 FP8-row trunk used "
-        "only as the near-BF16 KL reference; never a deliverable",
+        help="q4_g32: shipping Q4/W4A8 recipe (default). q4_g32_a16: same Q4 weights with A16 only. "
+        "q5_g64: native five-bit group64 with AllowA8 target projections (wide FP8 prefill, narrow A16). "
+        "q5_g64_a16: identical Q5 storage, A16 only. Both import exact GPTQ5 with --gptq-source, otherwise "
+        "BF16-source RTN. fp8_row: near-BF16 A16 reference, not a deliverable",
     )
     build.add_argument(
         "--group-size",
@@ -332,9 +333,8 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument(
         "--native-groups",
         action="store_true",
-        help="Store logical groups above 32 in the real q4_g128_fp16/q4_g256_fp16 format (smaller file) "
-        "instead of repeated g32 scales. Works with A16 (q4_g32_a16) and W4A8 (q4_g32). Group 64 "
-        "has no Gemma kernels and is refused",
+        help="Q4 only: store logical groups above 32 in real q4_g128_fp16/q4_g256_fp16 instead of repeated "
+        "g32 scales. Q4 group64 has no Gemma kernels. Q5 recipes are already native group64; do not pass this flag",
     )
     build.add_argument(
         "--imatrix",
@@ -353,18 +353,19 @@ def build_parser() -> argparse.ArgumentParser:
         choices=MTP_WEIGHTS,
         default=None,
         help="Storage of the MTP assistant's layer projections (query, output, gate, up, down): fp8 (FP8 per-row; "
-        "the default for the q4 weights), bf16 (the old layout, 184 MB larger) or q4 (q4_g32; 81 MB smaller than "
+        "the default for Q4/Q5 weights), bf16 (the old layout, 184 MB larger) or q4 (q4_g32; 81 MB smaller than "
         "fp8 but about 1 point lower draft acceptance). They run on 16-bit activations; the assistant's FP8 head and "
         "outer projections are unchanged. Draft quality, not target output, is at risk",
     )
     build.add_argument(
         "--gptq-source",
         type=Path,
-        help="Directory of an external compressed-tensors pack-quantized INT4 checkpoint (LLM Compressor GPTQ, "
-        "symmetric, static contiguous groups, no activation order, text projections only). Its codes and "
-        "binary16-exact scales are copied into q4_g32_fp16 (or, with --native-groups, a 128/256-group source "
-        "into q4_g128_fp16/q4_g256_fp16) without re-rounding; a layout the converter cannot store "
-        "exactly is refused. Mutually exclusive with --scale-search/--imatrix/--group-size/--region-group",
+        help="Directory of an external compressed-tensors pack-quantized checkpoint (LLM Compressor GPTQ, "
+        "symmetric, static groups, no activation order, text projections only). Q4 recipes require INT4; "
+        "q5_g64/q5_g64_a16 require dense-cross-word INT5 group64 and store native q5_g64_fp16. Codes and "
+        "binary16-exact scales are copied without re-rounding. Q4 optionally stores native g128/g256 "
+        "with --native-groups. Incompatible layouts and bit widths are refused. Mutually exclusive with "
+        "--scale-search/--imatrix/--group-size/--region-group",
     )
     build.add_argument(
         "--gguf-source",

@@ -19,7 +19,7 @@ from tools.convert.gemma4_gptq import checkpoint_group_size, gptq_projection_sou
 from tools.convert.gemma4_q4 import Q4Options, build_recipe
 from tools.convert.model import Model, Parameter
 from tools.convert.sources.logical import array_source
-from tools.convert.sources.packed_int4 import column_group_index, packed_int4_matrix_source, unpack_codes
+from tools.convert.sources.packed_int import column_group_index, packed_matrix_source, unpack_codes
 from tools.convert.sources.safetensors import SafetensorsSource
 
 HIDDEN, INTER, HEADS, KV, SLIDING_DIM, GLOBAL_DIM = 256, 512, 4, 1, 64, 128
@@ -247,7 +247,7 @@ def test_k_is_padded_to_128_with_zero_groups(tmp_path):
         str(tmp_path / "model.safetensors"),
     )
     with SafetensorsSource(tmp_path) as store:
-        source = packed_int4_matrix_source(store, "m", (5, 96), 32)
+        source = packed_matrix_source(store, "m", (5, 96), 32)
         words = source.read_encoded(0, 5)
         assert words.codes.shape == (5, 4, 32) and words.scales.shape == (5, 4)
         assert not bool(words.codes[:, 3].any()) and not bool(words.scales[:, 3].view(torch.int16).any())
@@ -457,9 +457,9 @@ def test_native_refusals(tmp_path):
     )
     with SafetensorsSource(tmp_path) as store:
         with pytest.raises(ValueError, match="not a multiple of the group size 256"):
-            packed_int4_matrix_source(store, "m", (4, 384), 256, native=True)
+            packed_matrix_source(store, "m", (4, 384), 256, native=True)
         # a g128 source of the same K is fine natively
-        source = packed_int4_matrix_source(store, "m", (4, 384), 128, native=True)
+        source = packed_matrix_source(store, "m", (4, 384), 128, native=True)
         assert source.read_encoded(0, 4).format == "q4_g128_fp16"
     # the tensors a column permutation splits cannot be native; the importer refuses to store them so
     perm_cols = (torch.arange(2)[:, None] * 512 + prope_perm(512, 0.25)[None, :]).reshape(-1)

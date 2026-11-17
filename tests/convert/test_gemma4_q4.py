@@ -572,3 +572,63 @@ def test_two_level_scales_and_the_s6_format_are_refused():
     )
     with pytest.raises(ValueError, match="q4_g32_s6_fp16"):
         recipe.prepare(device="cpu")
+
+
+@pytest.mark.parametrize("weights", ["q5_g64", "q5_g64_a16"])
+def test_q5_rtn_is_native_group64_and_preserves_vocabulary_and_mtp_policy(weights):
+    model, _ = mtp_model()
+    built = build_recipe(model, None, Q4Options(weights=weights), device="cpu", rows_per_chunk=7)
+    activation = "a8" if weights == "q5_g64" else "a16"
+    assert built.name == f"q5_g64_absmax_fp8_vocab_{activation}_mtp_fp8"
+    assert set(built.groups.values()) == {64}
+    assert built.q4_groups["native"] and built.q4_groups["default"] == 64
+    assert built.q4_groups["projected_real_weight_bytes"] == built.payload
+    for name in projections(model):
+        chosen = selection(built, name)
+        assert chosen.format == "q5_g64_fp16" and chosen.method is grouped_absmax
+    assert allow_a8(built) == (set(projections(model)) if weights == "q5_g64" else set())
+    assert all(
+        policy == ("AllowA8" if weights == "q5_g64" and name in projections(model) else "A16Only")
+        for (name, _), policy in built.recipe.policies.items()
+    )
+    assert selection(built, "text/token_embedding").format == "fp8_e4m3fn_row_bf16"
+    assert selection(built, "text/output_head").format == "fp8_e4m3fn_row_bf16"
+    assert selection(built, "mtp/layers/0/mlp/gate").format == "fp8_e4m3fn_row_bf16"
+    assert selection(built, "mtp/input_projection").format == "bf16"
+    assert selection(built, "mtp/output_head").format == "fp8_e4m3fn_row_bf16"
+
+
+@pytest.mark.parametrize("changes", [
+    {"group_size": 64}, {"native_groups": True}, {"region_groups": ("mlp_down=64",)},
+    {"scale_search": "mse"}, {"imatrix": "m.gguf"}, {"gguf_source": "m.gguf"},
+])
+@pytest.mark.parametrize("weights", ["q5_g64", "q5_g64_a16"])
+def test_q5_refuses_q4_tuning_and_gguf_import(changes, weights):
+    with pytest.raises(ValueError, match="fix native group64|gguf-source"):
+        Q4Options(weights=weights, **changes)
+
+
+def test_four_bit_recipe_defaults_are_unchanged():
+    options = Q4Options()
+    assert options.weights == "q4_g32" and options.group_size == 32 and options.bits == 4
+    model, _, built = build(options)
+    assert built.name == "q4_g32_absmax_fp8_vocab_a8"
+    assert set(built.groups.values()) == {32}
+    assert allow_a8(built) == set(projections(model))
+
+
+def test_q5_activation_recipes_differ_only_in_target_projection_permissions():
+    model, _ = mtp_model()
+    a16 = build_recipe(model, None, Q4Options(weights="q5_g64_a16"), device="cpu", rows_per_chunk=7)
+    a8 = build_recipe(model, None, Q4Options(weights="q5_g64"), device="cpu", rows_per_chunk=7)
+    assert a16.payload == a8.payload and a16.groups == a8.groups
+    for name in model.parameters:
+        left, right = selection(a16, name), selection(a8, name)
+        assert (left.format, left.layout, left.method, left.parameters) == (
+            right.format, right.layout, right.method, right.parameters
+        )
+    for (name, input_name), policy in a16.recipe.policies.items():
+        assert policy == "A16Only"
+        assert a8.recipe.policies[(name, input_name)] == (
+            "AllowA8" if name in projections(model) else "A16Only"
+        )

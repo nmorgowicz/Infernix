@@ -103,3 +103,35 @@ def test_no_cuda_device_is_a_clean_fallback(monkeypatch, capsys):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     assert fast_solve.install("auto") is False
     assert "no CUDA device" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("rows", [5, 40])
+def test_five_bit_group64_kernel_arithmetic_matches_eager(rows):
+    args = QuantizationArgs(num_bits=5, type="int", symmetric=True, strategy="group", group_size=64, actorder=None)
+    weight, Hinv, old_scale = problem(rows, 256, 64, seed=rows + 64)
+    scale = (old_scale.float() * (7.5 / 15.5)).to(torch.bfloat16)
+    results = []
+    for update in (lambda *a: fast_solve.block_update_eager(*a, args), fast_solve.block_update_torch):
+        W = weight.clone()
+        losses = fast_solve.solve_blocks(W, Hinv, scale, 64, 128, -16.0, 15.0, update)
+        results.append((W, losses))
+    assert torch.equal(results[0][0], results[1][0])
+    torch.testing.assert_close(results[0][1], results[1][1], rtol=1e-4, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU and Triton")
+def test_five_bit_group64_triton_self_test():
+    assert fast_solve.self_test("cuda", group_size=64, bits=5) is None
+
+
+def test_five_bit_install_qualifies_the_five_bit_range(monkeypatch):
+    calls = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    def self_test(device, **kwargs):
+        calls.append((device, kwargs))
+        return "qualification failed"
+
+    monkeypatch.setattr(fast_solve, "self_test", self_test)
+    assert fast_solve.install("auto", bits=5) is False
+    assert calls == [("cuda", {"group_size": 64, "bits": 5})]

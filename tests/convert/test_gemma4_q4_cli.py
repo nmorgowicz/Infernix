@@ -168,3 +168,16 @@ def test_verify_refuses_a_missing_artifact(tmp_path, capsys):
     code, err = run(["verify", "--artifact", str(tmp_path / "none.ninfer")], capsys)
     assert code == 1 and err.startswith("gemma4_q4: ")
 
+
+
+@pytest.mark.parametrize("weights", ["q5_g64", "q5_g64_a16"])
+def test_explicit_q5_recipe_and_unchanged_four_bit_cli_defaults(tmp_path, weights):
+    parser = cli.build_parser()
+    defaults = cli.options_from(parser.parse_args(convert_args(tmp_path)))
+    assert defaults == Q4Options()
+    args = parser.parse_args(convert_args(
+        tmp_path, "--weights", weights, "--gptq-source", str(tmp_path / "gptq5")
+    ))
+    options, _ = cli.check_convert_arguments(args)
+    assert options.bits == 5 and options.gptq_source == tmp_path / "gptq5"
+    assert not (tmp_path / "out").exists()

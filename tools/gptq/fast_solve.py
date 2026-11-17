@@ -1,7 +1,7 @@
 """Fused GPTQ solve for LLM Compressor 0.13.0: one Triton launch per 128-column block instead of 128 Python steps.
 
 `quantize_weight` is LLM Compressor 0.13.0's `modifiers/gptq/gptq_quantize.py:quantize_weight` (lines 84-264) for the one
-case this route uses (group strategy, symmetric INT4, no activation order, bf16 scales) with the inner per-column loop
+case this route uses (group strategy, symmetric INT4 or group64 INT5, no activation order, bf16 scales) with the inner per-column loop
 (lines 177-238: ~30 CUDA launches and 2-3 host/device syncs per column, 0.70 ms per column on the author's RTX 5090,
 3.42 M columns for Gemma 4 31B) replaced by `fused_gptq_kernel.fused_gptq_block_update`, the kernel LLM Compressor 0.14.0
 (PR #3128) ships for the same purpose. Everything else - dead-column masking, damping, Cholesky chain, the error
@@ -90,7 +90,8 @@ def supported(module, quant_args: QuantizationArgs, blocksize: int) -> bool:
         and quant_args.strategy == QuantizationStrategy.GROUP
         and quant_args.symmetric
         and quant_args.type == "int"
-        and quant_args.num_bits == 4
+        and quant_args.num_bits in (4, 5)
+        and (quant_args.num_bits == 4 or quant_args.group_size == 64)
         and not quant_args.actorder
         and 0 < blocksize <= 256
         and not blocksize & (blocksize - 1)
@@ -143,7 +144,9 @@ def quantize_weight(module, quant_args, hessian, blocksize=128, percdamp=0.01):
     }
 
 
-def self_test(device: str = "cuda", rows: int = 40, cols: int = 256, group_size: int = 32, seed: int = 7) -> str | None:
+def self_test(
+    device: str = "cuda", rows: int = 40, cols: int = 256, group_size: int = 32, seed: int = 7, *, bits: int = 4
+) -> str | None:
     """Run the kernel and the eager loop on a small random problem (two blocks, rows not a multiple of the kernel's row
     tile, dead-looking small weights included). Returns None when they are bit-identical, else a description."""
     try:
@@ -156,13 +159,14 @@ def self_test(device: str = "cuda", rows: int = 40, cols: int = 256, group_size:
         samples = torch.randn(cols, 4 * cols, generator=generator).to(device)
         H = samples @ samples.T / samples.shape[1] + 0.01 * torch.eye(cols, device=device)
         Hinv = torch.linalg.cholesky(torch.cholesky_inverse(torch.linalg.cholesky(H)), upper=True)
-        scale = (weight.reshape(rows, cols // group_size, group_size).abs().amax(-1) / 7.5).clamp_min(1e-8)
+        scale = (weight.reshape(rows, cols // group_size, group_size).abs().amax(-1) / (2 ** (bits - 1) - 0.5)).clamp_min(1e-8)
         scale = scale.to(torch.bfloat16)
-        args = QuantizationArgs(num_bits=4, type="int", symmetric=True, strategy="group", group_size=group_size, actorder=None)
+        args = QuantizationArgs(num_bits=bits, type="int", symmetric=True, strategy="group", group_size=group_size, actorder=None)
         results = []
         for update in (lambda *a: block_update_eager(*a, args), block_update_triton):
             W = weight.clone()
-            losses = solve_blocks(W, Hinv, scale, group_size, 128, -8.0, 7.0, update)
+            limit = float(2 ** (bits - 1))
+            losses = solve_blocks(W, Hinv, scale, group_size, 128, -limit, limit - 1, update)
             results.append((W, losses))
         if device.startswith("cuda"):
             torch.cuda.synchronize()
@@ -176,15 +180,20 @@ def self_test(device: str = "cuda", rows: int = 40, cols: int = 256, group_size:
         return f"{type(error).__name__}: {error}"
 
 
-def install(mode: str = "auto", device: str = "cuda") -> bool:
+def install(mode: str = "auto", device: str = "cuda", *, bits: int = 4) -> bool:
     """Install the fused solve. `on` raises when it cannot run, `auto` warns and keeps the eager solver, `off` does nothing."""
     if mode not in MODES:
         raise ValueError(f"--fused-solve must be one of {MODES}")
+    if bits not in (4, 5):
+        raise ValueError("fused solve supports 4 or 5 bits")
     if mode == "off":
         print("fused solve: off (eager solver, about 0.7 ms per weight column)", flush=True)
         return False
     started = time.time()
-    problem = self_test(device) if torch.cuda.is_available() else "no CUDA device"
+    if not torch.cuda.is_available():
+        problem = "no CUDA device"
+    else:
+        problem = self_test(device) if bits == 4 else self_test(device, group_size=64, bits=bits)
     if problem is not None:
         message = f"fused solve unavailable ({problem}); using the eager solver, expect a run about 3x slower"
         if mode == "on":

@@ -577,6 +577,8 @@ The stored Q5 codes/scales are identical; the difference is the target projectio
 
 Vocabulary, assistant and other non-target-projection Uses do not acquire `AllowA8`. Loading
 an existing `A16Only` artifact never opts it into A8. There is no Q5 narrow/decode A8 route.
+The wide A8 composition belongs to Gemma's projection dispatcher (`project()`), not a new
+generic Linear Q5-A8 kernel: generic `ops::linear` on Q5 remains A16 even with `AllowA8`.
 
 The Q5 wide-prefill bake uses **actual decoded values**, not the Q4 scale-order bound.
 For each stored signed five-bit code `q` and binary16 scale `d`, decode

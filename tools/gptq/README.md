@@ -1,9 +1,10 @@
 # GPTQ recipe runner (`--gptq-source`)
 
 These scripts produce the checkpoint that `python -m tools.convert.gemma4_q4 convert --gptq-source DIR` imports:
-LLM Compressor GPTQ, symmetric INT4, static contiguous groups, no activation order. The converter copies the codes
-and the (binary16-exact) scales word for word; nothing is re-rounded. Measured on the author's calibrated 31B this
-route halves the KL of calibrated RTN at group 32 (see `docs/maintainer/gemma4-benchmarks.md`),
+LLM Compressor GPTQ, symmetric INT4 or explicit group64 INT5, static contiguous groups, no activation order.
+The converter copies the codes and the (binary16-exact) scales word for word; nothing is re-rounded.
+Measured on the author's calibrated INT4 31B this route halves the KL of calibrated RTN at group 32
+(see `docs/maintainer/gemma4-benchmarks.md`),
 so use the recommended `imatrix_mse` observer: the default `memoryless_minmax` observer is worse than calibrated RTN.
 (The numbers below were measured for Gemma 4 31B, the one family with a recipe so far.)
 
@@ -14,7 +15,7 @@ so use the recommended `imatrix_mse` observer: the default `memoryless_minmax` o
 | `run_gptq.py` | GPTQ with LLM Compressor, layer by layer, writes the packed projections as it goes; model-specific choices come from `--recipe` |
 | `recipes/` | One module per model family: sequential targets, ignore patterns, Hessian leader map, calibration defaults, load check |
 | `fast_solve.py`, `fused_gptq_kernel.py` | The fused block solve `run_gptq.py` installs by default (Triton kernel vendored from LLM Compressor 0.14.0), with its start-up self-test |
-| `check_checkpoint.py` | Verifies the checkpoint is importable (4-bit codes, scales exact in binary16) before you convert |
+| `check_checkpoint.py` | Verifies exact INT4 or explicit `--bits 5` native INT5 import (including packing/shape checks and binary16-exact scales) before you convert |
 
 This is a separate environment from the converter's. The converter itself needs only what
 [weight-conversion.md](../../docs/weight-conversion.md) lists; only these scripts need `requirements.txt`.
@@ -83,6 +84,19 @@ because transformers rewrites a truncated model's last layer to full attention.
 
 ## 4. GPTQ
 
+The default remains **`--bits 4`**, with the recipe's group size. Native INT5 is explicit:
+`--bits 5 --group-size 64`; other five-bit groups are refused before model loading. Use the same
+text tree and identity-checked calibration tensor for matched four/five-bit comparisons, with
+separate fresh checkpoint and offload directories. The fused solver qualifies the requested bit
+width at startup; the native compressor's dense cross-word five-bit packing is independently
+checked first, and its actual version/layout are recorded in the checkpoint config.
+
+See the [native GPTQ5 conversion instructions](../../docs/weight-conversion.md#native-gptq5-group64-explicit-a16a8-permissions)
+for complete commands. `--weights q5_g64_a16` retains native A16 throughout; explicit
+`--weights q5_g64` stores the same native codes/scales and permits a separate wide-prefill FP8
+route (64 columns and above). Neither enables narrow/decode A8 or changes vocabulary/MTP policy.
+The historical timings and quality results below concern INT4, not a measured GPTQ5 result.
+
 ```bash
 python tools/gptq/run_gptq.py --recipe gemma4_31b --tree work/text60 --calib work/calib.pt --out work/gptq-g32 \
   --group-size 32 --max-cpu-gb 32 --offload-dir work/offload --peak-log work/gptq-g32.peak.jsonl
@@ -124,8 +138,8 @@ remaining 186 s (by subtraction, not measured separately). Forward passes and He
   blocks, solved with the kernel and with the original per-column loop; a bit difference or a Triton compile failure
   disables the fast path), prints one line saying which solver runs, and otherwise keeps the original solver with a
   warning; the run is then about 3 times slower but correct. `on` refuses to start without the kernel, `off` is the
-  original solver. Modules the kernel does not cover (anything but symmetric INT4 groups with bf16 scales and a
-  power-of-two block width dividing the columns) fall back per module.
+  original solver. Modules the kernel does not cover (anything but symmetric INT4 groups or
+  group64 INT5, bf16 scales and a power-of-two block width dividing the columns) fall back per module.
 - Needs Triton: `triton-windows` is pinned in `requirements.txt` (on Linux torch brings Triton). The kernel was
   compiled for `sm_120a` by triton-windows 3.8.0.post28 on an RTX 5090. It needs ptxas, which that package bundles.
 - `--share-hessians {on,off}` (default `on`). q/k/v read one tensor, and so do gate/up, but LLM Compressor builds a
@@ -190,7 +204,9 @@ Use `--weights q4_g32` for the W4A8 artifact and `--mtp-assistant DIR` instead o
 `q4_g128_fp16`/`q4_g256_fp16` formats (without it the scales are repeated into g32 words: same values, no size win).
 `--gptq-source` is mutually exclusive with `--scale-search`, `--imatrix`, `--group-size`, `--region-group` and
 `--scale-bits`. The converter refuses a checkpoint it cannot store exactly: zero points, `weight_g_idx`, scales that
-are not exactly representable in binary16, asymmetric or non-4-bit schemes. Score the artifact with the quality tooling (`docs/quality.md`).
+are not exactly representable in binary16, asymmetric or wrong-bit schemes. The commands above
+are INT4; INT5 requires `check_checkpoint.py --bits 5` and a `q5_g64`/`q5_g64_a16` import recipe.
+Score each activation policy separately with the quality tooling (`docs/quality.md`).
 
 Global-layer permutations: the converter permutes global q/k rows and o columns (`prope_perm`). Row permutations never
 touch groups. The o permutation maps every 32-group of the Hugging Face order onto a whole 32-group (the rotated blocks
@@ -198,6 +214,9 @@ touch groups. The o permutation maps every 32-group of the Hugging Face order on
 and 256 the permutation interleaves 64-wide runs of two source groups into one converter group, so the ten global-layer
 o projections cannot be stored natively; with `--native-groups` they are stored as `q4_g32_fp16` with the repeated
 source scales (still exact), and the receipt lists them under `kept_g32_storage`.
+
+For INT5 group64, each global-o permutation run is exactly one 64-wide group: every text
+projection stays native `q5_g64_fp16` with its original scale words; there is no g32 fallback.
 
 ## 6. Upgrading the GPTQ stack
 

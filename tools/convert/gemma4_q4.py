@@ -1,4 +1,4 @@
-"""Gemma 4 31B dense BF16 -> Q4/FP8 recipe composition and its pure helpers.
+"""Gemma 4 31B dense BF16 -> Q4/Q5/FP8 recipe composition and its pure helpers.
 
 `build_recipe` layers q4 projections (logical absmax group 32/64/128/256, native or emulated storage,
 absmax / MSE / imatrix-weighted scale search) on the `gemma4_31b_fp8` base. The command line lives in
@@ -23,7 +23,7 @@ Q4_REGIONS = (
     "first4_layers",
     "last4_layers",
 )
-Q4_WEIGHTS = ("q4_g32", "q4_g32_a16", "fp8_row")
+Q4_WEIGHTS = ("q4_g32", "q4_g32_a16", "q5_g64", "q5_g64_a16", "fp8_row")
 SCALE_SEARCHES = ("absmax", "mse", "weighted")
 MTP_WEIGHTS = ("bf16", "fp8", "q4")
 IMATRIX_ROLES = {
@@ -232,6 +232,13 @@ class Q4Options:
         if self.scale_search not in SCALE_SEARCHES:
             raise ValueError(f"--scale-search must be one of {SCALE_SEARCHES}, got {self.scale_search!r}")
         regions = parse_region_groups(list(self.region_groups))
+        if self.q5 and (
+            self.group_size != 32 or regions or self.native_groups
+            or self.scale_search != "absmax" or self.imatrix is not None
+        ):
+            raise ValueError(
+                "Q5 weights fix native group64; do not pass Q4 group/scale-search options"
+            )
         if self.quantized:
             if (self.scale_search == "weighted") != (self.imatrix is not None):
                 raise ValueError("--scale-search weighted requires --imatrix, and --imatrix requires weighted")
@@ -247,7 +254,7 @@ class Q4Options:
             raise ValueError("--mtp-weights fp8|q4 applies only to the q4_g32 and q4_g32_a16 weights")
         if self.gptq_source is not None:
             if not self.quantized:
-                raise ValueError("--gptq-source applies only to the q4_g32 and q4_g32_a16 weights")
+                raise ValueError("--gptq-source applies only to q4_g32, q4_g32_a16, q5_g64 and q5_g64_a16")
             if (
                 self.scale_search != "absmax"
                 or self.imatrix
@@ -260,7 +267,7 @@ class Q4Options:
                     "128/256 source in the real q4_g128_fp16/q4_g256_fp16 formats)"
                 )
         if self.gguf_source is not None:
-            if not self.quantized:
+            if not self.quantized or self.q5:
                 raise ValueError("--gguf-source applies only to the q4_g32 and q4_g32_a16 weights")
             if (
                 self.gptq_source is not None
@@ -277,7 +284,15 @@ class Q4Options:
 
     @property
     def quantized(self) -> bool:
-        return self.weights in ("q4_g32", "q4_g32_a16")
+        return self.weights in ("q4_g32", "q4_g32_a16") or self.q5
+
+    @property
+    def q5(self) -> bool:
+        return self.weights in ("q5_g64", "q5_g64_a16")
+
+    @property
+    def bits(self) -> int:
+        return 5 if self.q5 else 4
 
     @property
     def regions(self) -> list[tuple[str, int]]:
@@ -368,7 +383,7 @@ def build_recipe(model, source, options: Q4Options, *, device: str, rows_per_chu
             from .gemma4_gptq import gptq_projection_sources
 
             imported, imported_group, imported_formats = gptq_projection_sources(
-                model, options.gptq_source, native=options.native_groups
+                model, options.gptq_source, native=options.native_groups or options.q5, bits=options.bits
             )
             if set(imported) != set(projections):
                 raise ValueError("the GPTQ source does not cover exactly the model's text-layer projections")
@@ -376,7 +391,12 @@ def build_recipe(model, source, options: Q4Options, *, device: str, rows_per_chu
                 "method": "external_gptq_import",
                 "gptq_source": str(options.gptq_source.resolve()),
                 "group_size": imported_group,
-                "native": options.native_groups and imported_group > 32,
+                "num_bits": options.bits,
+                "packing": "dense_cross_word_int32" if options.q5 else "eight_codes_per_int32",
+                "compressor": json.loads((options.gptq_source / "config.json").read_text(encoding="utf-8")).get(
+                    "infernix_gptq", {}
+                ),
+                "native": options.q5 or (options.native_groups and imported_group > 32),
                 "storage_formats": {
                     fmt: sum(1 for value in imported_formats.values() if value == fmt)
                     for fmt in sorted(set(imported_formats.values()))
@@ -394,7 +414,17 @@ def build_recipe(model, source, options: Q4Options, *, device: str, rows_per_chu
             if name in imported:
                 target = imported_formats[name]
                 groups[name] = imported_group if target != "q4_g32_fp16" or not options.native_groups else 32
-                recipe.assign(name, format=target, layout="auto", method="import_encoded", source=imported[name])
+                recipe.assign(
+                    name, format=target, layout="auto", method="import_encoded", source=imported[name],
+                    activation_policy=("AllowA8" if options.weights == "q5_g64" else "A16Only") if options.q5 else None,
+                )
+                continue
+            if options.q5:
+                groups[name] = 64
+                recipe.assign(
+                    name, format="q5_g64_fp16", layout="auto", method="grouped_absmax",
+                    activation_policy="AllowA8" if options.weights == "q5_g64" else "A16Only",
+                )
                 continue
             groups[name] = q4_group_for(name, layer_types, regions, options.group_size)
             if options.native_groups and groups[name] == 64:
@@ -439,13 +469,15 @@ def build_recipe(model, source, options: Q4Options, *, device: str, rows_per_chu
     name = {
         "q4_g32": "q4_g32_absmax_fp8_vocab_a8",
         "q4_g32_a16": "q4_g32_absmax_fp8_vocab_a16",
+        "q5_g64": "q5_g64_absmax_fp8_vocab_a8",
+        "q5_g64_a16": "q5_g64_absmax_fp8_vocab_a16",
         "fp8_row": "fp8_row_maxabs_a16_reference",
     }[options.weights]
     if options.gptq_source is not None:
         name = name.replace("absmax", "gptq_import")
     if options.gguf_source is not None:
         name = name.replace("absmax", "gguf_import")
-    if any(size != 32 for size in groups.values()):
+    if not options.q5 and any(size != 32 for size in groups.values()):
         name += "_native_groups" if options.native_groups else "_virtual_groups"
     if options.scale_search != "absmax":
         name = name.replace("absmax", options.scale_search + "_search")
@@ -464,14 +496,14 @@ def build_recipe(model, source, options: Q4Options, *, device: str, rows_per_chu
     for size in groups.values():
         histogram[size] = histogram.get(size, 0) + 1
     q4_groups = {
-        "default": options.group_size,
+        "default": 64 if options.q5 else options.group_size,
         "regions": list(options.region_groups),
-        "native": options.native_groups,
+        "native": options.native_groups or options.q5,
         "tensors_by_group": {str(size): count for size, count in sorted(histogram.items())},
         "projected_real_weight_bytes": round(payload - saved),
         "projection_note": (
             "weight_bytes is the real native size"
-            if options.native_groups
+            if options.native_groups or options.q5
             else "scale-plane bytes only; the artifact itself is physically g32"
         ),
     }
