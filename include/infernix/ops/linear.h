@@ -157,6 +157,22 @@ enum class LinearRoutes : std::uint16_t {
 [[nodiscard]] bool linear_fp32_output(QType qtype) noexcept;
 
 /**
+ * Widens a native Q5_G64_FP16 RowSplit matrix to row-scaled E4M3FN for an A8 projection.
+ * For signed five-bit code q and stored binary16 group scale d, v = fl32(q * d), with no
+ * intermediate BF16 cast. For each row, m = max |v|, s = bf16_ru(fl32(m / 448)) (1 for an
+ * all-zero row), r = fl32(1 / FP32(s)), and codes = e4m3_rn_satfinite(fl32(v * r)).
+ * Each fl32 operation is round-to-nearest-even. This uses the actual decoded maximum,
+ * not the Q4 bake's bound or its different multiplication order. LOSSY: E4M3 rounds v again.
+ *
+ * `weight` has positive N, K divisible by 64, padded K divisible by 128, finite FP16 scales
+ * and aligned device-visible planes. `codes` is contiguous 8-byte-aligned U8 [K,N] and
+ * `row_scales` contiguous 2-byte-aligned BF16 [N]; neither output overlaps any input or the
+ * other output. Writes exactly those outputs on `stream`, capture-safe, no allocation or scratch.
+ * This transform alone does not admit a new Linear problem or change its activation permission.
+ */
+void q5_widen_e4m3(const Weight& weight, Tensor& codes, Tensor& row_scales, cudaStream_t stream);
+
+/**
  * The transient bytes LinearRoutes::F16Accumulate needs for a call of `tokens` columns of K =
  * `input_rows` (the FP16-encoded activation and its column scales). linear_workspace_capacity_bytes()
  * and gdn_input_proj_workspace_capacity_bytes() include it wherever an interval reaches the route; a

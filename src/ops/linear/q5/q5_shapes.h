@@ -11,5 +11,11 @@ namespace infernix::ops::detail {
 [[nodiscard]] Q5Launch select_q5_n5120_k17408(std::int32_t tokens);
 [[nodiscard]] Q5Launch select_q5_n1152_k1152(std::int32_t tokens);
 [[nodiscard]] Q5Launch select_q5_n1152_k4304(std::int32_t tokens);
+[[nodiscard]] Q5Launch select_q5_n16384_k5376(std::int32_t tokens);
+[[nodiscard]] Q5Launch select_q5_n18432_k5376(std::int32_t tokens);
+[[nodiscard]] Q5Launch select_q5_n43008_k5376(std::int32_t tokens);
+[[nodiscard]] Q5Launch select_q5_n5376_k8192(std::int32_t tokens);
+[[nodiscard]] Q5Launch select_q5_n5376_k16384(std::int32_t tokens);
+[[nodiscard]] Q5Launch select_q5_n5376_k21504(std::int32_t tokens);
 
 } // namespace infernix::ops::detail

@@ -19,6 +19,11 @@ bool fp8_through_cublas(const Weight& weight, ops::LinearPolicy policy, int toke
            policy == ops::LinearPolicy::A16Only && tokens >= kFp8CublasMinTokens;
 }
 
+bool q5_through_fp8(const Weight& weight, ops::LinearPolicy policy, int tokens) {
+    return weight.qtype == QType::Q5_G64_FP16 &&
+           policy == ops::LinearPolicy::AllowA8 && tokens >= kQ5DenseMinTokens;
+}
+
 std::size_t checked_bytes(int rows, int tokens, std::size_t element_bytes) {
     if (rows <= 0 || tokens <= 0) {
         throw std::invalid_argument("Gemma4 projection: extents must be positive");
@@ -78,6 +83,18 @@ Weight fp8_row_weight(void* payload, int rows, int k) {
 
 void project(const Tensor& x, const Weight& weight, ops::LinearPolicy policy, Tensor& out,
              ops::Fp8RowCublasContext& gemm, WorkspaceArena& workspace, cudaStream_t stream) {
+    if (out.dtype == DType::BF16 && q5_through_fp8(weight, policy, x.ne[1])) {
+        auto scope = workspace.scope();
+        const auto payload = workspace.alloc_bytes(aligned(checked_bytes(weight.n, weight.k, 1)) +
+                                                       checked_bytes(weight.n, 1, 2),
+                                                   kAlignment);
+        const Weight fp8 = fp8_row_weight(payload.data, weight.n, weight.k);
+        Tensor codes(const_cast<void*>(fp8.qdata), DType::U8, {weight.k, weight.n});
+        Tensor scales(const_cast<void*>(fp8.scales), DType::BF16, {weight.n});
+        ops::q5_widen_e4m3(weight, codes, scales, stream);
+        ops::linear(x, fp8, out, ops::LinearPolicy::AllowA8, workspace, stream);
+        return;
+    }
     if (out.dtype == DType::BF16 && fp8_through_cublas(weight, policy, x.ne[1])) {
         ops::fp8_row_cublas(x, weight, out, gemm, workspace, stream);
     } else {
@@ -145,6 +162,16 @@ std::size_t projection_bytes(const Weight& weight, ops::LinearPolicy policy, int
     // Query BF16 too: its native fallback owns its workspace contract, not this family.
     const auto linear = ops::linear_workspace_capacity_bytes(weight.qtype, weight.n, weight.k,
                                                              policy, 1, tokens);
+    if (q5_through_fp8(weight, policy, tokens)) {
+        const auto payload = aligned(aligned(checked_bytes(weight.n, weight.k, 1)) +
+                                     checked_bytes(weight.n, 1, 2));
+        return std::max(linear, payload +
+                                   ops::linear_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16,
+                                                                        weight.n, weight.k,
+                                                                        ops::LinearPolicy::AllowA8,
+                                                                        kQ5DenseMinTokens, tokens) +
+                                   2 * kAlignment);
+    }
     if (!fp8_through_cublas(weight, policy, tokens)) { return linear; }
     return std::max(linear, ops::fp8_row_cublas_workspace_bytes(weight.n, weight.k, tokens));
 }

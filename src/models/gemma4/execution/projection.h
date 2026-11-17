@@ -37,9 +37,14 @@ struct GgmlProjection {
 inline constexpr ops::LinearRoutes kGgmlRoutes = ops::LinearRoutes::GgmlBf16Wide;
 inline constexpr int kGgmlDenseMinTokens = 64;
 
-// out = weight * x for contiguous BF16 x [K,T]. BF16 uses native ops::linear; wide FP8 A16
-// with BF16 output uses caller-owned cuBLAS resources and per-call widening in the arena; an active
-// GgmlProjection runs ops::ggml_linear instead (weight then only describes its [N,K]).
+// Explicit AllowA8 native Q5 trunks bake row-scaled E4M3 only at prefill widths. Narrow
+// decode/MTP and every A16Only call retain the stored-code native Q5 A16 route.
+inline constexpr int kQ5DenseMinTokens = 64;
+
+// out = weight * x for contiguous BF16 x [K,T]. Wide AllowA8 native Q5 uses a transient row-FP8
+// bake and the existing FP8 A8 GEMM; wide FP8 A16 with BF16 output uses caller-owned cuBLAS
+// resources and per-call widening in the arena. An active GgmlProjection runs its routes below
+// (weight then only describes [N,K]); all other calls use ops::linear.
 void project(const Tensor& x, const Weight& weight, ops::LinearPolicy policy, Tensor& out,
              ops::Fp8RowCublasContext& gemm, WorkspaceArena& workspace, cudaStream_t stream);
 void project(const Tensor& x, const Weight& weight, const GgmlProjection& ggml, ops::LinearPolicy policy,

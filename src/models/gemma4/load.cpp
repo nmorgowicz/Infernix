@@ -67,27 +67,32 @@ public:
     explicit Bindings(artifact::Binder& binder) : binder(binder) {}
 
     // A stored matrix [rows, K] (a projection, the vocabulary table or a head): device-resident, one of
-    // kMatrixFormats (or, with `gguf_blocks`, kGgmlFormats in ggml_rows_v1), whole rows, and a complete stored
-    // parent where its layout needs one. `inputs` are the Uses the artifact declares for it (each with an
-    // activation policy and no auxiliaries).
+    // kMatrixFormats, whole rows, and a complete stored parent where its layout needs one. Text-layer
+    // projections also admit Q5 group64 RowSplit with A16Only/AllowA8 Uses, or kGgmlFormats in ggml_rows_v1.
+    // `inputs` are the Uses the artifact declares for it (activation policy, no auxiliaries).
     WeightId matrix(std::string name, Shape shape, std::vector<std::string> inputs = {},
-                    bool grouped = false, bool gguf_blocks = false) {
+                    bool grouped = false, bool text_projection = false) {
         if (shape.size() != 2) { throw ArtifactError(name + ": a matrix parameter is two-dimensional"); }
         PendingWeight pending;
         pending.reference = binder.parameter(name, shape);
         const auto& reader = binder.reader();
+        bool native_q5 = false;
         for (const auto& part : pending.reference.binding.parts) {
             const auto& geometry = reader.geometry(part.object);
             const QType format   = geometry.format;
             const bool native    = std::find(std::begin(kMatrixFormats), std::end(kMatrixFormats), format) !=
                                 std::end(kMatrixFormats);
-            const bool ggml      = gguf_blocks && geometry.layout == QuantLayout::GgmlRows &&
+            const bool q5 = text_projection && format == QType::Q5_G64_FP16 &&
+                            geometry.layout == QuantLayout::RowSplit;
+            native_q5 = native_q5 || q5;
+            const bool ggml      = text_projection && geometry.layout == QuantLayout::GgmlRows &&
                               std::find(std::begin(kGgmlFormats), std::end(kGgmlFormats), format) !=
                                   std::end(kGgmlFormats);
-            if (!native && !ggml) {
+            if (!native && !q5 && !ggml) {
                 throw ArtifactError(name + ": stored format " + std::string(artifact::format_name(format)) +
                                     " is not supported (Gemma4 binds " + allowed_formats() +
-                                    (gguf_blocks ? "; text-layer projections also GGUF blocks in ggml_rows_v1)" : ")"));
+                                    (text_projection ? "; text-layer projections also q5_g64_fp16 in RowSplit "
+                                                       "(A16Only/AllowA8) or GGUF blocks in ggml_rows_v1)" : ")"));
             }
             if (part.begin % shape[1] != 0 || part.end % shape[1] != 0) {
                 throw ArtifactError(name + ": a matrix binds whole rows of its stored parent");
@@ -100,6 +105,10 @@ public:
             }
             if (!use.auxiliaries.empty()) {
                 throw ArtifactError(name + "@" + input + ": Gemma4 weights carry no Use auxiliaries");
+            }
+            if (native_q5 && *use.activation_policy != artifact::ActivationPolicy::A16Only &&
+                *use.activation_policy != artifact::ActivationPolicy::AllowA8) {
+                throw ArtifactError(name + "@" + input + ": native Q5 projections require A16Only or AllowA8");
             }
             pending.uses.push_back({input, linear_policy(*use.activation_policy)});
         }

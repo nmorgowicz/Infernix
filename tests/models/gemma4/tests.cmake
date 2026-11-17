@@ -10,6 +10,14 @@ infernix_add_test(infernix_gemma4_gguf_projection_test
   LIBRARIES infernix_model_runtime)
 set_tests_properties(infernix_gemma4_gguf_projection_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu")
 
+# Native Q5 through model project(): explicit A8 prefill vs A16Only/narrow, independently
+# encoded operands and original packed-weight FP64 oracles, eager and changed-input graphs.
+infernix_add_test(infernix_gemma4_q5_projection_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q5_projection.cpp"
+  LIBRARIES infernix_model_runtime infernix_linear_test_support)
+infernix_op_oracle_options(infernix_gemma4_q5_projection_test)
+set_tests_properties(infernix_gemma4_q5_projection_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu")
+
 # A real Gemma 4 text(+mtp) artifact by explicit path (--artifact); skips (77) without one. Host only.
 infernix_add_test(infernix_gemma4_loading_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_loading_real.cpp"

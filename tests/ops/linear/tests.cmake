@@ -12,6 +12,18 @@ infernix_add_family_op_test(infernix_linear_q5_a16_test FAMILY linear
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q5_a16.cpp"
   LIBRARIES infernix_linear_test_support)
 
+# Gemma 4 31B native Q5 group64: packed-weight FP32 decode and FP64 projection oracle,
+# decode/MTP and 128/2048-token prefill, eager and graph-replayed.
+infernix_add_family_op_test(infernix_linear_gemma4_q5_a16_test FAMILY linear
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gemma4_q5_a16.cpp"
+  LIBRARIES infernix_linear_test_support)
+
+# The transient Q5 row-FP8 bake against an independent host byte oracle (including signed
+# scales, zero rows, actual-vs-bound maxima, E4M3 ties, and padded physical row strides).
+infernix_add_family_op_test(infernix_linear_q5_widen_e4m3_test FAMILY linear
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q5_widen_e4m3.cpp"
+  LIBRARIES infernix_ops)
+
 infernix_add_family_op_test(infernix_linear_q6_a16_test FAMILY linear
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q6_a16.cpp"
   LIBRARIES infernix_linear_test_support)
