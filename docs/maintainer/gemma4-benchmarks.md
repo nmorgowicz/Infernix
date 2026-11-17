@@ -413,10 +413,10 @@ no KL was scored for it).
 
 ## Final-layer early exit in intermediate prefill chunks (2026-11-16)
 
-`INFERNIX_TMP_GEMMA4_FINAL_LAYER_EXIT=1` (off by default; [mechanism](engine-architecture.md)) skips the last layer's attention, output
-projection and FFN in prefill forwards whose final hidden state nothing reads, after that layer's K/V is written.
+The default [mechanism](engine-architecture.md) skips the last layer's attention, output projection and FFN
+in prefill forwards whose final hidden state nothing reads, after that layer's K/V is written.
 
-**Equivalence (switch unset against `=1`, separate processes, same build).** All of these matched exactly:
+**Historical equivalence (switch unset against `=1`, separate processes, same build).** All of these matched exactly:
 - Native direct calls: every BF16 and global FP8 code/scale plane after full versus KV-only forwards, at intermediate and final boundaries,
   and final full-vocabulary logits. 32 cells (four diode artifacts x chunk 128/2048 x CUDA graphs off/on x MTP off/on), 160 fingerprints
   (selecting-distribution, readout, token, MTP counters), Host snapshot restore and two-intermediate-chunk root replay equal to cold generation.
@@ -447,10 +447,35 @@ All 48 cells (4 tiers x 2 chunks x 3 prompts x 2 orders; 32 server runs) complet
 text, token counts and draft counters between arms. AB and BA gains agree within about one point (largest gap: IQ3_XS chunk 128 at 65k, +3.19%
 against +4.08%). The 1k prompt at chunk 2048 is one chunk whose last call is complete, so no skipping applies and its spread is noise.
 [INFERENCE] The gain growing with prompt length points at the last layer's long-context attention being a larger share of each intermediate chunk than its
-weight-GEMM cost; this was not profiled per layer. Not measured: decode, MTP-round speed, physical 16 GB cards, free-cache-resume equality
+weight-GEMM cost; this was not profiled per layer. That campaign did not measure decode or MTP-round speed, physical 16 GB cards, free-cache-resume equality
 (that route's partition arithmetic differs from cold by contract), and any tier or chunk other than those above.
 
 Full tables, receipts and drivers: the camp's `convert/iq3xs-20261115/prefill-earlyexit-20261116/` (`results.md`, `results.json`, `receipts/`).
+
+**Default cutover and decode (2026-11-17).** The switch is removed. The rebuilt development binary's real-artifact
+native test passed all eight diode IQ3_XXS cells (chunk 128/2048, graphs and MTP on/off); 36 unique fingerprints
+matched the retained switch-off baseline across builds. Full versus KV-only calls compared BF16 and FP8 KV planes
+and full-vocabulary logits; generation, readout, scoring, root replay and Host snapshot restore passed. This is not a
+same-build on/off comparison.
+
+Real HTTP on the rebuilt binary (`a81341d60b1d`), RTX 5090, diode IQ3_XXS text+MTP artifact, FP8 KV/QK,
+BF16 logits, auto chunk 2048, max context 131072, 4096 MiB Host, free-cache-resume disabled, thinking off,
+greedy top-k 20, seed 1234: one excluded warmup and three timed distinct prompts per length, 256 output tokens
+each, all `length`, with zero cached tokens. Fresh server per mode, plain first then MTP d1; no reversed-order control.
+Rates are server decode timings; ranges are repetitions, not confidence intervals.
+
+| Prompt tokens (timed) | Plain tok/s median [range] | MTP d1 tok/s median [range] | Accepted / drafted (3 reps) | MTP ms / round proxy median [range] |
+|---|---|---|---|---|
+| 984–986 | 83.85 [83.32–84.18] | 122.27 [121.48–125.67] | 312 / 451 | 13.80 [13.72–13.81] |
+| 64,983–64,985 | 71.37 [70.65–71.59] | 94.74 [94.39–102.26] | 331 / 431 | 18.13 [18.07–18.69] |
+| 121,983–121,985 | 62.18 [60.79–62.53] | 76.16 [73.94–77.63] | 306 / 457 | 22.05 [21.88–22.25] |
+
+The round figure is **not a direct device-round timer**: aggregate server `predicted_ms` divided by drafted tokens
+(one draft per speculative round), including any fallback and other decode overhead. It is a duration proxy, not
+an isolated MTP kernel latency. Plain versus MTP differs in backend and acceptance; these measurements do not isolate
+the early exit's effect on decode. Historical prefill A/B used eight-token outputs, so it is not a matched decode baseline.
+The 24 HTTP requests succeeded under the guarded GPU lease (minimum free RAM 29.33 GiB); raw responses, logs,
+driver and summaries are in `prefill-earlyexit-20261116/default-20261117/`.
 
 ## Route-specific measurements
 

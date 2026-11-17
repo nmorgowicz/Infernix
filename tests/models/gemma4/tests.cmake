@@ -23,8 +23,8 @@ infernix_add_test(infernix_gemma4_program_real_test
 set_tests_properties(infernix_gemma4_program_real_test
   PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 900)
 
-# Final-layer early exit on an explicit MTP artifact. Run separate switch-unset/on processes and
-# compare EVIDENCE lines; direct native full/KV-only calls also compare every layer's cache bytes.
+# Final-layer early exit on an explicit MTP artifact. Direct native full/KV-only calls compare
+# every layer's cache bytes; EVIDENCE fingerprints can be compared with retained baseline runs.
 infernix_add_test(infernix_gemma4_prefill_earlyexit_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_prefill_earlyexit_real.cpp"
   LIBRARIES infernix_engine infernix_model_runtime)

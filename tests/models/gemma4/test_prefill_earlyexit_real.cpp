@@ -1,6 +1,5 @@
 // Real-artifact final-layer early-exit evidence; no downloads. Missing artifact skips (77).
-// Run in SEPARATE processes with INFERNIX_TMP_GEMMA4_FINAL_LAYER_EXIT unset and =1, and
-// compare every EVIDENCE line byte-for-byte. The Program switch is cached on first use.
+// EVIDENCE fingerprints can be compared with retained pre-cutover baseline runs.
 // INFERNIX_GEMMA4_ARTIFACT includes MTP unless --mtp 0; INFERNIX_GEMMA4_HOST_MIB sizes the Host tier.
 // Optional arguments: --chunk 128|2048 --graphs 0|1 --mtp 0|1 (default: all combinations).
 // Direct execution additionally compares full and KV-only calls exactly within each process.
@@ -329,7 +328,7 @@ void scoring(const g4::execution::Parameters& parameters, DeviceContext& device,
     emit("causal-boundaries", chunk, graphs, score_hash(result));
 
     // The bound diagnostic route preserves serving's GEMV head and full-prompt call partition.
-    // Its arithmetic is not the tiled causal-score head's oracle; compare only its own A/B hash.
+    // Its arithmetic is not the tiled causal-score head's oracle; retain its own fingerprint.
     auto plan = program.plan_request(frontend.prepare_tokens(prompt), greedy_execution(1, false));
     const auto sequence = bind(program, plan);
     Hash diagnostic;
@@ -395,7 +394,7 @@ int main(int argc, char** argv) {
             }
             device.synchronize();
         }
-        std::puts("PASS early-exit invariants; compare EVIDENCE lines with the separate switch arm");
+        std::puts("PASS early-exit invariants");
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what()); return 1;

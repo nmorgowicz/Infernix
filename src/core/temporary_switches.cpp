@@ -72,12 +72,6 @@ constexpr Registration kSwitches[] = {
     // Gemma D512 prefill split-K diagnostic: 0 keeps wave-aware selection; 1..13
     // forces the segment count (ops/launcher/gemma4_attention_mma_d512.cu).
     {"INFERNIX_TMP_GEMMA4_ATTN_SPLIT_K", Scope::Gemma4, Kind::Value},
-    // Gemma prefill (models/gemma4/program/program.cpp, run_layers; execution/text_forward.cpp): =1 lets a
-    // prefill forward whose final hidden state no consumer reads (an intermediate chunk of a prompt or of a
-    // replay, a scored chunk without a predictor) skip the last layer's attention, output projection and FFN
-    // after its K/V append. Every K/V, logit and MTP carry is bit-identical by construction; the A/B decides
-    // whether the saved last-layer tail is measurable.
-    {"INFERNIX_TMP_GEMMA4_FINAL_LAYER_EXIT", Scope::Gemma4, Kind::Flag},
 };
 constexpr std::size_t kCount = std::size(kSwitches);
 

@@ -479,8 +479,7 @@ boundary.
 Length buckets bound the resource scope; the Program does not duplicate the dispatch boundaries of
 the Attention Op's private kernels.
 
-**Gemma final-layer hidden liveness.** The experimental
-`INFERNIX_TMP_GEMMA4_FINAL_LAYER_EXIT=1` arm lets a forward stop after the final layer's QKV
+**Gemma final-layer hidden liveness.** A forward can stop after the final layer's QKV
 preparation has appended its complete K/V, omitting that layer's attention, output projection,
 residuals and FFN only when no consumer reads its final hidden state. Earlier layers remain complete.
 Intermediate prompt and Replay calls need only KV; their last call remains complete for prompt
@@ -491,10 +490,10 @@ Snapshots contain KV/ring state, not hidden/carry, so capture and publication fr
 a restore without a subsequent complete forward continues to use the existing plain-decode fallback.
 The configured full-chunk partial graph has its own planned/captured slot at supported graph widths;
 otherwise an existing complete graph is safe to use, or eager execution takes the KV-only route.
-The arm changes neither KV layout nor reserved layer-workspace capacity. It is bit-identical in every
-qualified check and raised cold prefill rate by about 3-8% at ~65k and ~122k prompts (about 1-3% at 1k
+This changes neither KV layout nor reserved layer-workspace capacity. Historical switch-on qualification
+raised cold prefill rate by about 3-8% at ~65k and ~122k prompts (about 1-3% at 1k
 with chunk 128; none at chunk 2048, where a 1k prompt is one complete chunk) on the four Gemma
-artifacts; it stays off by default until promoted. Qualification and timing: [Gemma benchmarks](gemma4-benchmarks.md).
+artifacts. Qualification and timing: [Gemma benchmarks](gemma4-benchmarks.md).
 
 Source ordering uses the transfer and prefill costs corresponding to the hardware and actual bindings;
 defaults are used for configurations without a matching measurement.

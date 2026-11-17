@@ -3,7 +3,6 @@
 #include "core/arena.h"
 #include "core/decode_graph.h"
 #include "core/startup.h"
-#include "core/temporary_switches.h"
 #include "models/gemma4/execution/parameters.h"
 #include "models/gemma4/program/kv_layout.h"
 #include "infernix/types.h"
@@ -44,12 +43,6 @@ constexpr int kScoreTile = 128;
 constexpr std::array<std::uint32_t, 6> kGraphWidths{32, 64, 128, 256, 512, 1024};
 constexpr std::uint64_t kGraphGuardMargin = 256ULL << 20;
 constexpr std::uint64_t kGraphAllowance = 64ULL << 20;
-// INFERNIX_TMP_GEMMA4_FINAL_LAYER_EXIT (core/temporary_switches.cpp): the last layer's tail is skipped in
-// forwards whose final hidden state nothing reads. Read once; unset keeps every forward complete.
-bool final_layer_exit() {
-    static const bool enabled = temporary_switches::flag("INFERNIX_TMP_GEMMA4_FINAL_LAYER_EXIT");
-    return enabled;
-}
 // MTP rounds: at most kMaxDraftTokens drafts (the CLI's range). One I32 slot block carries a round's
 // device inputs and outputs, so a captured round replays after one upload: the draft position, the
 // anchor and drafts (verify ids), the verify positions, the target argmaxes, the licensed tokens and
@@ -186,7 +179,7 @@ ProgramDevicePlan Program::plan_device(const Model& model, const ProgramOptions&
             }
         }
         if (geometry.draft) { ++plan.graph_bound; } // the round graph
-        if (final_layer_exit() && options.prefill_chunk <= std::min(options.max_context, plan.kv_pages * kPage) &&
+        if (options.prefill_chunk <= std::min(options.max_context, plan.kv_pages * kPage) &&
             std::find(kGraphWidths.begin(), kGraphWidths.end(), options.prefill_chunk) != kGraphWidths.end()) {
             ++plan.graph_bound; // the tail-free prefill graph
         }
@@ -627,7 +620,7 @@ struct ProgramImpl {
             graph.executable.upload(stream);
             graph.executable.launch(stream);
         }
-        if (final_layer_exit() && options.prefill_chunk <= capacity() &&
+        if (options.prefill_chunk <= capacity() &&
             std::find(kGraphWidths.begin(), kGraphWidths.end(), options.prefill_chunk) != kGraphWidths.end()) {
             // The full-chunk forward whose final hidden state nothing reads (an intermediate prompt chunk).
             partial_prefill_graph.definition.capture(stream, [this] { layers_body(options.prefill_chunk, false); });
@@ -1140,8 +1133,8 @@ struct ProgramImpl {
         return out;
     }
     // final_hidden: whether anything reads this forward's final hidden state (the head, a scored column or
-    // the MTP carry). When nothing does, the INFERNIX_TMP_GEMMA4_FINAL_LAYER_EXIT arm skips the last layer's
-    // tail after its K/V append; hidden then holds no model state, so carry_column is left unset.
+    // the MTP carry). When nothing does, skip the last layer's tail after its K/V append;
+    // hidden then holds no model state, so carry_column is left unset.
     void run_layers(std::span<const TokenId> tokens, std::uint32_t first,
                     runtime::ExecutionTimingRecorder* timing = nullptr, bool final_hidden = true) {
         if (tokens.empty() || tokens.size() > options.prefill_chunk || first != fed ||
@@ -1153,7 +1146,7 @@ struct ProgramImpl {
         upload_pinned(ids.data, tokens.data(), tokens.size_bytes(), stream);
         upload_pinned(positions.data, host_positions.data(), tokens.size() * sizeof(std::int32_t), stream);
         physical_written = first + static_cast<std::uint32_t>(tokens.size());
-        const bool skip_tail = !final_hidden && final_layer_exit();
+        const bool skip_tail = !final_hidden;
         bool graphed = false;
         bool tail_skipped = false;
         if (skip_tail && tokens.size() == options.prefill_chunk && partial_prefill_graph.executable.ready()) {
