@@ -736,6 +736,14 @@ Automatic context is page-aligned, capped at 131072/native positions, and refuse
 physical-free reading; Gemma refuses `--vram-past-budget`. An explicit `--context N` is never silently
 reduced. Other programs can still consume memory after startup: headroom is not a VRAM reservation
 against future desktop activity, and no profile guarantees complete answers or the absence of loops.
+Auto keeps 192 MiB beyond the 1024 MiB headroom for what the plan does not name (Parameters, kernel
+modules loaded at first use, CUDA Graph state; 128 MiB measured past the plan with this artifact, chunk
+128 and MTP) and re-checks the headroom after startup, so a start that cannot keep it is refused. Measured
+on an RTX 5090 with the ballast method of the [16 GB envelope](maintainer/gemma4-benchmarks.md#16-gb-profile-qualification)
+(not a physical 16 GB card): the headless envelope (15,791 MiB usable) resolves **14,464 tokens with MTP**
+and **37,568 tokens with `--no-mtp`**; the nominal desktop envelope (14,767 MiB) and the conservative one
+(13,743 MiB, [INFERENCE]: less than nominal) are refused with the 9216-token message, not started and not paged.
+Which tokens a 16 GB card holds depends on its other VRAM use; read `/v1/models` after startup.
 
 Profile overrides permit chunks `128`, `256`, `512`, at least 1024 MiB headroom, and one MTP draft only;
 larger chunks trade context for prompt speed. FP8 KV and BF16 logits are required. Key-only KV is

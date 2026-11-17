@@ -74,6 +74,24 @@ int main() {
         failures += check(resident_vram_free(snapshot) == 14812, "past-budget allowance must not enable paging");
         snapshot.physical_free = 100;
         failures += check(resident_vram_free(snapshot) == 0, "withheld gap must saturate, not wrap");
+        // The OS budget shrinks to usage plus physical free as memory fills: the gap latched at
+        // open (1188 MiB) must keep binding, not total less the shrunken budget.
+        snapshot.budget_allowance = 0;
+        snapshot.device_total = 32607;
+        snapshot.local_budget = 17154;
+        snapshot.local_usage = 12624;
+        snapshot.cuda_free = 4530;
+        snapshot.physical_free = 4530 + 1188;
+        snapshot.budget_gap = 1188;
+        failures += check(resident_vram_free(snapshot) == 4530, "a shrunken OS budget must not erase resident room");
+        snapshot.budget_gap.reset();
+        failures += check(resident_vram_free(snapshot) == 0, "without a latched gap the current budget decides");
+        snapshot.budget_gap.reset();
+        snapshot.budget_allowance = 640;
+        snapshot.local_budget = 31419 + 640;
+        snapshot.local_usage = 0;
+        snapshot.cuda_free = 31419;
+        snapshot.physical_free = 100;
         snapshot.physical_free.reset();
         snapshot.has_budget = false;
         failures += check(resident_vram_free(snapshot) == 31419, "unknown NVML/OS facts retain CUDA's bound");

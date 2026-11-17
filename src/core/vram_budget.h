@@ -31,6 +31,9 @@ struct VramSnapshot {
     bool has_budget            = false;
     std::uint64_t local_budget = 0;
     std::uint64_t local_usage  = 0;
+    // Card total less the OS budget at the source's first reading. The budget shrinks as device
+    // memory fills, so resident sizing keeps this gap; absent: derived from the current budget.
+    std::optional<std::uint64_t> budget_gap;
     // Whether local_usage is this process's device-memory use: with has_budget on Windows, and under WSL2 through
     // DXCore's budget query of the local segment, which only reports it (no WSL2 sizing reads a budget).
     bool has_local_usage = false;

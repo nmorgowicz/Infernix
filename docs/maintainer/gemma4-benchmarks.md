@@ -411,6 +411,36 @@ card, Linux or a headless driver stack, any reserve other than the three above, 
 `iq3-xs` at the conservative reserve, and quality at the reduced chunk (the chunk changes scheduling, not the stored weights;
 no KL was scored for it).
 
+## 16 GB profile qualification
+
+**Setup (2026-11-17, RTX 5090, simulated capacity, not a physical 16 GB card).** The generated `--profile memory-16gb`
+launcher (`launcher --profile memory-16gb`, the actual CMD file) of the diode IQ3_XXS text+MTP artifact, chunk 128, one fresh
+process per cell under the ballast method of the envelope section above (headless 15,791 MiB, nominal 14,767 MiB usable;
+ballast set to usable + 1,161 MiB; whole-device peak must stay within 31,419 MiB). Sampler temperature 1.0, top_p 0.95,
+top_k 64, min_p 0.03; thinking on; output cap 8192 including reasoning; seeds 4100, 4101, 4200. Two ~1k prompts exercise
+prefix reuse; a third has `resolved context - 8320` tokens; an over-context request and an explicit `--max-context 131072`
+start must be refused. Camp evidence: `iq3xs-20261115/preset16-20261117/` (`qualify.py`, per-cell raw SSE, server logs, `results.json`).
+
+| Envelope | MTP | Resolved context (`/v1/models`) | Whole-device peak / server added (MiB) | Result |
+|---|---|---:|---|---|
+| headless 15,791 MiB | d1 | **14,464** | 29,980 / 14,330 | 3/3 requests finished (`stop`); over-context HTTP 400, explicit 131072 start refused |
+| headless 15,791 MiB | off | **37,568** | 29,943 / 14,275 | 3/3 requests finished (`stop`); both refusals hold |
+| nominal 14,767 MiB | d1 or off | none | not started (242 MiB) | refused: cannot fit 9,216 tokens beside 1,024 MiB headroom |
+
+Requests (headless, MTP d1 / off): 992-token prompt, 1,401-1,419 output tokens (797-806 reasoning), second identical-prefix request
+cached 986 of 992 prompt tokens; 6,133-token (d1) / 29,238-token (off) prompt, 1,381 / 1,506 output tokens. Decode 114-116 tok/s
+(d1, accepted/drafted 546-571/829-847) and 77-84 tok/s (off) on the RTX 5090: **no 16 GB card throughput claim**. No request reached
+the 8192-token cap, so the cap itself was not exercised to exhaustion here; loop flags were false for all six; no quality rating follows.
+
+**What the numbers mean.** The 9,216-token minimum fits only barely headless: the planned reservation at 9,216 tokens
+is 1,264 MiB (weights 12,385 MiB with MTP), so 2,737 MiB free after weights leaves ~449 MiB for context before the 1,024 MiB
+headroom. Automatic sizing also keeps 192 MiB for allocations the plan does not name; a first run without it resolved 21,504 tokens
+and then failed the post-startup headroom check at 960 MiB free (64 MiB short). Because the profile never lowers headroom below
+1,024 MiB and never pages, the nominal desktop envelope is refused although a non-profile launch with explicit context and the default headroom was
+recorded as `fit` in the envelope section (that criterion is the 31,419 MiB budget line, not 1,024 MiB of remaining free VRAM). Sampling
+whole-device memory can miss brief spikes. Retained process finding: the Windows OS budget shrinks to usage plus free memory as device
+memory fills (31,419 MiB at open, 17,154 MiB after the weights under the ballast), so resident sizing latches the budget gap at the first reading.
+
 ## Final-layer early exit in intermediate prefill chunks (2026-11-16)
 
 The default [mechanism](engine-architecture.md) skips the last layer's attention, output projection and FFN

@@ -480,7 +480,9 @@ struct ProgramImpl {
                 // browser) inflates it, so a run with 0-19 MiB of graphs can read as 64+. The KV pool was sized with slack
                 // beside the allowance and the serve log warns when the allowance is exceeded, so only a gross excess is an error.
                 if (graph_measured_bytes > plan.graph_allowance + kGraphGuardMargin) {
-                    throw std::runtime_error("Gemma4 CUDA graph preparation exceeded its planned device allowance; reduce prefill_chunk or disable CUDA graphs");
+                    throw std::runtime_error("Gemma4 CUDA graph preparation exceeded its planned device allowance (" +
+                        std::to_string(graph_measured_bytes >> 20) + " MiB measured, " +
+                        std::to_string(plan.graph_allowance >> 20) + " MiB planned); reduce prefill_chunk or disable CUDA graphs");
                 }
                 graph_phase.complete();
             }

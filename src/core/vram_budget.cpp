@@ -206,6 +206,10 @@ public:
                                           ? static_cast<std::size_t>(out.local_budget - out.local_usage)
                                           : 0;
                 }
+                if (!budget_gap_) {
+                    budget_gap_ = out.device_total > info.Budget ? out.device_total - info.Budget : 0;
+                }
+                out.budget_gap = budget_gap_;
             }
             if (shared_ != 0 && SUCCEEDED(adapter_->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &info))) {
                 out.shared_system  = shared_;
@@ -299,6 +303,7 @@ private:
     int device_ = 0;
     bool resident_only_ = false;
     std::uint64_t allowance_ = 0; // past the budget (measured at open); 0: the OS budget as reported
+    std::optional<std::uint64_t> budget_gap_; // card total less the OS budget at the first reading
     bool several_devices_ =
         false; // more than one CUDA device visible (Windows: free memory from DXGI)
     cudaDeviceProp props_{};
@@ -357,7 +362,11 @@ std::uint64_t resident_vram_free(const VramSnapshot& snapshot) noexcept {
         free = std::min(free, budget > snapshot.local_usage ? budget - snapshot.local_usage : 0);
         // WDDM's process budget is smaller than the card. Keep that withheld gap physically
         // free too: budget-free alone misses ballast, while raw NVML free includes the gap.
-        const auto withheld = snapshot.device_total > budget ? snapshot.device_total - budget : 0;
+        // The OS budget shrinks to this process's usage plus what is physically free once device
+        // memory fills (RTX 5090 under a 15.6 GiB ballast: 31,419 MiB at open, 17,154 MiB after the
+        // weights), so the gap is the one latched at open, not total less the current budget.
+        const auto withheld = snapshot.budget_gap ? *snapshot.budget_gap
+                              : snapshot.device_total > budget ? snapshot.device_total - budget : 0;
         if (physical) { *physical = *physical > withheld ? *physical - withheld : 0; }
     }
     if (physical) { free = std::min(free, *physical); }

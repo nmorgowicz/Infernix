@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <chrono>
 #include <map>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -261,8 +262,12 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& supplied, DeviceContext&
             return curve.reservation_bytes(candidate.kv_capacity_tokens / curve.main_page_tokens);
         };
         if (options.max_context_auto) {
+            // Parameters, kernel modules loaded at first use and CUDA Graph state allocate after this reading
+            // (128 MiB past the plan on the IQ3 artifact at chunk 128 with MTP, one measured startup); auto keeps this
+            // margin so the final headroom check holds after startup instead of failing it.
+            constexpr std::size_t kAutoStartupMargin = 192ULL << 20;
             options.max_context = resolve_gemma4_auto_context(
-                options.max_context, available, headroom,
+                options.max_context, available, headroom + kAutoStartupMargin,
                 [&](std::uint32_t context) {
                     // Maximize context first; then choose the widest chunk that fits it.
                     return reservation(context, options.prefill_chunk_auto ? 128U : options.prefill_chunk);
@@ -334,7 +339,18 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& supplied, DeviceContext&
     }
     const auto actual = budget->query();
     require_auto_readings(actual);
-    const auto request_plan = resolve_options(*model, actual.device_free);
+    std::optional<models::gemma4::ProgramDevicePlan> resolved_plan;
+    try {
+        resolved_plan = resolve_options(*model, actual.device_free);
+    } catch (const std::runtime_error& error) {
+        const auto mib = [](std::uint64_t bytes) { return std::to_string(bytes >> 20) + " MiB"; };
+        throw std::runtime_error(std::string(error.what()) + " [resident free after weights " +
+                                 mib(actual.device_free) + " (CUDA " + mib(actual.cuda_free.value_or(0)) +
+                                 ", physical " + mib(actual.physical_free.value_or(0)) + ", budget " +
+                                 mib(actual.local_budget) + " less usage " + mib(actual.local_usage) +
+                                 "), planned " + mib(available) + ", headroom " + mib(headroom) + "]");
+    }
+    const auto& request_plan = *resolved_plan;
     const auto curve = request_plan.capacity_curve();
     auto resolution = resolve_kv_capacity(options.kv_capacity, curve, actual.device_free, headroom);
     if (resolution.resolved_tokens < options.max_context) {
@@ -349,7 +365,14 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& supplied, DeviceContext&
     const std::size_t runtime_room = after_parameters.device_free + instance->parameters.derived_device_bytes();
     resolution = resolve_kv_capacity(options.kv_capacity, curve, runtime_room, headroom);
     if (resolution.resolved_tokens < options.max_context) {
-        throw std::runtime_error("Gemma4 resident VRAM changed during startup; cannot hold --max-context and headroom");
+        const auto mib = [](std::uint64_t bytes) { return std::to_string(bytes >> 20) + " MiB"; };
+        throw std::runtime_error(
+            "Gemma4 resident VRAM changed during startup; cannot hold --max-context and headroom [free after weights " +
+            mib(actual.device_free) + ", after parameters " + mib(after_parameters.device_free) + " (CUDA " +
+            mib(after_parameters.cuda_free.value_or(0)) + ", physical " + mib(after_parameters.physical_free.value_or(0)) +
+            "), derived " + mib(instance->parameters.derived_device_bytes()) + ", room " + mib(runtime_room) +
+            ", headroom " + mib(headroom) + ", resolved " + std::to_string(resolution.resolved_tokens) + " of " +
+            std::to_string(options.max_context) + " tokens]");
     }
     instance->kv_capacity_resolution = resolution;
     {
@@ -366,9 +389,14 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& supplied, DeviceContext&
     const auto after_startup = budget->query();
     require_auto_readings(after_startup);
     if (options.max_context_auto && after_startup.device_free < headroom) {
+        const auto mib = [](std::uint64_t bytes) { return std::to_string(bytes >> 20) + " MiB"; };
         throw std::runtime_error(
             "Gemma4 resident VRAM changed during startup; required headroom is no longer free. "
-            "Free GPU memory and restart; host-paged startup is not permitted");
+            "Free GPU memory and restart; host-paged startup is not permitted [free " +
+            mib(after_startup.device_free) + " (CUDA " + mib(after_startup.cuda_free.value_or(0)) + ", physical " +
+            mib(after_startup.physical_free.value_or(0)) + ", budget " + mib(after_startup.local_budget) +
+            " less usage " + mib(after_startup.local_usage) + "), headroom " + mib(headroom) + ", context " +
+            std::to_string(options.max_context) + "]");
     }
     instance->kv_capacity_resolution.available_after_startup_bytes = after_startup.device_free;
     // The Engine and the request log report the tier actually resolved (--host-context-mib auto).
