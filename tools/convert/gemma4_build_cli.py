@@ -124,9 +124,9 @@ def add_serve_arguments(parser: argparse.ArgumentParser, *, prefix: str) -> None
     add("--gemma4-sliding-kv", choices=("bf16", "fp8"), default=None,
         help="sliding K/V ring storage: bf16 (general default), or experimental fp8 (memory-16gb default; "
         "about half the ring memory, measurable fidelity and prefill cost; requires --kv-dtype fp8). Explicit bf16 overrides the profile")
-    add("--gemma4-q5-prefill", choices=("a16", "int8-g32", "int8-g64"), default=None,
-        help="Gemma4 only, opt-in, lossy: native Q5 trunk projections of 64+ columns (prompt chunks, wide verification) "
-        "run INT8 activations quantized per 32 or 64 values of K on the stored codes; a16 (default) emits no flag")
+    add("--gemma4-q5-prefill", choices=("a16", "fp8", "int8-g32", "int8-g64"), default=None,
+        help="Gemma4 native Q5 trunk calls of 64+ columns: fp8 row-E4M3 bake or int8-g32/g64 groupwise INT8 "
+        "activations (lossy opt-ins); a16 (default) preserves artifact policy and emits no flag; narrow calls stay A16")
     add("--allow-shared-memory", action="store_true",
         help="opt in to starting when the model does not fit the free VRAM: the shortfall runs in shared GPU memory "
         "(system RAM over PCIe, much slower; default off = the server refuses). memory-16gb tries resident starts first")

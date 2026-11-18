@@ -576,3 +576,32 @@ human and JSON startup records, one-token requests both returned 818. Lease exit
 unchanged 8 GiB floor, no named heavy overlap. No quality/timing campaign was repeated.
 `phase2/startup-scope-summary.json` connects the measured and rebuilt hashes to the implementation/logging
 commits; `int8-phase2-log-scope-approved.*` and `int8-phase2-startup-scope.receipt.json` retain build/smoke evidence.
+
+## Single-artifact compute selection and incremental scoring (item 2d, 2026-11-18)
+
+Item 2c already implemented INT8 launch-time selection, scoped workspace, graph routing, cache signatures,
+CLI/serve/perplexity/builder propagation and the narrow A16 split. Item 2d reuses those mechanisms.
+The same `--gemma4-q5-prefill` now accepts `fp8`, enabling the existing W5A8 bake for all four prepared
+native Q5 trunk projections (QKV/QK, output, gate/up, down), including trunk verification. No second flag,
+artifact rewrite, copied artifact or persistent extra weight representation is needed.
+
+The historical `a16` default remains **artifact policy**, not a forced override: an A16Only artifact runs
+A16; an AllowA8 artifact keeps W5A8. For an actual launch-time A16/FP8/INT8 choice, use the **one A16Only
+Q5 artifact** and select `a16|fp8|int8-g32|int8-g64`. All lossy routes apply at 64+ columns only; single-token
+decode and narrow MTP verification remain native A16. Assistant/head representations stay unchanged.
+The prepared policy feeds both planning and execution, and existing mode-specific signatures isolate caches.
+
+`ScoreOptions::incremental` and `infernix-perplexity --incremental` add a Gemma4-only teacher-forced
+schedule to the existing scoring/full-vocabulary KL API: independently reset each window, prefill exactly
+`tokens[0:first_target]` in the configured chunks, then feed each preceding ground-truth suffix token in
+one-column forwards with that window's retained KV. **Scored position zero is the final prefill state**;
+only positions 1+ measure incremental arithmetic. This is not repeated prefix rescoring, sampled generation,
+or a block-prefill quality result. `scoring_schedule=prefill-then-one-token/1` binds reference caches to the
+new schedule; old block-prefill references cannot silently qualify it. The companion explicit-token Q8
+reference writer inherits the same prefix/chunk/one-token schedule from that protocol.
+
+Compare identical token IDs, window boundaries and target positions against the plain model's own Q8
+reference. Cross-mode incremental differences include changed prefill KV; an identical narrow A16 prefix
+control separately isolates whether the decode arithmetic itself changed. Short bounded evidence and
+verification are reported below; no default, promotion, long-context qualification or item-2e sweep follows
+from this instrumentation.

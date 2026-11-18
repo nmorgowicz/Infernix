@@ -71,6 +71,7 @@ struct Options {
     std::uint32_t context               = 4096;
     std::uint32_t stride                = 2048;
     std::uint32_t score_tail = 0;
+    bool incremental = false;
     std::optional<std::uint32_t> prefill_chunk;
     int device                          = 0;
     infernix::KvCacheStorage kv           = infernix::KvCacheStorage::Fp8E4M3Row256;
@@ -99,6 +100,8 @@ std::string usage_text() {
            "       [--context N] [--stride N] [--device N]\n"
            "       [--score-window-tail N] (score only the last N targets per unchanged window;\n"
            "        0 scores all targets, default; bounded references are a distinct protocol)\n"
+           "       [--incremental] (Gemma4 only: prefill through the first target's predictor,\n"
+           "        then teacher-force one token per forward with retained KV; first score is prefill)\n"
            "       [--prefill-chunk N] (tokens per scoring prefill pass, a multiple of 128;\n"
            "        default the Engine's 1024)\n"
            "       [--rope-yarn-factor F] (startup-fixed, finite [1,4], default 1; ceiling only)\n"
@@ -107,8 +110,8 @@ std::string usage_text() {
            "       [--gemma4-key-only-kv] (derive global V from FP8 K; opt-in lossy cache)\n"
            "       [--gemma4-sliding-kv bf16|fp8] (Gemma4 sliding ring K/V format; fp8 is an opt-in lossy\n"
            "        cache with one scale per row; needs --kv-dtype fp8)\n"
-           "       [--gemma4-q5-prefill a16|int8-g32|int8-g64] (Gemma4 native Q5 trunk projections of 64+\n"
-           "        columns; int8-g* run INT8 activations per 32/64 K values on exact stored codes; lossy, opt-in)\n"
+           "       [--gemma4-q5-prefill a16|fp8|int8-g32|int8-g64] (Gemma4 native Q5 trunk projections of 64+\n"
+           "        columns; fp8 row-E4M3 bake, int8-g* exact codes with groupwise INT8 activations; lossy opt-ins)\n"
            "       [--logits-dtype fp32|bf16] (the head's logits scoring reads; default fp32, bf16\n"
            "        rounds each once, as Transformers returns them, for comparisons)\n"
            "       [--use-original-int8-prefill-kernel (int8 only; default fast kernel)]\n"
@@ -215,6 +218,8 @@ Options parse_options(int argc, char** argv) {
             out.ngram_volume = std::filesystem::path(value("--ngram-volume"));
         } else if (option == "--reproducible") {
             out.fast_paths = false;
+        } else if (option == "--incremental") {
+            out.incremental = true;
         } else if (option == "--fast-path") {
             const std::string_view name = value("--fast-path");
             const std::optional<infernix::FastPath> path = infernix::parse_fast_path(name);
@@ -472,6 +477,7 @@ public:
                      {"gemma4_qk", infernix::gemma4_qk_name(engine.gemma4_qk)},
                      {"positions", total_positions}};
         if (options.score_tail != 0) { protocol_["score_window_tail"] = options.score_tail; }
+        if (options.incremental) { protocol_["scoring_schedule"] = "prefill-then-one-token/1"; }
         std::error_code size_error;
         const auto bytes = std::filesystem::file_size(options.artifact, size_error);
         reference_ = {{"artifact",
@@ -514,6 +520,7 @@ public:
             const auto columns = static_cast<std::uint32_t>(std::min<std::size_t>(
                 targets_.size() - begin, infernix::kMaximumScoreLogitPositions));
             infernix::ScoreOptions selection;
+            selection.incremental = options_.incremental;
             selection.logits_positions.resize(columns);
             std::iota(selection.logits_positions.begin(), selection.logits_positions.end(),
                       static_cast<std::uint32_t>(begin));
@@ -851,6 +858,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
                                          {"tokens", input}});
             }
             infernix::ScoreOptions score_options{.top_k = own_top_tokens};
+            score_options.incremental = options.incremental;
             std::optional<infernix::perplexity::ReferenceWindow> reference;
             if (kl_reference) {
                 reference = kl_reference->next();
@@ -1036,6 +1044,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"prefix_ids", options.full_vocab_prefix},
           {"score_window_tail", options.score_tail},
           {"rope_yarn_factor", options.rope_yarn_factor},
+          {"incremental", options.incremental},
           {"original_int8_prefill_kernel", options.original_int8_prefill_kernel},
           {"original_nvfp4_prefill_kernel", options.original_nvfp4_prefill_kernel},
           {"lossless", options.lossless},

@@ -705,8 +705,9 @@ Sliding rings remain BF16 for the general profile and native commands. Since the
 The FP8 ring saves 446 MiB at chunk 128 or 1,191 MiB at chunk 2048, but short-context KL increases and prefill slows:
 see the [FP8-ring measurements and limits](maintainer/gemma4-benchmarks.md#fp8-sliding-ring-experimental-off-by-default).
 Planning/fallback commands preserve the selected ring, and `serve-check` records the effective selection.
-`--gemma4-q5-prefill a16|int8-g32|int8-g64` (default `a16`, lossy opt-in, no profile enables it) is forwarded to every
-serve command of the launcher only when not `a16`; `serve-check` records it in the effective profile.
+`--gemma4-q5-prefill a16|fp8|int8-g32|int8-g64` (default `a16`, preserves artifact policy; other choices lossy,
+no profile enables them) is forwarded to every serve command only when not `a16`; `serve-check` records it.
+`fp8` enables the existing wide Q5 row-E4M3 bake on the same A16Only artifact; narrow decode/MTP remains A16.
 
 ```text
 python -m tools.convert.gemma4_build launcher --artifact <file.ninfer> --out <serve.cmd>

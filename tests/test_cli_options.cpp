@@ -416,6 +416,9 @@ int run_tests() {
     failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "hello"}).gemma4_q5_prefill ==
                           infernix::Gemma4Q5Prefill::A16,
                       "--gemma4-q5-prefill must default to a16");
+    failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--gemma4-q5-prefill", "fp8"})
+                              .gemma4_q5_prefill == infernix::Gemma4Q5Prefill::Fp8,
+                      "--gemma4-q5-prefill fp8 was not parsed");
     failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--gemma4-q5-prefill", "int8-g32"})
                               .gemma4_q5_prefill == infernix::Gemma4Q5Prefill::Int8G32,
                       "--gemma4-q5-prefill int8-g32 was not parsed");

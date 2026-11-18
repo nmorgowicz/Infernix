@@ -69,7 +69,7 @@ struct ServeOptions {
     bool max_context_auto = false; // Gemma4 only; max_context is the upper ceiling
     bool gemma4_key_only_kv = false;
     KvCacheStorage gemma4_sliding_kv = KvCacheStorage::BFloat16; // Gemma4 only: the sliding rings' format
-    Gemma4Q5Prefill gemma4_q5_prefill = Gemma4Q5Prefill::A16; // Gemma4 only: opt-in lossy INT8 prompt projections
+    Gemma4Q5Prefill gemma4_q5_prefill = Gemma4Q5Prefill::A16; // Gemma4 native Q5: artifact policy or FP8/INT8 prefill
     bool allow_shared_memory = false; // Gemma4 only: start with the shortfall in shared GPU memory
     SharedMemoryPlacement shared_memory_placement = SharedMemoryPlacement::RuntimeResident;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(8192);

@@ -107,9 +107,10 @@ The ring saves 446 MiB at chunk 128 or 1,191 MiB at chunk 2048, but measured sho
 prefill slows; it is not a free quality/speed improvement. See the
 [measured trade-offs](../docs/maintainer/gemma4-benchmarks.md#fp8-sliding-ring-experimental-off-by-default).
 
-`--gemma4-q5-prefill a16|int8-g32|int8-g64` is a separate opt-in (default `a16`, no flag emitted, for every profile):
-the launcher passes `--gemma4-q5-prefill <value>` to every serve command only when it is not `a16`. It is lossy
-and Gemma4-only; see the [CLI reference](../docs/cli.md).
+`--gemma4-q5-prefill a16|fp8|int8-g32|int8-g64` is a separate opt-in (default `a16`, no flag emitted, every profile):
+the launcher passes nondefault selections to every serve command. `a16` preserves artifact policy; `fp8`
+enables wide row-E4M3 bake on one A16Only Q5 artifact; INT8 retains exact stored codes. All overrides are lossy,
+Gemma4 native-Q5-only, with A16 narrow decode/MTP; see the [CLI reference](../docs/cli.md).
 
 
 ## Benchmark orchestration

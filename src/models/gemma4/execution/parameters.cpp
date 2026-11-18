@@ -241,6 +241,7 @@ ParameterGeometry Parameters::geometry(const Model& source) {
     out.output_head = prepare.linear({weights.output_head}, head_use.input).weight;
     out.layers.reserve(weights.layers.size());
     const auto q5_routes = q5_prefill_routes(source.options().gemma4_q5_prefill);
+    const auto q5_mode = source.options().gemma4_q5_prefill;
     for (std::size_t i = 0; i < weights.layers.size(); ++i) {
         const auto& stored = weights.layers[i];
         const auto kind = config.layer_types[i];
@@ -277,15 +278,15 @@ ParameterGeometry Parameters::geometry(const Model& source) {
         const auto gate_up = prepare.linear({stored.gate, stored.up}, prefix + "ffn_input");
         const auto down = prepare.linear({stored.down}, prefix + "mlp/product");
         layer.qkv = qkv.weight;
-        layer.qkv_policy = qkv.policy;
+        layer.qkv_policy = q5_prefill_policy(qkv.weight.qtype, qkv.policy, q5_mode);
         layer.q_norm = prepare.norm(q_norm, layer.head_dim);
         layer.k_norm = prepare.norm(k_norm, layer.head_dim);
         layer.o_proj = o.weight;
-        layer.o_policy = o.policy;
+        layer.o_policy = q5_prefill_policy(o.weight.qtype, o.policy, q5_mode);
         layer.gate_up = gate_up.weight;
-        layer.gate_up_policy = gate_up.policy;
+        layer.gate_up_policy = q5_prefill_policy(gate_up.weight.qtype, gate_up.policy, q5_mode);
         layer.down = down.weight;
-        layer.down_policy = down.policy;
+        layer.down_policy = q5_prefill_policy(down.weight.qtype, down.policy, q5_mode);
         layer.qkv_ggml = qkv.ggml;
         layer.o_ggml = o.ggml;
         layer.gate_up_ggml = gate_up.ggml;

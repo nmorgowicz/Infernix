@@ -722,6 +722,9 @@ ScoreResult Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t firs
     if (impl_->options.purpose != EnginePurpose::CausalScoring) {
         throw std::logic_error("score_tokens requires a CausalScoring Engine");
     }
+    if (options.incremental && impl_->architecture != models::Architecture::Gemma4) {
+        throw std::invalid_argument("incremental causal scoring is supported only for Gemma4");
+    }
     if (tokens.size() < 2 || tokens.size() > impl_->options.max_context) {
         throw std::invalid_argument("score_tokens token count must be in [2,max_context]");
     }

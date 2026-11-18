@@ -2043,7 +2043,10 @@ ScoreResult Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_t
     p.occupied = true; p.fed = p.physical_written = 0;
     try {
         for (std::uint32_t cursor = 0; cursor < n - 1;) {
-            const auto width = std::min<std::uint32_t>(p.options.prefill_chunk, static_cast<std::uint32_t>(n - 1) - cursor);
+            auto width = std::min<std::uint32_t>(p.options.prefill_chunk, static_cast<std::uint32_t>(n - 1) - cursor);
+            if (options.incremental) {
+                width = cursor < first_target ? std::min(width, first_target - cursor) : 1;
+            }
             // Only a chunk with a predictor reads its final hidden state; an earlier one only feeds K/V.
             const bool predicts = std::max(cursor, first_target - 1) < cursor + width;
             p.run_layers(std::span<const TokenId>(tokens).subspan(cursor, width), cursor, nullptr, predicts);

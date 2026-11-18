@@ -31,6 +31,13 @@ infernix_add_test(infernix_gemma4_program_real_test
 set_tests_properties(infernix_gemma4_program_real_test
   PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 900)
 
+# Teacher-forced one-token scoring matches real generation and preserves shared-prefix A16 arithmetic.
+infernix_add_test(infernix_gemma4_incremental_score_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_incremental_score_real.cpp"
+  LIBRARIES infernix_engine infernix_model_runtime)
+set_tests_properties(infernix_gemma4_incremental_score_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 300)
+
 # Final-layer early exit on an explicit MTP artifact. Direct native full/KV-only calls compare
 # every layer's cache bytes; EVIDENCE fingerprints can be compared with retained baseline runs.
 infernix_add_test(infernix_gemma4_prefill_earlyexit_real_test

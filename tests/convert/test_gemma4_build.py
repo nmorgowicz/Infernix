@@ -1551,7 +1551,7 @@ def test_fp8_sliding_ring_launcher_refuses_bf16_globals(env, capsys):
 
 
 @pytest.mark.parametrize("profile", ["default", "memory-16gb"])
-@pytest.mark.parametrize("selection", [None, "a16", "int8-g32", "int8-g64"])
+@pytest.mark.parametrize("selection", [None, "a16", "fp8", "int8-g32", "int8-g64"])
 def test_q5_prefill_selection_is_opt_in_and_in_every_serve_command(env, tmp_path, monkeypatch, profile, selection):
     monkeypatch.setattr(launcher, "artifact_info", lambda path: launcher.ArtifactInfo(True, False, 262144, True))
     artifact = tmp_path / "iq3.ninfer"
@@ -1576,7 +1576,7 @@ def test_q5_prefill_selection_is_opt_in_and_in_every_serve_command(env, tmp_path
 
 
 def test_q5_prefill_refuses_unknown_values(env):
-    with pytest.raises(ValueError, match="--gemma4-q5-prefill must be a16, int8-g32 or int8-g64"):
+    with pytest.raises(ValueError, match="--gemma4-q5-prefill must be a16, fp8, int8-g32 or int8-g64"):
         launcher.check_serve_settings(launcher.ServeProfile(gemma4_q5_prefill="int8"))
     with pytest.raises(SystemExit):
         cli.build_parser().parse_args(env.argv("iq3-xxs", "--gemma4-q5-prefill", "int8"))

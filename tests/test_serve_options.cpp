@@ -463,6 +463,9 @@ int main() {
     failures += check(sliding_int8_rejected, "--gemma4-sliding-kv int8 was accepted");
     failures += check(parse({"infernix-serve", "model.ninfer"}).gemma4_q5_prefill == infernix::Gemma4Q5Prefill::A16,
                       "--gemma4-q5-prefill must default to a16");
+    failures += check(parse({"infernix-serve", "model.ninfer", "--gemma4-q5-prefill", "fp8"}).gemma4_q5_prefill ==
+                          infernix::Gemma4Q5Prefill::Fp8,
+                      "--gemma4-q5-prefill fp8 was not parsed");
     failures += check(parse({"infernix-serve", "model.ninfer", "--gemma4-q5-prefill", "int8-g32"}).gemma4_q5_prefill ==
                           infernix::Gemma4Q5Prefill::Int8G32,
                       "--gemma4-q5-prefill int8-g32 was not parsed");

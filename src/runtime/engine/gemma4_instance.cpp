@@ -86,9 +86,13 @@ ModelMetadata metadata(const models::gemma4::Model& model) {
     return out;
 }
 
-// Whether any weight is a native Q5_G64_FP16 matrix, the only format --gemma4-q5-prefill's routes serve.
+// The opt-ins serve native Q5 trunk projections, not a Q5 head or assistant alone.
 bool has_native_q5(const models::gemma4::Model& model) {
     for (const auto& weight : model.weight_data()) {
+        const bool trunk = std::any_of(weight.uses.begin(), weight.uses.end(), [](const auto& use) {
+            return use.input.starts_with("text/layers/");
+        });
+        if (!trunk) { continue; }
         for (const auto& part : weight.view.parts) {
             if (part.parent && part.parent->geometry.format == QType::Q5_G64_FP16) { return true; }
         }

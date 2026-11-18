@@ -42,12 +42,21 @@ inline constexpr int kGgmlDenseMinTokens = 64;
 // decode/MTP and every A16Only call retain the stored-code native Q5 A16 route.
 inline constexpr int kQ5DenseMinTokens = 64;
 
+// Apply only to native Q5 trunk projections, never to the head, assistant or Q4/GGUF.
+// Keeping the policy on the prepared layer makes workspace planning and graph execution agree.
+[[nodiscard]] constexpr ops::LinearPolicy q5_prefill_policy(QType type, ops::LinearPolicy artifact,
+                                                           Gemma4Q5Prefill mode) noexcept {
+    return type == QType::Q5_G64_FP16 && mode == Gemma4Q5Prefill::Fp8
+        ? ops::LinearPolicy::AllowA8 : artifact;
+}
+
 // --gemma4-q5-prefill: the route flag the layer's native Q5 projections of kQ5DenseMinTokens or more columns carry
 // (ops::LinearRoutes::Q5Int8G32 / Q5Int8G64); a16 is no flag. It takes precedence over an AllowA8 Use's row-FP8 bake
 // at those widths; narrower calls never use it.
 [[nodiscard]] constexpr ops::LinearRoutes q5_prefill_routes(Gemma4Q5Prefill mode) noexcept {
     switch (mode) {
     case Gemma4Q5Prefill::A16: return ops::LinearRoutes::Exact;
+    case Gemma4Q5Prefill::Fp8: return ops::LinearRoutes::Exact;
     case Gemma4Q5Prefill::Int8G32: return ops::LinearRoutes::Q5Int8G32;
     case Gemma4Q5Prefill::Int8G64: return ops::LinearRoutes::Q5Int8G64;
     }

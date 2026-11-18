@@ -101,7 +101,12 @@ int run_shape(int n, int k, std::uint32_t seed) {
     DeviceContext context;
     ops::Fp8RowCublasContext gemm(context.stream);
     int failures = 0;
-    for (auto policy : {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8}) {
+    for (auto artifact_policy : {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8}) {
+      for (auto mode : {Gemma4Q5Prefill::A16, Gemma4Q5Prefill::Fp8}) {
+        const auto policy = g4::q5_prefill_policy(weight.qtype, artifact_policy, mode);
+        if (mode == Gemma4Q5Prefill::Fp8 && policy != ops::LinearPolicy::AllowA8) {
+            throw std::runtime_error("launch-time fp8 did not enable the existing Q5 bake");
+        }
         const auto envelope = g4::projection_bytes(weight, policy, kTokens.back());
         for (int tokens : kTokens) {
             const bool baked = policy == ops::LinearPolicy::AllowA8 && tokens >= g4::kQ5DenseMinTokens;
@@ -146,6 +151,7 @@ int run_shape(int n, int k, std::uint32_t seed) {
                 ++failures;
             }
         }
+      }
     }
     std::vector<std::uint8_t> weight_after(host.payload.size());
     device_weight.copy_to_host(weight_after.data(), device_weight.bytes);

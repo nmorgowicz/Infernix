@@ -134,8 +134,8 @@ def check_serve_settings(profile: ServeProfile) -> None:
         raise ValueError("--gemma4-key-only-kv needs --kv-dtype fp8")
     if profile.gemma4_sliding_kv not in ("bf16", "fp8"):
         raise ValueError("--gemma4-sliding-kv must be bf16 or fp8")
-    if profile.gemma4_q5_prefill not in ("a16", "int8-g32", "int8-g64"):
-        raise ValueError("--gemma4-q5-prefill must be a16, int8-g32 or int8-g64")
+    if profile.gemma4_q5_prefill not in ("a16", "fp8", "int8-g32", "int8-g64"):
+        raise ValueError("--gemma4-q5-prefill must be a16, fp8, int8-g32 or int8-g64")
     if profile.gemma4_sliding_kv == "fp8" and profile.kv_dtype != "fp8":
         raise ValueError("--gemma4-sliding-kv fp8 needs --kv-dtype fp8")
     if profile.gemma4_qk not in GEMMA4_QKS:
@@ -261,7 +261,7 @@ def launcher_lines(
     if profile.gemma4_sliding_kv == "fp8":
         lines.append("rem Experimental FP8 sliding K/V ring: lower memory, measurable fidelity and prefill cost; memory-16gb default, explicit bf16 overrides it.")
     if profile.gemma4_q5_prefill != "a16":
-        lines.append("rem Experimental INT8-activation Q5 prefill (lossy, opt-in): calls of 64+ columns; decode unchanged. Default launches do not enable it.")
+        lines.append(f"rem Experimental Q5 prefill {profile.gemma4_q5_prefill} (lossy, opt-in): calls of 64+ columns; narrow decode/MTP verification stays A16. Artifact unchanged.")
     if profile.context == "auto":
         lines.append("rem Context is fitted at startup to available VRAM; refuses below 9216 tokens. Read /v1/models for the resolved limit.")
     if profile.gemma4_qk == "fp8":
