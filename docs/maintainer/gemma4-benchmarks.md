@@ -658,7 +658,7 @@ Camp evidence: `iq3xs-20261115/konly-20261117/` (drivers, raw requests/responses
 The rebuild (a sine and cosine per rotated pair and key) costs more than the halved V read saves at these lengths;
 outputs differ from K==V FP8 (a different lossy V) but are identical across AB and BA runs of the same arm.
 
-## Five-bit text projections: quality (2026-11-17, speed not yet measured)
+## Five-bit text projections: quality, speed and 32 GB capacity (2026-11-17)
 
 Explicit alternatives to best-medium, not defaults. Each arm is scored on the pinned full-vocabulary protocol
 (context 512, stride 256, chunk 128, chat prefix, BF16 QK, FP8 KV, BF16 logits; 47 windows, 13,728 positions)
@@ -684,8 +684,57 @@ KV changes short-context KL by no measurable amount on the same artifact (GPTQ4 
 GPTQ5 A8 +0.0002 [-0.0014, +0.0019]); that says nothing about long context. The same GGUF blocks scored through
 libllama give about half the native-import KL (plain Q5_K_S 0.0117), so roughly 0.012 KL comes from the native
 serving path rather than the K-quant weights. The native projection tests are `infernix_linear_gemma4_q5_a16_test`,
-`infernix_linear_q5_widen_e4m3_test` and `infernix_gemma4_q5_projection_test`. Serving speed, the 32 GB capacity
-frontier and chat-prefixed long-context KL are not measured for these artifacts; do not infer them from the table.
+`infernix_linear_q5_widen_e4m3_test` and `infernix_gemma4_q5_projection_test`.
+
+**Serving instrument.** RTX 5090, development server (build `windows-2026.11.07-187-g9dc29360-dirty`), FP8 KV, FP8 QK, BF16 logits,
+`--max-context auto --kv-capacity auto`, `--vram-headroom-mib 1024`, prefix reuse off, thinking-off cold natural-text prompts,
+greedy, 256 output tokens; per cell one excluded warmup and two timed requests per length (Q5_K_S import: one), plus one request of
+(capacity - 768) tokens. MTP d1 acceptance is accepted/drafted summed over the timed requests. RAM floor 8 GiB in every cell
+(never relaxed); each row stores process-list overlap (no build, quantizer or other heavy process was seen in any row) and available RAM / Pages/sec samples
+(available RAM stayed >= 33 GiB; Pages/sec spikes were file reads, not memory pressure). The best-medium artifact is the actual
+G: file (diode model); the Q5 artifacts are the plain model, so speed, not KL, is comparable across the rows. Cells are prefill tok/s | decode tok/s
+(MTP: accepted/drafted); "stored" is normal FP8 K==V, "key-only" is `--gemma4-key-only-kv`.
+
+| Artifact, chunk, mode | ~1k | ~65k | ~122k | Capacity tokens (headroom 1024 MiB) |
+|---|---|---|---|---:|
+| best-medium c2048 stored, plain | 6302 / 71.0 | 3341 / 61.8 | 2305 / 55.3 | >= 131,072 |
+| best-medium c2048 stored, MTP | 6324 / 114.6 (222/287) | 3342 / 88.9 | 2305 / 75.7 | >= 131,072 |
+| best-medium c2048 key-only, plain / MTP | 6273 / 70.8; 6441 / 113.7 | 2948 / 60.2; 2956 / 87.0 | 1963 / 53.7; 1963 / 69.8 | >= 131,072 |
+| best-medium c128 stored, plain / MTP | 3710 / 71.0; 3696 / 114.0 | 2360 / 61.9; 2358 / 87.4 | 1750 / 55.2; 1749 / 76.0 | >= 131,072 |
+| GPTQ5 W5A8 c2048 stored, plain | 6303 / 53.7 | 3332 / 48.0 | not run (outside capacity) | 108,096 |
+| GPTQ5 W5A8 c2048 stored, MTP | 6286 / 82.4 (213/297) | 3334 / 65.9 | not run | 97,344 |
+| GPTQ5 W5A8 c2048 key-only, plain / MTP | 6205 / 53.6; 6329 / 83.7 | 2941 / 47.6; 2963 / 67.5 | 1985 / 43.1; 1987 / 58.8 | >= 131,072 |
+| GPTQ5 W5A8 c128 stored, plain / MTP | 2059 / 53.6; 2125 / 83.1 | 1616 / 46.7; 1536 / 60.1 | 1311 / 43.7; 1110 / 52.0 | >= 131,072 |
+| GPTQ5 W5A8 c128 key-only, plain / MTP | 1959 / 49.9; 2121 / 85.6 | 1545 / 47.2; 1547 / 65.3 | 1179 / 40.8; 1195 / 54.8 | >= 131,072 |
+| GPTQ5 A16 c2048 stored, plain / MTP | 2719 / 53.3; 2683 / 83.1 | 1944 / 47.6; 1939 / 65.4 | not run | 95,744 / 84,608 |
+| Q5_K_S import c2048 stored, plain / MTP | 1421 / 57.2; 1076 / 65.8 | 1803 / 51.3; 1749 / 73.2 | not run | 83,328 / 72,320 |
+| Q5_K_S import c128 stored, plain | 212 / 58.1 | 209 / 50.7 | 195 / 42.4 | >= 131,072 |
+
+">= 131,072" means the automatic context reached its 131,072 ceiling at this headroom and a 130,304-token request completed in every such cell; the true frontier of
+those cells is not located. The measured frontiers are those below 131,072: normal FP8 KV at chunk 2048 does **not** hold a 122k prompt with five-bit weights
+(GPTQ5 W5A8 97k-108k, GPTQ5 A16 85k-96k, Q5_K_S import 72k-83k tokens), whereas key-only KV reaches the ceiling with every artifact. Key-only costs
+prefill (65k: 3332 -> 2941, 122k: ~2300 -> ~1990 tok/s for best-medium/GPTQ5) and 1-8 % decode, as in the key-only section above; it is an arm, not a free offset.
+Five-bit weights cost 24 % of plain decode against best-medium (71.0 -> 53.7 tok/s at 1k) and 28 % of MTP decode (114.6 -> 82.4); prefill at chunk 2048 matches best-medium for the W5A8 bake (6303 vs 6302 at 1k, 3332 vs 3341 at 65k) but is 43 % (1k) and 58 % (65k) of it for GPTQ5 A16 and 54 % at 65k for the Q5_K_S import. The Q5_K_S GGUF import has no fast prefill route
+at these shapes (about 200 tok/s at chunk 128), which makes it impractical for long prompts independent of its good KL.
+
+**Long-context quality (bounded, chat-prefixed; plain model only).** Reference: the plain Q8_0 GGUF through libllama
+(`token_logprobs.py reference`, no mmap, 40 GPU layers; a quality run at a 4 GiB RAM floor, minimum free 7.5 GiB) on the windows
+of a native control run with the same 17-token chat prefix: 3 streams (wikitext-00, pg19-00, ninfer-00 of the 12-stream long corpus), context 32,768, stride
+16,384, 11 windows, last 64 targets of each window (`--score-window-tail 64`) = 704 positions, chunk 2048, FP8 KV, BF16 QK,
+BF16 logits. Reference sha256 `fc66c718...d7a5`, Q8_0 sha256 `02776a5f...c77`. Windows are unchanged independent 32k contexts, so these are late-context
+tokens at 32.7k depth; the sample is small (CIs wide, the ninfer-00 domain has 4 windows) and says nothing about 65k/122k or a full corpus.
+
+| Artifact | KV | KL [95% CI] | dNLL [95% CI] | Top-1 disagr. |
+|---|---|---|---|---:|
+| GPTQ5 g64 A16 | normal FP8 | 0.0317 [0.0145, 0.0579] | -0.0037 [-0.0347, +0.0268] | 0.0526 |
+| GPTQ5 g64 A16 | key-only | 0.0319 [0.0148, 0.0582] | -0.0088 [-0.0437, +0.0245] | 0.0540 |
+| GPTQ5 g64 A8 | normal FP8 | 0.0346 [0.0162, 0.0652] | +0.0115 [-0.0220, +0.0435] | 0.0526 |
+| GPTQ5 g64 A8 | key-only | 0.0384 [0.0183, 0.0717] | +0.0048 [-0.0307, +0.0399] | 0.0526 |
+
+Paired (same windows, 4000 window resamples): key-only minus normal dKL +0.0002 [-0.0010, +0.0015] for A16 and +0.0038 [+0.0004, +0.0077] for A8;
+A8 minus A16 (normal KV) +0.0030 [-0.0059, +0.0107]. At this bound key-only is indistinguishable from normal KV with A16 weights and
+shows a small but interval-excluding-zero KL increase with A8 weights; weight precision and KV precision are separate factors and neither offsets the other here.
+
 
 ## Route-specific measurements
 
