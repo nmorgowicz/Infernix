@@ -274,12 +274,63 @@ precision/default change, source-wiring test or relaxed numerical threshold is r
    quant. Evaluate immutable per-row metadata/preparation versus fused/groupwise alternatives
    under explicit memory and represented-value contracts; a full persistent FP8 trunk would
    cost roughly a whole additional weight representation and is not assumed to fit. The
-   separate groupwise-A8 item 2b remains subject to parent review, not started here.
+   separate groupwise-A8 question is answered for quality by the next section (INT8 per-32 recovers A16 KL); its kernel speed is unmeasured.
 4. **Keep long-context attention separate.** Its ~11.23 s A8 primary cost limits the
    end-to-end return from projection work. Do not mix FP8 rings/key-only KV into a kernel
    attribution baseline or silently trade quality to report a projection improvement.
 
 Unresolved: achieved hardware occupancy/read bandwidth/stall attribution, all-MTP behavior,
 other GPUs/power limits, longer prompts and quality of any proposed alternative. Existing
-quality gates and artifact/reference identities remain binding. Parent review precedes
-2b/2c or the separately approved serving-profile changes.
+quality gates and artifact/reference identities remain binding. Parent review precedes 2c or
+the separately approved serving-profile changes.
+
+## Compute-precision emulation (item 2b, 2026-11-18)
+
+Quality-only, offline study of which compute precision explains the plain GPTQ5 W5A8 gap to A16.
+No optimized kernel, default or artifact changed. A temporary emulation route (an explicit
+`INFERNIX_TMP_PRECISION` switch in `project()` that dequantized codes and ran grouped BF16 tensor-core
+GEMMs with an FP32 groupwise scale chain) was built into the approved development build for the
+runs and then removed; it survives only as the camp patch `emulator.patch`
+(SHA-256 `aafbc94c5f625c40f174c250443d7e9399f21059ac7ba10779ceabdcadac95d9`, on `8b9f67ac`).
+Executable SHA-256 `17e6fa923d69c0832394749c9669cff3b8e49292d313ac05fcf216fbbb30f8fb`; clean rebuild
+`d7a3e43fc66a48af4a8175776f6fd1eb3df33f5c0292972885d19aecc62693d2` reproduces the stored A16 positions bit for bit.
+
+Protocol: plain `plain-native-gptq5-g64-a16.ninfer` against `ref512-en-q8-plain.nklref`, context 512,
+stride 256, chunk 128, chat prefix, FP8 global KV, BF16 sliding ring, BF16 QK and logits;
+47 windows / 13,728 positions; 4000-resample paired window bootstrap. Mean KL [95% CI]:
+
+| Arm | KL | dKL vs exact A16 |
+|---|---|---|
+| native A16 / exact Q5 emulation | 0.0199 [0.0173, 0.0225] / 0.0199 | +0.00002 / 0 |
+| exact Q5 codes, INT8 activations per 32 | 0.0200 [0.0174, 0.0226] | +0.00011 [-0.00044, +0.00057] |
+| exact Q5 codes, INT8 activations per 64 | 0.0204 [0.0176, 0.0230] | +0.00050 [-0.00013, +0.00107] |
+| row-E4M3 weight bake only | 0.0244 [0.0213, 0.0275] | +0.00452 [+0.00324, +0.00582] |
+| row-E4M3 activations only (exact weights) | 0.0246 [0.0214, 0.0277] | +0.00470 [+0.00378, +0.00564] |
+| MXFP8 block-32 activations only (exact weights) | 0.0255 [0.0222, 0.0288] | +0.00565 [+0.00430, +0.00705] |
+| native W5A8 / emulated W5A8 | 0.0297 [0.0260, 0.0332] / 0.0295 | +0.00976 / +0.00965 |
+| MXFP8 activations on row-E4M3 weights | 0.0315 [0.0276, 0.0353] | +0.01159 [+0.00946, +0.01367] |
+| MXFP8 weights and activations | 0.0320 [0.0282, 0.0358] | +0.01211 [+0.01002, +0.01421] |
+
+Exact Q5 codes are signed two's-complement five-bit integers, so they are exact INT8 operands; the
+FP16 group-64 weight scale is applied after integer accumulation, per K group, never once per full-K dot.
+A group dot of |code| <= 16 and |activation| <= 127 over 64 values is below 2^24, so FP32 accumulation of
+exactly representable BF16 integers equals INT32 accumulation; the proposed INT8 path would differ only
+in INT32-to-FP32 conversion (exact), scale-product association, K-split order and epilogue fusion
+(FP32-rounding scale, below the BF16 output). Activation INT8: per-token per-group scale max/127, FP32
+reciprocal multiply, round-half-even, clamp to +-127. MXFP8: E4M3 nearest-even saturating with the smallest
+power-of-two block scale whose range covers the block maximum (flooring variants untested).
+
+Independent NumPy/FP64 oracle (no CUDA/codec reuse) on the six real shapes (K = 5376, 8192, 16384, 21504):
+all ten modes' captured weights, scales and quantized activations match with zero mismatching elements
+and the BF16 outputs match its per-group FP32 chain with zero disagreements. Local projection error
+ordering (INT8 per-32 about 4x below row FP8; MXFP8 no better than row scaling) predicted the model
+ordering but used 8 tokens x 32 rows per shape, so it only filtered. Emulated W5A8 matches production
+W5A8 in aggregate (paired -0.00010 [-0.00136, +0.00105]) but not per position (production FP8 GEMM order).
+
+Reading: the W5A8 gap is two additive halves (weight bake +0.0045, activation rounding +0.0047); INT8
+per-32 activations on exact codes remove both and reach the A16 ceiling; E4M3 block scaling does not.
+Speed is not inferred: the emulator is slow by construction, and INT8 versus FP8 tensor-core throughput,
+per-K32 scale-apply cost and activation quantization cost on these shapes remain to be microbenchmarked.
+Limits: one plain model, short pinned protocol, intervals about +-0.0025 KL, MTP off, no long-context
+re-measurement; Brontir's cross-model KL numbers are not evidence here. Plan and full record:
+tooling `docs/plans/20261118-gemma4-q5-compute-precision.md`; evidence in the camp's `q5-precision-20261118/`.
