@@ -18,7 +18,7 @@ namespace {
 
 const char* gemma4_q5_prefill_scope(infernix::Gemma4Q5Prefill mode) {
     switch (mode) {
-    case infernix::Gemma4Q5Prefill::A16: return "stored-code BF16 tiles at every width";
+    case infernix::Gemma4Q5Prefill::A16: return "artifact A16Only/AllowA8 routing unchanged; narrow Q5 calls use A16";
     case infernix::Gemma4Q5Prefill::Int8G32:
         return "calls of 64+ columns: INT8 activations per 32 values of K on exact stored Q5 codes (lossy, opt-in); "
                "narrower calls unchanged a16";
