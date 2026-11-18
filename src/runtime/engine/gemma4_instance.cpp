@@ -143,6 +143,13 @@ std::size_t gemma4_shared_memory_room(const SequenceCapacityCurve& curve, std::s
 }
 
 void validate_gemma4_options(const EngineOptions& options) {
+    switch (options.gemma4_q5_prefill) {
+    case Gemma4Q5Prefill::A16:
+    case Gemma4Q5Prefill::Fp8:
+    case Gemma4Q5Prefill::Int8G32:
+    case Gemma4Q5Prefill::Int8G64: break;
+    default: throw std::invalid_argument("invalid Gemma4 Q5 prefill mode");
+    }
     if (!options.fast_paths || options.lossless || options.reference) {
         throw std::invalid_argument("Gemma4 does not support --reproducible, --lossless or --reference");
     }

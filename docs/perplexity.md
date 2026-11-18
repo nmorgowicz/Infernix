@@ -130,6 +130,18 @@ the actual scored/unscored counts. Nonzero tails are also part of the full-vocab
 top-token references already bind their target ranges. A tail-only result is a distinct sampled-position
 protocol, never the whole-corpus PPL or a replacement for the ordinary short-context qualification.
 
+For **Gemma4 incremental decode** use `--incremental`, optionally with `--score-window-tail N`.
+Each window still resets independently, but now prefills only through the first target's predictor,
+then teacher-forces one ground-truth token per forward with retained KV. Position zero is the final
+prefill distribution; only positions 1+ exercise single-token decode. Reports record `execution.incremental`;
+full-vocabulary caches additionally bind `scoring_schedule=prefill-then-one-token/1`, refusing old
+block-prefill references. NLL and full-vocabulary modes support this schedule; top-token caches do not.
+The explicit-token Q8 reference writer inherits the schedule and prefill chunk from the native protocol.
+Compare identical prefix IDs, windows and targets to the model's own reference, and report final-prefill
+and true incremental positions separately. Changing prefill precision changes the KV state inherited
+by decode even when every decode kernel remains A16; a matched narrow-prefix control distinguishes
+that history effect from changed decode arithmetic. See [bounded Q5 evidence](maintainer/gemma4-q5-prefill.md).
+
 `--save-tokens FILE` writes each scored window's input tokens, targets and fingerprint as JSON, so an
 external evaluator can write a `--kl-reference` file for the same windows
 (`tools/flash_next/fp64_kl_reference.py` does so with the FP64 reference forward of

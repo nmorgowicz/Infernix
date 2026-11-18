@@ -327,6 +327,9 @@ Options parse_options(int argc, char** argv) {
         usage_error("exactly one of --corpus and --text is required");
     }
     if (out.quick && !out.corpus) { usage_error("--quick requires --corpus"); }
+    if (out.incremental && (out.kl_reference || out.save_top_tokens)) {
+        usage_error("--incremental requires NLL or full-vocabulary mode; top-token caches do not bind its schedule");
+    }
     if (out.full_vocab_reference_write && out.full_vocab_reference) {
         usage_error("--full-vocab-reference-write and --full-vocab-reference are mutually exclusive");
     }
