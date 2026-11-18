@@ -17,6 +17,7 @@ run the CLI or HTTP server.
 | [Quality](quality.md) | output quality of Infernix and other engines against the exact model (KL divergence on WikiText-2): results, statistics, engine settings, and how to repeat the runs |
 | [Weight conversion](weight-conversion.md) | official recipes, custom formats and sources, conversion methods, optional components and artifact output |
 | [Gemma 4 HF BF16 → IQ3 creation](weight-conversion.md#create-the-smaller-iq3-files-from-hf-bf16) | create IQ3_XS/IQ3_XXS `.ninfer` files with own-model calibration, optional MTP, resume and verification |
+| [Gemma 4 higher-quality Q5 builder](weight-conversion.md#native-gptq5-group64-explicit-a16a8-permissions) | one-call own-model GPTQ5 g64, independent prefill compute and Quality/Long-context ring choices |
 | [Gemma 4 four-tier comparison](maintainer/gemma4-benchmarks.md#four-tier-comparison) | best-medium/best-small/IQ3_XS/IQ3_XXS measured sizes, matched quality, thinking-enabled serving and limits |
 | [Perplexity](perplexity.md) | fixed-corpus and custom-text causal perplexity, comparison rules, progress, and reports |
 | [CLI examples](../examples/cli/) | committed text, multimodal, thinking, long-decode, and long-context inputs |

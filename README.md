@@ -676,8 +676,17 @@ python -m tools.convert.gemma4_build --preset iq3-xs --model <BF16 Gemma-4-31B d
 python -m tools.convert.gemma4_build serve-check --launcher <dir>\serve-<name>.cmd
 ```
 
-`best-small` uses GPTQ group 256; `best-medium` uses GPTQ group 32. The smaller `iq3-xs` and `iq3-xxs`
-presets take `--llama-cpp <binary dir> --llama-cpp-source <source dir>`, collect the BF16 model's own
+`best-small` uses GPTQ group 256; `best-medium` uses GPTQ group 32.
+
+The explicit higher-quality `q5-g64` preset builds native GPTQ5 group64 with own-model Hessians,
+FP8 vocabulary and the BF16-source assistant in one A16Only artifact. Select prefill compute separately:
+`--gemma4-q5-prefill a16|fp8|int8-g32|int8-g64` (historical default `a16`; recommended explicit opt-in
+`int8-g64`). `--profile q5-quality` uses BF16 rings; `q5-long-context` opts into FP8 rings; both use
+auto context and chunk 2048, never implicit key-only KV. Explicit ring/operator overrides are retained.
+See [Q5 creation and serving choices](docs/weight-conversion.md#native-gptq5-group64-explicit-a16a8-permissions)
+for the single-call command and bounded quality evidence; plain results do not qualify diode or long INT8.
+
+The smaller `iq3-xs` and `iq3-xxs` presets take `--llama-cpp <binary dir> --llama-cpp-source <source dir>`, collect the BF16 model's own
 importance matrix through a Q8_0 copy and import the resulting IQ3 blocks. No GPTQ environment is needed.
 Follow [HF BF16 → IQ3 creation](docs/weight-conversion.md#create-the-smaller-iq3-files-from-hf-bf16) for both
 commands, prerequisites, corpus/resume policy, disk/time costs, MTP and exact-A16 options.
