@@ -22,6 +22,7 @@ EngineOptions options(const char* artifact, Gemma4Q5Prefill mode) {
     EngineOptions out;
     out.artifact_path = artifact;
     out.max_context = 512;
+    out.kv_capacity = KvCapacityPolicy::explicit_capacity(512);
     out.prefill_chunk = 128;
     out.context_cache.enabled = false;
     out.kv_cache = KvCacheStorage::Fp8E4M3Row256;
