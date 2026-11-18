@@ -329,8 +329,101 @@ W5A8 in aggregate (paired -0.00010 [-0.00136, +0.00105]) but not per position (p
 
 Reading: the W5A8 gap is two additive halves (weight bake +0.0045, activation rounding +0.0047); INT8
 per-32 activations on exact codes remove both and reach the A16 ceiling; E4M3 block scaling does not.
-Speed is not inferred: the emulator is slow by construction, and INT8 versus FP8 tensor-core throughput,
-per-K32 scale-apply cost and activation quantization cost on these shapes remain to be microbenchmarked.
+Speed was measured separately in the next section (item 2c phase 1).
 Limits: one plain model, short pinned protocol, intervals about +-0.0025 KL, MTP off, no long-context
 re-measurement; Brontir's cross-model KL numbers are not evidence here. Plan and full record:
 tooling `docs/plans/20261118-gemma4-q5-compute-precision.md`; evidence in the camp's `q5-precision-20261118/`.
+
+## INT8 per-32 kernel microbenchmark (item 2c phase 1, 2026-11-18)
+
+Standalone CUDA microbenchmark, **no engine change, no engine kernel built**: gate not met, so phase 2 was not
+started. Instrument and sources live in the camp (`q5-int8-20261118/`: `q5_i8.cuh` kernel, `bench.cu`, `probe.cu`,
+`oracle_check.py`, `summarize.py`, runner logs). The baseline is the engine's own native A16 code, instantiated from
+the same headers: `launch_rowsplit_ring_linear<Q5RingFormat, RowSplitRingTile128, 3, 4>` for T = 2048 and
+`q5_a16_mma_kernel<MmaR32T128>` for T = 128. RTX 5090 (170 SMs), CUDA 13.5 `sm_120a`, plain GPTQ5 g64 layout on
+the six real shapes with random weights/activations; L2 flushed before each of 15 events-timed repetitions, median of
+three serial lease cells (`item2c-final-r1..3`, exit 0, 9.1 s each, minimum free RAM 42.2 GiB, floor 8 GiB, no
+build or other heavy job overlapped; Pages/sec samples 15.9 / 16.0 / 1,601.9 with >= 43.2 GiB available, so no
+paging-free claim). Native A16 reproduces the in-situ rates of item 2a (191-208 TFLOP/s versus 177-193).
+
+**Tensor-core peaks** (register-only probe, 170 SMs): INT8 `mma.m16n8k32` s32 **1,002 TOPS**; MX block-scaled E4M3
+(`kind::mxf8f6f4`, the production W5A8 GEMM's instruction) **998 TFLOP/s**; plain E4M3 `mma.sync` FP32-accumulate
+504; BF16 FP32-accumulate 251. INT8 and block-scaled FP8 peaks are equal, so INT8 has no raw-rate advantage over
+the production FP8 GEMM (which reaches 625-655 TFLOP/s in situ); both are 4x the BF16 path.
+
+**Kernel measured.** Exact signed Q5 codes, no bake. Producer warps unpack the stored planes to sign-extended INT8
+shared tiles (a 32-value chunk is stored [even | odd] values and the activation quantizer writes the same
+permutation, so low/high nibble planes unpack with mask/shift); consumer warps run `mma.m16n8k32` s8 with the
+accumulator initialised to `0x4B400000`, so the INT32 result is the bit pattern of `1.5*2^23 + dot` and costs no
+conversion; per activation group two FFMA (`fma(F, as, -1.5*2^23*as)` is `dot*as` correctly rounded because the
+activation scale keeps <= 22 mantissa bits, then `fma(., ws, run)` with the FP16 group-64 scale). The per-32
+scale apply is therefore 8 FFMA per MMA; per-64 chains two MMAs per apply (4 per MMA). Activations: per token per
+K group, scale `max|x|/127` (FP32, low two mantissa bits cleared), FP32 reciprocal multiply, round-half-even,
+clamp +-127. Pipeline: mbarrier stages of K = 128 (64 also tried), 8 consumer warps (64 x 32 warp tiles of a
+128 x 128 CTA tile, one CTA per SM) plus 4 producer warps; optional TMA copy of the activation tile and scales.
+
+**Verification before timing.** Independent NumPy/FP64 oracle (`oracle_check.py`; real captured 2b operands tiled to
+the full N and T with per-row scale and per-token magnitude variation; 46 configuration/T combinations over both
+group sizes, fused / TMA / pre-baked / K64 variants): the activation quantizer matches the independent NumPy rule
+with **0** mismatching codes or scales; 979,695 sampled BF16 outputs match the FP32 group-chain emulation
+(`t = fl32(dot*as)`, `run = fl32(t*ws + run)`, ascending groups) with **0** disagreements; worst relative L2 to the
+FP64 ideal 0.00199 (the BF16 output rounding; native A16 versus exact Q5 x BF16 is 0.0016-0.0021). Against the 2b
+emulator captures (real rows/tokens, 256 elements per shape) 4-19 elements per shape differ by one BF16 ulp
+(relative L2 4e-5 to 4.3e-4): the 22-bit activation-scale mantissa and the association of the FP32 scale products,
+as 2b predicted; 4-48 of 43k-172k int8 codes per shape differ from the 2b quantizer for the truncated scale.
+
+**Per-shape time at T = 2048** (median of three cells; effective TOP/s = `2*N*K*T / time`; best per shape):
+
+| Shape N x K | native A16 ms (TOP/s) | INT8 per-32 ms (TOP/s) | INT8 per-64 ms (TOP/s) | quant per-32 ms | bake ms |
+|---|---:|---:|---:|---:|---:|
+| sliding QKV 16384 x 5376 | 1.845 (196) | 1.002 (360) | 0.834 (432) | 0.039 | 0.109 |
+| global QK 18432 x 5376 | 2.017 (201) | 1.127 (360) | 0.951 (427) | 0.040 | 0.123 |
+| sliding output 5376 x 8192 | 0.879 (205) | 0.496 (364) | 0.414 (435) | 0.058 | 0.054 |
+| global output 5376 x 16384 | 1.738 (208) | 0.969 (372) | 0.807 (447) | 0.113 | 0.110 |
+| gate/up 43008 x 5376 | 4.957 (191) | 2.600 (364) | 2.193 (432) | 0.040 | 0.286 |
+| down 5376 x 21504 | 2.340 (202) | 1.297 (365) | 1.090 (434) | 0.148 | 0.144 |
+
+At T = 128 the native A16 route runs 92-138 TOP/s and the best INT8 per-32 kernel 176-297 TOP/s (0.101 / 0.101 /
+0.064 / 0.111 / 0.199 / 0.156 ms in the order above; native 0.205 / 0.209 / 0.123 / 0.234 / 0.429 / 0.312 ms).
+
+**Gate projection at T = 2048.** Each candidate's per-shape time relative to native A16 in the same session
+scales item 2a's in-situ cumulative A16 projection time of that shape (20.62 s); quantizer and bake calls are counted
+per layer and chunk (50 sliding + 10 global layers, 32 chunks). The standalone quantizer is unfused and about 2x
+its memory floor [INFERENCE: roughly 0.3 s fused, not measured]. Reference: W5A8 GEMM 5.85 s + bake 1.02 s + quant
+0.31 s = 7.18 s.
+
+| Candidate (exact codes) | GEMM s | quant s | bake s | total s | vs native A16 (20.62 s) | vs W5A8 stack (7.18 s) |
+|---|---:|---:|---:|---:|---:|---:|
+| INT8 per-32, fused unpack | 11.12 | 0.56 | - | **11.68** | **1.77x faster** | **1.63x** |
+| INT8 per-32, pre-baked INT8 scratch | 10.04 | 0.56 | 1.16 | 11.77 | 1.75x | 1.64x |
+| INT8 per-64, fused unpack | 9.34 | 0.55 | - | 9.89 | 2.09x | 1.38x |
+| INT8 per-64, pre-baked INT8 scratch | 8.87 | 0.55 | 1.16 | 10.57 | 1.95x | 1.47x |
+
+At chunk 128 (A16 33.87 s; W5A8 stack 9.64 + 14.97 + 0.74 = 25.35 s) the fused per-32 kernel projects to 16.43 s
+GEMM + 0.95 s quantizer = 17.38 s (1.95x faster than native, **0.69x** of the W5A8 stack because W5A8 rebakes every
+chunk), per-64 16.12 s. These chunk-128 projections split item 2a's A16 total by call-weighted measured per-call time
+[INFERENCE for the split]; the 65k layer-interval projection (not measured) is 23.55 s for per-32 and 21.76 s for
+per-64, against 32.49 s native A16 and 19.06 s W5A8.
+
+**Verdict: the per-32 gate is not met.** It projects 1.77x faster than native A16 at T = 2048 (the 1.3x criterion
+holds) but 1.63x the W5A8 stack (the ~1.5x criterion fails by 8 %; a fused quantizer at the memory floor would give
+about 1.59x [INFERENCE]). Per-64 (KL 0.0204 in 2b against 0.0200, not separable at that sample size) projects 1.38x and passes.
+The engine kernel, the opt-in compute mode and the model-level checks were therefore not built or run.
+
+**Where the per-32 rate goes** (gate/up shape, T = 2048, one 128 x 128 tile configuration, effective TOP/s):
+consumers alone (staging replaced by barrier pacing) 548; plus real MMA/staging without scale apply 536;
+consumers plus activation staging 485; plus weight staging without activations 406; everything 364; producers alone
+894. Nsight Compute (profiler SM clock 2.30 GHz; ratios only): tensor pipe 46.5 % active on the full
+kernel (56 % consumer-only, where the FMA pipes are about 32 % busy), issue slots 50 % busy, L2 throughput 67 % of
+peak, consumers wait on the full barrier for 14 % of their cycles. Neither tensor, FMA, issue nor L2 is saturated
+[INFERENCE: the 8 FFMA + 1 IMMA per 4,096 MACs and two consumer warps per scheduler leave the kernel latency-bound,
+and the producer and consumer work largely add rather than overlap]. Variants that did not help: K64 stages
+(313 versus 353 TOP/s), three-deep pipelines with 12 consumer
+warps (334-344), 64 x 256 tiles (334-353 per-32; the best per-64), two or eight producer warps, TMA activation
+copies (+2-3 %, kept as the best per-32 for four shapes), mbarrier wait policies (no change), L1-cached side planes
+(+1 %), a pre-baked exact INT8 scratch (+11 % GEMM, but 1.16 s of bake and no net gain), two CTAs per SM (180).
+
+Limits: synthetic weights and activations ([INFERENCE]: timing does not depend on data values except through power), one GPU and power
+limit, no engine integration (the chunk partials, bounds handling, graph capture and arena fit are untested), no
+quality or HTTP measurement, and the FP8 reference is item 2a's in-situ number rather than the same harness.
+Tooling plan: `docs/plans/20261118-gemma4-q5-int8-per32-microbench.md`.
