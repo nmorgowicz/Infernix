@@ -557,3 +557,22 @@ becomes a default. No tuning campaign, item 2d, model promotion, artifact rewrit
 Evidence: `q5-int8-20261118/phase2/{oracle-engine,kl-summary,http-summary}.json`, test dumps, benchmark
 sources, request/SSE/metrics/logs, and parent `int8-phase2-*.receipt.json`. Plan:
 tooling `docs/plans/20261118-gemma4-q5-int8-per32-microbench.md`.
+
+### Final rebuild and path incident
+
+The logging-only rebuild was first invoked with a basename rather than the required absolute `-BuildDir`.
+The wrapper resolved it under the checkout, rebuilding the **pre-existing**
+`D:/AI/loaders/infernix/build-infernix-prefill-earlyexit-cuda13.5` tree instead of the approved sibling.
+That process tree was stopped. The initial claim that it had created a new directory was corrected after
+checking its creation time (09:15, before recovery); the pre-existing tree and outputs were preserved,
+not deleted. No production or approved-build output was changed by that mistaken invocation.
+
+The corrected invocation used **`-BuildDir D:/AI/loaders/build-infernix-prefill-earlyexit-cuda13.5`**,
+target `infernix-serve`: exit 0, minimum free RAM 39.51 GiB. Only the startup string changed in source
+(`5d0c6343`); numerical kernels/settings are unchanged from the measured implementation.
+Rebuilt executable SHA-256 **`4732960a69f40a4a32d56281c3a4af3c87045429bf7f384d941b601e4b7c643a`**.
+A narrow, serialized startup/log smoke then passed on default W5A8 and opt-in g32: expected mode/scope in
+human and JSON startup records, one-token requests both returned 818. Lease exit 0, 33 s, >=35.84 GiB RAM,
+unchanged 8 GiB floor, no named heavy overlap. No quality/timing campaign was repeated.
+`phase2/startup-scope-summary.json` connects the measured and rebuilt hashes to the implementation/logging
+commits; `int8-phase2-log-scope-approved.*` and `int8-phase2-startup-scope.receipt.json` retain build/smoke evidence.
