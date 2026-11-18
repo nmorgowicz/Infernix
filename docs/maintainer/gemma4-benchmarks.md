@@ -833,9 +833,10 @@ not rerun; the serving/perplexity binaries used for the measurements were not re
 
 ### Adoption decision and coverage limits
 
-Keep **BF16 rings as every default**, including the generated `memory-16gb` profile. FP8 rings are an
-explicit memory/fidelity trade through the native flag and the existing build/launcher generator
-([usage](../../tools/README.md#gemma-sliding-ring-memory-opt-in)); planning and fallback stages preserve it.
+Initial 2026-11-18 recommendation was BF16 for every default. The later operator decision accepts the measured
+memory/fidelity/speed trade for **`memory-16gb` IQ3_XXS only**, now FP8-ring by default; explicit
+`--gemma4-sliding-kv bf16` overrides it. General/Q5/native defaults remain BF16. Planning and fallback stages
+preserve the selection ([usage](../../tools/README.md#gemma-sliding-ring-memory-opt-in)). No quality gate changes.
 The short plain-GPTQ5 KL increase of 9.3-11.2 % exceeds the plan's order-of-magnitude warning relative
 to key-only's historical +0.45 %, and the speed gates above fail.
 

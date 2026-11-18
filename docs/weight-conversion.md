@@ -700,11 +700,11 @@ file carries the assistant, `--logits-dtype bf16`, a host-only prefix cache (`--
 --host-context-mib 8192`), `--any-model-name`, and `0.0.0.0:8001`. The server binary is
 `apps/Release/infernix-serve.exe` (or a `build*/apps/Release` of the checkout) unless `--serve` names another.
 Every setting has a flag; `--gemma4-qk bf16` omits the QK flag.
-Sliding rings remain BF16 by default. Builds and `launcher` accept `--gemma4-sliding-kv fp8` as an explicit
-memory-saving alternative (requires `--kv-dtype fp8`, including in the `memory-16gb` profile). This saves about
-446 MiB at chunk 128 or 1,191 MiB at chunk 2048, but short-context KL increases and prefill slows:
+Sliding rings remain BF16 for the general profile and native commands. Since the 2026-11-18 operator decision,
+`memory-16gb` defaults to FP8 ring; explicit `--gemma4-sliding-kv bf16` overrides it. FP8 requires `--kv-dtype fp8`.
+The FP8 ring saves 446 MiB at chunk 128 or 1,191 MiB at chunk 2048, but short-context KL increases and prefill slows:
 see the [FP8-ring measurements and limits](maintainer/gemma4-benchmarks.md#fp8-sliding-ring-experimental-off-by-default).
-Planning/fallback commands preserve the selected ring, and `serve-check` records the opt-in.
+Planning/fallback commands preserve the selected ring, and `serve-check` records the effective selection.
 
 ```text
 python -m tools.convert.gemma4_build launcher --artifact <file.ninfer> --out <serve.cmd>
@@ -729,7 +729,7 @@ python -m tools.convert.gemma4_build launcher --profile memory-16gb --artifact "
 Run the resulting `serve-16gb.cmd`. It plans with the MTP assistant first (`--plan`, no GPU work) and starts without it
 when only that fits (`echo` notice on stderr; the artifact keeps the assistant). `launcher ... --no-mtp` always omits it, which
 buys context: the explicit ladder fits 24,576 tokens without it against 20,480 (the highest tried) with it at 14,767 MiB usable and zero headroom. Thinking stays enabled.
-The profile emits `--max-context auto --kv-capacity auto --gemma4-key-only-kv --kv-dtype fp8 --gemma4-qk fp8 --prefill-chunk 128`,
+The profile emits `--max-context auto --kv-capacity auto --gemma4-key-only-kv --kv-dtype fp8 --gemma4-qk fp8 --gemma4-sliding-kv fp8 --prefill-chunk 128`,
 BF16 logits, one lane, a host-only 8192 MiB prefix cache, 64 MiB VRAM headroom (`--vram-headroom-mib`, any value from 0) and one
 MTP draft when enabled. The default alias is `gemma4-16gb`; host/port retain `0.0.0.0:8001` (use `--host 127.0.0.1` for local-only).
 No environment variable enables key-only KV.
@@ -745,7 +745,7 @@ Auto requires `--kv-capacity auto` and a physical-free reading; Gemma refuses `-
 tens of MiB lower `--vram-headroom-mib` (0 gives the 1.9 GiB desktop 16,192 tokens instead of a refusal), close programs holding VRAM,
 or use `--no-mtp`.
 
-Measured on an RTX 5090 with the ballast method of the [16 GB envelopes](maintainer/gemma4-benchmarks.md#16-gb-profile-qualification)
+Historical **BF16-ring** measurements on an RTX 5090 with the ballast method of the [16 GB envelopes](maintainer/gemma4-benchmarks.md#16-gb-profile-qualification)
 (not a physical 16 GB card; rates are the 5090's): headless 15,791 MiB usable resolves **58,752 tokens with MTP**; a 14,767 MiB desktop (1.5 GiB
 reserved) **11,392-13,248 tokens with MTP** (115-121 tok/s) or, [INFERENCE] from the explicit ladder, about 20k without; a ~1.9 GiB-idle desktop (14,357 MiB) **13,184 tokens without
 MTP**, 16,192 with `--vram-headroom-mib 0`; a 2.5 GiB-reserve desktop (13,743 MiB) is **refused**, 9,216 tokens being short by about 253 MiB with
@@ -764,7 +764,7 @@ without the flag is unchanged: refusal, nothing paged.
 
 Profile overrides permit chunks `128`, `256`, `512` (larger chunks trade context for prompt speed: 1,081 / 1,381 MiB of ring plus KV at
 chunk 128 / 512), any non-negative headroom, and one MTP draft only. FP8 KV and BF16 logits are required. Key-only KV is
-experimental and changes attention arithmetic; sliding layers remain BF16 unless `--gemma4-sliding-kv fp8` is explicit.
+experimental and changes attention arithmetic; the FP8 sliding ring is this profile's default, with an explicit BF16 override.
 Key-only's historical numerical and long-context speed costs remain in the [key-only measurements](maintainer/gemma4-benchmarks.md#key-only-global-kv-cache-experimental-off-by-default).
 
 ### Gemma 4 31B from a llama.cpp GGUF quant (IQ3_XS, IQ3_XXS, ...)

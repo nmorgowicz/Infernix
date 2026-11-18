@@ -91,7 +91,8 @@ by the references linked from the [documentation map](../docs/README.md).
 ### Gemma sliding-ring memory opt-in
 
 The existing `python -m tools.convert.gemma4_build` build and `launcher` commands accept
-`--gemma4-sliding-kv bf16|fp8`. The default stays **BF16**, including `--profile memory-16gb`.
+`--gemma4-sliding-kv bf16|fp8`. General/Q5 defaults stay **BF16**. `--profile memory-16gb` defaults to FP8
+since the 2026-11-18 operator decision; explicit `--gemma4-sliding-kv bf16` overrides that profile.
 For an existing artifact, generate an explicitly experimental launcher:
 
 ```text

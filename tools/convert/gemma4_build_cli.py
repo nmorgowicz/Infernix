@@ -102,7 +102,7 @@ def add_serve_arguments(parser: argparse.ArgumentParser, *, prefix: str) -> None
     add = parser.add_argument
     add("--profile", choices=launcher_tools.SERVE_PROFILES, default="default",
         help="launcher profile: default (unchanged 131k roleplay), or memory-16gb (IQ3_XXS, experimental key-only "
-        "FP8, chunk 128, context fitted at startup to actual free VRAM; refuses below 9216 tokens)")
+        "FP8 globals and sliding ring, chunk 128, context fitted at startup to actual free VRAM; refuses below 9216 tokens)")
     add("--context", type=context_value,
         help=f"{prefix} --max-context: positive tokens or auto (default 131072; memory-16gb: auto)")
     add("--alias", help=f"{prefix} --model-id, the name /v1/models reports and requests must use unless "
@@ -121,9 +121,9 @@ def add_serve_arguments(parser: argparse.ArgumentParser, *, prefix: str) -> None
         "needs --kv-dtype fp8) or bf16 (no flag, the engine default)")
     add("--gemma4-key-only-kv", action="store_true",
         help="experimental global key-only FP8 KV (default off; memory-16gb enables it)")
-    add("--gemma4-sliding-kv", choices=("bf16", "fp8"), default="bf16",
-        help="sliding K/V ring storage: bf16 (default), or experimental fp8 (about half the ring memory, "
-        "measurable fidelity and prefill cost; requires --kv-dtype fp8)")
+    add("--gemma4-sliding-kv", choices=("bf16", "fp8"), default=None,
+        help="sliding K/V ring storage: bf16 (general default), or experimental fp8 (memory-16gb default; "
+        "about half the ring memory, measurable fidelity and prefill cost; requires --kv-dtype fp8). Explicit bf16 overrides the profile")
     add("--allow-shared-memory", action="store_true",
         help="opt in to starting when the model does not fit the free VRAM: the shortfall runs in shared GPU memory "
         "(system RAM over PCIe, much slower; default off = the server refuses). memory-16gb tries resident starts first")
@@ -178,7 +178,7 @@ def serve_kwargs(args: argparse.Namespace) -> dict:
         "default_thinking_budget": args.default_thinking_budget,
         "thinking_budget_message": args.thinking_budget_message, "reasoning_loop": args.reasoning_loop,
         "gemma4_key_only_kv": small or args.gemma4_key_only_kv, "mtp_fallback": small, "allow_shared_memory": args.allow_shared_memory,
-        "gemma4_sliding_kv": args.gemma4_sliding_kv,
+        "gemma4_sliding_kv": args.gemma4_sliding_kv if args.gemma4_sliding_kv is not None else ("fp8" if small else "bf16"),
     }
 
 

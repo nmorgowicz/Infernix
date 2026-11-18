@@ -255,7 +255,7 @@ def launcher_lines(
     if profile.gemma4_key_only_kv:
         lines.append("rem Experimental key-only global FP8 KV. Default launches do not enable it.")
     if profile.gemma4_sliding_kv == "fp8":
-        lines.append("rem Experimental FP8 sliding K/V ring: lower memory, measurable fidelity and prefill cost; BF16 is the default.")
+        lines.append("rem Experimental FP8 sliding K/V ring: lower memory, measurable fidelity and prefill cost; memory-16gb default, explicit bf16 overrides it.")
     if profile.context == "auto":
         lines.append("rem Context is fitted at startup to available VRAM; refuses below 9216 tokens. Read /v1/models for the resolved limit.")
     if profile.gemma4_qk == "fp8":

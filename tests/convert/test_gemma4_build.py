@@ -1522,24 +1522,24 @@ def test_memory_profile_shared_memory_option_is_the_last_resort_stage(tmp_path, 
 
 
 @pytest.mark.parametrize("profile", ["default", "memory-16gb"])
-def test_fp8_sliding_ring_launcher_is_explicit_and_survives_all_stages(env, tmp_path, monkeypatch, profile):
+@pytest.mark.parametrize("selection", [None, "bf16", "fp8"])
+def test_sliding_ring_profile_selection_survives_all_stages(env, tmp_path, monkeypatch, profile, selection):
     monkeypatch.setattr(launcher, "artifact_info", lambda path: launcher.ArtifactInfo(True, False, 262144, True))
     artifact = tmp_path / "iq3.ninfer"
     artifact.write_bytes(b"x")
     out = tmp_path / "ring.cmd"
+    option = [] if selection is None else ["--gemma4-sliding-kv", selection]
+    expected = selection or ("fp8" if profile == "memory-16gb" else "bf16")
     assert cli.main(["launcher", "--artifact", str(artifact), "--serve", str(env.server), "--out", str(out),
-                     "--profile", profile, "--gemma4-sliding-kv", "fp8", "--allow-shared-memory"]) == 0
+                     "--profile", profile, *option, "--allow-shared-memory"]) == 0
     parsed = build.parse_launcher(out)
-    assert parsed.gemma4_sliding_kv == "fp8" and parsed.effective_profile()["gemma4_sliding_kv"] == "fp8"
+    assert parsed.gemma4_sliding_kv == expected
+    assert parsed.effective_profile().get("gemma4_sliding_kv", "bf16") == expected
     text = out.read_text(encoding="utf-8")
-    assert "sliding KV stays BF16" not in text
     for command in text.split(f'"{env.server.resolve()}" "{artifact.resolve()}"')[1:]:
-        assert "--gemma4-sliding-kv fp8" in command
-    args = cli.build_parser().parse_args(env.argv("iq3-xxs", "--profile", profile, "--gemma4-sliding-kv", "fp8"))
-    assert cli.resolve_config(args)[1].gemma4_sliding_kv == "fp8"
-    default = cli.resolve_config(cli.build_parser().parse_args(env.argv("iq3-xxs", "--profile", profile)))[1]
-    assert default.gemma4_sliding_kv == "bf16"
-    assert "--gemma4-sliding-kv" not in launcher.serve_argv(env.server, artifact, default, mtp=True, vision=False)
+        assert ("--gemma4-sliding-kv fp8" in command) == (expected == "fp8")
+    args = cli.build_parser().parse_args(env.argv("iq3-xxs", "--profile", profile, *option))
+    assert cli.resolve_config(args)[1].gemma4_sliding_kv == expected
 
 
 def test_fp8_sliding_ring_launcher_refuses_bf16_globals(env, capsys):
