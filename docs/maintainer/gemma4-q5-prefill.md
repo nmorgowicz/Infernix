@@ -880,3 +880,67 @@ No ~122k arm was needed (it exceeds this fixed 68,096 profile); no ring/global-K
 quality campaign or completed item-2c/2d test rerun. Since the chosen chunk remains 2048,
 the existing short MTP evidence is retained and no new MTP run is needed.
 Tooling protocol/results: `docs/plans/20261118-gemma4-q5-chunk-sweep.md`.
+
+## Calibrated builder on the diode model (item 3, 2026-11-18)
+
+The canonical `q5-g64` preset was run for real on the immutable BF16 variant `diode-s15-t005`,
+with Hessians collected on **that model** (the plain model's calibration is never reused), the
+BF16-source MTP assistant and `--gemma4-q5-prefill int8-g64` as the generated launcher's explicit
+compute opt-in. All builder steps completed (calibration 26 s, text tree 92 s, GPTQ 1093 s,
+checkpoint check 189 s, convert 561 s). Result: **one** A16Only artifact,
+`diode-q5-g64.ninfer`, **21,151,124,484 B**, SHA-256
+`55d5e8cf1fe33a96e09d0adf4e7330ad3906f55b58ab49d1f90bf155eeed07c7`, plus a build receipt
+and a generated `serve-diode-q5-g64.cmd`. The campaign stays in the camp; nothing was promoted.
+
+### Artifact identity
+
+Reader-verified: 706 tensor objects, 240 `q5_g64_fp16` objects, 410 target text-projection
+Uses all `A16Only`, 60 text layers, `mtp` present, no vision. Every `text/output_head` and `mtp/*`
+binding (including range-split parts) is byte-identical to the same-source G32 best-medium
+artifact: the FP8 row vocabulary (`fp8_e4m3fn_row_bf16`) and the BF16-source MTP assistant
+are exactly the established encodings. Each object digest is recorded in `artifact-identity.json`.
+
+### Own-Q8 KL against the matched best-medium diode
+
+Instrument `item3-diode-own-q8-block-prefill-v1`: `refs/ref512-en-q8-diode.nklref`
+(SHA-256 `695f365e…b49782`) own-Q8 diode reference, context 512, stride 256, chunk 128, chat
+prefix, FP8 global KV, BF16 sliding ring, BF16 QK and logits, 47 windows / 13,728 positions,
+4000-resample paired window bootstrap, executable
+`infernix-perplexity.exe` SHA-256 `c10f25f1…426`. The analyzer asserts identical protocol,
+window counts, reference log-probabilities and execution fields across all three rows. The
+best-medium row **reproduces the matched 0.0941**, so the instrument is comparable.
+
+| Row | Mean KL [95% CI] | Mean ΔNLL [95% CI] | Top-1 disagreement |
+|---|---:|---:|---:|
+| best-medium G32 (A16) | 0.0941 [0.0804, 0.1099] | 0.0316 [0.0155, 0.0484] | 9.05% |
+| diode Q5 g64, `a16` | **0.0331** [0.0280, 0.0389] | 0.0134 [0.0056, 0.0222] | 5.41% |
+| diode Q5 g64, `int8-g64` | **0.0336** [0.0288, 0.0396] | 0.0127 [0.0040, 0.0220] | 5.55% |
+
+Paired against best-medium: A16 KL **−0.0610 [−0.0729, −0.0501]**, ΔNLL −0.0182
+[−0.0332, −0.0033]; int8-g64 KL **−0.0605 [−0.0724, −0.0493]**, ΔNLL −0.0188
+[−0.0334, −0.0043]. The prior Q5_K_S diode value (0.0403) came from a different encoder and
+is a historical context number, not a paired comparison. The two compute modes' KL
+intervals overlap almost entirely; this short block-prefill instrument does not separate them.
+**Not measured:** long-context quality, incremental-decode quality or INT8 long-context
+quality of this diode artifact [INFERENCE: item 2d's plain-model incremental figures are
+expected to transfer but were not re-measured here]. No promotion.
+
+### Generated-launcher smoke
+
+The generated launcher (FP8 KV, FP8 QK, BF16 sliding ring, chunk 2048, MTP d1, int8-g64) was
+parsed and started unmodified under the GPU lease: 80,960 tokens of context, two chat
+requests with default thinking (296 and 271 reasoning tokens, finish `stop`, `top_k` 64,
+seed 1234) returned reasoning content and a two-sentence answer; metrics show MTP rounds
+(354 verification rounds). This is a short functional smoke, not a quality or speed
+measurement.
+
+### Staging
+
+The builder-owned `work/text60` tree (61,427,043,204 B, 20 files) was deleted after
+recording per-file SHA-256 in `owned-stage-sha256.json`; it is reconstructible from the
+immutable BF16 variant. The GPTQ checkpoint, calibration, build receipts, BF16 sources, plain
+text60 and all earlier artifacts were left in place.
+
+Evidence: camp `q5-20261117/builder-20261118/{qualify.py,variant/,quality-*,quality-summary.json,
+artifact-identity.json,launcher-smoke.json,owned-stage-sha256.json,work/logs}`; parent
+`infernix-port-p3-20261112/item3-*.receipt.json`.
