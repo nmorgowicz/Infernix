@@ -39,6 +39,7 @@ from .gemma4_build_checks import GPTQ_PINS, Probes, parse_pins, preflight, versi
 METHODS = {
     "best-small": "GPTQ g256",
     "best-medium": "GPTQ g32",
+    "q5-g64": "GPTQ5 g64, A16Only",
     "draft": "absmax g32, no calibration",
     "iq3-xs": "IQ3_XS, own imatrix",
     "iq3-xxs": "IQ3_XXS, own imatrix",
@@ -55,7 +56,8 @@ See docs/maintainer/gemma4-benchmarks.md#four-tier-comparison for matched diode 
 
 {{table}}
 
-Recommended: best-small for most people (best quality per byte); best-medium for the highest quality.
+Recommended: best-small for most people (best quality per byte); best-medium for higher-quality Q4.
+q5-g64 is the explicit higher-quality Q5 tier (plain-model own-Q8 historical hint, not a diode claim).
 iq3-xs and iq3-xxs trade quality for smaller files and collect their own importance matrix; draft is a quick
 test build only. The calibrated-RTN presets and the two-level 6-bit scale format (q4_g32_s6_fp16) are not built here.
 other commands:
@@ -101,8 +103,9 @@ def add_serve_arguments(parser: argparse.ArgumentParser, *, prefix: str) -> None
     """The launcher flags shared by a build and the `launcher` subcommand; `prefix` names the command in help."""
     add = parser.add_argument
     add("--profile", choices=launcher_tools.SERVE_PROFILES, default="default",
-        help="launcher profile: default (unchanged 131k roleplay), or memory-16gb (IQ3_XXS, experimental key-only "
-        "FP8 globals and sliding ring, chunk 128, context fitted at startup to actual free VRAM; refuses below 9216 tokens)")
+        help="default: unchanged 131k roleplay; q5-quality: BF16 ring; q5-long-context: opt-in FP8 ring. "
+        "Both Q5 profiles fit context at startup, use chunk 2048, and never implicitly enable key-only KV. "
+        "memory-16gb: IQ3_XXS, key-only FP8 globals/ring, chunk 128, auto context")
     add("--context", type=context_value,
         help=f"{prefix} --max-context: positive tokens or auto (default 131072; memory-16gb: auto)")
     add("--alias", help=f"{prefix} --model-id, the name /v1/models reports and requests must use unless "
@@ -159,10 +162,12 @@ def add_serve_arguments(parser: argparse.ArgumentParser, *, prefix: str) -> None
 def serve_kwargs(args: argparse.Namespace) -> dict:
     """`ServeProfile` fields from parsed arguments."""
     small = args.profile == "memory-16gb"
+    q5 = args.profile in ("q5-quality", "q5-long-context")
     headroom = args.vram_headroom_mib if args.vram_headroom_mib is not None else (
         launcher_tools.SMALL_VRAM_HEADROOM_MIB if small else launcher_tools.DEFAULT_VRAM_HEADROOM_MIB)
-    context = args.context if args.context is not None else ("auto" if small else launcher_tools.DEFAULT_CONTEXT)
-    chunk = args.prefill_chunk if args.prefill_chunk is not None else ("128" if small else launcher_tools.DEFAULT_PREFILL_CHUNK)
+    context = args.context if args.context is not None else ("auto" if small or q5 else launcher_tools.DEFAULT_CONTEXT)
+    chunk = args.prefill_chunk if args.prefill_chunk is not None else (
+        "128" if small else "2048" if q5 else launcher_tools.DEFAULT_PREFILL_CHUNK)
     if small:
         if args.kv_dtype != "fp8" or args.logits_dtype != "bf16":
             raise ValueError("--profile memory-16gb requires --kv-dtype fp8 and --logits-dtype bf16")
@@ -173,7 +178,7 @@ def serve_kwargs(args: argparse.Namespace) -> dict:
         if args.draft_tokens != "1":
             raise ValueError("--profile memory-16gb supports --draft-tokens 1 only; use --no-mtp for more context")
     return {
-        "host": args.host, "port": args.port, "alias": args.alias, "context": context,
+        "host": args.host, "port": args.port, "alias": args.alias or ("gemma4-q5" if q5 else None), "context": context,
         "kv_dtype": args.kv_dtype, "model_match": args.model_match, "gemma4_qk": args.gemma4_qk,
         "prefill_chunk": chunk, "draft_tokens": args.draft_tokens, "logits_dtype": args.logits_dtype,
         "host_context_mib": args.host_context_mib, "vram_headroom_mib": headroom,
@@ -181,7 +186,8 @@ def serve_kwargs(args: argparse.Namespace) -> dict:
         "default_thinking_budget": args.default_thinking_budget,
         "thinking_budget_message": args.thinking_budget_message, "reasoning_loop": args.reasoning_loop,
         "gemma4_key_only_kv": small or args.gemma4_key_only_kv, "mtp_fallback": small, "allow_shared_memory": args.allow_shared_memory,
-        "gemma4_sliding_kv": args.gemma4_sliding_kv if args.gemma4_sliding_kv is not None else ("fp8" if small else "bf16"),
+        "gemma4_sliding_kv": args.gemma4_sliding_kv if args.gemma4_sliding_kv is not None else (
+            "fp8" if small or args.profile == "q5-long-context" else "bf16"),
         "gemma4_q5_prefill": args.gemma4_q5_prefill if args.gemma4_q5_prefill is not None else "a16",
     }
 
@@ -190,7 +196,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m tools.convert.gemma4_build",
         description="Build a Gemma 4 31B .ninfer for infernix-serve from a BF16 checkpoint in one command "
-        "(q4 or IQ3 weights; FP8 KV cache and attention QK in the launcher): checks, plan, "
+        "(Q4, Q5 or IQ3 weights; FP8 KV cache and attention QK in the launcher): checks, plan, "
         "calibration, quantization, conversion, receipts, launcher.",
         epilog=EPILOG.format(table=preset_table()),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -290,6 +296,11 @@ def resolve_config(args: argparse.Namespace) -> tuple[BuildConfig, ServeSettings
     """Turn flags into a config; every argument-only mistake is refused here, before any probe."""
     if args.preset is None and args.profile == "memory-16gb":
         args.preset = "iq3-xxs"
+    if args.profile in ("q5-quality", "q5-long-context"):
+        if args.preset is None:
+            args.preset = "q5-g64"
+        elif args.preset != "q5-g64":
+            raise ValueError(f"--profile {args.profile} builds --preset q5-g64 only")
     if args.profile == "memory-16gb" and args.preset != "iq3-xxs":
         raise ValueError("--profile memory-16gb builds --preset iq3-xxs only")
     if args.profile == "memory-16gb" and args.with_vision:

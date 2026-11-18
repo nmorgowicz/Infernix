@@ -35,7 +35,7 @@ DEFAULT_DRAFT_TOKENS = "1"
 DEFAULT_HOST_CONTEXT_MIB = 8192
 DEFAULT_VRAM_HEADROOM_MIB = 1024
 SMALL_VRAM_HEADROOM_MIB = 64  # memory-16gb default; any value >= 0 (docs/weight-conversion.md, 16 GB profile)
-SERVE_PROFILES = ("default", "memory-16gb")
+SERVE_PROFILES = ("default", "memory-16gb", "q5-quality", "q5-long-context")
 MAX_TOP_K = 64  # Gemma4's sampler ceiling (Qwen stays at 20)
 REASONING_LOOPS = ("stop", "conclude")  # --reasoning-loop; "off" is the server default and emits no flag
 # Libraries infernix binaries load from their own directory: FFmpeg (vcpkg) and the staged cuBLAS.

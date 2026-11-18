@@ -7,8 +7,9 @@ the work; this module only builds their command lines, runs them with logs, and 
 GPTQ scripts run in their own interpreter (`tools/gptq/requirements.txt`), never in the converter's. Source weights
 are only read.
 
-Presets: best-small (GPTQ group 256, `q4_g256_fp16`), best-medium (GPTQ group 32, `q4_g32_fp16`), draft
-(uncalibrated absmax, group 32), and iq3-xs / iq3-xxs (llama.cpp IQ3_XS / IQ3_XXS blocks quantized with the model's own
+Presets: best-small (GPTQ group 256, `q4_g256_fp16`), best-medium (GPTQ group 32, `q4_g32_fp16`),
+q5-g64 (GPTQ5 group 64, A16Only), draft (uncalibrated absmax, group 32), and iq3-xs / iq3-xxs
+(llama.cpp IQ3_XS / IQ3_XXS blocks quantized with the model's own
 importance matrix and imported verbatim; they need a llama.cpp build and its source tree for `convert_hf_to_gguf.py`).
 The two-level 6-bit scale format `q4_g32_s6_fp16` and calibrated round-to-nearest presets are not built here.
 
@@ -80,6 +81,7 @@ class Preset:
     residual_gb: float  # what stays in the work dir once big intermediates are pruned
     minutes: dict[str, float]  # per step, typical RTX 5090 + NVMe
     gguf_type: str = ""  # method "gguf": the llama-quantize type (IQ3_XS, IQ3_XXS)
+    bits: int = 4
 
 
 PRESETS: dict[str, Preset] = {
@@ -90,10 +92,19 @@ PRESETS: dict[str, Preset] = {
          "gptq-check": 1, "convert": 6, "receipt-check": 0.5, "finalize": 0.5},
     ),
     "best-medium": Preset(
-        "best-medium", "gptq", "GPTQ, group 32", "Highest quality; about 1.6 GB larger than best-small.",
+        "best-medium", "gptq", "GPTQ, group 32", "Higher-quality Q4; about 1.6 GB larger than best-small.",
         "medium", 18.41, 0.0845, "about 30 min", 32, False, "q4_g32_fp16", 75, 103, 17,
         {"calibration-source": 1, "calibration-render": 1, "calibration-tokens": 1, "text-tree": 2, "gptq": 18,
          "gptq-check": 1, "convert": 6, "receipt-check": 0.5, "finalize": 0.5},
+    ),
+    "q5-g64": Preset(
+        "q5-g64", "gptq", "GPTQ 5-bit, group 64, A16Only",
+        "Higher-quality Q5 tier; independent opt-in prefill compute choices on one artifact. "
+        "Historical KL is plain-model A16 versus own Q8_0, not a diode qualification.",
+        "quality", 21.15, 0.0199, "about 40 min", 64, False, "q5_g64_fp16", 85, 115, 22,
+        {"calibration-source": 1, "calibration-render": 1, "calibration-tokens": 1, "text-tree": 2, "gptq": 25,
+         "gptq-check": 1, "convert": 6, "receipt-check": 0.5, "finalize": 0.5},
+        bits=5,
     ),
     "draft": Preset(
         "draft", "plain", "uncalibrated absmax, group 32 (the old default)",
@@ -226,10 +237,9 @@ def default_gptq_python() -> Path:
 
 
 def q4_convert_flags(cfg: BuildConfig, checkpoint: Path | None) -> list[str]:
-    """Recipe flags of `gemma4_q4 convert` for the preset (always `q4_g32`: W4A8, or 8-bit activations on GGUF
-    blocks)."""
+    """Storage recipe; Q5 is A16Only, independently selectable at serving time."""
     preset = cfg.preset
-    flags = ["--weights", "q4_g32"]
+    flags = ["--weights", "q5_g64_a16" if preset.bits == 5 else "q4_g32"]
     if preset.method == "gptq":
         flags += ["--gptq-source", str(checkpoint)]
         if preset.native_groups:
@@ -336,11 +346,12 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
                  [gpy, str(gptq_dir / "run_gptq.py"), "--tree", str(tree), "--calib", str(calib), "--out",
                   str(checkpoint), "--recipe", GPTQ_RECIPE, "--observer", "imatrix_mse", "--group-size",
                   str(preset.group_size), "--max-cpu-gb", str(cfg.gptq_max_cpu_gb), "--offload-dir", str(offload), "--peak-log",
-                  str(cfg.work("gptq.peak.jsonl"))],
+                  str(cfg.work("gptq.peak.jsonl"))] + (["--bits", "5"] if preset.bits == 5 else []),
                  outputs=(checkpoint, offload, cfg.work("gptq.peak.jsonl")), prune_always=(offload,)),
-            Step("gptq-check", "Check the GPTQ checkpoint is importable (4-bit codes, exact binary16 scales)",
+            Step("gptq-check", f"Check the GPTQ checkpoint is importable ({preset.bits}-bit codes, exact binary16 scales)",
                  minutes["gptq-check"],
-                 [gpy, str(gptq_dir / "check_checkpoint.py"), "--gptq", str(checkpoint), "--tree", str(tree)],
+                 [gpy, str(gptq_dir / "check_checkpoint.py"), "--gptq", str(checkpoint), "--tree", str(tree)]
+                 + (["--bits", "5"] if preset.bits == 5 else []),
                  prune_if_short=(tree,)),
         ]
     if preset.method == "gguf":
@@ -398,10 +409,11 @@ def score_steps(cfg: BuildConfig, checkpoint: Path) -> list[Step]:
              convert_argv(cfg, candidate, scoring=True, checkpoint=checkpoint),
              outputs=(candidate, Path(str(candidate) + ".build.json"), Path(str(candidate) + ".conversion.json"))),
         Step("score-run", "Paired KL against the reference"
-             + (f" (W4A8 exact route, {EXACT_ROUTE_ENV}=1)" if cfg.preset.method != "gguf" else " (GGUF AllowA8)"),
+             + (f" (W4A8 exact route, {EXACT_ROUTE_ENV}=1)" if cfg.preset.bits == 4 and cfg.preset.method != "gguf"
+                else " (Q5 A16)" if cfg.preset.bits == 5 else " (GGUF AllowA8)"),
              minutes["score-run"],
              [exe, str(candidate)] + common + ["--full-vocab-reference", str(nklref), "--output", str(run)],
-             env={EXACT_ROUTE_ENV: "1"} if cfg.preset.method != "gguf" else {}, outputs=(run,)),
+             env={EXACT_ROUTE_ENV: "1"} if cfg.preset.bits == 4 and cfg.preset.method != "gguf" else {}, outputs=(run,)),
         Step("score-report", "Record the score in the build receipt and BUILD-SUMMARY.md", minutes["score-report"],
              call=score_report),
     ]
@@ -545,12 +557,14 @@ def render_summary(info: dict) -> str:
         f"- Preset: **{p['id']}**: {p['summary']} ({p['size_class']} file).",
         f"- In plain words: {p['meaning']}",
         ("- Weights: IQ3 GGUF blocks, AllowA8 for prefill and decode; "
-         if p["method"] == "gguf" else "- Weights: W4A8 (4-bit weights, FP8 activations while reading the prompt); ")
+         if p["method"] == "gguf" else "- Weights: native GPTQ5 group 64, A16Only; "
+         if p["bits"] == 5 else "- Weights: W4A8 (4-bit weights, FP8 activations while reading the prompt); ")
         + f"{'with the MTP draft assistant (speculative decoding)' if info['mtp'] else 'no MTP assistant'}; "
         f"{'with the vision tower' if info['vision'] else 'text only'}.",
-        f"- Measured on the author's model (one fine-tune, English, text only, RTX 5090): mean KL {p['kl']:.4f} from "
-        + ("the model's own Q8_0 reference" if p["method"] == "gguf" else "the near-lossless FP8-row reference")
-        + " (lower is better). A different model can move this number.",
+        f"- Historical hint (English, text only, RTX 5090): mean KL {p['kl']:.4f} from "
+        + ("the plain model's own Q8_0 reference, A16 compute" if p["bits"] == 5 else
+           "the model's own Q8_0 reference" if p["method"] == "gguf" else "the near-lossless FP8-row reference")
+        + ". This is not a quality measurement of your build.",
         "",
         "## Files",
         "",
@@ -592,7 +606,7 @@ def render_summary(info: dict) -> str:
             f"- Mean KL vs FP8-row reference: {s['mean_kl']:.4f}; delta NLL {s['mean_delta_nll']:+.3f}; "
             f"top-1 disagreement {s['top1_disagreement']:.4f}; perplexity {s['perplexity']:.3f}",
             "- Instrument: windows of 512 tokens (English subset), FP8 KV, "
-            + ("GGUF AllowA8" if p["method"] == "gguf" else "W4A8 exact route")
+            + ("GGUF AllowA8" if p["method"] == "gguf" else "Q5 A16" if p["bits"] == 5 else "W4A8 exact route")
             + ", no MTP, text only, native full-vocabulary KL.",
         ]
     return "\n".join(parts) + "\n"
@@ -618,7 +632,7 @@ def build_info(builder: "Builder") -> dict:
         )
     return {
         "name": cfg.name,
-        "preset": {k: getattr(cfg.preset, k) for k in ("id", "summary", "meaning", "size_class", "kl", "method")},
+        "preset": {k: getattr(cfg.preset, k) for k in ("id", "summary", "meaning", "size_class", "kl", "method", "bits")},
         "mtp": info_artifact.mtp,
         "vision": info_artifact.vision,
         "artifact": str(cfg.artifact),

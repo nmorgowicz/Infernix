@@ -501,7 +501,7 @@ element ordering for a component it does claim to cover would not.
 ## Gemma 4 31B: builder presets and the self-contained workflow
 
 `python -m tools.convert.gemma4_build` turns a BF16 Gemma 4 31B dense checkpoint (or a fine-tune of it) into a
-q4 or IQ3 `.ninfer` with the MTP assistant, then writes the receipts, a Windows `infernix-serve` launcher and
+Q4, Q5 or IQ3 `.ninfer` with the MTP assistant, then writes the receipts, a Windows `infernix-serve` launcher and
 `BUILD-SUMMARY.md`. It builds command lines and records which step finished; conversion is owned by
 `python -m tools.convert.gemma4_q4 {convert,verify,calibration-text}`, GPTQ by `tools/gptq/`, and the IQ3
 collector/quantizer by an existing llama.cpp build supplied explicitly below. No other orchestration repository
@@ -511,6 +511,7 @@ is needed. Source weights are read-only, outputs are never overwritten, and a fa
 |---|---|---|
 | `best-small` (recommended q4) | calibrated GPTQ, group 256 | `q4_g256_fp16` plus permutation-safe g32 global output projections |
 | `best-medium` | calibrated GPTQ, group 32 | `q4_g32_fp16` |
+| `q5-g64` (higher-quality Q5) | own-model calibrated GPTQ, 5 bits, group 64 | `q5_g64_fp16`, A16Only |
 | `iq3-xs` | own-model importance matrix, IQ3_XS allocation | GGUF IQ3_S / IQ3_XXS / Q6_K blocks |
 | `iq3-xxs` | own-model importance matrix, IQ3_XXS allocation | GGUF IQ3_XXS / IQ2_S / IQ3_S blocks |
 | `draft` | uncalibrated absmax, group 32 | `q4_g32_fp16`; a quick conversion smoke, not a calibrated tier |
@@ -533,11 +534,47 @@ python -m tools.convert.gemma4_build --preset best-small --model <BF16 dir> --as
 
 ### Native GPTQ5 group64, explicit A16/A8 permissions
 
-These are explicit conversion alternatives, **not builder presets or new defaults**. Every target
-text-layer projection uses the existing `q5_g64_fp16` format. `q5_g64_a16` keeps `A16Only` Uses;
-`q5_g64` explicitly permits A8 on target text projections only. Quality, speed and VRAM must be
-measured separately for both activation policies against same-model Q4 and GGUF Q5_K_S/Q5_K_M
-artifacts; five bits alone establish no winner.
+The canonical one-call preset is `q5-g64`: the same calibration/render/tokenize/text-tree/GPTQ/check/import
+workflow as best-medium, with explicit five-bit/group64 quantization and `q5_g64_a16` import. It collects
+Hessians on **your actual model**; plain-model Hessians must never be reused for a diode variant.
+It writes one A16Only artifact with FP8 vocabulary and the BF16-source MTP assistant (assistant layer
+projections encoded FP8, outer projections BF16). It does not replace or rename best-medium.
+
+```text
+python -m tools.convert.gemma4_build --preset q5-g64 --profile q5-quality --model "<BF16-dir>" --assistant "<assistant-dir>" --gptq-python "<gptq-python>" --out-dir "<camp>/q5-g64" --work-dir "<camp>/convert/q5-g64" --serve "<absolute-infernix-serve-path>" --gemma4-q5-prefill int8-g64 --yes
+```
+
+Use `--dry-run` for exact commands and input/RAM/disk checks. Budget roughly 60 GB for the owned BF16
+text stage plus the checkpoint/artifact (85 GB minimum scratch, 115 GB comfortable); these estimates
+exclude the preserved original source. `--keep-work` retains logs/checkpoint/stage for qualification.
+
+Artifact selection and compute selection are independent. Historical `a16` remains the default in
+all profiles. Explicit `--gemma4-q5-prefill int8-g64` is the recommended speed/fidelity opt-in;
+`fp8` is faster but less faithful, `int8-g32` is another measured opt-in, and `a16` preserves
+artifact policy. All narrow trunk decode/MTP verification remains A16. Do not rebuild weights
+to change compute: regenerate the launcher with the desired selector on the same artifact.
+
+| Serving profile | Sliding ring | Context / chunk | Global KV |
+|---|---|---|---|
+| `q5-quality` | BF16 | auto / 2048 | normal stored FP8 K/V |
+| `q5-long-context` | opt-in FP8 | auto / 2048 | normal stored FP8 K/V |
+
+Both reuse the existing launcher profiles, retain 1024 MiB headroom, thinking on, MTP d1, BF16 logits,
+host-only prefix cache and operator overrides. Explicit `--gemma4-sliding-kv bf16` overrides either
+profile. Neither silently enables key-only KV: add `--gemma4-key-only-kv` only when the required
+context needs that additional capacity, after reading the measured quality/performance costs.
+Auto context reports the actual resolved limit at startup; it does not guarantee 131k.
+Chunk 1536 is a memory tradeoff (about 884 MiB savings), not a new speed default.
+
+The historical plain-model short block-prefill KL is A16 0.0199 / INT8-g64 0.0203 / FP8 0.0296.
+The separate 276-position incremental sample is g64 0.0104 / A16 0.00995; overlapping-window
+uncertainty is not equivalence. G32 has a significant measured incremental delta-NLL increase.
+Long-context INT8 quality is unmeasured, and plain evidence does not qualify diode quality.
+See [the measured protocols and limitations](maintainer/gemma4-q5-prefill.md).
+
+The lower-level explicit conversion alternatives remain available: `q5_g64_a16` keeps A16Only Uses,
+while `q5_g64` permits the historical wide A8 policy. Every target text projection uses
+`q5_g64_fp16`. These are storage permissions, not a second serving-compute selector.
 
 Start with a complete unquantized Gemma 4 **31B dense** BF16 HF checkpoint, its tokenizer and the
 converter environment (Python 3.11 with torch/numpy/safetensors). GPTQ uses the separate pinned

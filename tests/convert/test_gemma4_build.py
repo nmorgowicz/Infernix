@@ -1580,3 +1580,35 @@ def test_q5_prefill_refuses_unknown_values(env):
         launcher.check_serve_settings(launcher.ServeProfile(gemma4_q5_prefill="int8"))
     with pytest.raises(SystemExit):
         cli.build_parser().parse_args(env.argv("iq3-xxs", "--gemma4-q5-prefill", "int8"))
+
+def test_q5_preset_builds_own_hessians_and_one_a16_artifact(env):
+    cfg = env.config("q5-g64", score=True)
+    steps = plan_by_id(cfg)
+    quant = steps["gptq"].argv
+    assert quant[quant.index("--tree") + 1] == w(cfg, "text60")
+    assert quant[quant.index("--bits") + 1] == "5"
+    assert quant[quant.index("--group-size") + 1] == "64"
+    assert quant[quant.index("--observer") + 1] == "imatrix_mse"
+    assert steps["gptq-check"].argv[-2:] == ["--bits", "5"]
+    convert = steps["convert"].argv
+    assert convert[convert.index("--weights") + 1] == "q5_g64_a16"
+    assert convert[convert.index("--mtp-assistant") + 1] == str(cfg.assistant)
+    assert "--native-groups" not in convert
+    assert steps["score-run"].env == {}
+    assert "Q5 A16" in steps["score-run"].title
+
+
+@pytest.mark.parametrize("profile, ring", [("q5-quality", "bf16"), ("q5-long-context", "fp8")])
+def test_q5_profiles_preserve_compute_and_explicit_ring_choices(env, profile, ring):
+    args = cli.build_parser().parse_args(env.argv("q5-g64", "--profile", profile))
+    cfg, serve, _ = cli.resolve_config(args)
+    assert cfg.preset.bits == 5 and serve.gemma4_sliding_kv == ring
+    assert serve.gemma4_q5_prefill == "a16" and not serve.gemma4_key_only_kv
+    assert serve.context == "auto" and serve.prefill_chunk == "2048"
+    assert serve.draft_tokens == "1" and not serve.mtp_fallback
+    args = cli.build_parser().parse_args(env.argv(
+        "q5-g64", "--profile", profile, "--gemma4-sliding-kv", "bf16",
+        "--gemma4-q5-prefill", "int8-g64", "--alias", "own", "--top-k", "64"))
+    _, serve, _ = cli.resolve_config(args)
+    assert serve.gemma4_sliding_kv == "bf16" and serve.gemma4_q5_prefill == "int8-g64"
+    assert serve.alias == "own" and serve.top_k == 64 and not serve.gemma4_key_only_kv
