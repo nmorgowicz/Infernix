@@ -605,3 +605,139 @@ reference. Cross-mode incremental differences include changed prefill KV; an ide
 control separately isolates whether the decode arithmetic itself changed. Short bounded evidence and
 verification are reported below; no default, promotion, long-context qualification or item-2e sweep follows
 from this instrumentation.
+
+### Behavioral verification
+
+Implementation `e80af5ef` + protocol/API validation `132c9dcf`; the test-capacity correction is `3c8f0c23`.
+The approved absolute development tree builds all affected executables/tests successfully; final measured
+perplexity executable SHA-256 `c10f25f193c8faf6775c65efb6bd29334da9cb7e8fea827519794a7aeec39426`.
+No production build or artifact is rewritten.
+
+- The existing Q5 projection test now also exercises launch-time `fp8` on A16Only and AllowA8 policies
+  over all six shapes and its existing T=1/2/8/63/64/65/127/128/129/2048 widths, independent represented
+  and stored-operand FP64 gates, changed-input graph replay and workspace guards. It passes unchanged gates.
+- `infernix_gemma4_incremental_score_real_test` passes all four compute modes on the one A16Only artifact:
+  eight teacher-forced top-1 outputs equal real public greedy generation, repeated windows reset bit-exactly,
+  and the first selected full-vocabulary row equals the corresponding ordinary final-prefill row.
+  With an identical 31-token A16 prefix, selected full-vocabulary rows at scored positions 0/1/7 are
+  bit-identical across all modes. This separately establishes the unchanged narrow arithmetic for the
+  measured control, not equivalence of KV written by different wide-prefill modes.
+- Native CLI/serve parser tests pass; 11 targeted builder launcher tests and 15 reference-window/schedule/
+  byte-exact CRLF Python cases pass. The builder emits nondefault precision on every generated serve/planning command.
+
+The first test lease passed projection but the Engine test failed before `main` (`0xC0000135`): targeted
+builds had not staged its DLL closure. The retry uses the approved apps runtime directory on PATH (no copied
+DLLs). That exposed a test setup error: max context 512 with the generation API's default KV capacity 2048.
+The test now explicitly requests capacity 512; no engine gate or numerical threshold changed. Completed
+projection work was not rerun. Successful corrected lease: exit 0, 71 s, minimum free RAM **35.05 GiB**;
+the first projection lease retained >=34.84 GiB. Every GPU lease retains the 8 GiB floor and is serialized
+with builds. Build minima: initial 20.77 GiB, final validation rebuild 37.56 GiB, test-only rebuild 38.81 GiB.
+The first native Python test attempt lacked pytest; the tooling environment completed the same targeted cases.
+
+### Bounded incremental protocol
+
+Plain model only, same **A16Only Q5 artifact** for A16/FP8/INT8 g32/INT8 g64, with the legacy AllowA8
+artifact used solely as a bit-equivalence control. Corpus: the first two streams each of English reference,
+long-form prose and code. Selection used the first 768 HF tokens of each LF-normalized source prefix;
+Windows serialization preserved CRLF in the resulting files. The authoritative native input counts are
+**785/773/918/847/827/833** (4,983 total), not the original 768-token selection estimate.
+Context 512, stride 256, 17 explicit chat-prefix IDs, chunk 128, last 17 targets per independent window;
+ordinary stored global FP8 K/V, BF16 sliding ring, BF16 QK/logits, MTP off, default graphs.
+Actual plan: **18 windows, 294 targets: 18 final-prefill distributions and 276 true incremental positions**.
+Seventeen windows prefill 512 tokens; the short terminal window prefills 524 and scores five targets.
+Each subsequent target is scored after one new ground-truth input, not a re-prefilled prefix.
+
+The first Q8 reference attempt correctly refused before model loading: Python's universal-newline read
+changed CRLF to LF, giving 768 tokens where native binary input recorded 785. The reference reader now
+decodes UTF-8 bytes without newline translation, with explicit CRLF regressions for both window builders.
+The completed native protocol is retained, not rerun; no target/window gate is relaxed. The Q8 reference
+uses the plain model's own Q8_0 GGUF, exact native input IDs/predictor frontiers and the inherited chunk/
+one-token schedule, with its existing default KV representation and FP32 logits. Candidates round logits
+to BF16 as in the earlier native quality protocol. Counts and reference identity must match before analysis.
+
+Confidence intervals use 4,000 **paired window** bootstrap resamples, seed 20261118, token weighting
+within each slice. The windows overlap and come from only six short source prefixes: these are conditional
+sample intervals, not population guarantees or long-context qualification. Final-prefill and incremental
+slices are never pooled to make a decode claim; the shared-prefix A16 control above isolates unchanged
+decode arithmetic separately from the inherited prefill-state error.
+
+### Incremental quality results
+
+Full-vocabulary `KL(Q8 || candidate)` and NLL differences, natural logs, paired-window 95% intervals.
+Reference cache SHA-256 `42c8c8f47aa6893b79efb748183ccff7c41101c325ccb1a1de5f8bb02ff7ce00`,
+own plain Q8 GGUF SHA-256 `02776a5fd33cb05a4cfee40d4bb4e88afef5d145f3f70ccede6bbccc4a49fc77`.
+The preflight independently proves **every native/Q8 input token ID and first-target frontier identical**.
+
+**True incremental positions only (276):**
+
+| Prefill / decode | Mean KL [95% CI] | ΔNLL vs Q8 [95% CI] | Paired ΔKL vs A16 [95% CI] | Paired ΔNLL vs A16 [95% CI] |
+|---|---|---|---|---|
+| A16 / A16 | 0.009948 [0.006199, 0.014050] | -0.002820 [-0.025807, +0.019563] | 0 | 0 |
+| FP8 / A16 | 0.011924 [0.008183, 0.015671] | +0.014275 [-0.007691, +0.036316] | +0.001976 [+0.000355, +0.004001] | +0.017095 [-0.004153, +0.038221] |
+| INT8 g32 / A16 | 0.011127 [0.006619, 0.016588] | +0.010323 [-0.010305, +0.030062] | +0.001179 [-0.000047, +0.003028] | +0.013143 [+0.004969, +0.022636] |
+| INT8 g64 / A16 | 0.010398 [0.006561, 0.014765] | +0.000793 [-0.020607, +0.020409] | +0.000449 [-0.000341, +0.001318] | +0.003613 [-0.009612, +0.017883] |
+
+**Final-prefill distributions only (18), not decode:**
+
+| Prefill | Mean KL [95% CI] | Paired ΔKL vs A16 [95% CI] | Paired ΔNLL vs A16 [95% CI] |
+|---|---|---|---|
+| A16 | 0.006828 [0.002273, 0.013841] | 0 | 0 |
+| FP8 | 0.016623 [0.003429, 0.039364] | +0.009795 [+0.000785, +0.025828] | -0.113922 [-0.211589, -0.034989] |
+| INT8 g32 | 0.006688 [0.002170, 0.013318] | -0.000141 [-0.000932, +0.000842] | +0.047943 [-0.006762, +0.127210] |
+| INT8 g64 | 0.007830 [0.002216, 0.016752] | +0.001002 [-0.000395, +0.003062] | +0.027199 [-0.017296, +0.097572] |
+
+The incremental FP8 KL penalty is resolved on this bounded sample despite unchanged A16 decode arithmetic.
+G32/g64 paired KL intervals cross zero; that is **not equivalence**. G32's paired incremental NLL increase
+is resolved in this conditional window bootstrap; do not carry the earlier block-prefill “near-A16” result
+over as a blanket decode-quality claim. G64's NLL interval crosses zero. No general ranking or default follows.
+Incremental top-1 disagreements with Q8: A16/FP8/g32/g64 **2.90%/4.35%/2.17%/2.90%**.
+Worst window-mean incremental ΔKL versus A16: FP8 +0.015007, g32 +0.013925, g64 +0.004331.
+The negative FP8 NLL change on the tiny final-prefill slice alongside worse KL also illustrates why NLL
+alone is not a distribution-quality criterion. These are different target positions and a different
+schedule from item 2c's 13,728-position block-prefill protocol; their absolute KL means are not comparable.
+
+The new single-artifact `fp8` route and legacy A8-tagged artifact produce **all 18 full-logit window hashes
+and all 294 per-position records bit-identically**. Default A16's protocol-write and comparison logit
+hashes also match exactly. This is a bounded numerical equivalence proof for the new selection path,
+not a reason to repeat item 2c's completed ~65k timing campaign.
+
+The byte-exact quality lease exits 0 in 224 s, minimum free RAM **32.27 GiB**, unchanged executable hash,
+8 GiB floor. The earlier refused reference lease retained >=36.09 GiB and proved both original artifact
+hashes unchanged. No model deletion, promotion, production build, long-context campaign or chunk sweep.
+Explicit refusal checks pass for a real Q4 artifact, non-Gemma/unknown-artifact configuration, and incremental
+top-token references whose format cannot bind the schedule (exit 1 with the intended errors; parent lease
+exit 0, >=37.67 GiB). The first Q4 refusal harness hit the unrelated FP32-logits guard; its corrected BF16
+configuration reaches the intended native-Q5 artifact guard.
+
+Evidence: camp `q5-20261117/item2d-20261118/` (`run.py`, `quality.py`, `summarize.py`, `quality-summary.json`,
+`token-window-equivalence.json`, `reference.identity.json`, `refusals.json`, independent protocol/reference
+caches, all window/position records and command/log files); parent `item2d-*.receipt.json` and build logs.
+
+### New-path short HTTP/MTP smoke and resource equivalence
+
+Only the genuinely new `A16Only artifact + fp8` path gets a short serving comparison against the legacy
+AllowA8 artifact; prior item-2c long and INT8 timings above are retained, not rerun. Same clean development
+server SHA-256 `63af2c0d78a6788ee5b97ba16d8206a1d503e4d78c9abe106fa527925c010c8c`, default graphs,
+context/KV 68,096, chunk 2048, FP8 global KV/QK, BF16 ring/logits, headroom 1,024 MiB, cache/reuse off,
+MTP d1. Each start has one excluded 982-token/one-output warmup and the same 987-token/32-output request.
+All tokens match across starts, including all 32 MTP outputs; both accept **14/16** drafts.
+
+Single-artifact / legacy observations: prompt **163.84 / 175.32 ms** (6024 / 5630 tok/s), MTP decode
+**85.59 / 83.96 tok/s**, wire TTFT **191.59 / 191.52 ms**. One pair is a smoke, not a performance
+confidence interval, speedup claim or replacement for item 2c. Startup/request records correctly expose
+`fp8` versus historical `a16` artifact routing, with distinct `q5=fp8` execution signatures.
+
+With the assistant loaded, **both** starts allocate weights **21,118,694,400 B**, workspace capacity/peak
+**1,604,329,984 / 1,331,691,520 B**, and measured graphs **31,457,280 B** within the 64 MiB allowance.
+This is the observed unchanged allocation envelope, not a VRAM-capacity-frontier test. The only new
+selection changes the prepared trunk policy; no persistent widened trunk appears.
+Lease exit 0, 33 s, minimum free physical RAM **36.12 GiB**, unchanged server hash, 8 GiB floor.
+No named heavy-process overlap was sampled; Pages/sec reaches **4930.25**, so no paging-free claim.
+Evidence: `http-summary.json`, both starts' request/SSE/metrics/logs and `item2d-fp8-http-smoke.receipt.json`.
+
+**Disposition:** item 2d complete. One A16Only Q5 artifact supports the explicit A16/FP8/INT8 launch choices;
+default artifact behavior, production artifacts/builds and staging models remain untouched. The new path
+is numerically equivalent to the prior A8-tagged artifact on the bounded protocol and MTP smoke.
+True incremental quality is now measured separately from final-prefill state; narrow A16 arithmetic is
+unchanged on the shared-prefix control, but prefill history still changes decode distributions and g32 shows
+a measured NLL increase. No new default, general quality equivalence, long-context claim or item 2e.
