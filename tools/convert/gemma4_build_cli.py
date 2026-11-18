@@ -112,7 +112,7 @@ def add_serve_arguments(parser: argparse.ArgumentParser, *, prefix: str) -> None
     add("--port", type=int, default=launcher_tools.DEFAULT_PORT,
         help=f"{prefix} --port (default {launcher_tools.DEFAULT_PORT})")
     add("--kv-dtype", choices=launcher_tools.KV_DTYPES, default="fp8",
-        help=f"{prefix} KV storage (default fp8, qualified; sliding layers stay BF16)")
+        help=f"{prefix} global KV storage (default fp8, qualified; sliding storage is selected separately)")
     add("--model-match", choices=launcher_tools.MODEL_MATCHES, default=launcher_tools.DEFAULT_MODEL_MATCH,
         help="any (default) passes --any-model-name so OpenAI requests may send any model name, as a gateway that "
         "forwards several names needs; exact accepts only --alias and emits no flag")
@@ -120,7 +120,10 @@ def add_serve_arguments(parser: argparse.ArgumentParser, *, prefix: str) -> None
         help="Gemma attention QK precision: fp8 (default: faster long-prompt prefill, measurably lower fidelity; "
         "needs --kv-dtype fp8) or bf16 (no flag, the engine default)")
     add("--gemma4-key-only-kv", action="store_true",
-        help="experimental global key-only FP8 KV (default off; memory-16gb enables it); sliding KV stays BF16")
+        help="experimental global key-only FP8 KV (default off; memory-16gb enables it)")
+    add("--gemma4-sliding-kv", choices=("bf16", "fp8"), default="bf16",
+        help="sliding K/V ring storage: bf16 (default), or experimental fp8 (about half the ring memory, "
+        "measurable fidelity and prefill cost; requires --kv-dtype fp8)")
     add("--allow-shared-memory", action="store_true",
         help="opt in to starting when the model does not fit the free VRAM: the shortfall runs in shared GPU memory "
         "(system RAM over PCIe, much slower; default off = the server refuses). memory-16gb tries resident starts first")
@@ -175,6 +178,7 @@ def serve_kwargs(args: argparse.Namespace) -> dict:
         "default_thinking_budget": args.default_thinking_budget,
         "thinking_budget_message": args.thinking_budget_message, "reasoning_loop": args.reasoning_loop,
         "gemma4_key_only_kv": small or args.gemma4_key_only_kv, "mtp_fallback": small, "allow_shared_memory": args.allow_shared_memory,
+        "gemma4_sliding_kv": args.gemma4_sliding_kv,
     }
 
 

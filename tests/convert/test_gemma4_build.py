@@ -1519,3 +1519,32 @@ def test_memory_profile_shared_memory_option_is_the_last_resort_stage(tmp_path, 
     assert cli.main(["launcher", "--artifact", str(artifact), "--serve", str(server), "--out", str(plain),
                      "--profile", "memory-16gb"]) == 0
     assert "--allow-shared-memory" not in plain.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("profile", ["default", "memory-16gb"])
+def test_fp8_sliding_ring_launcher_is_explicit_and_survives_all_stages(env, tmp_path, monkeypatch, profile):
+    monkeypatch.setattr(launcher, "artifact_info", lambda path: launcher.ArtifactInfo(True, False, 262144, True))
+    artifact = tmp_path / "iq3.ninfer"
+    artifact.write_bytes(b"x")
+    out = tmp_path / "ring.cmd"
+    assert cli.main(["launcher", "--artifact", str(artifact), "--serve", str(env.server), "--out", str(out),
+                     "--profile", profile, "--gemma4-sliding-kv", "fp8", "--allow-shared-memory"]) == 0
+    parsed = build.parse_launcher(out)
+    assert parsed.gemma4_sliding_kv == "fp8" and parsed.effective_profile()["gemma4_sliding_kv"] == "fp8"
+    text = out.read_text(encoding="utf-8")
+    assert "sliding KV stays BF16" not in text
+    for command in text.split(f'"{env.server.resolve()}" "{artifact.resolve()}"')[1:]:
+        assert "--gemma4-sliding-kv fp8" in command
+    args = cli.build_parser().parse_args(env.argv("iq3-xxs", "--profile", profile, "--gemma4-sliding-kv", "fp8"))
+    assert cli.resolve_config(args)[1].gemma4_sliding_kv == "fp8"
+    default = cli.resolve_config(cli.build_parser().parse_args(env.argv("iq3-xxs", "--profile", profile)))[1]
+    assert default.gemma4_sliding_kv == "bf16"
+    assert "--gemma4-sliding-kv" not in launcher.serve_argv(env.server, artifact, default, mtp=True, vision=False)
+
+
+def test_fp8_sliding_ring_launcher_refuses_bf16_globals(env, capsys):
+    assert cli.main(env.argv("draft", "--dry-run", "--gemma4-qk", "bf16", "--kv-dtype", "bf16",
+                             "--gemma4-sliding-kv", "fp8"), probes=FakeProbes()) == 1
+    assert "--gemma4-sliding-kv fp8 needs --kv-dtype fp8" in capsys.readouterr().err
+    with pytest.raises(ValueError, match="--gemma4-sliding-kv must be"):
+        launcher.check_serve_settings(launcher.ServeProfile(gemma4_sliding_kv="int8"))

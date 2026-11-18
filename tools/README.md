@@ -88,6 +88,25 @@ Recipes, mixed sources, custom methods, resources and sharding are described in 
 [conversion guide](../docs/weight-conversion.md). Numeric formats, layouts and framing are defined
 by the references linked from the [documentation map](../docs/README.md).
 
+### Gemma sliding-ring memory opt-in
+
+The existing `python -m tools.convert.gemma4_build` build and `launcher` commands accept
+`--gemma4-sliding-kv bf16|fp8`. The default stays **BF16**, including `--profile memory-16gb`.
+For an existing artifact, generate an explicitly experimental launcher:
+
+```text
+py -3.11 -m tools.convert.gemma4_build launcher --artifact <model.ninfer> --serve <absolute-infernix-serve-path> --out <new-launcher.cmd> --gemma4-sliding-kv fp8
+```
+
+This needs a server with the FP8-ring implementation and `--kv-dtype fp8`; it composes with
+`--gemma4-key-only-kv`. Add `--profile memory-16gb` only for its supported text-only IQ3_XXS artifact.
+Every planning/fallback stage preserves the ring option, and `serve-check` records it in its effective profile.
+The tooling checkout's thin `infernix_gemma.py` frontend forwards the same flag unchanged.
+The ring saves 446 MiB at chunk 128 or 1,191 MiB at chunk 2048, but measured short-context KL increases and
+prefill slows; it is not a free quality/speed improvement. See the
+[measured trade-offs](../docs/maintainer/gemma4-benchmarks.md#fp8-sliding-ring-experimental-off-by-default).
+
+
 ## Benchmark orchestration
 
 `tools/bench/run_infernix_bench_matrix.py` builds and runs the public-Engine benchmark matrix and

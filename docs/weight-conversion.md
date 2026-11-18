@@ -700,6 +700,11 @@ file carries the assistant, `--logits-dtype bf16`, a host-only prefix cache (`--
 --host-context-mib 8192`), `--any-model-name`, and `0.0.0.0:8001`. The server binary is
 `apps/Release/infernix-serve.exe` (or a `build*/apps/Release` of the checkout) unless `--serve` names another.
 Every setting has a flag; `--gemma4-qk bf16` omits the QK flag.
+Sliding rings remain BF16 by default. Builds and `launcher` accept `--gemma4-sliding-kv fp8` as an explicit
+memory-saving alternative (requires `--kv-dtype fp8`, including in the `memory-16gb` profile). This saves about
+446 MiB at chunk 128 or 1,191 MiB at chunk 2048, but short-context KL increases and prefill slows:
+see the [FP8-ring measurements and limits](maintainer/gemma4-benchmarks.md#fp8-sliding-ring-experimental-off-by-default).
+Planning/fallback commands preserve the selected ring, and `serve-check` records the opt-in.
 
 ```text
 python -m tools.convert.gemma4_build launcher --artifact <file.ninfer> --out <serve.cmd>
@@ -759,8 +764,8 @@ without the flag is unchanged: refusal, nothing paged.
 
 Profile overrides permit chunks `128`, `256`, `512` (larger chunks trade context for prompt speed: 1,081 / 1,381 MiB of ring plus KV at
 chunk 128 / 512), any non-negative headroom, and one MTP draft only. FP8 KV and BF16 logits are required. Key-only KV is
-experimental and changes attention arithmetic; sliding layers remain BF16. Its historical numerical
-and long-context speed costs remain in the [key-only measurements](maintainer/gemma4-benchmarks.md#key-only-global-kv-cache-experimental-off-by-default).
+experimental and changes attention arithmetic; sliding layers remain BF16 unless `--gemma4-sliding-kv fp8` is explicit.
+Key-only's historical numerical and long-context speed costs remain in the [key-only measurements](maintainer/gemma4-benchmarks.md#key-only-global-kv-cache-experimental-off-by-default).
 
 ### Gemma 4 31B from a llama.cpp GGUF quant (IQ3_XS, IQ3_XXS, ...)
 

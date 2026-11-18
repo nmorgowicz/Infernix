@@ -375,7 +375,7 @@ double relative_rms(const std::vector<double>& got, const std::vector<double>& r
 // is reported (measurement, not an adoption gate). Key-norm weights of `key_weight` scale K: unit weights
 // make rmsnorm'd Q.K scores of standard deviation ~16 over 256 dimensions, a near-argmax softmax that
 // amplifies any K perturbation; 0.05-0.2 gives moderate scores.
-int ring_comparison_test(int first, int queries, float key_weight_low, float key_weight_high) {
+void ring_comparison_test(int first, int queries, float key_weight_low, float key_weight_high) {
     const int tokens = Window + queries;
     const int ring_pages = (queries + Window - 1 + 63) / 64;
     const int logical_pages = (first + tokens - 1) / 64 + 1;
@@ -427,10 +427,9 @@ int ring_comparison_test(int first, int queries, float key_weight_low, float key
     std::cout << "GEMMA4_FP8_RING_VS_BF16 first=" << first << " queries=" << queries << " window=" << Window
               << " key_norm_weights=" << key_weight_low << ".." << key_weight_high
               << " fp8_ring_rel_rms_vs_bf16_ring=" << error << '\n';
-    // Gross-error bound, not quality: a wrong row, scale or page errs by O(1); the exact comparisons above
-    // carry correctness.
-    if (!(error < 0.25)) { std::cerr << "FP8 ring attention far from the BF16 ring: " << error << '\n'; return 1; }
-    return 0;
+    // Measurement only. The initial experiment's 0.10 cutoff failed (up to 0.139); replacing it with
+    // 0.25 did not establish acceptance. Exact codec and represented-value FP64 checks above carry
+    // correctness; model-level quality and adoption are reported separately.
 }
 } // namespace
 
@@ -463,8 +462,8 @@ INFERNIX_OP_TEST(gemma4_fp8_ring) {
     for (const int tokens : {1, 8, 64, 129, 2048}) { failures += attention_test(5 * 1152 + 37, tokens, true); }
     for (const int first : {0, 9000}) {
         for (const int queries : {1, 64, 128}) {
-            failures += ring_comparison_test(first, queries, 0.4f, 1.7f);
-            failures += ring_comparison_test(first, queries, 0.05f, 0.2f);
+            ring_comparison_test(first, queries, 0.4f, 1.7f);
+            ring_comparison_test(first, queries, 0.05f, 0.2f);
         }
     }
     std::cout << (failures ? "FAIL" : "OK") << " gemma4_fp8_ring\n";

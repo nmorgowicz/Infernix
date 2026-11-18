@@ -471,10 +471,11 @@ no quality rating follows. Rates belong to the RTX 5090.
 
 **What does not fit, and why.** Conservative (13,743 MiB): without MTP 9,216 tokens need 1,422 MiB beside the 11,921 MiB of weights
 (the engine plan with ring, workspace and graphs), 1,169 MiB are available after weights: **short by about 253 MiB** with no headroom and no
-margin, 512 MiB at the profile default; MTP adds 464 MiB of weights (short about 717 MiB). Ranked options, none started here: (1) sliding-window K/V stored as FP8 instead of
-BF16: the 900 MiB ring would roughly halve ([INFERENCE]: about 440 MiB, needs a kernel and a quality study); (2) a smaller weight tier than IQ3_XXS (about 1 GiB per
-IQ3 to IQ2-class step is [INFERENCE]; needs a new quantization and KL study); (3) chunk 64 saves roughly 50 MiB of ring and ~16 MiB of workspace
-([INFERENCE], unsupported); (4) `--no-cuda-graph` saves 24 MiB at about -15-20 % decode; (5) a physical card with the desktop on the iGPU.
+margin, 512 MiB at the profile default; MTP adds 464 MiB of weights (short about 717 MiB). This historical result
+used BF16 rings. The later [FP8-ring ladder](#fp8-ring-desktop-ladders-2026-11-18) demonstrates conservative
+9,216/12,288-token starts without MTP; it remains opt-in because of the measured fidelity and prefill costs.
+Smaller weight tiers and unsupported chunk 64 were not implemented by that study; `--no-cuda-graph` saved 24 MiB at
+about -15-20 % decode, and moving the display to an iGPU was not tested.
 The vocabulary/output head (FP8, ~1.3 GiB) cannot leave the device without paging.
 
 Retained process finding: the Windows OS budget shrinks to usage plus free memory as device memory fills (31,419 MiB at open, 17,154 MiB after the
@@ -667,8 +668,8 @@ unit scale). It requires `--kv-dtype fp8` and combines with `--gemma4-key-only-k
 
 **What runs.** `gemma4_qkv_prep` quantizes each sliding K and V row once as it writes its ring slot. The decode SIMT
 kernel (T < 64: decode, MTP verify and the drafter) expands codes on load; the D256 tensor-core prefill kernel stages
-the codes by `cp.async` into the compact half of each BF16 tile and expands them in place, half a tile at a time
-(255 registers, no spills). Every reader consumes BF16(FP32 code x FP32 scale), so sliding QK and PV keep their BF16
+the codes by `cp.async` into the compact half of each BF16 tile and expands them in place, half a tile at a time.
+Every reader consumes BF16(FP32 code x FP32 scale), so sliding QK and PV keep their BF16
 math; FP8 QK stays a global-layer option. `KvCacheLayout` carries the sliding format as its own axis; the prefix-cache
 identity carries it (`/sliding-fp8`, layout packing version 2), so blocks and snapshots never restore across ring
 formats. Host snapshot images hold the FP8 codes and row scales. The memory summary, the `Gemma KV` startup line
@@ -688,12 +689,183 @@ about 2-6 % of the error for 1-6 more scale bytes per row.
 of the BF16 ring's rows, nonfinite rows included; decode and tensor-core attention over a wrapped ring with unmapped and
 out-of-range pages, T = 1-2048, equal bit for bit to BF16 attention over the expanded ring and within the BF16 attention
 criterion of an FP64 oracle; never-written rows not read; graph replay). Its writer-input comparison against the BF16
-ring reports 0.057-0.068 relative RMS attention error with moderate scores and 0.10-0.14 with unit key-norm weights (a
-near-argmax softmax); a measurement, bounded only against gross errors. `infernix_gemma4_fp8_ring_real_test`
+ring reports 0.057-0.068 relative RMS attention error with moderate scores and 0.10-0.14 with key-norm weights
+0.4-1.7 (a near-argmax softmax). The original experimental 0.10 criterion **failed**, as detailed below.
+`infernix_gemma4_fp8_ring_real_test`
 (`INFERNIX_GEMMA4_ARTIFACT`): refusal with BF16 globals; the first sliding layer's FP8 rows equal the row codec of the
 BF16 ring's; sliding payload and plan equal to the FP8 layout; deterministic generation, root replay and Host snapshot
-restore equal to the cold FP8-ring run, chunk 128 and 2048, CUDA graphs off and on, stored and key-only globals, MTP
-off and on (2026-11-18, diode IQ3_XXS: pass).
+restore equal to the cold FP8-ring run, chunk 128 and 2048, CUDA graphs off and on, stored globals, MTP
+off and on; key-only globals are additionally checked with graphs on (2026-11-18, diode IQ3_XXS: pass).
+
+**Measurement setup (2026-11-18, RTX 5090, preserved development binary SHA-256 prefix `96a403667812`, implementation committed as `e03a5e26`).** One binary serves every arm; its embedded build label predates that commit (`gcbc85732-dirty`). Arms differ
+only by `--gemma4-sliding-kv`. Camp evidence: `iq3xs-20261115/fp8ring-20261118/` (drivers, receipts, reports, raw
+requests/responses, server logs, `results.json`).
+
+- **Default unchanged.** With the BF16 ring the new binary reproduces the pre-change binary's native KL runs bit for bit
+  (per-position sidecars and report statistics equal): diode IQ3_XXS short (a baseline run before the change), plain
+  GPTQ5 A8 short stored and key-only, and the GPTQ5 A8 bounded long protocol stored and key-only (the Q5 study's runs).
+- **Native full-vocabulary KL** (pinned protocol: context 512, stride 256, chunk 128, chat prefix, FP8 KV, BF16 logits,
+  47 windows, 13,728 positions, each artifact against its own source's Q8 reference; paired window bootstrap, 4000
+  resamples, FP8 ring minus BF16 ring):
+
+| Artifact, arm | BF16 ring KL | FP8 ring KL | Paired delta KL [95% CI] | Relative | Delta dNLL [95% CI] |
+|---|---:|---:|---|---:|---|
+| diode IQ3_XXS, BF16 QK | 0.31540 | 0.32219 | +0.0068 [+0.0001, +0.0130] | +2.2 % | -0.0046 [-0.0127, +0.0036] |
+| diode IQ3_XXS, FP8 QK | 0.31222 | 0.32092 | +0.0087 [+0.0020, +0.0154] | +2.8 % | +0.0005 [-0.0085, +0.0092] |
+| diode IQ3_XXS, key-only, BF16 QK | 0.31683 | 0.32163 | +0.0048 [-0.0033, +0.0110] | +1.5 % | +0.0039 [-0.0056, +0.0120] |
+| plain GPTQ5 A8, BF16 QK | 0.02965 | 0.03242 | +0.0028 [+0.0004, +0.0055] | +9.3 % | +0.0053 [-0.0005, +0.0111] |
+| plain GPTQ5 A8, key-only, BF16 QK | 0.02985 | 0.03319 | +0.0034 [+0.0009, +0.0059] | +11.2 % | +0.0046 [-0.0011, +0.0104] |
+
+- **Bounded long context** (the Q5 study's chat-prefixed protocol: context 32,768, stride 16,384, chunk 2048, last 64
+  targets per window, 3 streams, 704 positions, plain Q8 reference; plain GPTQ5 A8): stored 0.03463 -> 0.03305, paired
+  -0.0016 [-0.0138, +0.0076]; key-only 0.03838 -> 0.03877, +0.0004 [-0.0039, +0.0041]. No change is resolvable at this
+  sample size (CIs about +/-0.01).
+- **Retrieval** (diode IQ3_XXS, 131,072 context, auto chunk, MTP off, greedy; four 7-digit codes per prompt at 10/50/90 %
+  depth and one inside the last ~2,600 characters before the question; four prompts each at ~16k/65k/120k tokens): 48/48
+  for both rings, including all 12 tail codes.
+- **Plans** (`--plan`, MTP d1, headroom 1024 MiB, KV includes rings and tables; BF16 -> FP8 ring): diode IQ3_XXS stored at
+  131,072 tokens 7,560 -> 6,369 MiB (`auto` = chunk 2048) and 6,060 -> 5,614 MiB (chunk 128); key-only 4,980 -> 3,789 and
+  3,480 -> 3,034 MiB. Plain GPTQ5 A8 stored at 131,072 tokens and chunk 2048: BF16 ring refused (101,888 tokens fit),
+  FP8 ring's **estimated plan** fits with 43 MiB left; `auto` keeps chunk 2048 with the FP8 ring. This is not a
+  successful 131k resident start: the actual MTP start below resolves only 114,368. Planning before weights load
+  does not include every first-use allocation or the live auto-context safety margin; available desktop memory
+  also changes between starts. Use the startup capacity, not this tight static plan, for a serving claim.
+- **Speed** (diode IQ3_XXS, the matched instrument of the key-only section: 131,072 context, FP8 KV/QK, auto chunk 2048,
+  256 greedy tokens, free-cache-resume off, rep 0 excluded, medians of 3, AB and BA orders, one fresh server per cell,
+  no build or quantizer running; BF16 -> FP8 ring):
+
+| Prompt | Plain prefill tok/s | Plain decode tok/s | MTP d1 decode tok/s (accepted / drafted) | Whole-device peak MiB, plain |
+|---:|---|---|---|---|
+| ~1k | 6,393-6,583 -> 5,746-5,761 (-11 %) | 83.1-84.7 -> 83.6-84.1 | 122.8-124.9 -> 121.5-122.1 (314/448 -> 325/439) | 22,971-23,067 -> 21,908-21,972 |
+| ~65k | 3,337-3,399 -> 3,102-3,113 (-8 %) | 70.5-71.2 -> 71.0-71.1 | 95.5-95.7 -> 91.5-92.0 (-4 %; 320/444 -> 312/452) | 22,971-23,074 -> 21,996-22,001 |
+| ~122k | 2,310-2,332 -> 2,212-2,213 (-4 %) | 61.3-62.8 -> 62.3-63.1 | 79.6-80.1 -> 77.3 (-3 %; 323/441 -> 317/447) | 23,040-23,078 -> 22,014-22,022 |
+
+The in-place expansion of each staged tile (a register round trip and two barriers per K and V tile) costs prefill more
+than the halved ring read saves; plain decode is unchanged within the AB/BA spread; MTP rounds lose 2-4 %, partly through
+different acceptance (a different lossy ring). Outputs differ from the BF16 ring but are identical across AB and BA runs
+of the same arm. Paging counters (Pages/sec, which include file-backed reads) spiked in single rows of both arms with
+no visible rate change in those rows.
+
+MTP prefill medians (BF16 -> FP8 ring, AB/BA ranges) are 6,405-6,521 -> 5,789-5,802 at ~1k,
+3,349-3,384 -> 3,107-3,108 at ~65k and 2,328-2,350 -> 2,184-2,228 at ~122k. In matched orders the
+plain prefill loss is 10.1-12.5 % / 7.1-8.4 % / 4.2-5.1 %; MTP prefill loss is 9.6-11.0 % /
+7.2-8.2 % / 5.2-6.2 %. Thus the planned -5 % prefill gate is **not met**. MTP decode loses 3.0-3.5 %
+at ~122k and 3.6-4.4 % at ~65k, also failing the planned -3 % gate. Neither is dismissed as noise.
+
+- **32 GB frontier, plain GPTQ5 A8** (`--max-context auto` up to 131,072, chunk 2048, headroom 1024 MiB, the same
+  instrument plus one near-capacity request; capacity is the startup's resolved context and moves with the desktop's
+  free VRAM by several thousand tokens between starts):
+
+| Globals, ring | Mode | Capacity tokens | ~1k prefill / decode | ~65k | ~122k |
+|---|---|---:|---|---|---|
+| stored, BF16 (this campaign) | MTP | 86,976 | 6,278 / 84.6 (322/442) | 3,365 / 67.8 | not run (outside capacity) |
+| stored, BF16 (Q5 study, pre-change binary) | plain / MTP | 108,096 / 97,344 | 6,303 / 53.7; 6,286 / 82.4 | 3,332 / 48.0; 3,334 / 65.9 | not run |
+| stored, FP8 | plain | 125,376 | 5,754 / 54.8 | 3,130 / 49.0 | 2,217 / 44.6 (frontier 124,608: 2,190 / 44.5) |
+| stored, FP8 | MTP | 114,368 | 5,750 / 84.9 (329/434) | 3,131 / 66.9 | not run (frontier 113,600: 2,318 / 62.6) |
+| key-only, FP8 | plain | 131,072 | 5,751 / 54.7 | 2,783 / 48.3 | 1,902 / 43.6 (130,304: 1,821 / 43.1) |
+| key-only, FP8 | MTP | 131,072 | 5,732 / 84.2 (329/434) | 2,789 / 66.2 | 1,903 / 55.7 |
+
+  With normal FP8 global KV the FP8 ring served a 122k prompt without MTP on this 32 GB 5090,
+  not with MTP; key-only plus the FP8 ring reaches the 131,072 ceiling in both modes. The +17,280
+  tokens against the earlier BF16-ring plain run is a cross-start observation, not an isolated ring-only
+  capacity gain: free VRAM and startup margin differ. The new binary's BF16-ring MTP cell reproduced the
+  Q5 study's responses, usage and draft counts for all six shared requests.
+
+### FP8-ring desktop ladders (2026-11-18)
+
+The inherited batch completed without interruption (receipt `fp8ring-ladder2`, exit 0, 915 s, minimum
+free host RAM 30.03 GiB). Six ladders, **idle** torch ballast on the RTX 5090, not active ballast:
+the driver's original comment was incorrect (`fit16g.start_ballast` runs `vram_ballast.py`, not
+`vram_ballast_active.py`). Same simulated 16 GB usable envelopes and 31,419 MiB budget line as above;
+key-only global FP8 KV, FP8 QK, chunk 128, explicit context and KV capacity, headroom **0**,
+8,192 MiB Host tier, one near-capacity 48-token thinking-off greedy request per successful start.
+The BF16-ring comparison is the retained `preset16-20261117/ladder2-*` campaign, not rerun.
+
+| Usable MiB | Mode | Largest demonstrated FP8-ring context (peak spare MiB) | Next attempted refusals | Retained BF16-ring largest demonstrated |
+|---:|---|---:|---|---:|
+| 14,767 nominal | plain | 65,536 (182) | not tested above | 40,960 |
+| 14,767 nominal | MTP d1 | 32,768 (240) | 40,960; 49,152 | 20,480 (not tested above) |
+| 14,357 (~1.9 GiB reserve) | plain | 40,960 (153) | 49,152; 57,344 | 20,480 |
+| 14,357 | MTP d1 | 20,480 (198) | 24,576 (spill guard); 32,768 | none (4,096 refused) |
+| 13,743 conservative | plain | 12,288 (169); 9,216 also fits (232) | 16,384; 20,480 | none (2,048 refused) |
+| 13,743 conservative | MTP d1 | none | 2,048; 4,096 | none |
+
+All 35 admitted cells completed their one request within the sampled budget; the other 10 starts were
+refused (nine reservation shortfalls, one spill guard). The 14,357 MiB/MTP/24,576 start reports shared-system
+memory rising from 106 to 8,299 MiB while allocating runtime; it is **not a fit** despite a sampled peak
+112 MiB under the budget. Conservative/plain/16,384 missed its reservation by only 306,176 bytes;
+this remains a refusal, not a rounded success. Ladders stop after two consecutive failures.
+
+These are sparse, drifting desktop envelopes, not guaranteed hardware limits, a physical 16 GB-card test,
+active-overcommit proof or qualification of the default 64 MiB-headroom automatic profile. Idle ballast can
+be evicted; sampling can miss spikes. The conservative plain result establishes the intended memory
+benefit at zero headroom; it does not promise that the generated memory-16gb profile will fit every such desktop.
+
+### Generated-launcher sampled thinking smoke (2026-11-18)
+
+The missing end-to-end surface check ran the **actual generated CMD**, eight fresh servers:
+BF16/FP8 ring x MTP off/d1 x chunk 128/2048, normal stored global FP8 KV, FP8 QK, BF16 logits,
+32,768 context, 4,096 MiB Host tier, loopback, fixed Gemma template. Each receives the same two
+natural-text prompts (990 / 15,993 actual tokens), thinking explicitly on, cap **8192 total tokens**,
+sampler temperature 1.0 / top_p 0.95 / top_k 64 / min_p 0.03, seeds 4100 / 4200.
+`fp8ring-finish-qualification` completed (exit 0, 536 s, minimum free RAM **34.72 GiB**).
+
+All **16 requests** returned `stop`, nonempty reasoning and final answers, with no HTTP/transport
+errors (1,224-6,672 completion tokens). That is transport/stability evidence, **not 16 healthy thoughts**:
+three ~1k requests visibly degenerated in reasoning before the enforced thinking budget closed them:
+FP8/chunk128/plain and BF16/chunk2048/plain/MTP. Each reports **6,168 reasoning tokens**
+(6,144 model thinking + 24 control); they then produced 476 / 504 / 444 final-answer tokens and stopped.
+The retained thought tails show repeated self-correction, repeated phrases or low-vocabulary garbage.
+The existing whole-response `loop` flag is false for all 16 (the final answer masks the bad reasoning);
+the softer `repetitive` flag catches only two of these three. No detector criterion was changed.
+This is an observed failure on **both** rings, not evidence of sampled-quality parity, a loop-free option
+or a statistically resolved difference. No final answer was rated for correctness or roleplay quality.
+Other requests used 630-1,195 reasoning tokens. No request exhausted the total 8192 cap.
+
+The new generator selection passed **15 focused CPU fixtures** (135 deselected) in the existing
+tooling Python 3.13 environment; Python 3.11 syntax compilation passed. Neither installed Python 3.11
+nor infernix's Python 3.13 venv had pytest, so no passing 3.11 pytest execution is claimed.
+The test-only removal of the unjustified synthetic cutoff compiled in the approved development tree
+(`infernix_ops_gemma4_attention_test`, guarded receipt `fp8ring-finish-test-build`: exit 0, 17 s,
+minimum free RAM 43.18 GiB). The already-passing codec/FP64 and real-artifact GPU proofs were reused,
+not rerun; the serving/perplexity binaries used for the measurements were not rebuilt.
+
+
+### Adoption decision and coverage limits
+
+Keep **BF16 rings as every default**, including the generated `memory-16gb` profile. FP8 rings are an
+explicit memory/fidelity trade through the native flag and the existing build/launcher generator
+([usage](../../tools/README.md#gemma-sliding-ring-memory-opt-in)); planning and fallback stages preserve it.
+The short plain-GPTQ5 KL increase of 9.3-11.2 % exceeds the plan's order-of-magnitude warning relative
+to key-only's historical +0.45 %, and the speed gates above fail.
+
+**Retained failed synthetic criterion, not a pass.** The precommit `fp8ring-ops-first` experiment required
+BF16-versus-FP8 ring relative RMS below **0.10**; five of six high-key-norm cases failed (maximum **0.139054**).
+This was a newly invented experiment cutoff, not a preexisting repository attention gate: the entire test file
+first appears in `e03a5e26`. That commit raised the cutoff to **0.25**, after observing the failures. Passing
+that relaxed gross-error tripwire does **not** pass the original criterion or qualify quality. The completion
+change removes the unjustified bound altogether and keeps these comparisons as measurements. The original
+0.10 failure remains the result; exact codec checks and the unchanged FP64 represented-value attention
+criterion establish kernel correctness only, and the independent KL/speed adoption findings reject promotion.
+The earlier successful Op receipts ran the 0.25 revision; they are not relabelled as an original-criterion pass.
+Retained random-token diagnostics report final-position KL 1.15148 (chunk 128) / 0.489734 (2048) between
+the rings, changed argmaxes and causal-score differences; their NLL is ~19.8, so they are adversarial
+state/correctness probes, not the natural-text Q8 quality instrument.
+
+The initial `fp8ring-quality` receipt exited 1 when an FP8-QK candidate omitted the explicit BF16-QK
+reference expectation; the native protocol guard refused it. Corrected commands declare that reference,
+and `fp8ring-quality2` passed without changing corpus, reference, numerical thresholds or scored windows.
+An earlier ladder attempt used the wrong client port and timed out; its two cells are retained in
+`receipts/failed/ladder-nominal-off-ringfp8-port-mismatch`, not counted as fit or as server failures.
+The tooling repo's `verify_run_comparability.py` cannot parse these native `report.json` runs (it
+supports Sixcat/gate receipts); paired analysis instead checks exact native protocol, window counts
+and reference target log-probabilities before computing deltas.
+Full-vocabulary KL at chunk 2048/context 512 is refused by the pinned chunk-128 reference guard; the
+32k/chunk-2048 evidence instead uses the existing bounded Q5 reference (11 windows / 704 targets, three
+streams), **not** the original plan's full 12-stream study. There is no diode-own long-context KL,
+65k/122k KL, natural-text generated-distribution KL, all-factor key-only + FP8-QK short KL,
+physical 16 GB qualification or human-rated reasoning/roleplay-quality result. Retrieval (including tail
+codes) uses both global and sliding layers; a tail success cannot be attributed exclusively to the ring.
 
 ## Five-bit text projections: quality, speed and 32 GB capacity (2026-11-17)
 

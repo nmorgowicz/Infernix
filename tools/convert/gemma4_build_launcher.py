@@ -86,6 +86,7 @@ class ServeProfile:
     thinking_budget_message: str | None = None
     reasoning_loop: str | None = None
     gemma4_key_only_kv: bool = False
+    gemma4_sliding_kv: str = "bf16"
     mtp_fallback: bool = False  # memory-16gb: plan with MTP first, start without it when only that does not fit
     allow_shared_memory: bool = False  # --allow-shared-memory: start with the shortfall in shared GPU memory (slow)
 
@@ -130,6 +131,10 @@ def check_serve_settings(profile: ServeProfile) -> None:
         raise ValueError(f"--model-match must be one of {MODEL_MATCHES}")
     if profile.gemma4_key_only_kv and profile.kv_dtype != "fp8":
         raise ValueError("--gemma4-key-only-kv needs --kv-dtype fp8")
+    if profile.gemma4_sliding_kv not in ("bf16", "fp8"):
+        raise ValueError("--gemma4-sliding-kv must be bf16 or fp8")
+    if profile.gemma4_sliding_kv == "fp8" and profile.kv_dtype != "fp8":
+        raise ValueError("--gemma4-sliding-kv fp8 needs --kv-dtype fp8")
     if profile.gemma4_qk not in GEMMA4_QKS:
         raise ValueError(f"--gemma4-qk must be bf16 or fp8, got {profile.gemma4_qk!r}")
     if profile.gemma4_qk == "fp8" and profile.kv_dtype != "fp8":
@@ -173,6 +178,7 @@ def serve_groups(
         ["--max-context", str(profile.context), "--kv-capacity", "auto", "--vram-headroom-mib",
          str(profile.vram_headroom_mib), "--kv-dtype", profile.kv_dtype]
         + (["--gemma4-key-only-kv"] if profile.gemma4_key_only_kv else [])
+        + (["--gemma4-sliding-kv", "fp8"] if profile.gemma4_sliding_kv == "fp8" else [])
         + (["--gemma4-qk", "fp8"] if profile.gemma4_qk == "fp8" else []),
         ["--max-concurrency", "1", "--prefill-chunk", profile.prefill_chunk, "--logits-dtype", profile.logits_dtype]
         + (["--top-k", str(profile.top_k)] if profile.top_k is not None else [])
@@ -247,7 +253,9 @@ def launcher_lines(
         f"{profile.host_context_mib} MiB of pinned host context.",
     ]
     if profile.gemma4_key_only_kv:
-        lines.append("rem Experimental key-only global FP8 KV; sliding KV stays BF16. Default launches do not enable it.")
+        lines.append("rem Experimental key-only global FP8 KV. Default launches do not enable it.")
+    if profile.gemma4_sliding_kv == "fp8":
+        lines.append("rem Experimental FP8 sliding K/V ring: lower memory, measurable fidelity and prefill cost; BF16 is the default.")
     if profile.context == "auto":
         lines.append("rem Context is fitted at startup to available VRAM; refuses below 9216 tokens. Read /v1/models for the resolved limit.")
     if profile.gemma4_qk == "fp8":

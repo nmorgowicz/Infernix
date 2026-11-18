@@ -1029,6 +1029,7 @@ class LauncherCommand:
     host_context_mib: int | None
     device_snapshot_slots: int | None
     gemma4_key_only_kv: bool = False
+    gemma4_sliding_kv: str = "bf16"
     env: dict[str, str] = field(default_factory=dict)  # `set NAME=VALUE` lines; PATH is prepended, not replaced
 
     def effective_profile(self) -> dict[str, object]:
@@ -1040,6 +1041,7 @@ class LauncherCommand:
             "logits_dtype": self.logits_dtype, "host_context_mib": self.host_context_mib,
             "device_snapshot_slots": self.device_snapshot_slots,
             **({"gemma4_key_only_kv": True} if self.gemma4_key_only_kv else {}),
+            **({"gemma4_sliding_kv": self.gemma4_sliding_kv} if self.gemma4_sliding_kv != "bf16" else {}),
         }
 
 
@@ -1104,6 +1106,7 @@ def parse_launcher(path: Path) -> LauncherCommand:
         draft_tokens=value("--draft-tokens") if value("--spec") == "mtp" else None,
         logits_dtype=value("--logits-dtype"), host_context_mib=number("--host-context-mib"),
         gemma4_key_only_kv="--gemma4-key-only-kv" in flags,
+        gemma4_sliding_kv=value("--gemma4-sliding-kv", "bf16"),
         device_snapshot_slots=number("--device-snapshot-slots"), env=env,
     )
 
