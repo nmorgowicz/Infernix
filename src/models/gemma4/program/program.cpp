@@ -127,6 +127,18 @@ void validate_options(const Model& model, const ProgramOptions& o, std::uint32_t
             }
         }
     }
+    if (o.sliding_kv_cache != KvCacheStorage::BFloat16) {
+        // The FP8 ring: FP8 E4M3 K and V with one FP16 scale per D256 row, beside FP8 global KV only.
+        if (o.sliding_kv_cache != KvCacheStorage::Fp8E4M3Row256) {
+            throw std::invalid_argument("Gemma4 sliding KV supports only bf16 and fp8");
+        }
+        if (o.kv_cache != KvCacheStorage::Fp8E4M3Row256) {
+            throw std::invalid_argument("Gemma4 fp8 sliding KV requires --kv-dtype fp8");
+        }
+        if (c.head_dim != 256) {
+            throw std::invalid_argument("Gemma4 fp8 sliding KV requires D256 sliding layers");
+        }
+    }
     if (model.config().mtp ? o.draft_tokens == 0 || o.draft_tokens > kMaxDraftTokens : o.draft_tokens != 0) {
         throw std::invalid_argument(model.config().mtp
             ? "Gemma4 MTP drafts 1.." + std::to_string(kMaxDraftTokens) + " tokens per round"
@@ -157,11 +169,10 @@ ProgramDevicePlan Program::plan_device(const Model& model, const ProgramOptions&
     std::uint64_t global_page_bytes = 0;
     std::uint64_t sliding_page_bytes = 0;
     for (const auto& layer : geometry.layers) {
-        // Global layers follow the requested format (FP8 codes plus FP16 scales); rings stay BF16.
+        // Global layers follow the requested format (FP8 codes plus FP16 scales); rings follow the sliding format.
         const std::uint64_t bytes =
             require_implemented_storage(
-                kv_layer_layout(options.kv_cache, layer.global_layer, layer.head_dim, layer.kv_heads,
-                                options.global_kv_storage))
+                kv_layer_layout(options.kv_layout(), layer.global_layer, layer.head_dim, layer.kv_heads))
                 .page_bytes();
         (layer.global_layer ? global_page_bytes : sliding_page_bytes) += bytes;
         plan.workspace = std::max<std::uint64_t>(plan.workspace,
@@ -417,8 +428,8 @@ struct ProgramImpl {
         caches.reserve(layers);
         for (const auto& layer : p.layers) {
             const auto pages = layer.global_layer ? plan.kv_pages : ring_count;
-            const auto layout = kv_layer_layout(options.kv_cache, layer.global_layer, layer.head_dim, layer.kv_heads,
-                                                options.global_kv_storage);
+            const auto layout = kv_layer_layout(options.kv_layout(), layer.global_layer, layer.head_dim,
+                                                layer.kv_heads);
             const auto code_bytes = layout.code_page_bytes * pages;
             (layer.global_layer ? global_payload_bytes : sliding_payload_bytes) += layout.page_bytes() * pages;
             const std::initializer_list<std::int32_t> shape{
@@ -456,7 +467,7 @@ struct ProgramImpl {
                 .k_scales = scaled ? &key_scale_views[i] : nullptr,
                 .v_scales = scaled && stored ? &value_scale_views[i] : nullptr,
                 .block_table = global ? &global_table : &ring_table,
-                // Sliding descriptors retain BF16 QK.
+                // Sliding descriptors retain BF16 QK (on BF16 values expanded from an FP8 ring).
                 .qk_mode = global ? options.qk_mode : ops::Gemma4QkMode::BFloat16});
             if (!stored) {
                 auto& cache = caches.back();
@@ -764,15 +775,14 @@ struct ProgramImpl {
         for (const auto& layer : parameters.layers) {
             facts.push_back({layer.global_layer, layer.head_dim, layer.kv_heads});
         }
-        const auto geometry = prefix_cache_geometry(facts, c.sliding_window, options.kv_cache, options.global_kv_storage);
+        const auto geometry = prefix_cache_geometry(facts, c.sliding_window, options.kv_layout());
         const auto identity = prefix::make_layout_identity(facts, c.sliding_window, options.prefill_chunk,
-                                                           options.kv_cache, options.global_kv_storage,
-                                                           options.qk_mode);
+                                                           options.kv_layout(), options.qk_mode);
         std::vector<std::vector<prefix::DevicePlane>> global, sliding;
         for (std::size_t i = 0; i < parameters.layers.size(); ++i) {
             const auto& layer = parameters.layers[i];
-            const auto layout = kv_layer_layout(options.kv_cache, layer.global_layer, layer.head_dim, layer.kv_heads,
-                                                options.global_kv_storage);
+            const auto layout = kv_layer_layout(options.kv_layout(), layer.global_layer, layer.head_dim,
+                                                layer.kv_heads);
             // KvLayerLayout::planes() order: K codes, K scales (when scaled), then V codes and V
             // scales unless the layer is key-only.
             std::vector<prefix::DevicePlane> planes;
@@ -794,8 +804,8 @@ struct ProgramImpl {
         cache.cost.chunk_tokens = options.prefill_chunk;
         cache.cost.token_seconds = kCacheTokenSeconds;
         prefix_cache = std::make_unique<prefix::PrefixCache>(
-            cache, geometry, identity, prefix::plan_block_layout(facts, options.kv_cache, options.global_kv_storage),
-            prefix::plan_state_image(facts, c.sliding_window, options.kv_cache), std::move(global),
+            cache, geometry, identity, prefix::plan_block_layout(facts, options.kv_layout()),
+            prefix::plan_state_image(facts, c.sliding_window, options.kv_layout()), std::move(global),
             std::move(sliding), ring_pages_, options.host_bytes, stream);
     }
 
@@ -1946,10 +1956,10 @@ MemorySummary Program::memory_summary() const noexcept {
     result.weights.peak_used_bytes = result.weights.capacity_bytes;
     result.kv_capacity = p.plan.kv_pages * kPage; result.kv_capacity_page_groups = p.plan.kv_pages;
     result.kv_capacity_max_page_groups = pages_for(p.options.max_context);
-    // kv_cache is the global format; gemma4_kv states the BF16 sliding rings explicitly.
+    // kv_cache is the global format; gemma4_kv states the sliding rings' format (bf16 or fp8) explicitly.
     result.kv_cache = p.options.kv_cache;
     result.gemma4_kv = Gemma4KvMemorySummary{
-        .requested = p.options.kv_cache, .global = p.options.kv_cache, .sliding = KvCacheStorage::BFloat16,
+        .requested = p.options.kv_cache, .global = p.options.kv_cache, .sliding = p.options.sliding_kv_cache,
         .qk_mode = p.options.qk_mode, .global_key_only = p.options.global_kv_storage == KvStorageModel::KeyOnly,
         .global_payload_bytes = p.global_payload_bytes,
         .sliding_payload_bytes = p.sliding_payload_bytes};

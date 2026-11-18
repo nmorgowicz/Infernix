@@ -29,10 +29,11 @@ inline std::uint64_t mix(std::uint64_t x) {
     return x ^ (x >> 31);
 }
 
+// Any row width, including the FP8 ring's 2-byte scale rows.
 inline void fill_row(std::byte* row, std::size_t bytes, std::uint64_t seed) {
-    for (std::size_t i = 0; i + 8 <= bytes; i += 8) {
+    for (std::size_t i = 0; i < bytes; i += 8) {
         const std::uint64_t v = mix(seed + i);
-        std::memcpy(row + i, &v, 8);
+        std::memcpy(row + i, &v, std::min<std::size_t>(8, bytes - i));
     }
 }
 

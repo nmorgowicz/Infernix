@@ -44,6 +44,13 @@ inline constexpr std::size_t kDefaultMediaLiveBytes   = 2ULL << 30;
         : "BF16 QK including FP8-cache expansion; small SIMT and sliding D256 unchanged";
 }
 
+// --gemma4-sliding-kv: the Gemma4 sliding rings' format, bf16 (default) or the opt-in FP8 ring.
+[[nodiscard]] inline KvCacheStorage parse_gemma4_sliding_kv(std::string_view value) {
+    if (value == "bf16") { return KvCacheStorage::BFloat16; }
+    if (value == "fp8") { return KvCacheStorage::Fp8E4M3Row256; }
+    throw std::invalid_argument("--gemma4-sliding-kv must be bf16 or fp8");
+}
+
 inline void validate_gemma4_qk(ops::Gemma4QkMode mode, bool gemma4, KvCacheStorage storage) {
     if (mode != ops::Gemma4QkMode::BFloat16 && mode != ops::Gemma4QkMode::Fp8) {
         throw std::invalid_argument("invalid Gemma4 QK mode");
@@ -767,8 +774,11 @@ struct EngineOptions {
     // or refuses below 9216 tokens.
     // Engine::options() reports that resolved max_context; numeric contexts never shrink.
     bool max_context_auto = false;
-    // Gemma4 only, opt-in: global FP8 K planes alone; reconstruct V from K. Sliding KV stays BF16.
+    // Gemma4 only, opt-in: global FP8 K planes alone; reconstruct V from K. Sliding KV follows gemma4_sliding_kv.
     bool gemma4_key_only_kv = false;
+    // Gemma4 only (--gemma4-sliding-kv): the sliding rings' K/V format. BF16 (default), or the opt-in FP8 ring
+    // (FP8 E4M3 K and V, one FP16 scale per D256 row; needs --kv-dtype fp8). Other families refuse fp8.
+    KvCacheStorage gemma4_sliding_kv = KvCacheStorage::BFloat16;
     // Gemma4 only, opt-in (--allow-shared-memory): start even when weights plus runtime do not fit the free resident
     // VRAM; what does not fit is placed in shared GPU memory (system RAM over PCIe) and the Engine reports how much.
     // Off: a startup that would spill is refused. shared_memory_placement says which allocations get the resident

@@ -116,10 +116,12 @@ a comparison with a different prefix is refused before scoring that window. The 
 prefix, chunk, logits precision, KV and QK settings for both arms. Bare-prose measurements are not
 interchangeable with this protocol.
 
-On Gemma 4, `--gemma4-key-only-kv` opts into reconstructing global V from FP8 K. It is a separate lossy
-cache arm, recorded as `execution.gemma4_key_only_kv`; it does not improve weight precision. Compare it
-against ordinary FP8 on the **same artifact**, with the chat prefix retained. A top-token reference
-measures a lower bound on full KL, not the full-vocabulary KL of a `.nklref` reference.
+On Gemma 4, `--gemma4-key-only-kv` opts into reconstructing global V from FP8 K, and `--gemma4-sliding-kv fp8`
+into storing the sliding ring's K and V as FP8 with one scale per row. Each is a separate lossy cache arm,
+recorded as `execution.gemma4_key_only_kv` and `execution.gemma4_sliding_kv`; neither improves weight
+precision. Compare each against ordinary FP8 (BF16 ring) on the **same artifact**, with the chat prefix
+retained. A top-token reference measures a lower bound on full KL, not the full-vocabulary KL of a `.nklref`
+reference.
 
 `--score-window-tail N` bounds reference size by scoring only the last `min(N, original target count)`
 targets of each otherwise unchanged window (`0`, the default, retains all targets). It does **not**

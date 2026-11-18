@@ -23,8 +23,9 @@ inline void validate_gemma4_cache(const Gemma4CacheView& cache, int head_dim, bo
     }
     const bool fp8 = cache.format == Gemma4KvFormat::Fp8E4m3Row256;
     if (!fp8 && cache.format != Gemma4KvFormat::BFloat16) { fail("unknown cache format"); }
-    if (fp8 && (head_dim != 512 || !global)) {
-        fail("FP8 requires D512 global attention");
+    // FP8 serves D512 global attention and D256 sliding (windowed) attention, the opt-in FP8 ring.
+    if (fp8 && !(head_dim == 512 && global) && !(head_dim == 256 && !global)) {
+        fail("FP8 requires D512 global or D256 sliding attention");
     }
     if (cache.qk_mode != Gemma4QkMode::BFloat16 && cache.qk_mode != Gemma4QkMode::Fp8) {
         fail("unknown QK mode");
@@ -33,7 +34,7 @@ inline void validate_gemma4_cache(const Gemma4CacheView& cache, int head_dim, bo
         fail("FP8 QK requires D512 global FP8 cache");
     }
     if (derived) {
-        if (!fp8) { fail("key-derived values require a D512 global FP8 cache"); }
+        if (!fp8 || head_dim != 512 || !global) { fail("key-derived values require a D512 global FP8 cache"); }
         if (cache.v_pages || cache.v_scales) { fail("key-derived values take no V planes"); }
         if (cache.rotary_dim != kGemma4KeyValueRotaryDim || !std::isfinite(cache.rope_theta) ||
             !(cache.rope_theta > 0.0f) || !std::isfinite(cache.value_scale) || cache.value_scale == 0.0f) {
@@ -76,7 +77,7 @@ inline void validate_gemma4_cache(const Gemma4CacheView& cache, int head_dim, bo
             scales->ne[0] != head_dim / kGemma4KvFp8Group ||
             scales->ne[1] != kGemma4KvPageTokens || scales->ne[2] != k.ne[2] ||
             scales->ne[3] != k.ne[3]) {
-            fail("FP8 scales must be contiguous non-null FP16 [2,64,Hkv,pages]");
+            fail("FP8 scales must be contiguous non-null FP16 [D/256,64,Hkv,pages]");
         }
     }
 }

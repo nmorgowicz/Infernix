@@ -35,10 +35,11 @@ namespace infernix::ops {
  * containing nonnegative absolute query positions. window is nonnegative; scale is
  * positive and finite. Output storage must not alias positions or any cache plane.
  *
- * cache follows Gemma4CacheView's plane layout. FP8 is accepted only for D512/global
- * (window zero). With BF16 QK, each FP8 K/V code times its stored FP16 group scale
- * is multiplied in FP32 and rounded to BF16 before use. Gemma4QkMode::Fp8 requires
- * an FP8 cache; for T >= 64 it quantizes each query into two independent 256-element
+ * cache follows Gemma4CacheView's plane layout. FP8 is accepted for D512/global (window zero)
+ * and for D256 with a nonzero window (the opt-in FP8 sliding ring). With BF16 QK, each FP8 K/V
+ * code times its stored FP16 group scale is multiplied in FP32 and rounded to BF16 before use;
+ * every D256 FP8 read (decode and tensor-core prefill) uses that BF16 QK. Gemma4QkMode::Fp8 requires
+ * a D512 FP8 cache; for T >= 64 it quantizes each query into two independent 256-element
  * E4M3 groups using the cache codec's represented FP16 scales and bounded reciprocal.
  * A zero group uses the codec's zero-row rule; any nonfinite query element poisons
  * its entire group with canonical E4M3 NaNs and unit scale. Cached K codes/scales

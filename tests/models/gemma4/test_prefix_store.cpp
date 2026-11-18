@@ -10,13 +10,13 @@
 // the in-memory PrefixCache scenarios (capture -> publish -> restore, withdrawal, pins) are covered
 // by the real tests (test_prefix_scenarios_real.cpp, test_prefix_recovery_real.cpp) and the generic
 // index by tests/runtime/test_prefix_cache_index.cpp. What this file checks:
-//   * image/block layouts equal prefix_cache_geometry's bytes;
-//   * header round trip, foreign identity refused in both directions (and a value-only flag), every
-//     ignored header byte is padding;
+//   * image/block layouts equal prefix_cache_geometry's bytes, with BF16 and FP8 sliding rings;
+//   * header round trip, foreign identity refused in both directions (and a value-only flag, the
+//     key-only and the FP8-ring layouts), every ignored header byte is padding;
 //   * window_runs across a ring wrap and for a frontier below the window;
-//   * gather/scatter round trip over the ring emulation (frontiers around 1/63/64/65 and the wrap)
-//     against an oracle built from the documented layout, plus the committed window surviving the
-//     unaccepted writes a chunk can make;
+//   * gather/scatter round trip over the ring emulation (frontiers around 1/63/64/65 and the wrap,
+//     BF16 and FP8 rings) against an oracle built from the documented layout, plus the committed
+//     window surviving the unaccepted writes a chunk can make;
 //   * plan_copy_ops merging full consecutive pages while partial runs stay correct;
 //   * the Host floor refusal text, derive_tap_config and plan_call_ends.
 
@@ -50,10 +50,16 @@ using namespace prefix_test;
 
 constexpr std::uint32_t kWindow = 1024;          // W
 constexpr std::uint32_t kKept   = kWindow - 1;   // an image keeps W-1 tokens
-constexpr auto kFp8 = infernix::KvCacheStorage::Fp8E4M3Row256;
-constexpr auto kBf16 = infernix::KvCacheStorage::BFloat16;
-constexpr auto kKeyValue = infernix::models::gemma4::KvStorageModel::KeyEqualsValue;
-constexpr auto kKeyOnly = infernix::models::gemma4::KvStorageModel::KeyOnly;
+// Layout requests: FP8 K==V globals with BF16 rings (the stored default), BF16 globals, key-only
+// globals, and FP8 K==V globals with the FP8 ring.
+constexpr g4::KvCacheLayout kFp8{infernix::KvCacheStorage::Fp8E4M3Row256, g4::KvStorageModel::KeyEqualsValue,
+                                 infernix::KvCacheStorage::BFloat16};
+constexpr g4::KvCacheLayout kBf16{infernix::KvCacheStorage::BFloat16, g4::KvStorageModel::KeyEqualsValue,
+                                  infernix::KvCacheStorage::BFloat16};
+constexpr g4::KvCacheLayout kKeyOnly{infernix::KvCacheStorage::Fp8E4M3Row256, g4::KvStorageModel::KeyOnly,
+                                     infernix::KvCacheStorage::BFloat16};
+constexpr g4::KvCacheLayout kFp8Ring{infernix::KvCacheStorage::Fp8E4M3Row256, g4::KvStorageModel::KeyEqualsValue,
+                                     infernix::KvCacheStorage::Fp8E4M3Row256};
 constexpr std::uint32_t kEmulatedSliding = 2; // sliding layers in the ring emulation (groups > 1)
 
 struct Shape {
@@ -89,9 +95,9 @@ struct Descriptor {
 
 Descriptor describe(const Shape& s) {
     Descriptor d{s, layer_facts(s.global_layers, s.global_heads, s.sliding_layers, s.sliding_heads), {}, {}, {}};
-    d.geometry = g4::prefix_cache_geometry(d.full, kWindow, kFp8, kKeyValue);
+    d.geometry = g4::prefix_cache_geometry(d.full, kWindow, kFp8);
     d.want = expected_geometry(s.global_layers, s.global_heads, s.sliding_layers, s.sliding_heads, kWindow);
-    d.identity = g4p::make_layout_identity(d.full, kWindow, s.chunk, kFp8, kKeyValue, ops::Gemma4QkMode::BFloat16);
+    d.identity = g4p::make_layout_identity(d.full, kWindow, s.chunk, kFp8, ops::Gemma4QkMode::BFloat16);
     return d;
 }
 
@@ -122,8 +128,28 @@ void test_layouts(const Descriptor& d) {
     // The sliding rings stay BF16 whatever the global format.
     check(g4p::plan_state_image(d.full, kWindow, kBf16).image_bytes == image.image_bytes,
           label(s, "image bytes do not depend on the global format"));
+    // The FP8 ring's image: per group K codes, K row scales, V codes, V row scales, each its own
+    // 256-aligned part, and the geometry's bytes.
+    const g4p::StateImageLayout ring = g4p::plan_state_image(d.full, kWindow, kFp8Ring);
+    const g4::PrefixCacheGeometry ring_geometry = g4::prefix_cache_geometry(d.full, kWindow, kFp8Ring);
+    offset = g4p::kStateImageHeaderBytes;
+    bool ring_ok = ring.groups() == s.sliding_layers && ring.parts.size() == 4U * s.sliding_layers &&
+                   ring.image_bytes == ring_geometry.image_bytes && ring_geometry.block_bytes == d.geometry.block_bytes;
+    for (std::size_t i = 0; i < ring.parts.size(); ++i) {
+        const g4p::ImagePart& p = ring.parts[i];
+        const std::size_t ring_row = i % 2 == 0 ? 256U : 2U; // U8 codes, then one FP16 scale per row
+        ring_ok = ring_ok && p.group == i / 4 && p.plane == i % 4 && p.kv_heads == s.sliding_heads &&
+                  p.row_bytes == ring_row && p.page_bytes == kPage * s.sliding_heads * ring_row &&
+                  p.bytes == g4::align_bytes(static_cast<std::size_t>(kKept) * s.sliding_heads * ring_row, 256) &&
+                  p.offset == offset && ring.group_begin[i / 4] == (i / 4) * 4;
+        offset += p.bytes;
+    }
+    check(ring_ok && offset == ring.image_bytes && 2U * ring.image_bytes > image.image_bytes &&
+              100U * ring.image_bytes < 51U * image.image_bytes,
+          label(s, "FP8 ring image: codes and row scales of K then V per group, 50.4 % of the BF16 image"),
+          std::to_string(ring.image_bytes));
 
-    const g4p::BlockLayout block = g4p::plan_block_layout(d.full, kFp8, kKeyValue);
+    const g4p::BlockLayout block = g4p::plan_block_layout(d.full, kFp8);
     const std::size_t code = static_cast<std::size_t>(kPage) * s.global_heads * 512U;
     const std::size_t scale = static_cast<std::size_t>(kPage) * s.global_heads * (512U / 256U) * 2U;
     check(block.global_layers == s.global_layers && block.parts.size() == 4U * s.global_layers,
@@ -140,15 +166,15 @@ void test_layouts(const Descriptor& d) {
         at += p.bytes;
     }
     check(block_ok && at == block.record_bytes, label(s, "block parts: layer-major, K codes/scales then V"));
-    const g4p::BlockLayout bf16 = g4p::plan_block_layout(d.full, kBf16, kKeyValue);
-    const g4::PrefixCacheGeometry bf16_geometry = g4::prefix_cache_geometry(d.full, kWindow, kBf16, kKeyValue);
+    const g4p::BlockLayout bf16 = g4p::plan_block_layout(d.full, kBf16);
+    const g4::PrefixCacheGeometry bf16_geometry = g4::prefix_cache_geometry(d.full, kWindow, kBf16);
     check(bf16.parts.size() == 2U * s.global_layers &&
               bf16.record_bytes == bf16_geometry.global_bytes_per_token * kPage &&
               bf16.record_bytes == s.global_layers * 2U * code * 2U,
           label(s, "BF16 block record has two planes per global layer"));
     // The key-only record keeps each global layer's K codes and scales: half the K==V record.
-    const g4p::BlockLayout key_only = g4p::plan_block_layout(d.full, kFp8, kKeyOnly);
-    const g4::PrefixCacheGeometry key_only_geometry = g4::prefix_cache_geometry(d.full, kWindow, kFp8, kKeyOnly);
+    const g4p::BlockLayout key_only = g4p::plan_block_layout(d.full, kKeyOnly);
+    const g4::PrefixCacheGeometry key_only_geometry = g4::prefix_cache_geometry(d.full, kWindow, kKeyOnly);
     bool key_only_ok = key_only.parts.size() == 2U * s.global_layers && 2U * key_only.record_bytes == block.record_bytes &&
                        key_only.record_bytes == key_only_geometry.global_bytes_per_token * kPage &&
                        key_only_geometry.image_bytes == d.geometry.image_bytes;
@@ -172,16 +198,19 @@ void test_layouts(const Descriptor& d) {
               id.scale_group_columns == 256 && id.scale_element_bytes == 2 &&
               id.storage == g4::KvStorageModel::KeyEqualsValue,
           label(s, "make_layout_identity carries the geometry"), id.describe());
-    check(g4p::make_layout_identity(d.full, kWindow, s.chunk, kFp8, kKeyValue, ops::Gemma4QkMode::Fp8).fingerprint() !=
+    check(g4p::make_layout_identity(d.full, kWindow, s.chunk, kFp8, ops::Gemma4QkMode::Fp8).fingerprint() !=
               id.fingerprint(),
           label(s, "QK mode is part of the identity"));
-    check(g4p::make_layout_identity(d.full, kWindow, s.chunk, kFp8, kKeyOnly, ops::Gemma4QkMode::BFloat16)
+    check(g4p::make_layout_identity(d.full, kWindow, s.chunk, kKeyOnly, ops::Gemma4QkMode::BFloat16)
                   .fingerprint() != id.fingerprint(),
           label(s, "the storage model is part of the identity"));
+    check(g4p::make_layout_identity(d.full, kWindow, s.chunk, kFp8Ring, ops::Gemma4QkMode::BFloat16)
+                  .fingerprint() != id.fingerprint(),
+          label(s, "the sliding ring format is part of the identity"));
     auto ragged = d.full;
     ragged.push_back({true, 512, static_cast<int>(s.global_heads) + 1});
     check(throws<std::invalid_argument>([&] {
-              (void)g4p::make_layout_identity(ragged, kWindow, s.chunk, kFp8, kKeyValue, ops::Gemma4QkMode::BFloat16);
+              (void)g4p::make_layout_identity(ragged, kWindow, s.chunk, kFp8, ops::Gemma4QkMode::BFloat16);
           }),
           label(s, "global layers of unequal heads have no single identity"));
 }
@@ -228,17 +257,24 @@ void test_headers(const Descriptor& a, const Descriptor& b) {
           label(a.shape, "value-only flag is refused against K==V in both directions"));
     check(g4p::read_state_image_header(value_only, header_bytes(value_only, h).data()).ok(),
           label(a.shape, "a value-only identity round-trips its own header"));
-    // Key-only images never restore into K==V or value-only caches, nor the reverse.
-    const g4p::LayoutIdentity key_only = g4p::make_layout_identity(a.full, kWindow, a.shape.chunk, kFp8, kKeyOnly,
+    // Key-only and FP8-ring images never restore into K==V BF16-ring or value-only caches (nor into
+    // each other), nor the reverse.
+    const g4p::LayoutIdentity key_only = g4p::make_layout_identity(a.full, kWindow, a.shape.chunk, kKeyOnly,
                                                                    ops::Gemma4QkMode::BFloat16);
-    bool key_only_refused = true;
-    for (const g4p::LayoutIdentity* other : {&a.identity, static_cast<const g4p::LayoutIdentity*>(&value_only)}) {
-        key_only_refused = key_only_refused &&
-            g4p::read_state_image_header(key_only, header_bytes(*other, h).data()).status == g4p::HeaderStatus::Identity &&
-            g4p::read_state_image_header(*other, header_bytes(key_only, h).data()).status == g4p::HeaderStatus::Identity;
+    const g4p::LayoutIdentity fp8_ring = g4p::make_layout_identity(a.full, kWindow, a.shape.chunk, kFp8Ring,
+                                                                   ops::Gemma4QkMode::BFloat16);
+    for (const auto& [layout, name] : {std::pair{&key_only, "key-only"}, std::pair{&fp8_ring, "FP8-ring"}}) {
+        bool refused = true;
+        for (const g4p::LayoutIdentity* other : {&a.identity, static_cast<const g4p::LayoutIdentity*>(&value_only),
+                                                 &key_only, &fp8_ring}) {
+            if (other == layout) { continue; }
+            refused = refused &&
+                g4p::read_state_image_header(*layout, header_bytes(*other, h).data()).status == g4p::HeaderStatus::Identity &&
+                g4p::read_state_image_header(*other, header_bytes(*layout, h).data()).status == g4p::HeaderStatus::Identity;
+        }
+        check(refused && g4p::read_state_image_header(*layout, header_bytes(*layout, h).data()).ok(),
+              label(a.shape, (std::string("a ") + name + " identity refuses the other layouts' headers and round-trips its own").c_str()));
     }
-    check(key_only_refused && g4p::read_state_image_header(key_only, header_bytes(key_only, h).data()).ok(),
-          label(a.shape, "a key-only identity refuses K==V and value-only headers and round-trips its own"));
     // Every other identity field refuses; a packing version refuses by its own status.
     const std::pair<const char*, std::function<void(g4p::LayoutIdentity&)>> mutations[] = {
         {"qk_mode", [](g4p::LayoutIdentity& i) { i.qk_mode = ops::Gemma4QkMode::Fp8; }},
@@ -341,11 +377,11 @@ void test_window_runs() {
           "image_window_start is max(0, F-(W-1))");
 }
 
-void test_ring_transfers(const Shape& s) {
+void test_ring_transfers(const Shape& s, const g4::KvCacheLayout& request, const char* what) {
     const auto facts = layer_facts(s.global_layers, s.global_heads, kEmulatedSliding, s.sliding_heads);
-    const g4p::StateImageLayout layout = g4p::plan_state_image(facts, kWindow, kFp8);
-    const g4::PrefixCacheGeometry geometry = g4::prefix_cache_geometry(facts, kWindow, kFp8, kKeyValue);
-    const g4p::LayoutIdentity id = g4p::make_layout_identity(facts, kWindow, s.chunk, kFp8, kKeyValue,
+    const g4p::StateImageLayout layout = g4p::plan_state_image(facts, kWindow, request);
+    const g4::PrefixCacheGeometry geometry = g4::prefix_cache_geometry(facts, kWindow, request);
+    const g4p::LayoutIdentity id = g4p::make_layout_identity(facts, kWindow, s.chunk, request,
                                                              ops::Gemma4QkMode::BFloat16);
     const std::uint32_t ring_pages = ring_pages_for(s.chunk), capacity = ring_pages * kPage;
     Slabs slabs(geometry.slab_bytes, geometry.image_slabs);
@@ -355,7 +391,7 @@ void test_ring_transfers(const Shape& s) {
                                             capacity, capacity + 1, capacity + 63, capacity + 64, capacity + 65,
                                             2 * capacity + 1};
     for (const std::uint32_t frontier : frontiers) {
-        const std::string at = label(s, ("ring round trip at F=" + std::to_string(frontier)).c_str());
+        const std::string at = label(s, (std::string(what) + " ring round trip at F=" + std::to_string(frontier)).c_str());
         const g4p::StateImageHeader header = header_for(frontier, frontier % 2 == 0, false);
         live.reset();
         for (std::uint32_t p = frontier > capacity ? frontier - capacity : 0; p < frontier; ++p) { live.write(layout, p, 0); }
@@ -387,10 +423,12 @@ void test_ring_transfers(const Shape& s) {
         const Bytes before = gather();
         const std::uint32_t safe = capacity - kKept; // positions F .. F+safe-1 overwrite only < start
         for (std::uint32_t p = frontier; p < frontier + safe; ++p) { live.write(layout, p, 1); }
-        check(gather() == before, label(s, "unaccepted writes up to the ring slack leave the committed window"),
+        check(gather() == before, label(s, (std::string(what) + ": unaccepted writes up to the ring slack leave the "
+                                            "committed window").c_str()),
               std::to_string(frontier));
         live.write(layout, frontier + safe, 1);
-        check(gather() != before, label(s, "one write past the slack reaches the window start (control)"),
+        check(gather() != before, label(s, (std::string(what) + ": one write past the slack reaches the window start "
+                                            "(control)").c_str()),
               std::to_string(frontier));
     }
 }
@@ -554,10 +592,9 @@ void test_plan_copy_ops() {
 }
 
 // A block's DtoH/HtoD (PrefixCache::append_block_pieces): plane-major, block-minor over consecutive pages.
-void test_block_copies(const Descriptor& d, infernix::KvCacheStorage format, g4::KvStorageModel storage,
-                       const char* what) {
+void test_block_copies(const Descriptor& d, const g4::KvCacheLayout& request, const char* what) {
     const Shape& s = d.shape;
-    const g4p::BlockLayout layout = g4p::plan_block_layout(d.full, format, storage);
+    const g4p::BlockLayout layout = g4p::plan_block_layout(d.full, request);
     constexpr std::uint32_t pages = 5, first_page = 3; // pages 3..7 of the sequence, written to records 0..4
     std::size_t slab_bytes = g4::align_bytes(layout.record_bytes, 4096);
     std::vector<Bytes> device(layout.parts.size());
@@ -733,11 +770,12 @@ int main() {
     for (const Descriptor* d : {&big, &small}) {
         test_layouts(*d);
         test_host_floor(*d);
-        test_ring_transfers(d->shape);
+        test_ring_transfers(d->shape, kFp8, "BF16");
         test_ring_copy_shape(d->shape);
-        test_block_copies(*d, kFp8, kKeyValue, "FP8");
-        test_block_copies(*d, kFp8, kKeyOnly, "FP8 key-only");
-        test_block_copies(*d, kBf16, kKeyValue, "BF16");
+        test_ring_transfers(d->shape, kFp8Ring, "FP8");
+        test_block_copies(*d, kFp8, "FP8");
+        test_block_copies(*d, kKeyOnly, "FP8 key-only");
+        test_block_copies(*d, kBf16, "BF16");
     }
     test_headers(big, small);
     test_headers(small, big);

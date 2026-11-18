@@ -196,7 +196,8 @@ struct ContextProgress {
 };
 struct ProgramDevicePlan {
     std::uint32_t kv_pages = 0;
-    // KV includes global pools (BF16, or FP8 codes plus FP16 scales) and BF16 sliding rings, plus both page tables.
+    // KV includes global pools (BF16, or FP8 codes plus FP16 scales), the sliding rings (BF16, or FP8 codes plus
+    // FP16 row scales) and both page tables.
     std::uint64_t kv = 0, kv_max = 0, workspace = 0, state = 0, io = 0;
     std::uint64_t prepared_row_scales = 0, graph_allowance = 0;
     std::uint32_t graph_bound = 0;
@@ -216,7 +217,11 @@ struct ProgramOptions {
     // V = unrope(K) / c in attention; the Program refuses it unless every global layer's key-norm
     // weight is one finite nonzero constant c (checked on the loaded weights).
     KvStorageModel global_kv_storage = KvStorageModel::KeyEqualsValue;
+    // The sliding rings' format: BF16 (default) or, opt-in, FP8 E4M3 K and V with one FP16 scale per D256 row
+    // (requires FP8 global KV). Its own cache identity; combinable with KeyOnly and FP8 QK (global-only).
+    KvCacheStorage sliding_kv_cache = KvCacheStorage::BFloat16;
     ops::Gemma4QkMode qk_mode = ops::Gemma4QkMode::BFloat16;
+    [[nodiscard]] KvCacheLayout kv_layout() const noexcept { return {kv_cache, global_kv_storage, sliding_kv_cache}; }
     bool causal_scoring = false;
     // MTP drafts per round (1..kMaxDraftTokens) with the assistant loaded; 0 decodes plainly.
     std::uint32_t draft_tokens = 0;

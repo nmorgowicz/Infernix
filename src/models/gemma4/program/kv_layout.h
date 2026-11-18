@@ -14,8 +14,8 @@
 
 namespace infernix::models::gemma4 {
 
-// Gemma stores global-layer K/V as BF16 or FP8 E4M3 with one FP16 scale per 256 columns. Every
-// other KvCacheStorage is refused here, not mapped.
+// Gemma stores K/V as BF16 or FP8 E4M3 with one FP16 scale per 256 columns. Every other
+// KvCacheStorage is refused here, not mapped.
 [[nodiscard]] inline ops::Gemma4KvFormat gemma4_kv_format(KvCacheStorage requested) {
     switch (requested) {
     case KvCacheStorage::BFloat16: return ops::Gemma4KvFormat::BFloat16;
@@ -30,6 +30,15 @@ namespace infernix::models::gemma4 {
 // descriptor and the identity but not implemented. Each model is its own identity, never a smaller
 // alias of a K==V cache.
 enum class KvStorageModel : std::uint8_t { KeyEqualsValue, ValueOnly, KeyOnly };
+
+// The requested Gemma KV storage, two orthogonal axes: the global layers' format and storage model,
+// and the sliding rings' format (BF16 by default; FP8 E4M3 with one FP16 scale per D256 row is the
+// opt-in FP8 ring). Sliding layers always keep K and V.
+struct KvCacheLayout {
+    KvCacheStorage global = KvCacheStorage::BFloat16;
+    KvStorageModel global_storage = KvStorageModel::KeyEqualsValue;
+    KvCacheStorage sliding = KvCacheStorage::BFloat16;
+};
 
 // One plane of a page bundle: its element type and per-page byte size.
 struct KvPlane {
@@ -83,25 +92,24 @@ struct KvLayerLayout {
     return layout;
 }
 
-// Sliding layers always retain BF16 K==V storage, independently of the requested global format
-// and storage model. KeyOnly applies to global FP8 layers only.
-[[nodiscard]] inline KvLayerLayout kv_layer_layout(KvCacheStorage requested, bool global,
-                                                    int head_dim, int kv_heads,
-                                                    KvStorageModel global_storage) {
-    const auto requested_format = gemma4_kv_format(requested);
+// Global layers follow the requested global format and storage model; KeyOnly applies to global
+// FP8 layers only. Sliding layers follow the requested sliding format and always keep K==V.
+[[nodiscard]] inline KvLayerLayout kv_layer_layout(const KvCacheLayout& requested, bool global,
+                                                    int head_dim, int kv_heads) {
     if (head_dim <= 0 || kv_heads <= 0) {
         throw std::invalid_argument("Gemma4 KV cache geometry is invalid");
     }
     KvLayerLayout layout;
-    layout.format = global ? requested_format : ops::Gemma4KvFormat::BFloat16;
-    layout.storage = global ? global_storage : KvStorageModel::KeyEqualsValue;
+    layout.format = gemma4_kv_format(global ? requested.global : requested.sliding);
+    layout.storage = global ? requested.global_storage : KvStorageModel::KeyEqualsValue;
     if (layout.storage == KvStorageModel::KeyOnly && layout.format != ops::Gemma4KvFormat::Fp8E4m3Row256) {
         throw std::invalid_argument("Gemma4 key-only global KV requires --kv-dtype fp8");
     }
     const auto rows = static_cast<std::size_t>(ops::kGemma4KvPageTokens) * kv_heads;
     if (layout.format == ops::Gemma4KvFormat::Fp8E4m3Row256) {
-        if (head_dim != 512) {
-            throw std::invalid_argument("Gemma4 fp8 global KV requires head dimension 512");
+        if (head_dim != (global ? 512 : 256)) {
+            throw std::invalid_argument(global ? "Gemma4 fp8 global KV requires head dimension 512"
+                                               : "Gemma4 fp8 sliding KV requires head dimension 256");
         }
         layout.code_dtype = DType::U8;
         layout.scale_groups = head_dim / ops::kGemma4KvFp8Group;
@@ -142,8 +150,7 @@ struct PrefixCacheGeometry {
 
 [[nodiscard]] inline PrefixCacheGeometry prefix_cache_geometry(std::span<const KvLayerFact> layers,
                                                                std::uint32_t window,
-                                                               KvCacheStorage global_format,
-                                                               KvStorageModel global_storage) {
+                                                               const KvCacheLayout& requested) {
     constexpr std::size_t kHeaderBytes = 256;
     constexpr std::size_t kPartAlignment = 256;
     constexpr std::size_t kSlabAlignment = 4096;
@@ -152,9 +159,8 @@ struct PrefixCacheGeometry {
     const std::size_t window_tokens = window > 0 ? static_cast<std::size_t>(window - 1U) : 0U;
     out.image_bytes = kHeaderBytes;
     for (const auto& layer : layers) {
-        const auto layout = require_implemented_storage(kv_layer_layout(
-            layer.global ? global_format : KvCacheStorage::BFloat16, layer.global,
-            layer.head_dim, layer.kv_heads, global_storage));
+        const auto layout = require_implemented_storage(
+            kv_layer_layout(requested, layer.global, layer.head_dim, layer.kv_heads));
         const auto per_token = layout.page_bytes() / page_tokens;
         if (layer.global) {
             out.global_bytes_per_token += per_token;
@@ -165,7 +171,7 @@ struct PrefixCacheGeometry {
         const auto code_share  = layout.code_page_bytes / page_tokens;
         const auto scale_share = layout.scale_page_bytes / page_tokens;
         // Sliding layers always keep K==V, so every sliding layer contributes a K part then a V
-        // part, each its own 256-aligned codes (+ scales) run.
+        // part, each its own 256-aligned codes (+ scales, with the FP8 ring) run.
         for (int side = 0; side < 2; ++side) {
             out.image_bytes += align_bytes(window_tokens * code_share, kPartAlignment);
             if (layout.scale_page_bytes != 0) {

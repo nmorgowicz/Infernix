@@ -56,8 +56,8 @@ void execution_kv(const g4::execution::Parameters& p, DeviceContext& device, std
     caches.reserve(count);
     std::size_t workspace_bytes = g4::gemma4_logits_workspace_bytes(p.output_head, 1);
     for (const auto& layer : p.layers) {
-        const auto layout = g4::kv_layer_layout(kv, layer.global_layer, layer.head_dim, layer.kv_heads,
-                                                g4::KvStorageModel::KeyEqualsValue);
+        const auto layout = g4::kv_layer_layout({kv, g4::KvStorageModel::KeyEqualsValue, KvCacheStorage::BFloat16},
+                                                layer.global_layer, layer.head_dim, layer.kv_heads);
         keys.emplace_back(layout.code_page_bytes * pages); values.emplace_back(layout.code_page_bytes * pages);
         key_views.emplace_back(keys.back().p, layout.code_dtype, std::initializer_list<std::int32_t>{
             layer.head_dim, 64, layer.kv_heads, pages});

@@ -191,8 +191,13 @@ void gemma4_qkv_prep_launch(const Tensor& qkv, const Tensor& q_norm, const Tenso
                             cudaStream_t stream) {
     const int head_dim = q_out.ne[0];
     if (head_dim == 256 && rotary_dim == 256) {
-        launch<256, 2, Gemma4KvFormat::BFloat16>(qkv, q_norm, k_norm, positions, rotary_dim, theta,
-                                                 eps, v_from_k, q_out, cache, stream);
+        if (cache.format == Gemma4KvFormat::Fp8E4m3Row256) {
+            launch<256, 2, Gemma4KvFormat::Fp8E4m3Row256>(qkv, q_norm, k_norm, positions, rotary_dim,
+                                                          theta, eps, v_from_k, q_out, cache, stream);
+        } else {
+            launch<256, 2, Gemma4KvFormat::BFloat16>(qkv, q_norm, k_norm, positions, rotary_dim,
+                                                     theta, eps, v_from_k, q_out, cache, stream);
+        }
     } else if (head_dim == 512 && rotary_dim == 128) {
         if (cache.format == Gemma4KvFormat::Fp8E4m3Row256) {
             launch<512, 1, Gemma4KvFormat::Fp8E4m3Row256>(qkv, q_norm, k_norm, positions,

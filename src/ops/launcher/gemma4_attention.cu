@@ -42,12 +42,14 @@ __device__ __forceinline__ void load_row(const __nv_bfloat16* row, float (&out)[
     }
 }
 
-template <int E, Gemma4KvFormat Fmt>
+// One lane's E contiguous elements of a D-wide cache row starting at element `base`. FP8 rows carry
+// one FP16 scale per 256-column group (D / 256 per row).
+template <int D, int E, Gemma4KvFormat Fmt>
 __device__ __forceinline__ void load_cache(const void* pages, const __half* scales,
                                           std::int64_t base, float (&out)[E]) {
     if constexpr (Fmt == Gemma4KvFormat::Fp8E4m3Row256) {
         const auto* codes = static_cast<const std::uint8_t*>(pages) + base;
-        const __half scale = scales[(base / 512) * 2 + (base % 512) / kGemma4KvFp8Group];
+        const __half scale = scales[(base / D) * (D / kGemma4KvFp8Group) + (base % D) / kGemma4KvFp8Group];
 #pragma unroll
         for (int chunk = 0; chunk < E / 8; ++chunk) {
             const uint2 packed = reinterpret_cast<const uint2*>(codes)[chunk];
@@ -127,7 +129,7 @@ __global__ void gemma4_attention_kernel(
                 (static_cast<std::int64_t>(kvh) + static_cast<std::int64_t>(kv_heads) * physical) +
             static_cast<std::int64_t>(D) * (key & kPagedKVPageMask) + lane * E;
         float kv[E];
-        load_cache<E, Fmt>(k_pages, k_scales, base, kv);
+        load_cache<D, E, Fmt>(k_pages, k_scales, base, kv);
         float dot = 0.0f;
 #pragma unroll
         for (int dim = 0; dim < E; ++dim) { dot = fmaf(qv[dim], kv[dim], dot); }
@@ -137,7 +139,7 @@ __global__ void gemma4_attention_kernel(
         const float weight   = expf(score - next_max);
         running_sum          = running_sum * rescale + weight;
         running_max          = next_max;
-        load_cache<E, Fmt>(v_pages, v_scales, base, kv);
+        load_cache<D, E, Fmt>(v_pages, v_scales, base, kv);
 #pragma unroll
         for (int dim = 0; dim < E; ++dim) { acc[dim] = fmaf(acc[dim], rescale, weight * kv[dim]); }
     }
@@ -305,8 +307,13 @@ void gemma4_attention_launch(const Tensor& q, const Gemma4CacheView& cache,
             "gemma4_attention: key-derived values need the D=512 decode (group <= 8) or tensor-core kernel");
     }
     if (q.ne[0] == 256) {
-        launch<256, Gemma4KvFormat::BFloat16>(q, cache, positions, window, scale, out, partial,
-                                              stats, stream);
+        if (cache.format == Gemma4KvFormat::Fp8E4m3Row256) {
+            launch<256, Gemma4KvFormat::Fp8E4m3Row256>(q, cache, positions, window, scale, out,
+                                                       partial, stats, stream);
+        } else {
+            launch<256, Gemma4KvFormat::BFloat16>(q, cache, positions, window, scale, out, partial,
+                                                  stats, stream);
+        }
     } else if (cache.format == Gemma4KvFormat::Fp8E4m3Row256) {
         launch<512, Gemma4KvFormat::Fp8E4m3Row256>(q, cache, positions, window, scale, out,
                                                    partial, stats, stream);

@@ -109,6 +109,7 @@ constexpr std::array kCliOptions{
     CliOption{"--kv-dtype"},
     CliOption{"--gemma4-qk"},
     CliOption{"--gemma4-key-only-kv", false},
+    CliOption{"--gemma4-sliding-kv"},
     CliOption{"--allow-shared-memory", false},
     CliOption{"--shared-memory-placement"},
     CliOption{"--logits-dtype"},
@@ -295,6 +296,9 @@ std::string usage_text(const char* argv0) {
            "                           and is refused for other model families\n"
            "  --gemma4-key-only-kv     Gemma4 only: store global FP8 K alone, reconstruct V\n"
            "                           (approximate, default off; needs --kv-dtype fp8)\n"
+           "  --gemma4-sliding-kv M    bf16 (default) | fp8: Gemma4 sliding-window ring K/V format; fp8\n"
+           "                           stores FP8 K and V with one scale per row (about half the\n"
+           "                           ring; approximate; needs --kv-dtype fp8)\n"
            "  --allow-shared-memory    Gemma4 only: start even when weights plus runtime do not fit the\n"
            "                           free VRAM; the shortfall lives in shared GPU memory (much slower)\n"
            "  --shared-memory-placement P  runtime (default) | blind: which allocations stay resident\n"
@@ -568,6 +572,8 @@ Options parse_options(int argc, char** argv) {
             options.gemma4_qk = parse_gemma4_qk(value(arg));
         } else if (arg == "--gemma4-key-only-kv") {
             options.gemma4_key_only_kv = true;
+        } else if (arg == "--gemma4-sliding-kv") {
+            options.gemma4_sliding_kv = parse_gemma4_sliding_kv(value(arg));
         } else if (arg == "--allow-shared-memory") {
             options.allow_shared_memory = true;
         } else if (arg == "--shared-memory-placement") {

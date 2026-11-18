@@ -7,8 +7,8 @@
 
 namespace infernix::ops::detail {
 
-// Scalar row addresses are shared by SIMT, MMA staging and fused stores. Code rows
-// have 512 columns; scale rows have 512 / 256 columns, with identical page order.
+// Scalar row addresses are shared by SIMT, MMA staging and fused stores. Code rows have D
+// columns (512 global, 256 sliding); scale rows have D / 256 columns, with identical page order.
 __host__ __device__ inline std::int64_t gemma4_kv_row(int physical, int heads, int head, int slot) {
     return (static_cast<std::int64_t>(physical) * heads + head) * kGemma4KvPageTokens + slot;
 }
@@ -45,14 +45,18 @@ __device__ __forceinline__ void gemma4_unrope_pair(float rotated_a, float rotate
     b = fmaf(rotated_b, c, -rotated_a * s);
 }
 
-// One warp owns BF16 pairs lane + 32*s. Each D512 half spans four slots.
-// Nonfinite policy is explicit: any NaN or infinity poisons its complete row-half
+// One warp owns BF16 pairs lane + 32*s of a D = 64 * Pairs row (Pairs 8: D512 global, 4: D256
+// sliding). Each 256-column group spans four slots and gets its own FP16 scale.
+// Nonfinite policy is explicit: any NaN or infinity poisons its complete 256-column group
 // with canonical E4M3 NaNs and unit scale; never silently turn it into a zero row.
-__device__ __forceinline__ void gemma4_fp8_store(const __nv_bfloat162 (&values)[8],
+template <int Pairs>
+__device__ __forceinline__ void gemma4_fp8_store(const __nv_bfloat162 (&values)[Pairs],
                                                 std::uint8_t* codes, __half* scales,
                                                 std::int64_t row, int lane) {
+    static_assert(Pairs == 4 || Pairs == 8, "Gemma4 FP8 rows are D256 or D512");
+    constexpr int Groups = Pairs / 4;
 #pragma unroll
-    for (int group = 0; group < 2; ++group) {
+    for (int group = 0; group < Groups; ++group) {
         float amax = 0.0f;
         bool nonfinite = false;
 #pragma unroll
@@ -67,13 +71,13 @@ __device__ __forceinline__ void gemma4_fp8_store(const __nv_bfloat162 (&values)[
             amax = fmaxf(amax, __shfl_xor_sync(0xffffffffU, amax, offset));
         }
         const auto params = kv_cache_fp8_quant_params(amax);
-        if (lane == 0) { scales[row * 2 + group] = poison ? __float2half_rn(1.0f) : params.scale; }
+        if (lane == 0) { scales[row * Groups + group] = poison ? __float2half_rn(1.0f) : params.scale; }
 #pragma unroll
         for (int s = 0; s < 4; ++s) {
             const float2 x = __bfloat1622float2(values[group * 4 + s]);
             const auto packed = poison ? std::uint16_t{0x7f7f} :
                 kv_cache_fp8_quant_code2(x.x, x.y, params.inverse_scale);
-            reinterpret_cast<std::uint16_t*>(codes + row * 512)[lane + 32 * (group * 4 + s)] = packed;
+            reinterpret_cast<std::uint16_t*>(codes + row * (Pairs * 64))[lane + 32 * (group * 4 + s)] = packed;
         }
     }
 }

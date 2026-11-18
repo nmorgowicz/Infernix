@@ -451,6 +451,16 @@ int main() {
     failures += check(parse({"infernix-serve", "model.ninfer", "--gemma4-qk", "fp8"}).gemma4_qk ==
                           infernix::ops::Gemma4QkMode::Fp8,
                       "--gemma4-qk fp8 was not parsed");
+    failures += check(parse({"infernix-serve", "model.ninfer"}).gemma4_sliding_kv == infernix::KvCacheStorage::BFloat16,
+                      "--gemma4-sliding-kv must default to bf16");
+    failures += check(parse({"infernix-serve", "model.ninfer", "--gemma4-sliding-kv", "fp8"}).gemma4_sliding_kv ==
+                          infernix::KvCacheStorage::Fp8E4M3Row256,
+                      "--gemma4-sliding-kv fp8 was not parsed");
+    bool sliding_int8_rejected = false;
+    try {
+        (void)parse({"infernix-serve", "model.ninfer", "--gemma4-sliding-kv", "int8"});
+    } catch (const std::invalid_argument&) { sliding_int8_rejected = true; }
+    failures += check(sliding_int8_rejected, "--gemma4-sliding-kv int8 was accepted");
     const std::string kv_help = serve_usage_text("infernix-serve");
     failures += check(kv_help.find("nvfp4") != std::string::npos &&
                           kv_help.find("k8v4") != std::string::npos &&

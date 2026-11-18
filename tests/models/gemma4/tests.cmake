@@ -49,6 +49,17 @@ infernix_add_test(infernix_gemma4_key_only_real_test
 set_tests_properties(infernix_gemma4_key_only_real_test
   PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
+# The opt-in FP8 sliding ring on an explicit MTP artifact: refusal with BF16 globals, the first sliding
+# layer's FP8 rows equal to the row codec of the BF16 ring's, FP8-ring accounting, deterministic
+# generation, root replay and Host snapshot restore equal to the cold FP8-ring run (stored and key-only
+# globals, MTP off/on). METRIC lines report scale-granularity error, logits, token and causal-score
+# differences against the BF16 ring.
+infernix_add_test(infernix_gemma4_fp8_ring_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fp8_ring_real.cpp"
+  LIBRARIES infernix_engine infernix_model_runtime)
+set_tests_properties(infernix_gemma4_fp8_ring_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+
 # Tool-call body grammar (`call:NAME{k:v}`, `<|"|>` strings); CPU only, no model.
 infernix_add_test(infernix_gemma4_tool_parser_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_tool_parser.cpp"

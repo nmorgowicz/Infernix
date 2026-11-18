@@ -3,8 +3,8 @@
 // The prefix cache's cache/restore identity (P7 scope contract 2): everything that makes a
 // cached state alias-free. It is computed from config + kv_layout.h only, lives in the state
 // image's header, and is validated before any restore — a mismatch refuses instead of aliasing,
-// so a different geometry (26B-A4B), KV dtype, storage model or QK mode can never reuse another
-// layout's blocks or snapshots. Pure header, CPU-only; no device or model types.
+// so a different geometry (26B-A4B), KV dtype, storage model, sliding ring format or QK mode can
+// never reuse another layout's blocks or snapshots. Pure header, CPU-only; no device or model types.
 
 #include "core/dtype.h"
 #include "infernix/kv_format.h"
@@ -19,19 +19,21 @@
 
 namespace infernix::models::gemma4::prefix {
 
-// Bumped whenever the on-device/host packing of blocks or images changes shape or order; the
-// identity refuses across versions.
-inline constexpr std::uint32_t kLayoutPackingVersion = 1;
+// Bumped whenever the on-device/host packing of blocks or images (or the image header) changes
+// shape or order; the identity refuses across versions. 2: the header carries the sliding format.
+inline constexpr std::uint32_t kLayoutPackingVersion = 2;
 
 struct LayoutIdentity {
-    // KV dtype/format and the scale-group shape (a row-256 FP8 group, one FP16 scale each; zero
-    // groups for BF16).
+    // Global KV dtype/format and the scale-group shape (a row-256 FP8 group, one FP16 scale each;
+    // zero groups for BF16).
     ops::Gemma4KvFormat kv_format = ops::Gemma4KvFormat::BFloat16;
     DType code_dtype = DType::BF16;
     std::uint32_t scale_group_columns = 0;                        // grp (kGemma4KvFp8Group when scaled)
     std::uint32_t scale_element_bytes = 0;                        // scale width (2 for FP16)
     // Storage model: K==V, the opt-in key-only global layout, or the unimplemented value-only one.
     KvStorageModel storage = KvStorageModel::KeyEqualsValue;
+    // The sliding rings' format: BF16, or the opt-in FP8 ring (one FP16 scale per D256 row).
+    ops::Gemma4KvFormat sliding_format = ops::Gemma4KvFormat::BFloat16;
     // QK mode of the global layers (sliding layers always retain BF16 QK).
     ops::Gemma4QkMode qk_mode = ops::Gemma4QkMode::BFloat16;
     // Global layers: count, KV heads, head dimension. Sliding layers: count, KV heads, head dim.
@@ -73,6 +75,7 @@ struct LayoutIdentity {
         absorb(scale_group_columns);
         absorb(scale_element_bytes);
         absorb(static_cast<std::uint64_t>(storage));
+        absorb(static_cast<std::uint64_t>(sliding_format));
         absorb(static_cast<std::uint64_t>(qk_mode));
         absorb(static_cast<std::uint64_t>(global_layers) |
                (static_cast<std::uint64_t>(global_kv_heads) << 32));
@@ -96,6 +99,7 @@ struct LayoutIdentity {
                (storage == KvStorageModel::KeyEqualsValue ? ""
                 : storage == KvStorageModel::KeyOnly      ? "/key-only"
                                                           : "/value-only") +
+               (sliding_format == ops::Gemma4KvFormat::Fp8E4m3Row256 ? "/sliding-fp8" : "") +
                "/qk=" + std::to_string(static_cast<int>(qk_mode)) +
                "/global=" + std::to_string(global_layers) + "x" + std::to_string(global_kv_heads) +
                "x" + std::to_string(global_head_dim) +
@@ -108,15 +112,14 @@ struct LayoutIdentity {
 };
 
 // The identity of the cache this process builds: every field comes from the per-layer facts (the
-// same ones prefix_cache_geometry sums), the window, the prefill chunk and the requested global
-// KV format, storage model and QK mode. Global layers must agree on heads and head dimension, and
-// so must the sliding layers (they share one block and one ring layout each); a model that breaks
-// that has no single identity and the cache refuses it.
+// same ones prefix_cache_geometry sums), the window, the prefill chunk and the requested KV layout
+// (global format and storage model, sliding format) and QK mode. Global layers must agree on heads
+// and head dimension, and so must the sliding layers (they share one block and one ring layout
+// each); a model that breaks that has no single identity and the cache refuses it.
 [[nodiscard]] inline LayoutIdentity make_layout_identity(std::span<const KvLayerFact> layers,
                                                          std::uint32_t window,
                                                          std::uint32_t prefill_chunk,
-                                                         KvCacheStorage global_format,
-                                                         KvStorageModel global_storage,
+                                                         const KvCacheLayout& requested,
                                                          ops::Gemma4QkMode qk_mode) {
     LayoutIdentity id;
     id.qk_mode = qk_mode;
@@ -124,9 +127,8 @@ struct LayoutIdentity {
     id.prefill_chunk = prefill_chunk;
     id.page_tokens = static_cast<std::uint32_t>(ops::kGemma4KvPageTokens);
     for (const auto& layer : layers) {
-        const auto layout = require_implemented_storage(kv_layer_layout(
-            layer.global ? global_format : KvCacheStorage::BFloat16, layer.global, layer.head_dim,
-            layer.kv_heads, global_storage));
+        const auto layout = require_implemented_storage(
+            kv_layer_layout(requested, layer.global, layer.head_dim, layer.kv_heads));
         const auto heads = static_cast<std::uint32_t>(layer.kv_heads);
         const auto dim = static_cast<std::uint32_t>(layer.head_dim);
         if (layer.global) {
@@ -149,10 +151,11 @@ struct LayoutIdentity {
             }
             id.sliding_kv_heads = heads;
             id.sliding_head_dim = dim;
+            id.sliding_format = layout.format;
             ++id.sliding_layers;
         }
     }
-    const auto geometry = prefix_cache_geometry(layers, window, global_format, global_storage);
+    const auto geometry = prefix_cache_geometry(layers, window, requested);
     id.block_bytes = geometry.block_bytes;
     id.image_bytes = geometry.image_bytes;
     return id;

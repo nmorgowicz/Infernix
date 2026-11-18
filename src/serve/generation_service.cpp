@@ -367,6 +367,7 @@ infernix::EngineOptions make_engine_options(const ServeOptions& options, Startup
     engine_options.max_context              = options.max_context;
     engine_options.max_context_auto         = options.max_context_auto;
     engine_options.gemma4_key_only_kv        = options.gemma4_key_only_kv;
+    engine_options.gemma4_sliding_kv         = options.gemma4_sliding_kv;
     engine_options.allow_shared_memory       = options.allow_shared_memory;
     engine_options.shared_memory_placement   = options.shared_memory_placement;
     engine_options.rope_yarn_factor          = options.rope_yarn_factor;

@@ -2,8 +2,9 @@
 # before infernix_finish_op_families(). Each split arm is a fresh process: temporary switches
 # are immutable after their first snapshot. --split 0 selects one segment; --split 1 selects
 # the automatic rule. --segments 1..13 forces that many segments through the same switch.
-# gemma4_key_only_kv covers the experimental key-only global cache (Gemma4ValueSource::Key).
-foreach(op IN ITEMS gemma4_attention gemma4_fp8_kv gemma4_key_only_kv)
+# gemma4_key_only_kv covers the experimental key-only global cache (Gemma4ValueSource::Key);
+# gemma4_fp8_ring the opt-in FP8 sliding ring (D256 FP8 K/V, one FP16 scale per row).
+foreach(op IN ITEMS gemma4_attention gemma4_fp8_kv gemma4_key_only_kv gemma4_fp8_ring)
   if(op STREQUAL "gemma4_attention")
     set(extension cpp)
   else()

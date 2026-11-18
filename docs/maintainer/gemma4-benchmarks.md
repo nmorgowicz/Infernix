@@ -424,7 +424,7 @@ at chunk 128, KV 0.0197 MiB per token); prefill workspace 274; graph allowance 6
 server-added 14,176. The engine's ledger shows 103-146 MiB past the plan at startup (modules loaded at first use, graph state)
 plus about 3 KiB per context token (23.2 against 20.2 MiB per 1k tokens). Scaling with chunk (plan, 9,216 tokens): ring+KV 1,081 / 1,181 /
 1,381 / 1,781 MiB and workspace 274 / 306 / 370 / 765 MiB at chunk 128 / 256 / 512 / 1024, so minimum reservation 1,264 / 1,400 / 1,672 / 2,482 MiB.
-Chunks are multiples of 128: 64 is not supported. No existing option reduces the sliding ring below its chunk-128 size (sliding K/V stay BF16);
+Chunks are multiples of 128: 64 is not supported. The measurements of this section use the default BF16 sliding ring; `--gemma4-sliding-kv fp8` halves it ([FP8 sliding ring](#fp8-sliding-ring-experimental-off-by-default));
 `--no-cuda-graph` saves the 24 MiB graph state at about -15-20 % decode.
 
 **Context ladder** (explicit context and KV capacity, headroom 0, 48-token request at near-capacity prompt; `fit` = starts, answers, no spill;
@@ -594,7 +594,7 @@ driver and summaries are in `prefill-earlyexit-20261116/default-20261117/`.
 
 `--gemma4-key-only-kv` (explicit opt-in; omission keeps the default K==V FP8 layout) stores only the
 FP8 K codes and scales of the global (D512) layers and rebuilds V in attention. It requires `--kv-dtype fp8`; other
-formats are refused. Sliding layers keep BF16 K and V.
+formats are refused. The sliding ring follows `--gemma4-sliding-kv` (BF16 by default).
 
 **Why V can be rebuilt.** Gemma 4's global layers have no V projection: `gemma4_qkv_prep` forms V as the raw K row after
 the weightless norm, and K as the same row times the key-norm weight, then RoPE on the 128-wide rotated prefix (pairs
@@ -657,6 +657,43 @@ Camp evidence: `iq3xs-20261115/konly-20261117/` (drivers, raw requests/responses
 
 The rebuild (a sine and cosine per rotated pair and key) costs more than the halved V read saves at these lengths;
 outputs differ from K==V FP8 (a different lossy V) but are identical across AB and BA runs of the same arm.
+
+## FP8 sliding ring (experimental, off by default)
+
+`--gemma4-sliding-kv fp8` (explicit opt-in; `bf16`, the default, keeps the BF16 ring) stores the sliding (D256) layers'
+K and V ring as FP8 E4M3 codes with one FP16 scale per 256-value row, the codec of the global FP8 path (amax / 448, FP16
+rounded and bounded scale, round-to-nearest-even saturating codes; a row with any nonfinite value stores NaN codes and a
+unit scale). It requires `--kv-dtype fp8` and combines with `--gemma4-key-only-kv` and `--gemma4-qk fp8`.
+
+**What runs.** `gemma4_qkv_prep` quantizes each sliding K and V row once as it writes its ring slot. The decode SIMT
+kernel (T < 64: decode, MTP verify and the drafter) expands codes on load; the D256 tensor-core prefill kernel stages
+the codes by `cp.async` into the compact half of each BF16 tile and expands them in place, half a tile at a time
+(255 registers, no spills). Every reader consumes BF16(FP32 code x FP32 scale), so sliding QK and PV keep their BF16
+math; FP8 QK stays a global-layer option. `KvCacheLayout` carries the sliding format as its own axis; the prefix-cache
+identity carries it (`/sliding-fp8`, layout packing version 2), so blocks and snapshots never restore across ring
+formats. Host snapshot images hold the FP8 codes and row scales. The memory summary, the `Gemma KV` startup line
+(`sliding fp8`), the request log's `memory.gemma4_kv.sliding`, the perplexity report's `execution.gemma4_sliding_kv`
+and the prefill signature (`/s-fp8`) report the layout; `--plan`, the capacity curve and `auto` sizing count its bytes.
+
+**Bytes (layout, confirmed by the real test's accounting).** A ring row is 258 of BF16's 512 bytes (50.39 %). 31B ring
+(50 layers x 16 KV heads): 900 -> 454 MiB at chunk 128 (18 pages), 2,400 -> 1,209 MiB at chunk 2048 (48 pages). One
+Host snapshot image 838,041,856 -> 422,297,856 B (Host floor 320 -> 162 slabs of 2,641,920 B).
+
+**Scale granularity.** One scale per row was kept: on every sliding layer's real K/V rows (diode IQ3_XXS, positions
+0-128 of a 129-token prompt) the FP8 representation error is 0.0215 relative RMS with 256 columns per scale, 0.0210
+with 128 and 0.0203 with 64 (worst layer 0.0255 / 0.0251 / 0.0244; largest row peak/RMS 15.9): smaller groups would buy
+about 2-6 % of the error for 1-6 more scale bytes per row.
+
+**Tests.** `infernix_ops_gemma4_attention_test gemma4_fp8_ring` (validation; the writer's FP8 rows equal the row codec
+of the BF16 ring's rows, nonfinite rows included; decode and tensor-core attention over a wrapped ring with unmapped and
+out-of-range pages, T = 1-2048, equal bit for bit to BF16 attention over the expanded ring and within the BF16 attention
+criterion of an FP64 oracle; never-written rows not read; graph replay). Its writer-input comparison against the BF16
+ring reports 0.057-0.068 relative RMS attention error with moderate scores and 0.10-0.14 with unit key-norm weights (a
+near-argmax softmax); a measurement, bounded only against gross errors. `infernix_gemma4_fp8_ring_real_test`
+(`INFERNIX_GEMMA4_ARTIFACT`): refusal with BF16 globals; the first sliding layer's FP8 rows equal the row codec of the
+BF16 ring's; sliding payload and plan equal to the FP8 layout; deterministic generation, root replay and Host snapshot
+restore equal to the cold FP8-ring run, chunk 128 and 2048, CUDA graphs off and on, stored and key-only globals, MTP
+off and on (2026-11-18, diode IQ3_XXS: pass).
 
 ## Five-bit text projections: quality, speed and 32 GB capacity (2026-11-17)
 

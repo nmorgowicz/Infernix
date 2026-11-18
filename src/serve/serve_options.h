@@ -68,6 +68,7 @@ struct ServeOptions {
     std::uint32_t max_context          = 8192;
     bool max_context_auto = false; // Gemma4 only; max_context is the upper ceiling
     bool gemma4_key_only_kv = false;
+    KvCacheStorage gemma4_sliding_kv = KvCacheStorage::BFloat16; // Gemma4 only: the sliding rings' format
     bool allow_shared_memory = false; // Gemma4 only: start with the shortfall in shared GPU memory
     SharedMemoryPlacement shared_memory_placement = SharedMemoryPlacement::RuntimeResident;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(8192);

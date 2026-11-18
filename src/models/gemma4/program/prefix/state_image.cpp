@@ -19,8 +19,8 @@ constexpr std::size_t kPrintAt      = 16;  // u64 identity fingerprint
 constexpr std::size_t kFrontierAt   = 24;  // u32
 constexpr std::size_t kStartAt      = 28;  // u32 window start
 constexpr std::size_t kFlagsAt      = 32;  // u32: bit 0 opener, bit 1 lineage echo
-constexpr std::size_t kIdentityAt   = 40;  // 16 x u32, then 2 x u64
-constexpr std::size_t kIdentityWords = 16;
+constexpr std::size_t kIdentityAt   = 40;  // 17 x u32, then 2 x u64
+constexpr std::size_t kIdentityWords = 17;
 constexpr std::size_t kIdentityBytesAt = kIdentityAt + kIdentityWords * sizeof(std::uint32_t);
 static_assert(kIdentityBytesAt + 2 * sizeof(std::uint64_t) <= kStateImageHeaderBytes);
 
@@ -44,7 +44,8 @@ void put_identity(std::byte* base, const LayoutIdentity& id) {
         id.scale_group_columns, id.scale_element_bytes, static_cast<std::uint32_t>(id.storage),
         static_cast<std::uint32_t>(id.qk_mode), id.global_layers, id.global_kv_heads,
         id.global_head_dim, id.sliding_layers, id.sliding_kv_heads, id.sliding_head_dim,
-        id.window_tokens, id.prefill_chunk, id.packing_version, id.page_tokens};
+        id.window_tokens, id.prefill_chunk, id.packing_version, id.page_tokens,
+        static_cast<std::uint32_t>(id.sliding_format)};
     for (std::size_t i = 0; i < kIdentityWords; ++i) {
         put<std::uint32_t>(base, kIdentityAt + i * sizeof(std::uint32_t), words[i]);
     }
@@ -74,6 +75,7 @@ LayoutIdentity get_identity(const std::byte* base) {
     id.prefill_chunk = w[13];
     id.packing_version = w[14];
     id.page_tokens = w[15];
+    id.sliding_format = static_cast<ops::Gemma4KvFormat>(w[16]);
     id.block_bytes = get<std::uint64_t>(base, kIdentityBytesAt);
     id.image_bytes = get<std::uint64_t>(base, kIdentityBytesAt + sizeof(std::uint64_t));
     return id;
@@ -88,13 +90,12 @@ std::ptrdiff_t distance_between(const std::byte* a, const std::byte* b) noexcept
 
 // ---- layouts ---------------------------------------------------------------------------------
 
-BlockLayout plan_block_layout(std::span<const KvLayerFact> layers, KvCacheStorage global_format,
-                              KvStorageModel global_storage) {
+BlockLayout plan_block_layout(std::span<const KvLayerFact> layers, const KvCacheLayout& requested) {
     BlockLayout out;
     for (const auto& layer : layers) {
         if (!layer.global) { continue; }
         const auto layout = require_implemented_storage(
-            kv_layer_layout(global_format, true, layer.head_dim, layer.kv_heads, global_storage));
+            kv_layer_layout(requested, true, layer.head_dim, layer.kv_heads));
         const auto planes = layout.planes();
         for (std::uint32_t plane = 0; plane < layout.plane_count(); ++plane) {
             out.parts.push_back({out.global_layers, plane, out.record_bytes, planes[plane].page_bytes});
@@ -106,17 +107,16 @@ BlockLayout plan_block_layout(std::span<const KvLayerFact> layers, KvCacheStorag
 }
 
 StateImageLayout plan_state_image(std::span<const KvLayerFact> layers, std::uint32_t window,
-                                  KvCacheStorage global_format) {
-    (void)global_format; // sliding rings are always BF16, whatever the global format
+                                  const KvCacheLayout& requested) {
     StateImageLayout out;
     out.window_tokens = window > 0 ? window - 1U : 0U;
     std::size_t offset = kStateImageHeaderBytes;
     std::uint32_t group = 0;
     for (const auto& layer : layers) {
         if (layer.global) { continue; }
+        // The rings' own format: BF16 K and V planes, or FP8 codes plus FP16 scales of each side.
         const auto layout = require_implemented_storage(
-            kv_layer_layout(KvCacheStorage::BFloat16, false, layer.head_dim, layer.kv_heads,
-                            KvStorageModel::KeyEqualsValue));
+            kv_layer_layout(requested, false, layer.head_dim, layer.kv_heads));
         const auto planes = layout.planes();
         out.group_begin.push_back(static_cast<std::uint32_t>(out.parts.size()));
         const std::size_t heads = static_cast<std::size_t>(layer.kv_heads);

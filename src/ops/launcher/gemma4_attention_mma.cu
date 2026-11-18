@@ -43,16 +43,23 @@ __device__ __forceinline__ void stage_keys(__nv_bfloat16* dst, const __nv_bfloat
 // query rows [64 tile, 64 tile + 64) of head h. Online softmax over the union of the rows'
 // visible keys in Bc-key tiles; each row masks with its own position and the window. Used for
 // D256; D512 runs gemma4_attention_mma_d512.cu, one 8-warp CTA for both output halves.
-template <int D, int Bc>
+// FP8 (the opt-in D256 ring): K and V codes arrive by cp.async in the compact first half of their
+// BF16 tile and expand in place (gemma4_expand_quant_tile) to BF16(FP32(code) x FP32(scale)), the
+// values every Gemma FP8 reader consumes; QK and PV then run unchanged on the BF16 tiles.
+template <int D, int Bc, Gemma4KvFormat Fmt>
 __launch_bounds__(kThreads, 1) __global__
     void gemma4_attention_mma_kernel(const __nv_bfloat16* __restrict__ q,
-                                     const __nv_bfloat16* __restrict__ k_pages,
-                                     const __nv_bfloat16* __restrict__ v_pages,
+                                     const void* __restrict__ k_pages,
+                                     const void* __restrict__ v_pages,
+                                     const __half* __restrict__ k_scales,
+                                     const __half* __restrict__ v_scales,
                                      const std::int32_t* __restrict__ block_table,
                                      const std::int32_t* __restrict__ positions,
                                      __nv_bfloat16* __restrict__ out, int tokens, int q_heads,
                                      int kv_heads, int window, float scale,
                                      std::int32_t logical_pages, std::int32_t physical_pages) {
+    constexpr bool kQuantKv     = Fmt != Gemma4KvFormat::BFloat16;
+    static_assert(!kQuantKv || D == kSlice, "the FP8 ring is D256: one V slice is the whole row");
     constexpr int QKNt          = Bc / 8;
     constexpr int QKKs          = D / 16;
     constexpr int PVNt          = kSlice / 8;
@@ -161,12 +168,36 @@ __launch_bounds__(kThreads, 1) __global__
     };
     const bool all_rows = rows == kRows;
 
+    // Keys and the V column slice of tile `k0`: BF16 rows, or the compact FP8 codes
+    // gemma4_expand_quant_tile expands after they arrive.
+    const auto stage_key = [&](int mapped, int k0) {
+        if constexpr (kQuantKv) {
+            gemma4_stage_quant_codes<D, Bc, kThreads>(k_s, static_cast<const std::uint8_t*>(k_pages), kv_heads,
+                                                      kvh, mapped, k0, last_key, tid);
+        } else {
+            stage_keys<D, D, Bc>(k_s, static_cast<const __nv_bfloat16*>(k_pages), kv_heads, kvh, mapped, k0,
+                                 last_key, 0, tid);
+        }
+    };
+    const auto stage_value = [&](int mapped, int k0) {
+        if constexpr (kQuantKv) {
+            gemma4_stage_quant_codes<D, Bc, kThreads>(v_s, static_cast<const std::uint8_t*>(v_pages), kv_heads,
+                                                      kvh, mapped, k0, last_key, tid);
+        } else {
+            stage_keys<D, kSlice, Bc>(v_s, static_cast<const __nv_bfloat16*>(v_pages), kv_heads, kvh, mapped,
+                                      k0, last_key, column, tid);
+        }
+    };
+    const auto expand = [&](__nv_bfloat16* tile, const __half* scales, int mapped, int k0) {
+        if constexpr (kQuantKv) {
+            gemma4_expand_quant_tile<D, Bc, kThreads, 1>(tile, scales, kv_heads, kvh, mapped, k0, last_key, tid);
+            __syncthreads();
+        }
+    };
+
     int physical = block_begin < block_end ? physical_of(block_begin) : -1;
     cp_commit();
-    if (block_begin < block_end) {
-        stage_keys<D, D, Bc>(k_s, k_pages, kv_heads, kvh, physical, block_begin * Bc, last_key, 0,
-                             tid);
-    }
+    if (block_begin < block_end) { stage_key(physical, block_begin * Bc); }
     cp_commit();
 
     const auto step = [&]<bool FullTile>(int block) {
@@ -176,7 +207,8 @@ __launch_bounds__(kThreads, 1) __global__
 
         cp_wait<0>();
         __syncthreads();
-        stage_keys<D, kSlice, Bc>(v_s, v_pages, kv_heads, kvh, physical, k0, last_key, column, tid);
+        expand(k_s, k_scales, physical, k0);
+        stage_value(physical, k0);
         cp_commit();
 
         float score[QKNt][4];
@@ -219,10 +251,10 @@ __launch_bounds__(kThreads, 1) __global__
 
         cp_wait<0>();
         __syncthreads();
+        expand(v_s, v_scales, physical, k0);
         if (block + 1 < block_end) {
             physical = next_physical;
-            stage_keys<D, D, Bc>(k_s, k_pages, kv_heads, kvh, physical, (block + 1) * Bc, last_key,
-                                 0, tid);
+            stage_key(physical, (block + 1) * Bc);
             cp_commit();
         }
 
@@ -358,27 +390,30 @@ __launch_bounds__(kThreads, 1) __global__
     }
 }
 
-template <int D, int Bc>
-void launch(const Tensor& q, const Tensor& k_pages, const Tensor& v_pages,
-            const Tensor& block_table, const Tensor& positions, int window, float scale,
-            Tensor& out, cudaStream_t stream) {
+template <int D, int Bc, Gemma4KvFormat Fmt>
+void launch(const Tensor& q, const Gemma4CacheView& cache, const Tensor& positions, int window,
+            float scale, Tensor& out, cudaStream_t stream) {
+    constexpr bool Quantized     = Fmt != Gemma4KvFormat::BFloat16;
     constexpr std::size_t shared = kSharedBytes<D, Bc>;
     static bool configured       = false;
     if (!configured) {
-        CUDA_CHECK(cudaFuncSetAttribute(gemma4_attention_mma_kernel<D, Bc>,
+        CUDA_CHECK(cudaFuncSetAttribute(gemma4_attention_mma_kernel<D, Bc, Fmt>,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         static_cast<int>(shared)));
         configured = true;
     }
+    const Tensor& k_pages     = *cache.k_pages;
+    const Tensor& block_table = *cache.block_table;
     // One CTA per query head. Packing a GQA group onto one CTA would reload Q on every key
     // tile (one Q tile is already 32 KB, and K plus V fill the rest of the 99 KB), which costs
     // as much traffic as the shared K/V it would save. The grid stays one head.
     const int tokens = q.ne[2];
     const dim3 grid(static_cast<unsigned>((tokens + kRows - 1) / kRows),
                     static_cast<unsigned>(q.ne[1]), static_cast<unsigned>(D / kSlice));
-    gemma4_attention_mma_kernel<D, Bc><<<grid, kThreads, shared, stream>>>(
-        static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k_pages.data),
-        static_cast<const __nv_bfloat16*>(v_pages.data),
+    gemma4_attention_mma_kernel<D, Bc, Fmt><<<grid, kThreads, shared, stream>>>(
+        static_cast<const __nv_bfloat16*>(q.data), k_pages.data, cache.v_pages->data,
+        Quantized ? static_cast<const __half*>(cache.k_scales->data) : nullptr,
+        Quantized ? static_cast<const __half*>(cache.v_scales->data) : nullptr,
         static_cast<const std::int32_t*>(block_table.data),
         static_cast<const std::int32_t*>(positions.data), static_cast<__nv_bfloat16*>(out.data),
         tokens, q.ne[1], k_pages.ne[2], window, scale, block_table.ne[0], k_pages.ne[3]);
@@ -391,8 +426,11 @@ void gemma4_attention_mma_launch(const Tensor& q, const Gemma4CacheView& cache,
                                  const Tensor& positions, int window, float scale,
                                  Tensor& out, float* partial, float* stats, cudaStream_t stream) {
     if (q.ne[0] == 256) {
-        launch<256, 64>(q, *cache.k_pages, *cache.v_pages, *cache.block_table,
-                        positions, window, scale, out, stream);
+        if (cache.format == Gemma4KvFormat::Fp8E4m3Row256) {
+            launch<256, 64, Gemma4KvFormat::Fp8E4m3Row256>(q, cache, positions, window, scale, out, stream);
+        } else {
+            launch<256, 64, Gemma4KvFormat::BFloat16>(q, cache, positions, window, scale, out, stream);
+        }
     } else if (q.ne[0] == 512) {
         gemma4_attention_mma_d512_launch(q, cache, positions, window, scale, out, partial, stats,
                                          stream);

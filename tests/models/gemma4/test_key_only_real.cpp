@@ -56,7 +56,8 @@ struct Caches {
         const auto& config = p.model.config().text;
         for (std::size_t i = 0; i < count; ++i) {
             const auto& layer = p.layers[i];
-            const auto layout = g4::kv_layer_layout(kv, layer.global_layer, layer.head_dim, layer.kv_heads, storage);
+            const auto layout = g4::kv_layer_layout({kv, storage, KvCacheStorage::BFloat16}, layer.global_layer,
+                                                    layer.head_dim, layer.kv_heads);
             const std::initializer_list<std::int32_t> shape{layer.head_dim, 64, layer.kv_heads, pages};
             const std::initializer_list<std::int32_t> scale_shape{layout.scale_groups, 64, layer.kv_heads, pages};
             keys.emplace_back(layout.code_page_bytes * pages); keys.back().fill(0);
@@ -279,7 +280,8 @@ std::uint64_t global_payload(const g4::execution::Parameters& p, g4::KvStorageMo
     std::uint64_t bytes = 0;
     for (const auto& layer : p.layers) {
         if (layer.global_layer) {
-            bytes += g4::kv_layer_layout(kFp8, true, layer.head_dim, layer.kv_heads, storage).page_bytes() * pages;
+            bytes += g4::kv_layer_layout({kFp8, storage, KvCacheStorage::BFloat16}, true, layer.head_dim,
+                                         layer.kv_heads).page_bytes() * pages;
         }
     }
     return bytes;

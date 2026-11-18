@@ -660,11 +660,12 @@ Each repository's model card gives its files, requirements, recommended command,
 ### Gemma 4 31B (dense, text)
 
 Serves grouped-Q4 weights (`q4_g32`/`q4_g128`/`q4_g256`, FP16 scales; W4A8 prefill) or imported IQ3 GGUF
-projection blocks (AllowA8 prefill and decode), FP8 global KV with BF16 sliding rings, optional FP8 attention QK,
-MTP with Google's separate assistant, a host-only prefix cache and up to 131,072 tokens on one 32 GB card.
-Text generation and public causal scoring use native Gemma weights, tokenizer/template, sliding rings and global
-attention, not a Qwen model cast. K **and V** of the sliding layers stay BF16, and the head's BF16 rounding is
-preserved, so select `--logits-dtype bf16`; unrounded FP32 head sums are not implemented.
+projection blocks (AllowA8 prefill and decode), FP8 global KV with BF16 sliding rings (FP8 rings and key-only global
+KV are experimental opt-ins), optional FP8 attention QK, MTP with Google's separate assistant, a host-only prefix cache
+and up to 131,072 tokens on one 32 GB card. Text generation and public causal scoring use native Gemma weights,
+tokenizer/template, sliding rings and global attention, not a Qwen model cast. By default K **and V** of the sliding
+layers stay BF16 (`--gemma4-sliding-kv fp8` halves the ring), and the head's BF16 rounding is preserved, so select
+`--logits-dtype bf16`; unrounded FP32 head sums are not implemented.
 
 **Build a file and a launcher** (conversion, GPTQ and the launcher all live in this checkout; GPTQ runs in its own
 pinned environment, see [`tools/gptq/README.md`](tools/gptq/README.md)):

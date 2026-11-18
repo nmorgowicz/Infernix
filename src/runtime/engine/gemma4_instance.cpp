@@ -43,6 +43,7 @@ ProgramOptions program_options(const EngineOptions& options, std::uint64_t host_
         ((options.kv_capacity.explicit_tokens + 63U) / 64U) * 64U;
     out.kv_cache = options.kv_cache;
     out.global_kv_storage = global_kv_storage(options);
+    out.sliding_kv_cache = options.gemma4_sliding_kv;
     out.qk_mode = options.gemma4_qk;
     out.causal_scoring = options.purpose == EnginePurpose::CausalScoring;
     out.draft_tokens = options.speculative.backend == SpeculativeBackend::Mtp ? options.speculative.draft_tokens : 0U;
@@ -145,6 +146,12 @@ void validate_gemma4_options(const EngineOptions& options) {
     validate_gemma4_qk(options.gemma4_qk, true, options.kv_cache);
     if (options.gemma4_key_only_kv && options.kv_cache != KvCacheStorage::Fp8E4M3Row256) {
         throw std::invalid_argument("--gemma4-key-only-kv requires --kv-dtype fp8");
+    }
+    if (options.gemma4_sliding_kv != KvCacheStorage::BFloat16 && options.gemma4_sliding_kv != KvCacheStorage::Fp8E4M3Row256) {
+        throw std::invalid_argument("--gemma4-sliding-kv must be bf16 or fp8");
+    }
+    if (options.gemma4_sliding_kv == KvCacheStorage::Fp8E4M3Row256 && options.kv_cache != KvCacheStorage::Fp8E4M3Row256) {
+        throw std::invalid_argument("--gemma4-sliding-kv fp8 requires --kv-dtype fp8");
     }
     if (options.max_context_auto && options.vram_past_budget) {
         throw std::invalid_argument("Gemma4 --max-context auto refuses --vram-past-budget; startup must remain resident");
@@ -260,8 +267,9 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& supplied, DeviceContext&
                              static_cast<int>(text.head_dim_of(kind)),
                              static_cast<int>(text.kv_heads_of(kind))});
         }
-        const auto tier = models::gemma4::prefix_cache_geometry(facts, text.sliding_window, options.kv_cache,
-                                                                global_kv_storage(options));
+        const auto tier = models::gemma4::prefix_cache_geometry(
+            facts, text.sliding_window,
+            {options.kv_cache, global_kv_storage(options), options.gemma4_sliding_kv});
         if (prefix_bytes < tier.host_floor_bytes) {
             const std::uint64_t mib = (tier.host_floor_bytes + (1ULL << 20) - 1) >> 20;
             const std::string refusal =
@@ -460,7 +468,8 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& supplied, DeviceContext&
     summary.model_name = instance->model->info().name;
     summary.prefill_signature = std::string("gemma4/") +
         (options.kv_cache == KvCacheStorage::Fp8E4M3Row256 ? "fp8" : "bf16") + "-kv" +
-        (global_kv_storage(options) == models::gemma4::KvStorageModel::KeyOnly ? "/k-only" : "") + "/qk=" +
+        (global_kv_storage(options) == models::gemma4::KvStorageModel::KeyOnly ? "/k-only" : "") +
+        (options.gemma4_sliding_kv == KvCacheStorage::Fp8E4M3Row256 ? "/s-fp8" : "") + "/qk=" +
         gemma4_qk_name(options.gemma4_qk) + "/cold/chunk=" + std::to_string(options.prefill_chunk);
     std::set<std::string> formats;
     for (const auto& weight : instance->model->weight_data()) {

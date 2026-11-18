@@ -99,6 +99,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--kv-dtype"},
     ServeOptionArity{"--gemma4-qk"},
     ServeOptionArity{"--gemma4-key-only-kv", false},
+    ServeOptionArity{"--gemma4-sliding-kv"},
     ServeOptionArity{"--allow-shared-memory", false},
     ServeOptionArity{"--shared-memory-placement"},
     ServeOptionArity{"--logits-dtype"},
@@ -500,6 +501,9 @@ std::string serve_usage_text(const char* argv0) {
            "                             artifact and is refused for other model families\n"
            "  --gemma4-key-only-kv       Gemma4 only: global FP8 K alone, reconstruct V\n"
            "                             (approximate, default off; needs --kv-dtype fp8)\n"
+           "  --gemma4-sliding-kv M      bf16 (default) | fp8: Gemma4 sliding-window ring K/V\n"
+           "                             format; fp8 stores FP8 K and V with one scale per row\n"
+           "                             (about half the ring; approximate; needs --kv-dtype fp8)\n"
            "  --allow-shared-memory      Gemma4 only: when weights plus runtime do not fit the free\n"
            "                             VRAM start anyway, the shortfall in shared GPU memory\n"
            "                             (system RAM over PCIe: much slower; default off = refuse)\n"
@@ -1149,6 +1153,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.gemma4_qk = parse_gemma4_qk(require_value("--gemma4-qk"));
         } else if (arg == "--gemma4-key-only-kv") {
             options.gemma4_key_only_kv = true;
+        } else if (arg == "--gemma4-sliding-kv") {
+            options.gemma4_sliding_kv = parse_gemma4_sliding_kv(require_value("--gemma4-sliding-kv"));
         } else if (arg == "--allow-shared-memory") {
             options.allow_shared_memory = true;
         } else if (arg == "--shared-memory-placement") {

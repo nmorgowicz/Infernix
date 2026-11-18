@@ -20,8 +20,9 @@ inline constexpr int kGemma4KeyValueRotaryDim = 128;
 enum class Gemma4ValueSource { Stored, Key };
 
 // Non-owning view; finalize tensor owners before taking their addresses. BF16 pages are
-// [D,64,Hkv,pages]. Global-only FP8 pages are U8 [512,64,Hkv,pages], with separate
-// FP16 scales [2,64,Hkv,pages]. All planes use the same physical page IDs.
+// [D,64,Hkv,pages]. FP8 pages are U8 [D,64,Hkv,pages] with separate FP16 scales
+// [D/256,64,Hkv,pages], one per 256-column group of a row: D512 global layers (two groups per row)
+// and the opt-in FP8 D256 sliding rings (one group per row). All planes use the same physical page IDs.
 struct Gemma4CacheView {
     Gemma4KvFormat format = Gemma4KvFormat::BFloat16;
     Tensor* k_pages = nullptr;

@@ -404,6 +404,15 @@ int run_tests() {
     failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--gemma4-qk", "fp8"}).gemma4_qk ==
                           infernix::ops::Gemma4QkMode::Fp8,
                       "--gemma4-qk fp8 was not parsed");
+    failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "hello"}).gemma4_sliding_kv ==
+                          infernix::KvCacheStorage::BFloat16,
+                      "--gemma4-sliding-kv must default to bf16");
+    failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--gemma4-sliding-kv", "fp8"})
+                              .gemma4_sliding_kv == infernix::KvCacheStorage::Fp8E4M3Row256,
+                      "--gemma4-sliding-kv fp8 was not parsed");
+    failures += check(rejects([] {
+                          (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--gemma4-sliding-kv", "int8"});
+                      }), "--gemma4-sliding-kv must refuse formats other than bf16 and fp8");
     const std::string help = infernix::cli::usage_text("infernix-cli");
     failures +=
         check(help.find("nvfp4") != std::string::npos && help.find("k8v4") != std::string::npos &&
