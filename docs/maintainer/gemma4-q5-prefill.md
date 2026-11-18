@@ -336,8 +336,8 @@ tooling `docs/plans/20261118-gemma4-q5-compute-precision.md`; evidence in the ca
 
 ## INT8 per-32 kernel microbenchmark (item 2c phase 1, 2026-11-18)
 
-Standalone CUDA microbenchmark, **no engine change, no engine kernel built**: gate not met, so phase 2 was not
-started. Instrument and sources live in the camp (`q5-int8-20261118/`: `q5_i8.cuh` kernel, `bench.cu`, `probe.cu`,
+Standalone CUDA microbenchmark, **no engine change during phase 1**. The per-32 soft gate was not met;
+the parent subsequently chose to proceed with both group sizes in phase 2 below. Sources live in the camp (`q5-int8-20261118/`: `q5_i8.cuh` kernel, `bench.cu`, `probe.cu`,
 `oracle_check.py`, `summarize.py`, runner logs). The baseline is the engine's own native A16 code, instantiated from
 the same headers: `launch_rowsplit_ring_linear<Q5RingFormat, RowSplitRingTile128, 3, 4>` for T = 2048 and
 `q5_a16_mma_kernel<MmaR32T128>` for T = 128. RTX 5090 (170 SMs), CUDA 13.5 `sm_120a`, plain GPTQ5 g64 layout on
@@ -408,7 +408,8 @@ per-64, against 32.49 s native A16 and 19.06 s W5A8.
 **Verdict: the per-32 gate is not met.** It projects 1.77x faster than native A16 at T = 2048 (the 1.3x criterion
 holds) but 1.63x the W5A8 stack (the ~1.5x criterion fails by 8 %; a fused quantizer at the memory floor would give
 about 1.59x [INFERENCE]). Per-64 (KL 0.0204 in 2b against 0.0200, not separable at that sample size) projects 1.38x and passes.
-The engine kernel, the opt-in compute mode and the model-level checks were therefore not built or run.
+The parent assistant (not the operator) then decided to proceed with both group sizes behind an explicit opt-in load-time compute mode
+(A16 stays the default); the engine kernel, the mode and their model-level checks are the next section.
 
 **Where the per-32 rate goes** (gate/up shape, T = 2048, one 128 x 128 tile configuration, effective TOP/s):
 consumers alone (staging replaced by barrier pacing) 548; plus real MMA/staging without scale apply 536;
@@ -423,7 +424,136 @@ warps (334-344), 64 x 256 tiles (334-353 per-32; the best per-64), two or eight 
 copies (+2-3 %, kept as the best per-32 for four shapes), mbarrier wait policies (no change), L1-cached side planes
 (+1 %), a pre-baked exact INT8 scratch (+11 % GEMM, but 1.16 s of bake and no net gain), two CTAs per SM (180).
 
-Limits: synthetic weights and activations ([INFERENCE]: timing does not depend on data values except through power), one GPU and power
-limit, no engine integration (the chunk partials, bounds handling, graph capture and arena fit are untested), no
-quality or HTTP measurement, and the FP8 reference is item 2a's in-situ number rather than the same harness.
+Phase-1 limits: synthetic weights and activations ([INFERENCE]: timing does not depend on data values except through power), one GPU and power
+limit; engine partial tiles, bounds, graphs, arena fit, quality and HTTP were not yet measured at that stage.
+The FP8 reference is item 2a's in-situ number rather than the same harness. Phase 2 supplies the engine checks below.
 Tooling plan: `docs/plans/20261118-gemma4-q5-int8-per32-microbench.md`.
+
+## INT8 prefill engine kernel (item 2c phase 2, 2026-11-18)
+
+Implemented in `74eff759`: `--gemma4-q5-prefill a16|int8-g32|int8-g64`, default `a16`, across Engine,
+CLI, serving, native perplexity and the builder-generated launcher/serve-check profile. No profile enables INT8
+implicitly. **The default preserves the artifact's existing A16Only/AllowA8 policy**: an A16 artifact stays A16;
+an AllowA8 artifact still uses the existing W5A8 bake. The INT8 choices override the six native Q5 trunk
+shapes at **T >= 64** only, using the existing Q5 group-64 artifact without rewriting or duplicating weights.
+They are refused with lossless execution, other model families or an artifact without native Q5 trunk weights.
+Mode is included in the prefix-cache signature and request/execution records.
+
+`q5_int8_prefill.cuh/.cu` retains the phase-1 exact-code IMMA/groupwise FP32 scale chain, with a bounded
+activation quantizer and partial-token handling. The same two configurations serve both group sizes:
+128 x 128 wide tiles, 64 x 128 tiles for T = 64..128. The quantizer writes a 128-token-padded INT8
+activation buffer and two FP32 metadata values per group in the existing scoped workspace. There is no
+persistent weight bake, new device allocation or environment-controlled inference route.
+
+**Actual decode precision:** calls below 64 columns retain native Q5 A16, including single-token decode
+and short MTP verification; the assistant/vocabulary keep their existing representations. Wide verification
+can select INT8. This is not an “all-token INT8” implementation, and changed prefill KV can change later
+argmaxes even when the decode kernel itself is unchanged.
+
+### Numerical and integration evidence
+
+RTX 5090, CUDA 13.5 `sm_120a`, approved `build-infernix-prefill-earlyexit-cuda13.5` only.
+The integrated Linear test passes on all six shapes at T = 64/65/128/129/193/256, with T = 2048 on
+gate/up and down, guard/poison checks, changed-input graph replay and below-threshold/default
+route comparisons. Its independent host decoder uses integer dots and `std::fmaf`; the separately decoded
+NumPy/FP64 capture oracle covers **92 cases / 110,600 elements, zero BF16 disagreements** against the
+documented FP32 group chain, worst relative L2 **0.001961** against the FP64 represented-operand ideal.
+`infernix_gemma4_q5_projection_test` also passes through model projection policy/workspace/graphs.
+Receipts: `int8-phase2-optest-2` / `int8-phase2-q5proj-1`, exit 0, minimum free RAM 37.48 / 37.59 GiB.
+The saved implementation session additionally ran the native CLI/serve parsers and affected Python builder
+tests; those checks were not repeated during recovery.
+
+Pinned native full-vocabulary KL: the same plain A16 artifact and Q8 reference as 2b, context 512,
+stride 256, chunk 128, chat prefix, FP8 global KV, BF16 ring/QK/logits; **47 windows / 13,728 positions**,
+4000-resample paired window bootstrap:
+
+| Route | Mean KL [95% CI] | dKL versus default A16 [95% CI] | dNLL versus A16 | Top-1 disagreement |
+|---|---|---|---:|---:|
+| default A16 | 0.019914 [0.017267, 0.022466] | 0 | 0 | 0.04422 |
+| INT8 g32 | 0.020425 [0.017716, 0.022952] | +0.000511 [-0.000095, +0.001127] | +0.002021 | 0.04538 |
+| INT8 g64 | 0.020305 [0.017541, 0.022987] | +0.000391 [-0.000416, +0.001178] | +0.001506 | 0.04356 |
+| W5A8 (retained matched 2b result) | 0.029649 [0.026021, 0.033243] | +0.009735 | +0.003517 | 0.05427 |
+
+Default A16 reproduces every retained 2b position bit for bit. Native g32 versus its 2b emulator is
++0.000422 [-0.000149, +0.000997] KL; g64 -0.000081 [-0.000647, +0.000426]. Neither is bit-identical to
+the emulator (truncated scale/FP32 association), but this sample does not resolve an aggregate difference.
+Nor does it establish exact equivalence to A16 or a quality ranking between g32/g64 (paired g64 minus g32
+-0.000120 [-0.000728, +0.000470]). Both recover most of W5A8's quality gap: dKL -0.009224 / -0.009344.
+Worst individual window increases versus A16 are +0.00636 / +0.00746; do not replace that distribution with
+the mean. Long-context quality is unmeasured. The KL lease exits 0 in 166 s with >=36.62 GiB free RAM.
+
+### Clean HTTP prefill
+
+All arms use the same executable SHA-256 `ec6905ca4cc799623862814439316d56083d0bf68f1a2967e71b37bdeb83db53`,
+with no event-instrumentation switch. Same hardware/power, artifacts and requests as item 2a; context/KV 68,096,
+headroom 1024 MiB, normal global FP8 K/V and FP8 QK, **BF16 sliding ring**, BF16 logits, one lane,
+graphs on, prefix reuse/Host cache off, `free-cache-resume` off, greedy/seed 1234/thinking off.
+Four measured requests per arm/length at chunk 2048 (forward/reverse starts), two at chunk 128; one excluded
+982-token warmup per start. Actual timed lengths are 986/987 and 64,985 tokens, one output token.
+Request hashes/counts, no prefix reuse, completed requests, binary identity and no named heavy overlap
+are checked before aggregation. Ranges below are repetitions, not confidence intervals.
+
+| Chunk / prompt | A16 tok/s [range] | W5A8 tok/s [range] | INT8 g32 tok/s [range] | INT8 g64 tok/s [range] |
+|---|---:|---:|---:|---:|
+| 2048 / ~1k | 2797 [2748, 2834] | 6329 [6302, 6365] | 4660 [4569, 4709] | 5390 [5286, 5486] |
+| 2048 / ~65k | 1968 [1866, 1993] | 3411 [3384, 3434] | 2734 [2723, 2757] | 2982 [2968, 3003] |
+| 128 / ~1k | 1736 [1731, 1742] | 2273 [2261, 2286] | 3308 [3302, 3314] | 3716 [3660, 3772] |
+| 128 / ~65k | 1326 [1303, 1348] | 1658 [1658, 1659] | 2071 [2070, 2072] | 2148 [2144, 2153] |
+
+At chunk 2048 g32/g64 are **1.67x/1.93x** A16 throughput short and **1.39x/1.51x** long, but
+**26.4%/14.8% slower** than W5A8 short and **19.9%/12.6% slower** long. At chunk 128 both beat W5A8,
+but both remain slower than their own chunk-2048 route: smaller chunks are not recommended for speed.
+Median prompt times in arm order A16/W5A8/g32/g64: 353/156/212/183 ms short and
+33.014/19.050/23.769/21.793 s long at 2048; 568/434/298/266 ms and 49.041/39.187/31.379/30.251 s at 128.
+Wire TTFT: 378/183/275/211 ms and 33.146/19.192/23.932/21.923 s at 2048;
+597/463/315/291 ms and 49.169/39.307/31.505/30.387 s at 128.
+All **60** prefill requests return the same first token (818), also matching the retained A16/W5A8 item-2a
+requests. That is a smoke observation, not proof of full-output/logit equivalence.
+
+The three saved cold-L2 microbench repetitions of the integrated configurations (15 CUDA-event samples each)
+give T=2048 GEMM medians in shape order sliding QKV/global QK/sliding out/global out/gate-up/down:
+g32 **1.036/1.148/0.506/0.981/2.879/1.301 ms**, g64 **0.873/0.963/0.418/0.809/2.458/1.080 ms**.
+G32 quantization costs 0.029/0.029/0.046/0.083/0.030/0.108 ms; these are kernel numbers, not HTTP totals.
+The harness's `projection_65k_ms` rows are ratio-based projections using item-2a chunk-2048 weights, not
+measured engine intervals; its T=128 projection uses that same weighting and is not a valid chunk-128
+end-to-end estimate. The clean HTTP table, not those projected rows, is the performance result.
+
+### Plain decode, MTP and resources
+
+Short smoke only, chunk 2048, two different ~1k requests per cell, **128 output tokens each**, all complete:
+
+| Route | Plain decode tok/s [range] | MTP d1 decode tok/s [range] | Accepted / drafted, two requests |
+|---|---:|---:|---|
+| A16 | 50.57 [50.55, 50.58] | 83.49 [81.25, 85.74] | 56/71, 53/74 |
+| W5A8 | 50.56 [50.53, 50.59] | 79.10 [75.99, 82.20] | 57/69, 51/76 |
+| INT8 g32 | 50.83 [50.82, 50.85] | 81.65 [79.21, 84.09] | 56/70, 52/75 |
+| INT8 g64 | 50.94 [49.99, 51.89] | 78.88 [73.93, 83.83] | 60/67, 51/76 |
+
+Plain decode uses the same A16 kernels, with no measured slowdown in these medians; MTP g32/g64 medians are
+2.2%/5.5% below A16. Different generated continuations/acceptance and two samples do not isolate a kernel
+regression or qualify general MTP throughput. Every route/spec matches the first eight tokens for each
+request; whole 128-token sequences can diverge (first observed difference from A16/plain at output 11).
+Two different requests are not repeatability trials. No blanket token-identity claim is made.
+
+All arms' weight allocations remain **20,631,888,384 B**. Whole-program workspace capacity/high-water
+at chunk 2048 is **1,604,329,984 / 1,331,691,520 B**, unchanged across modes and these MTP starts;
+at 128, A16/g32/g64 **75,014,656 / 57,966,592 B**, W5A8 **287,176,192 / 281,137,664 B**.
+Transient INT8 codes/metadata fit inside that reused envelope: at K=21504, T=2048, g32/g64 need
+52.5/47.25 MiB plus alignment, not another weight matrix. No VRAM-capacity-frontier claim is inferred.
+Observed whole-device peaks (including desktop) are 28,421 MiB prefill and 29,256 MiB short decode/MTP.
+
+All GPU leases retain the **8 GiB** physical-RAM floor and are serialized with builds. HTTP prefill/decode
+leases exit 0 in 881/163 s, minimum free RAM 36.85/36.67 GiB; no named heavy-process overlap.
+Maximum sampled Pages/sec is **3445.76** prefill / **16.85** decode, so no paging-free claim.
+The original HTTP attempt failed before server startup because its system Python lacked NumPy;
+the existing clean2 retry used the tooling venv and succeeded. Recovery preserved all its rows, reran
+neither KL nor completed numerical/timing tests, and added only the missing short decode/MTP cells.
+The default-mode startup description was then corrected to say artifact routing, not falsely label W5A8
+as BF16; that logging-only change was rebuilt separately and is not the measured executable above.
+
+**Disposition:** the opt-in routes provide near-A16 short-protocol KL at materially faster prefill, not
+W5A8 parity at chunk 2048. G64 is faster with no resolved quality loss versus g32 on this sample; neither
+becomes a default. No tuning campaign, item 2d, model promotion, artifact rewrite or production build change.
+Evidence: `q5-int8-20261118/phase2/{oracle-engine,kl-summary,http-summary}.json`, test dumps, benchmark
+sources, request/SSE/metrics/logs, and parent `int8-phase2-*.receipt.json`. Plan:
+tooling `docs/plans/20261118-gemma4-q5-int8-per32-microbench.md`.
