@@ -659,8 +659,8 @@ Each repository's model card gives its files, requirements, recommended command,
 
 ### Gemma 4 31B (dense, text)
 
-Serves grouped-Q4 weights (`q4_g32`/`q4_g128`/`q4_g256`, FP16 scales; W4A8 prefill) or imported IQ3 GGUF
-projection blocks (AllowA8 prefill and decode), FP8 global KV with BF16 sliding rings (FP8 rings and key-only global
+Serves grouped-Q4 weights (`q4_g32`/`q4_g128`/`q4_g256`, FP16 scales; W4A8 prefill), native GPTQ5 group64
+(A16, optional FP8/INT8 prefill), or imported IQ3 GGUF projection blocks (AllowA8 prefill and decode), FP8 global KV with BF16 sliding rings (FP8 rings and key-only global
 KV are experimental opt-ins), optional FP8 attention QK, MTP with Google's separate assistant, a host-only prefix cache
 and up to 131,072 tokens on one 32 GB card. Text generation and public causal scoring use native Gemma weights,
 tokenizer/template, sliding rings and global attention, not a Qwen model cast. By default K **and V** of the sliding
