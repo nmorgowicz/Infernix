@@ -13,6 +13,8 @@ target_sources(infernix_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/q5_a16_simt.cu"
 )
 
-# Per-call Q5 -> row-FP8 widening is self-contained; reuse the existing non-RDC Gemma archive.
+# Per-call Q5 -> row-FP8 widening and the opt-in INT8-activation prefill route are Gemma-specific and self-contained;
+# reuse the existing non-RDC Gemma archive.
 target_sources(infernix_gemma4_ops PRIVATE
+  "${CMAKE_CURRENT_LIST_DIR}/q5_int8_prefill.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q5_widen_e4m3.cu")

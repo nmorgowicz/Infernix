@@ -62,6 +62,8 @@ struct LoadOptions {
     // Qwen4Exp --a8-activations with fast paths: a GGUF import's hyper-connection matrices are repacked to Q8 at load
     // (execution::Parameters' hc_q8), so its mixers stay BF16 for that repack; every other artifact's mixers pack.
     bool hc_q8_repack = false;
+    // Gemma4 (EngineOptions::gemma4_q5_prefill): the native Q5 trunk projections' compute at 64 or more columns.
+    Gemma4Q5Prefill gemma4_q5_prefill = Gemma4Q5Prefill::A16;
 
     bool operator==(const LoadOptions&) const = default;
 
@@ -147,7 +149,8 @@ struct LoadOptions {
                                options.speculative.backend == SpeculativeBackend::Mtp,
             .pack_bf16       = architecture == Architecture::Qwen4Exp && !options.lossless,
             .hc_q8_repack    = architecture == Architecture::Qwen4Exp && options.a8_activations && !options.lossless &&
-                            options.fast_paths};
+                            options.fast_paths,
+            .gemma4_q5_prefill = architecture == Architecture::Gemma4 ? options.gemma4_q5_prefill : Gemma4Q5Prefill::A16};
 }
 
 } // namespace infernix::models

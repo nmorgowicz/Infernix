@@ -1548,3 +1548,35 @@ def test_fp8_sliding_ring_launcher_refuses_bf16_globals(env, capsys):
     assert "--gemma4-sliding-kv fp8 needs --kv-dtype fp8" in capsys.readouterr().err
     with pytest.raises(ValueError, match="--gemma4-sliding-kv must be"):
         launcher.check_serve_settings(launcher.ServeProfile(gemma4_sliding_kv="int8"))
+
+
+@pytest.mark.parametrize("profile", ["default", "memory-16gb"])
+@pytest.mark.parametrize("selection", [None, "a16", "int8-g32", "int8-g64"])
+def test_q5_prefill_selection_is_opt_in_and_in_every_serve_command(env, tmp_path, monkeypatch, profile, selection):
+    monkeypatch.setattr(launcher, "artifact_info", lambda path: launcher.ArtifactInfo(True, False, 262144, True))
+    artifact = tmp_path / "iq3.ninfer"
+    artifact.write_bytes(b"x")
+    out = tmp_path / "q5.cmd"
+    option = [] if selection is None else ["--gemma4-q5-prefill", selection]
+    expected = selection or "a16"
+    assert cli.main(["launcher", "--artifact", str(artifact), "--serve", str(env.server), "--out", str(out),
+                     "--profile", profile, *option, "--allow-shared-memory"]) == 0
+    parsed = build.parse_launcher(out)
+    assert parsed.gemma4_q5_prefill == expected
+    assert parsed.effective_profile().get("gemma4_q5_prefill", "a16") == expected
+    assert ("gemma4_q5_prefill" in parsed.effective_profile()) == (expected != "a16")
+    text = out.read_text(encoding="utf-8")
+    commands = text.split(f'"{env.server.resolve()}" "{artifact.resolve()}"')[1:]
+    assert commands
+    for command in commands:
+        assert ("--gemma4-q5-prefill " + expected in command) == (expected != "a16")
+        assert (" --gemma4-q5-prefill" in command) == (expected != "a16")
+    args = cli.build_parser().parse_args(env.argv("iq3-xxs", "--profile", profile, *option))
+    assert cli.resolve_config(args)[1].gemma4_q5_prefill == expected
+
+
+def test_q5_prefill_refuses_unknown_values(env):
+    with pytest.raises(ValueError, match="--gemma4-q5-prefill must be a16, int8-g32 or int8-g64"):
+        launcher.check_serve_settings(launcher.ServeProfile(gemma4_q5_prefill="int8"))
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(env.argv("iq3-xxs", "--gemma4-q5-prefill", "int8"))

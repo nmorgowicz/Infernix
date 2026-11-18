@@ -413,6 +413,7 @@ int main(int argc, char** argv) {
         engine_options.max_context_auto         = cli.max_context_auto;
         engine_options.gemma4_key_only_kv        = cli.gemma4_key_only_kv;
         engine_options.gemma4_sliding_kv        = cli.gemma4_sliding_kv;
+        engine_options.gemma4_q5_prefill        = cli.gemma4_q5_prefill;
         engine_options.allow_shared_memory       = cli.allow_shared_memory;
         engine_options.shared_memory_placement   = cli.shared_memory_placement;
         engine_options.rope_yarn_factor         = cli.rope_yarn_factor;

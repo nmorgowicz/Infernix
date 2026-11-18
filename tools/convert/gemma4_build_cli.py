@@ -124,6 +124,9 @@ def add_serve_arguments(parser: argparse.ArgumentParser, *, prefix: str) -> None
     add("--gemma4-sliding-kv", choices=("bf16", "fp8"), default=None,
         help="sliding K/V ring storage: bf16 (general default), or experimental fp8 (memory-16gb default; "
         "about half the ring memory, measurable fidelity and prefill cost; requires --kv-dtype fp8). Explicit bf16 overrides the profile")
+    add("--gemma4-q5-prefill", choices=("a16", "int8-g32", "int8-g64"), default=None,
+        help="Gemma4 only, opt-in, lossy: native Q5 trunk projections of 64+ columns (prompt chunks, wide verification) "
+        "run INT8 activations quantized per 32 or 64 values of K on the stored codes; a16 (default) emits no flag")
     add("--allow-shared-memory", action="store_true",
         help="opt in to starting when the model does not fit the free VRAM: the shortfall runs in shared GPU memory "
         "(system RAM over PCIe, much slower; default off = the server refuses). memory-16gb tries resident starts first")
@@ -179,6 +182,7 @@ def serve_kwargs(args: argparse.Namespace) -> dict:
         "thinking_budget_message": args.thinking_budget_message, "reasoning_loop": args.reasoning_loop,
         "gemma4_key_only_kv": small or args.gemma4_key_only_kv, "mtp_fallback": small, "allow_shared_memory": args.allow_shared_memory,
         "gemma4_sliding_kv": args.gemma4_sliding_kv if args.gemma4_sliding_kv is not None else ("fp8" if small else "bf16"),
+        "gemma4_q5_prefill": args.gemma4_q5_prefill if args.gemma4_q5_prefill is not None else "a16",
     }
 
 

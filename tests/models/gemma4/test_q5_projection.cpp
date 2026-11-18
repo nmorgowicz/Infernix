@@ -161,6 +161,67 @@ int run_shape(int n, int k, std::uint32_t seed) {
     }
     return failures;
 }
+
+// --gemma4-q5-prefill through model project(): the layer's route flag selects ops::linear's INT8 route (bit for bit,
+// under A16Only and AllowA8 alike, ahead of the AllowA8 bake) from 64 columns; narrower calls keep the policy's
+// route; the planning envelope covers the arena's peak.
+int run_int8(int n, int k, std::uint32_t seed) {
+    auto host = oracle::make_weight(n, k, seed);
+    const auto activation = oracle::make_activation(k, kTokens.back(), seed + 1);
+    DeviceBuffer device_weight(host.payload.size()), device_x(activation.size() * 2);
+    device_weight.copy_from_host(host.payload.data(), device_weight.bytes);
+    device_x.copy_from_host(activation.data(), device_x.bytes);
+    const Weight weight = host.device_weight(device_weight.p);
+    DeviceContext context;
+    ops::Fp8RowCublasContext gemm(context.stream);
+    int failures = 0;
+    for (auto mode : {Gemma4Q5Prefill::Int8G32, Gemma4Q5Prefill::Int8G64}) {
+        const auto routes = g4::q5_prefill_routes(mode);
+        for (auto policy : {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8}) {
+            for (int tokens : kTokens) {
+                const std::string label = std::string("Gemma Q5 project ") + gemma4_q5_prefill_name(mode) + " [" +
+                                          std::to_string(n) + ',' + std::to_string(k) + "] T=" + std::to_string(tokens) +
+                                          (policy == ops::LinearPolicy::A16Only ? " A16Only" : " AllowA8");
+                const bool selected = tokens >= g4::kQ5DenseMinTokens;
+                const auto capacity = g4::projection_bytes(weight, policy, tokens, routes);
+                if (selected && capacity < ops::linear_q5_int8_prefill_workspace_bytes(n, k, tokens, routes)) {
+                    std::cerr << label << ": the planning envelope omits the INT8 scratch\n";
+                    ++failures;
+                }
+                if (!selected && capacity != g4::projection_bytes(weight, policy, tokens)) {
+                    std::cerr << label << ": a narrow call's envelope changed\n";
+                    ++failures;
+                }
+                Tensor x(device_x.p, DType::BF16, {k, tokens});
+                test::GuardedDeviceBuffer model_out(static_cast<std::size_t>(n) * tokens * 2),
+                    reference_out(static_cast<std::size_t>(n) * tokens * 2);
+                Tensor routed(model_out.data(), DType::BF16, {n, tokens}), expected(reference_out.data(), DType::BF16, {n, tokens});
+                DeviceArena model_workspace(std::max<std::size_t>(capacity, 256));
+                DeviceArena reference_workspace(std::max<std::size_t>(g4::projection_bytes(weight, policy, tokens, routes), 256));
+                g4::project(x, weight, policy, routed, gemm, model_workspace, context.stream, routes);
+                if (selected) {
+                    ops::linear(x, weight, expected, ops::LinearPolicy::A16Only, reference_workspace, context.stream, routes);
+                } else {
+                    g4::project(x, weight, policy, expected, gemm, reference_workspace, context.stream);
+                }
+                CUDA_CHECK(cudaStreamSynchronize(context.stream));
+                failures += model_out.verify_guards(label) + reference_out.verify_guards(label);
+                std::vector<std::uint16_t> a(static_cast<std::size_t>(n) * tokens), b(a.size());
+                model_out.copy_to_host(a.data(), a.size() * 2);
+                reference_out.copy_to_host(b.data(), b.size() * 2);
+                if (a != b) {
+                    std::cerr << label << ": project() does not match the " << (selected ? "INT8 route" : "policy route") << " bit for bit\n";
+                    ++failures;
+                }
+                if (model_workspace.peak_used() > capacity || model_workspace.used() != 0) {
+                    std::cerr << label << ": workspace query/scope mismatch\n";
+                    ++failures;
+                }
+            }
+        }
+    }
+    return failures;
+}
 } // namespace
 
 int main() {
@@ -172,6 +233,8 @@ int main() {
                                       std::pair{43008, 5376}, std::pair{5376, 8192},
                                       std::pair{5376, 16384}, std::pair{5376, 21504}}) {
             failures += run_shape(n, k, seed++);
+            if (n == 5376 && k == 8192) { failures += run_int8(n, k, seed++); }
+            if (n == 43008) { failures += run_int8(n, k, seed++); }
         }
         std::cout << (failures == 0 ? "OK" : "FAIL") << " Gemma native Q5 projection\n";
         return failures == 0 ? 0 : 1;

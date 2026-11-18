@@ -100,6 +100,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--gemma4-qk"},
     ServeOptionArity{"--gemma4-key-only-kv", false},
     ServeOptionArity{"--gemma4-sliding-kv"},
+    ServeOptionArity{"--gemma4-q5-prefill"},
     ServeOptionArity{"--allow-shared-memory", false},
     ServeOptionArity{"--shared-memory-placement"},
     ServeOptionArity{"--logits-dtype"},
@@ -504,6 +505,10 @@ std::string serve_usage_text(const char* argv0) {
            "  --gemma4-sliding-kv M      bf16 (default) | fp8: Gemma4 sliding-window ring K/V\n"
            "                             format; fp8 stores FP8 K and V with one scale per row\n"
            "                             (about half the ring; approximate; needs --kv-dtype fp8)\n"
+           "  --gemma4-q5-prefill M      a16 (default) | int8-g32 | int8-g64: Gemma4 native Q5 trunk\n"
+           "                             projections of 64+ columns; int8-g* run INT8 activations (scale\n"
+           "                             per 32 / 64 K values) on exact stored codes (lossy, opt-in;\n"
+           "                             decode unchanged)\n"
            "  --allow-shared-memory      Gemma4 only: when weights plus runtime do not fit the free\n"
            "                             VRAM start anyway, the shortfall in shared GPU memory\n"
            "                             (system RAM over PCIe: much slower; default off = refuse)\n"
@@ -1155,6 +1160,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.gemma4_key_only_kv = true;
         } else if (arg == "--gemma4-sliding-kv") {
             options.gemma4_sliding_kv = parse_gemma4_sliding_kv(require_value("--gemma4-sliding-kv"));
+        } else if (arg == "--gemma4-q5-prefill") {
+            options.gemma4_q5_prefill = parse_gemma4_q5_prefill(require_value("--gemma4-q5-prefill"));
         } else if (arg == "--allow-shared-memory") {
             options.allow_shared_memory = true;
         } else if (arg == "--shared-memory-placement") {

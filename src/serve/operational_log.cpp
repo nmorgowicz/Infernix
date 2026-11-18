@@ -16,6 +16,19 @@
 namespace infernix::serve {
 namespace {
 
+const char* gemma4_q5_prefill_scope(infernix::Gemma4Q5Prefill mode) {
+    switch (mode) {
+    case infernix::Gemma4Q5Prefill::A16: return "stored-code BF16 tiles at every width";
+    case infernix::Gemma4Q5Prefill::Int8G32:
+        return "calls of 64+ columns: INT8 activations per 32 values of K on exact stored Q5 codes (lossy, opt-in); "
+               "narrower calls unchanged a16";
+    case infernix::Gemma4Q5Prefill::Int8G64:
+        return "calls of 64+ columns: INT8 activations per 64 values of K on exact stored Q5 codes (lossy, opt-in); "
+               "narrower calls unchanged a16";
+    }
+    return "";
+}
+
 std::atomic<bool>& colours_enabled() {
     static std::atomic<bool> enabled{false};
     return enabled;
@@ -614,6 +627,8 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
         const infernix::Gemma4KvMemorySummary& kv = *memory.gemma4_kv;
         logger_->info("Gemma QK | requested {} | resolved {} | {}", infernix::gemma4_qk_name(engine.gemma4_qk),
                       infernix::gemma4_qk_name(kv.qk_mode), infernix::gemma4_qk_scope(kv.qk_mode));
+        logger_->info("Gemma Q5 prefill | {} | {}", infernix::gemma4_q5_prefill_name(engine.gemma4_q5_prefill),
+                      gemma4_q5_prefill_scope(engine.gemma4_q5_prefill));
         logger_->info("Gemma KV | requested {} | global {}{} ({}) | sliding {} ({})",
                       infernix::kv_cache_cli_name(kv.requested), infernix::kv_cache_cli_name(kv.global),
                       kv.global_key_only ? " key-only" : "", product::format_pretty_bytes(kv.global_payload_bytes),

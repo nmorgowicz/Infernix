@@ -51,6 +51,28 @@ inline constexpr std::size_t kDefaultMediaLiveBytes   = 2ULL << 30;
     throw std::invalid_argument("--gemma4-sliding-kv must be bf16 or fp8");
 }
 
+// --gemma4-q5-prefill: how the native Q5_G64_FP16 trunk projections compute calls of 64 or more columns (prompt
+// chunks, wide verification). a16 (default): the stored-code BF16-activation kernels. int8-g32 / int8-g64: the opt-in
+// LOSSY INT8-activation routes on exact stored codes (ops::LinearRoutes::Q5Int8G32 / Q5Int8G64), the activation scale
+// per 32 / per 64 values of K. Narrower calls (decode, MTP drafts and short verification) always run a16.
+enum class Gemma4Q5Prefill : std::uint8_t { A16, Int8G32, Int8G64 };
+
+[[nodiscard]] inline Gemma4Q5Prefill parse_gemma4_q5_prefill(std::string_view value) {
+    if (value == "a16") { return Gemma4Q5Prefill::A16; }
+    if (value == "int8-g32") { return Gemma4Q5Prefill::Int8G32; }
+    if (value == "int8-g64") { return Gemma4Q5Prefill::Int8G64; }
+    throw std::invalid_argument("--gemma4-q5-prefill must be a16, int8-g32 or int8-g64");
+}
+
+[[nodiscard]] inline const char* gemma4_q5_prefill_name(Gemma4Q5Prefill mode) {
+    switch (mode) {
+    case Gemma4Q5Prefill::A16: return "a16";
+    case Gemma4Q5Prefill::Int8G32: return "int8-g32";
+    case Gemma4Q5Prefill::Int8G64: return "int8-g64";
+    }
+    return "a16";
+}
+
 inline void validate_gemma4_qk(ops::Gemma4QkMode mode, bool gemma4, KvCacheStorage storage) {
     if (mode != ops::Gemma4QkMode::BFloat16 && mode != ops::Gemma4QkMode::Fp8) {
         throw std::invalid_argument("invalid Gemma4 QK mode");
@@ -779,6 +801,9 @@ struct EngineOptions {
     // Gemma4 only (--gemma4-sliding-kv): the sliding rings' K/V format. BF16 (default), or the opt-in FP8 ring
     // (FP8 E4M3 K and V, one FP16 scale per D256 row; needs --kv-dtype fp8). Other families refuse fp8.
     KvCacheStorage gemma4_sliding_kv = KvCacheStorage::BFloat16;
+    // Gemma4 only (--gemma4-q5-prefill): native Q5 trunk projections of 64 or more columns on the stored-code A16
+    // kernels (default) or the opt-in lossy INT8-activation routes. Other families and the lossless route refuse it.
+    Gemma4Q5Prefill gemma4_q5_prefill = Gemma4Q5Prefill::A16;
     // Gemma4 only, opt-in (--allow-shared-memory): start even when weights plus runtime do not fit the free resident
     // VRAM; what does not fit is placed in shared GPU memory (system RAM over PCIe) and the Engine reports how much.
     // Off: a startup that would spill is refused. shared_memory_placement says which allocations get the resident

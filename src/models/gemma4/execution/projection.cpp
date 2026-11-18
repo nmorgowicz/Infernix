@@ -82,7 +82,13 @@ Weight fp8_row_weight(void* payload, int rows, int k) {
 } // namespace
 
 void project(const Tensor& x, const Weight& weight, ops::LinearPolicy policy, Tensor& out,
-             ops::Fp8RowCublasContext& gemm, WorkspaceArena& workspace, cudaStream_t stream) {
+             ops::Fp8RowCublasContext& gemm, WorkspaceArena& workspace, cudaStream_t stream,
+             ops::LinearRoutes q5_routes) {
+    if (out.dtype == DType::BF16 && ops::linear_q5_int8_prefill_selected(weight, x.ne[1], q5_routes)) {
+        // The explicit opt-in: exact stored codes x INT8 activations, whatever the Use's policy says.
+        ops::linear(x, weight, out, policy, workspace, stream, q5_routes);
+        return;
+    }
     if (out.dtype == DType::BF16 && q5_through_fp8(weight, policy, x.ne[1])) {
         auto scope = workspace.scope();
         const auto payload = workspace.alloc_bytes(aligned(checked_bytes(weight.n, weight.k, 1)) +
@@ -103,9 +109,10 @@ void project(const Tensor& x, const Weight& weight, ops::LinearPolicy policy, Te
 }
 
 void project(const Tensor& x, const Weight& weight, const GgmlProjection& ggml, ops::LinearPolicy policy,
-             Tensor& out, ops::Fp8RowCublasContext& gemm, WorkspaceArena& workspace, cudaStream_t stream) {
+             Tensor& out, ops::Fp8RowCublasContext& gemm, WorkspaceArena& workspace, cudaStream_t stream,
+             ops::LinearRoutes q5_routes) {
     if (!ggml.active()) {
-        project(x, weight, policy, out, gemm, workspace, stream);
+        project(x, weight, policy, out, gemm, workspace, stream, q5_routes);
         return;
     }
     require_ggml_policy(policy);
@@ -158,26 +165,30 @@ void project_down_ready(const Tensor& x, const Weight& weight, ops::LinearPolicy
     ops::linear_a8_ready(x, weight, out, policy, ready.codes, ready.scales, workspace, stream);
 }
 
-std::size_t projection_bytes(const Weight& weight, ops::LinearPolicy policy, int tokens) {
+std::size_t projection_bytes(const Weight& weight, ops::LinearPolicy policy, int tokens, ops::LinearRoutes q5_routes) {
     // Query BF16 too: its native fallback owns its workspace contract, not this family.
     const auto linear = ops::linear_workspace_capacity_bytes(weight.qtype, weight.n, weight.k,
                                                              policy, 1, tokens);
+    // The opt-in INT8-activation route's scratch (zero without the flag); a wide AllowA8 bake below competes only if
+    // both could apply.
+    const auto int8 = ops::linear_q5_int8_prefill_workspace_bytes(weight.n, weight.k, tokens, q5_routes);
     if (q5_through_fp8(weight, policy, tokens)) {
         const auto payload = aligned(aligned(checked_bytes(weight.n, weight.k, 1)) +
                                      checked_bytes(weight.n, 1, 2));
-        return std::max(linear, payload +
+        return std::max({linear, int8, payload +
                                    ops::linear_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16,
                                                                         weight.n, weight.k,
                                                                         ops::LinearPolicy::AllowA8,
                                                                         kQ5DenseMinTokens, tokens) +
-                                   2 * kAlignment);
+                                   2 * kAlignment});
     }
-    if (!fp8_through_cublas(weight, policy, tokens)) { return linear; }
-    return std::max(linear, ops::fp8_row_cublas_workspace_bytes(weight.n, weight.k, tokens));
+    if (!fp8_through_cublas(weight, policy, tokens)) { return std::max(linear, int8); }
+    return std::max({linear, int8, ops::fp8_row_cublas_workspace_bytes(weight.n, weight.k, tokens)});
 }
 
-std::size_t projection_bytes(const Weight& weight, const GgmlProjection& ggml, ops::LinearPolicy policy, int tokens) {
-    if (!ggml.active()) { return projection_bytes(weight, policy, tokens); }
+std::size_t projection_bytes(const Weight& weight, const GgmlProjection& ggml, ops::LinearPolicy policy, int tokens,
+                             ops::LinearRoutes q5_routes) {
+    if (!ggml.active()) { return projection_bytes(weight, policy, tokens, q5_routes); }
     // ggml_linear's workspace depends on the call's width (encoding batches, wide-route planes): the largest
     // over every width it takes; from kGgmlDenseMinTokens the prefill route of the policy: AllowA8 the E4M3 rows and
     // multipliers plus the FP8 A8 GEMM's own workspace (Gemma trunk shapes), A16Only the dense BF16 matrix and FP32

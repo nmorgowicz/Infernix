@@ -87,6 +87,18 @@ enum class LinearRoutes : std::uint16_t {
     /// reproducible route; it takes precedence over GgmlBf16Wide where both are set, and is independent of
     /// GgmlA8 (which decides the calls of 1-31 columns).
     GgmlA8Wide = 512,
+    /// q5-int8-g32: native Q5_G64_FP16 projections of the six Gemma 4 31B trunk shapes (query/key/value, gate/up and
+    /// the three output matrices) of 64 or more columns run on the stored exact five-bit codes (no weight bake) and
+    /// INT8 activations quantized per token and 32 values of K (scale max|x| / 127, round-half-even, clamp +-127):
+    /// m16n8k32 s8 tensor-core dots are exact in int32 per 32-value group, and FP32 applies the activation scale
+    /// and then the stored FP16 group-64 scale per group in ascending K order. LOSSY and opt-in
+    /// (`--gemma4-q5-prefill int8-g32`), under every policy except A16ColumnInvariant (which ignores every flag); calls
+    /// of fewer columns and every other problem run their exact routes. Needs the workspace overload and
+    /// linear_q5_int8_prefill_workspace_bytes().
+    Q5Int8G32 = 1024,
+    /// q5-int8-g64: q5-int8-g32 with the activation scale per 64 values of K (the weights' group): the integer dot
+    /// of both 32-value halves is chained in one int32 and scaled once, half the scale work.
+    Q5Int8G64 = 2048,
 };
 
 [[nodiscard]] constexpr LinearRoutes operator|(LinearRoutes a, LinearRoutes b) noexcept {
@@ -98,7 +110,10 @@ enum class LinearRoutes : std::uint16_t {
 }
 
 [[nodiscard]] constexpr bool valid_linear_routes(LinearRoutes routes) noexcept {
-    return (static_cast<std::uint16_t>(routes) & ~std::uint16_t{1023}) == 0;
+    constexpr std::uint16_t kBoth = static_cast<std::uint16_t>(LinearRoutes::Q5Int8G32) |
+                                    static_cast<std::uint16_t>(LinearRoutes::Q5Int8G64);
+    const auto bits = static_cast<std::uint16_t>(routes);
+    return (bits & ~std::uint16_t{4095}) == 0 && (bits & kBoth) != kBoth;
 }
 
 [[nodiscard]] constexpr bool valid_linear_policy(LinearPolicy policy) noexcept {
@@ -188,6 +203,22 @@ void q5_widen_e4m3(const Weight& weight, Tensor& codes, Tensor& row_scales, cuda
  */
 [[nodiscard]] std::size_t linear_fp8_a8_pair_block32_workspace_bytes(std::int32_t input_rows,
                                                                      std::int32_t tokens);
+
+/**
+ * Whether `routes` (LinearRoutes::Q5Int8G32 or Q5Int8G64) runs a call of `tokens` columns of `w` on the INT8
+ * prefill route: a native Q5_G64_FP16 RowSplit matrix of one of the six Gemma 4 31B trunk shapes and at least 64
+ * columns.
+ */
+[[nodiscard]] bool linear_q5_int8_prefill_selected(const Weight& w, std::int32_t tokens, LinearRoutes routes) noexcept;
+
+/**
+ * The transient bytes the INT8 prefill route takes for any call of up to `tokens` columns of a `[output_rows,
+ * input_rows]` Q5_G64_FP16 matrix: the INT8 activations and their group scales padded to 128-token tiles. Zero when
+ * `routes` has no INT8 flag, the shape is not one of the six registered trunk shapes or `tokens` is below 64.
+ * linear_workspace_capacity_bytes() does not include it (it takes no routes): the caller adds this.
+ */
+[[nodiscard]] std::size_t linear_q5_int8_prefill_workspace_bytes(std::int32_t output_rows, std::int32_t input_rows,
+                                                                 std::int32_t tokens, LinearRoutes routes);
 
 /**
  * @brief Applies a bias-free matrix projection independently to every input column.

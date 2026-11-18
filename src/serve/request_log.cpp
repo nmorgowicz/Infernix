@@ -588,6 +588,7 @@ std::string format_server_start_json(
              {"log_stats_interval_ms", options.log_stats_interval_ms},
              {"kv_cache", kv_cache_json_name(engine_options.kv_cache)},
              {"gemma4_qk", infernix::gemma4_qk_name(engine_options.gemma4_qk)},
+             {"gemma4_q5_prefill", infernix::gemma4_q5_prefill_name(engine_options.gemma4_q5_prefill)},
              {"logits_dtype", product::logits_dtype_name(engine_options.logits_dtype)},
              {"vision", engine_options.enable_vision},
              {"cuda_graph", engine_options.use_cuda_graph},

@@ -68,6 +68,9 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
         if (options.gemma4_sliding_kv != KvCacheStorage::BFloat16) {
             throw std::invalid_argument("--gemma4-sliding-kv fp8 is supported only for Gemma4");
         }
+        if (options.gemma4_q5_prefill != Gemma4Q5Prefill::A16) {
+            throw std::invalid_argument("--gemma4-q5-prefill int8-g32|int8-g64 is supported only for Gemma4");
+        }
         if (options.allow_shared_memory) {
             throw std::invalid_argument("--allow-shared-memory is supported only for Gemma4");
         }

@@ -18,6 +18,13 @@ infernix_add_family_op_test(infernix_linear_gemma4_q5_a16_test FAMILY linear
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gemma4_q5_a16.cpp"
   LIBRARIES infernix_linear_test_support)
 
+# Gemma 4 31B native Q5 group64 on the opt-in INT8-activation prefill route (LinearRoutes::Q5Int8G32 / G64): every
+# output against an independent host restatement of the chain (bit for bit on sampled rows and tokens), partial token
+# tiles, graph replay, workspace and the calls the route does not take.
+infernix_add_family_op_test(infernix_linear_gemma4_q5_int8_prefill_test FAMILY linear
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gemma4_q5_int8_prefill.cpp"
+  LIBRARIES infernix_linear_test_support)
+
 # The transient Q5 row-FP8 bake against an independent host byte oracle (including signed
 # scales, zero rows, actual-vs-bound maxima, E4M3 ties, and padded physical row strides).
 infernix_add_family_op_test(infernix_linear_q5_widen_e4m3_test FAMILY linear

@@ -77,6 +77,7 @@ struct Options {
     infernix::ops::Gemma4QkMode gemma4_qk = infernix::ops::Gemma4QkMode::BFloat16;
     bool gemma4_key_only_kv = false;
     infernix::KvCacheStorage gemma4_sliding_kv = infernix::KvCacheStorage::BFloat16;
+    infernix::Gemma4Q5Prefill gemma4_q5_prefill = infernix::Gemma4Q5Prefill::A16;
     infernix::LogitsDtype logits_dtype    = infernix::LogitsDtype::FP32;
     bool quick                          = false;
     bool original_int8_prefill_kernel   = false;
@@ -106,6 +107,8 @@ std::string usage_text() {
            "       [--gemma4-key-only-kv] (derive global V from FP8 K; opt-in lossy cache)\n"
            "       [--gemma4-sliding-kv bf16|fp8] (Gemma4 sliding ring K/V format; fp8 is an opt-in lossy\n"
            "        cache with one scale per row; needs --kv-dtype fp8)\n"
+           "       [--gemma4-q5-prefill a16|int8-g32|int8-g64] (Gemma4 native Q5 trunk projections of 64+\n"
+           "        columns; int8-g* run INT8 activations per 32/64 K values on exact stored codes; lossy, opt-in)\n"
            "       [--logits-dtype fp32|bf16] (the head's logits scoring reads; default fp32, bf16\n"
            "        rounds each once, as Transformers returns them, for comparisons)\n"
            "       [--use-original-int8-prefill-kernel (int8 only; default fast kernel)]\n"
@@ -254,6 +257,12 @@ Options parse_options(int argc, char** argv) {
         } else if (option == "--gemma4-sliding-kv") {
             try {
                 out.gemma4_sliding_kv = infernix::parse_gemma4_sliding_kv(value("--gemma4-sliding-kv"));
+            } catch (const std::invalid_argument& error) {
+                usage_error(error.what());
+            }
+        } else if (option == "--gemma4-q5-prefill") {
+            try {
+                out.gemma4_q5_prefill = infernix::parse_gemma4_q5_prefill(value("--gemma4-q5-prefill"));
             } catch (const std::invalid_argument& error) {
                 usage_error(error.what());
             }
@@ -712,6 +721,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.gemma4_qk        = options.gemma4_qk;
     engine_options.gemma4_key_only_kv = options.gemma4_key_only_kv;
     engine_options.gemma4_sliding_kv = options.gemma4_sliding_kv;
+    engine_options.gemma4_q5_prefill = options.gemma4_q5_prefill;
     engine_options.logits_dtype     = options.logits_dtype;
     engine_options.original_int8_prefill_kernel = options.original_int8_prefill_kernel;
     engine_options.original_nvfp4_prefill_kernel = options.original_nvfp4_prefill_kernel;
@@ -1041,6 +1051,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"gemma4_qk", infernix::gemma4_qk_name(options.gemma4_qk)},
           {"gemma4_key_only_kv", options.gemma4_key_only_kv},
           {"gemma4_sliding_kv", options.gemma4_sliding_kv == infernix::KvCacheStorage::Fp8E4M3Row256 ? "fp8" : "bf16"},
+          {"gemma4_q5_prefill", infernix::gemma4_q5_prefill_name(options.gemma4_q5_prefill)},
           {"logits_dtype", infernix::product::logits_dtype_name(options.logits_dtype)}}},
         {"timing",
          {{"load_seconds", load.load_seconds},

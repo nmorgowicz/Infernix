@@ -413,6 +413,18 @@ int run_tests() {
     failures += check(rejects([] {
                           (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--gemma4-sliding-kv", "int8"});
                       }), "--gemma4-sliding-kv must refuse formats other than bf16 and fp8");
+    failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "hello"}).gemma4_q5_prefill ==
+                          infernix::Gemma4Q5Prefill::A16,
+                      "--gemma4-q5-prefill must default to a16");
+    failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--gemma4-q5-prefill", "int8-g32"})
+                              .gemma4_q5_prefill == infernix::Gemma4Q5Prefill::Int8G32,
+                      "--gemma4-q5-prefill int8-g32 was not parsed");
+    failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--gemma4-q5-prefill", "int8-g64"})
+                              .gemma4_q5_prefill == infernix::Gemma4Q5Prefill::Int8G64,
+                      "--gemma4-q5-prefill int8-g64 was not parsed");
+    failures += check(rejects([] {
+                          (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--gemma4-q5-prefill", "int8"});
+                      }), "--gemma4-q5-prefill must refuse unknown modes");
     const std::string help = infernix::cli::usage_text("infernix-cli");
     failures +=
         check(help.find("nvfp4") != std::string::npos && help.find("k8v4") != std::string::npos &&

@@ -87,6 +87,7 @@ class ServeProfile:
     reasoning_loop: str | None = None
     gemma4_key_only_kv: bool = False
     gemma4_sliding_kv: str = "bf16"
+    gemma4_q5_prefill: str = "a16"
     mtp_fallback: bool = False  # memory-16gb: plan with MTP first, start without it when only that does not fit
     allow_shared_memory: bool = False  # --allow-shared-memory: start with the shortfall in shared GPU memory (slow)
 
@@ -133,6 +134,8 @@ def check_serve_settings(profile: ServeProfile) -> None:
         raise ValueError("--gemma4-key-only-kv needs --kv-dtype fp8")
     if profile.gemma4_sliding_kv not in ("bf16", "fp8"):
         raise ValueError("--gemma4-sliding-kv must be bf16 or fp8")
+    if profile.gemma4_q5_prefill not in ("a16", "int8-g32", "int8-g64"):
+        raise ValueError("--gemma4-q5-prefill must be a16, int8-g32 or int8-g64")
     if profile.gemma4_sliding_kv == "fp8" and profile.kv_dtype != "fp8":
         raise ValueError("--gemma4-sliding-kv fp8 needs --kv-dtype fp8")
     if profile.gemma4_qk not in GEMMA4_QKS:
@@ -179,6 +182,7 @@ def serve_groups(
          str(profile.vram_headroom_mib), "--kv-dtype", profile.kv_dtype]
         + (["--gemma4-key-only-kv"] if profile.gemma4_key_only_kv else [])
         + (["--gemma4-sliding-kv", "fp8"] if profile.gemma4_sliding_kv == "fp8" else [])
+        + (["--gemma4-q5-prefill", profile.gemma4_q5_prefill] if profile.gemma4_q5_prefill != "a16" else [])
         + (["--gemma4-qk", "fp8"] if profile.gemma4_qk == "fp8" else []),
         ["--max-concurrency", "1", "--prefill-chunk", profile.prefill_chunk, "--logits-dtype", profile.logits_dtype]
         + (["--top-k", str(profile.top_k)] if profile.top_k is not None else [])
@@ -256,6 +260,8 @@ def launcher_lines(
         lines.append("rem Experimental key-only global FP8 KV. Default launches do not enable it.")
     if profile.gemma4_sliding_kv == "fp8":
         lines.append("rem Experimental FP8 sliding K/V ring: lower memory, measurable fidelity and prefill cost; memory-16gb default, explicit bf16 overrides it.")
+    if profile.gemma4_q5_prefill != "a16":
+        lines.append("rem Experimental INT8-activation Q5 prefill (lossy, opt-in): calls of 64+ columns; decode unchanged. Default launches do not enable it.")
     if profile.context == "auto":
         lines.append("rem Context is fitted at startup to available VRAM; refuses below 9216 tokens. Read /v1/models for the resolved limit.")
     if profile.gemma4_qk == "fp8":

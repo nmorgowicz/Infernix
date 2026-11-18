@@ -240,6 +240,7 @@ ParameterGeometry Parameters::geometry(const Model& source) {
     }
     out.output_head = prepare.linear({weights.output_head}, head_use.input).weight;
     out.layers.reserve(weights.layers.size());
+    const auto q5_routes = q5_prefill_routes(source.options().gemma4_q5_prefill);
     for (std::size_t i = 0; i < weights.layers.size(); ++i) {
         const auto& stored = weights.layers[i];
         const auto kind = config.layer_types[i];
@@ -256,6 +257,7 @@ ParameterGeometry Parameters::geometry(const Model& source) {
         layer.rope_theta = kind == LayerKind::Global ? config.prope_theta_eff : config.rope_sliding_theta;
         layer.rms_eps = config.rms_norm_eps;
         layer.global_layer = kind == LayerKind::Global;
+        layer.q5_routes = q5_routes;
         PreparedProjection qkv;
         WeightId q_norm, k_norm, output;
         if (layer.global_layer) {

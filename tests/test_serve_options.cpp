@@ -461,6 +461,19 @@ int main() {
         (void)parse({"infernix-serve", "model.ninfer", "--gemma4-sliding-kv", "int8"});
     } catch (const std::invalid_argument&) { sliding_int8_rejected = true; }
     failures += check(sliding_int8_rejected, "--gemma4-sliding-kv int8 was accepted");
+    failures += check(parse({"infernix-serve", "model.ninfer"}).gemma4_q5_prefill == infernix::Gemma4Q5Prefill::A16,
+                      "--gemma4-q5-prefill must default to a16");
+    failures += check(parse({"infernix-serve", "model.ninfer", "--gemma4-q5-prefill", "int8-g32"}).gemma4_q5_prefill ==
+                          infernix::Gemma4Q5Prefill::Int8G32,
+                      "--gemma4-q5-prefill int8-g32 was not parsed");
+    failures += check(parse({"infernix-serve", "model.ninfer", "--gemma4-q5-prefill", "int8-g64"}).gemma4_q5_prefill ==
+                          infernix::Gemma4Q5Prefill::Int8G64,
+                      "--gemma4-q5-prefill int8-g64 was not parsed");
+    bool q5_int8_rejected = false;
+    try {
+        (void)parse({"infernix-serve", "model.ninfer", "--gemma4-q5-prefill", "int8"});
+    } catch (const std::invalid_argument&) { q5_int8_rejected = true; }
+    failures += check(q5_int8_rejected, "--gemma4-q5-prefill int8 was accepted");
     const std::string kv_help = serve_usage_text("infernix-serve");
     failures += check(kv_help.find("nvfp4") != std::string::npos &&
                           kv_help.find("k8v4") != std::string::npos &&

@@ -86,6 +86,16 @@ ModelMetadata metadata(const models::gemma4::Model& model) {
     return out;
 }
 
+// Whether any weight is a native Q5_G64_FP16 matrix, the only format --gemma4-q5-prefill's routes serve.
+bool has_native_q5(const models::gemma4::Model& model) {
+    for (const auto& weight : model.weight_data()) {
+        for (const auto& part : weight.view.parts) {
+            if (part.parent && part.parent->geometry.format == QType::Q5_G64_FP16) { return true; }
+        }
+    }
+    return false;
+}
+
 } // namespace
 
 std::uint32_t resolve_gemma4_auto_context(
@@ -238,6 +248,10 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& supplied, DeviceContext&
     auto cold_plan = models::gemma4::plan_load(reader, load_options);
     const std::uint64_t weight_bytes = cold_plan.device_bytes();
     auto geometry = models::gemma4::plan_model(std::move(cold_plan));
+    if (options.gemma4_q5_prefill != Gemma4Q5Prefill::A16 && !has_native_q5(*geometry)) {
+        throw std::invalid_argument(std::string("--gemma4-q5-prefill ") + gemma4_q5_prefill_name(options.gemma4_q5_prefill) +
+                                    " needs an artifact with native Q5 (q5_g64_fp16) trunk projections");
+    }
     if (options.max_context_auto) {
         options.max_context = std::min({options.max_context, 131072U, geometry->config().text.max_position_embeddings});
     } else if (options.max_context > geometry->config().text.max_position_embeddings) {
@@ -470,7 +484,11 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& supplied, DeviceContext&
         (options.kv_cache == KvCacheStorage::Fp8E4M3Row256 ? "fp8" : "bf16") + "-kv" +
         (global_kv_storage(options) == models::gemma4::KvStorageModel::KeyOnly ? "/k-only" : "") +
         (options.gemma4_sliding_kv == KvCacheStorage::Fp8E4M3Row256 ? "/s-fp8" : "") + "/qk=" +
-        gemma4_qk_name(options.gemma4_qk) + "/cold/chunk=" + std::to_string(options.prefill_chunk);
+        gemma4_qk_name(options.gemma4_qk) +
+        (options.gemma4_q5_prefill != Gemma4Q5Prefill::A16
+             ? std::string("/q5=") + gemma4_q5_prefill_name(options.gemma4_q5_prefill)
+             : std::string()) +
+        "/cold/chunk=" + std::to_string(options.prefill_chunk);
     std::set<std::string> formats;
     for (const auto& weight : instance->model->weight_data()) {
         for (const auto& part : weight.view.parts) {

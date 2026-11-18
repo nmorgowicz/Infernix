@@ -13,6 +13,7 @@
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
 #include "ops/linear/q4/q4_dispatch.h"
 #include "ops/linear/q5/q5_dispatch.h"
+#include "ops/linear/q5/q5_int8_prefill.h"
 #include "ops/linear/q6/q6_dispatch.h"
 #include "ops/linear/q8/q8_dispatch.h"
 #include "ops/common/q4_scale_mode.h"
@@ -105,6 +106,14 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         detail::q4_g32_dispatch(x, w, out, policy, workspace, stream);
         return;
     case QType::Q5_G64_FP16:
+        if (const int group = detail::q5_int8_route_group(routes);
+            group != 0 && detail::q5_int8_prefill_supported(w, x.ne[1])) {
+            if (workspace == nullptr) {
+                throw std::invalid_argument("linear: the Q5 INT8 prefill route needs the workspace overload");
+            }
+            detail::q5_int8_prefill(x, w, out, group, *workspace, stream);
+            return;
+        }
         detail::q5_dispatch(x, w, out, policy, stream);
         return;
     case QType::Q6_G64_FP16:
@@ -170,6 +179,19 @@ std::size_t linear_f16_accumulate_workspace_bytes(std::int32_t input_rows, std::
 
 std::size_t linear_fp8_a8_pair_block32_workspace_bytes(std::int32_t input_rows, std::int32_t tokens) {
     return detail::fp8_a8_pair_block32_workspace_capacity_bytes(tokens, input_rows);
+}
+
+bool linear_q5_int8_prefill_selected(const Weight& w, std::int32_t tokens, LinearRoutes routes) noexcept {
+    return detail::q5_int8_route_group(routes) != 0 && detail::q5_int8_prefill_supported(w, tokens);
+}
+
+std::size_t linear_q5_int8_prefill_workspace_bytes(std::int32_t output_rows, std::int32_t input_rows,
+                                                   std::int32_t tokens, LinearRoutes routes) {
+    const int group = detail::q5_int8_route_group(routes);
+    if (group == 0 || tokens < detail::kQ5Int8MinTokens || !detail::q5_int8_prefill_shape(output_rows, input_rows)) {
+        return 0;
+    }
+    return detail::q5_int8_prefill_workspace_bytes(input_rows, tokens, group);
 }
 
 std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_rows,

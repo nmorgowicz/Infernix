@@ -34,6 +34,9 @@ struct Gemma4LayerWeights {
     ops::LinearPolicy o_policy = ops::LinearPolicy::A16Only;
     ops::LinearPolicy gate_up_policy = ops::LinearPolicy::A16Only;
     ops::LinearPolicy down_policy = ops::LinearPolicy::A16Only;
+    // --gemma4-q5-prefill (q5_prefill_routes): the route flag of this layer's native Q5 projections at 64 or more
+    // columns; Exact is the stored-code A16 default.
+    ops::LinearRoutes q5_routes = ops::LinearRoutes::Exact;
     GgmlProjection qkv_ggml;
     GgmlProjection o_ggml;
     GgmlProjection gate_up_ggml;

@@ -5,6 +5,7 @@
 #include "infernix/ops/fp8_row_cublas.h"
 #include "infernix/ops/ggml_linear.h"
 #include "infernix/ops/linear.h"
+#include "infernix/types.h"
 
 #include <cuda_runtime.h>
 
@@ -41,14 +42,29 @@ inline constexpr int kGgmlDenseMinTokens = 64;
 // decode/MTP and every A16Only call retain the stored-code native Q5 A16 route.
 inline constexpr int kQ5DenseMinTokens = 64;
 
+// --gemma4-q5-prefill: the route flag the layer's native Q5 projections of kQ5DenseMinTokens or more columns carry
+// (ops::LinearRoutes::Q5Int8G32 / Q5Int8G64); a16 is no flag. It takes precedence over an AllowA8 Use's row-FP8 bake
+// at those widths; narrower calls never use it.
+[[nodiscard]] constexpr ops::LinearRoutes q5_prefill_routes(Gemma4Q5Prefill mode) noexcept {
+    switch (mode) {
+    case Gemma4Q5Prefill::A16: return ops::LinearRoutes::Exact;
+    case Gemma4Q5Prefill::Int8G32: return ops::LinearRoutes::Q5Int8G32;
+    case Gemma4Q5Prefill::Int8G64: return ops::LinearRoutes::Q5Int8G64;
+    }
+    return ops::LinearRoutes::Exact;
+}
+
 // out = weight * x for contiguous BF16 x [K,T]. Wide AllowA8 native Q5 uses a transient row-FP8
 // bake and the existing FP8 A8 GEMM; wide FP8 A16 with BF16 output uses caller-owned cuBLAS
 // resources and per-call widening in the arena. An active GgmlProjection runs its routes below
-// (weight then only describes [N,K]); all other calls use ops::linear.
+// (weight then only describes [N,K]); all other calls use ops::linear. `q5_routes` (q5_prefill_routes) selects the
+// opt-in INT8-activation route of a native Q5 trunk projection of 64 or more columns, whose scratch is the arena's.
 void project(const Tensor& x, const Weight& weight, ops::LinearPolicy policy, Tensor& out,
-             ops::Fp8RowCublasContext& gemm, WorkspaceArena& workspace, cudaStream_t stream);
+             ops::Fp8RowCublasContext& gemm, WorkspaceArena& workspace, cudaStream_t stream,
+             ops::LinearRoutes q5_routes = ops::LinearRoutes::Exact);
 void project(const Tensor& x, const Weight& weight, const GgmlProjection& ggml, ops::LinearPolicy policy,
-             Tensor& out, ops::Fp8RowCublasContext& gemm, WorkspaceArena& workspace, cudaStream_t stream);
+             Tensor& out, ops::Fp8RowCublasContext& gemm, WorkspaceArena& workspace, cudaStream_t stream,
+             ops::LinearRoutes q5_routes = ops::LinearRoutes::Exact);
 
 // Producer-owned ready E4M3 activation [rows,tokens] and one FP32 scale per column.
 struct DownA8 {
@@ -64,8 +80,10 @@ void project_down_ready(const Tensor& x, const Weight& weight, ops::LinearPolicy
                         cudaStream_t stream);
 
 // Complete arena capacity project can take for any positive column count up to tokens.
-[[nodiscard]] std::size_t projection_bytes(const Weight& weight, ops::LinearPolicy policy, int tokens);
+[[nodiscard]] std::size_t projection_bytes(const Weight& weight, ops::LinearPolicy policy, int tokens,
+                                           ops::LinearRoutes q5_routes = ops::LinearRoutes::Exact);
 [[nodiscard]] std::size_t projection_bytes(const Weight& weight, const GgmlProjection& ggml,
-                                           ops::LinearPolicy policy, int tokens);
+                                           ops::LinearPolicy policy, int tokens,
+                                           ops::LinearRoutes q5_routes = ops::LinearRoutes::Exact);
 
 } // namespace infernix::models::gemma4
