@@ -741,3 +741,142 @@ is numerically equivalent to the prior A8-tagged artifact on the bounded protoco
 True incremental quality is now measured separately from final-prefill state; narrow A16 arithmetic is
 unchanged on the shared-prefix control, but prefill history still changes decode distributions and g32 shows
 a measured NLL increase. No new default, general quality equivalence, long-context claim or item 2e.
+
+## Matched Q5 chunk sweep (item 2e, 2026-11-18)
+
+**Recommendation: retain chunk 2048.** On this RTX 5090 (170 SMs), FP8's highest measured
+~65k median is at 2048. INT8 g64's 1536 median is only **0.64%** higher than 2048, with
+overlapping repetition ranges; g32's 1536 median is 2.08% higher but also within its much
+wider range. Neither is a clear speed winner. Chunk **1536 is an explicit memory tradeoff**,
+not a new default or a demonstrated speed improvement. Compute modes remain independent
+choices: these timings do not qualify quality or erase item 2d's significant g32 incremental
+NLL increase. No source, kernel, artifact, preset, automatic chunk or production-build change.
+
+### Instrument and fixed serving profile
+
+`item2e-cold-http/v1`, source `f9a882adc021fc9ce2cf3dae144a67154513ceb9`, clean tracked source
+at instrument capture; the existing approved absolute executable is
+`D:/AI/loaders/build-infernix-prefill-earlyexit-cuda13.5/apps/Release/infernix-serve.exe`,
+SHA-256 **`63af2c0d78a6788ee5b97ba16d8206a1d503e4d78c9abe106fa527925c010c8c`**.
+No build was needed. Every mode uses the **one** A16Only artifact
+`plain-native-gptq5-g64-a16.ninfer`, 21,151,120,388 B, SHA-256
+`757652af20b91cf6b61c6cc61e50c58750f008a8343f9c8a107fba50edb09c72`.
+The lease verifies both hashes unchanged afterward. Driver 621.01, CUDA 13.5, 575 W limit;
+no clock lock or hardware-profiler claim. Campaign driver SHA-256
+`a502fb2b508da6f561fd822c055e41e720d6d636ce5b80af6ce3025077879ef0`;
+`identity.json` also binds the reused HTTP helper and fixed template
+(`dc99c0bae1b6113b7756e74fe119ad5933e8a181f99f152976cc650ff9104232`).
+
+Same profile as item 2c: context/KV **68,096**, 1024 MiB headroom, normal global FP8 K/V,
+FP8 QK, **BF16 sliding ring**, BF16 logits, one lane, graphs on, MTP off, prefix reuse
+and Host cache off, `free-cache-resume` off. “Cold” means **zero retained-prefix reuse**,
+not cold disk or cold L2: startup warmup and one excluded 982-token HTTP warmup remain.
+No temporary inference environment switches were set.
+
+The retained item-2a/2c English request bodies, greedy/top-k 20/seed 1234/thinking off,
+are identical across cells: short **986/987** tokens, long **64,985**, one output token.
+Each route/chunk has **three independent starts**, two measured shorts and one identical
+long per start: **six short / three long observations**. Chunk orders are forward,
+reverse and interleaved; mode orders are rotated/reversed. Two minimal A16/2048 starts
+bracket the sweep. All **38 starts / 152 HTTP requests** complete, including 38 excluded
+warmups. The analyzer verifies actual mode/chunk/KV/cache/graph settings, request hashes,
+native token counts, full computed-prefill counts and completed outputs. Actual long
+prefill units for chunks 1024/1280/1536/2048 are **64/51/43/32**. Every one-token response
+is token 818; this is only a smoke observation, not quality or full-output equivalence.
+
+### Measured HTTP throughput
+
+Tok/s **median [minimum, maximum]**; ranges are observed repetitions, not confidence intervals:
+
+| Chunk | Prompt | FP8 | INT8 g64 | INT8 g32 |
+|---:|---|---:|---:|---:|
+| 1024 | ~1k | 6412 [5926, 6513] | 5357 [4846, 5534] | 4641 [4354, 4744] |
+| 1280 | ~1k | 6322 [5734, 6391] | 5505 [5354, 5529] | 4629 [4428, 4721] |
+| 1536 | ~1k | 6375 [5673, 6439] | 5463 [4958, 5510] | 4659 [3854, 4738] |
+| 2048 | ~1k | 6378 [6072, 6420] | 5428 [5269, 5520] | 4356 [4182, 4731] |
+| 1024 | ~65k | 3193 [3019, 3246] | 2904 [2844, 2967] | 2665 [2655, 2719] |
+| 1280 | ~65k | 3314 [3309, 3345] | 2951 [2951, 2988] | 2704 [2702, 2733] |
+| 1536 | ~65k | 3351 [3175, 3361] | 3010 [2974, 3014] | 2749 [2435, 2760] |
+| 2048 | ~65k | 3421 [3187, 3436] | 2991 [2982, 3001] | 2694 [2674, 2705] |
+
+Median **prompt / wire-TTFT milliseconds**, mode order FP8 / g64 / g32:
+
+| Chunk | ~1k prompt / wire TTFT | ~65k prompt / wire TTFT |
+|---:|---|---|
+| 1024 | 154/176 ; 184/207 ; 213/235 | 20355/20489 ; 22379/22527 ; 24383/24496 |
+| 1280 | 156/183 ; 179/209 ; 213/238 | 19611/19751 ; 22018/22145 ; 24032/24184 |
+| 1536 | 155/182 ; 181/208 ; 212/273 | 19390/19526 ; 21591/21729 ; 23635/23826 |
+| 2048 | 155/182 ; 182/199 ; 226/260 | 18996/19131 ; 21730/21865 ; 24126/24306 |
+
+All short prompts fit in one chunk at every setting: their scatter is not evidence that
+smaller long-prefill chunks accelerate this workload. Long FP8 medians at 1024/1280/1536
+are **6.68%/3.14%/2.03% below 2048**. G64 at 1024/1280 is 2.90%/1.31% below 2048;
+1536 saves only 139 ms median prompt time. A16 controls themselves span **1734–1997 tok/s**
+long and **2318–2787** short (before/after long 1997/1734), demonstrating uncontrolled
+variation. Historical item-2c A16/2048 remains the reliable larger baseline; these two
+controls are not pooled into it or used to claim a fresh cross-precision speedup.
+No timing outlier is silently discarded or causally attributed to paging.
+
+### Measured memory, capacity and contamination
+
+Startup reservations/high-water are identical across FP8/g64/g32 at each chunk. All weight
+allocations stay **20,631,888,384 B**; global FP8 KV stays **2,811,002,880 B**. Every start
+actually resolves **68,096 context/KV tokens** (1064 page groups). This fixed-capacity
+experiment does **not** measure the auto-capacity frontier or a longer-context speed.
+
+| Chunk | Workspace capacity / high-water MiB | BF16 ring MiB | Total runtime reservation MiB | Startup free VRAM GiB, range |
+|---:|---:|---:|---:|---:|
+| 1024 | 765.008 / 635.000 | 1600 | 5121.839 | 3.707–3.780 |
+| 1280 | 827.758 / 635.000 | 1800 | 5387.216 | 3.438–3.531 |
+| 1536 | 1051.133 / 856.125 | 2000 | 5813.218 | 2.972–3.105 |
+| 2048 | 1530.008 / 1270.000 | 2400 | 6697.347 | 2.127–2.234 |
+
+Relative to 2048, 1536 reduces the measured **runtime reservation by 927,076,352 B =
+884.129 MiB**: **478.875 MiB workspace capacity + 400 MiB ring payload + 5.254 MiB
+other sequence reservation** (the non-payload residual is not separately attributed).
+That is not 884 MiB of KV payload or measured additional token capacity. Workspace
+high-water alone falls **413.875 MiB**. Graph measured allocation remains 14 MiB inside
+the unchanged 64 MiB allowance. Whole-device sampled peak is **29,004 MiB**, including
+desktop; free-VRAM differences also include desktop variation and are not a capacity proof.
+
+Lease `item2e-chunksweep`: exit 0, **1470 s**, minimum free physical RAM **35.257 GiB**;
+unchanged 8 GiB floor. All starts succeed. No named build/quantizer/heavy overlap or
+second Infernix server was sampled. **All cells nevertheless have nonzero system fault
+activity**: 660 raw per-cell samples record available RAM, `Memory\Pages/sec`,
+`Memory\Page Reads/sec` and `Memory\Pages Input/sec`; no counter-read failures.
+The latter two are disk-backed-fault proxies, not per-process hard-fault counts.
+Across the three starts per row, minimum available GiB and maximum sampled rates:
+
+| Mode / chunk | Min RAM GiB | Max Pages/sec / Page Reads/sec / Pages Input/sec |
+|---|---:|---:|
+| FP8 / 1024 | 36.09 | 749 / 148 / 749 |
+| FP8 / 1280 | 36.11 | 27212 / 10369 / 27212 |
+| FP8 / 1536 | 35.27 | 1487 / 420 / 1487 |
+| FP8 / 2048 | 36.09 | 6470 / 1229 / 6470 |
+| g64 / 1024 | 36.07 | 293 / 117 / 293 |
+| g64 / 1280 | 36.12 | 46033 / 516 / 46033 |
+| g64 / 1536 | 36.09 | 1762 / 1582 / 1762 |
+| g64 / 2048 | 36.20 | 108 / 47 / 108 |
+| g32 / 1024 | 36.03 | 1140 / 243 / 1140 |
+| g32 / 1280 | 36.17 | 1319 / 278 / 1319 |
+| g32 / 1536 | 35.36 | 128 / 23 / 128 |
+| g32 / 2048 | 35.98 | 697 / 384 / 697 |
+
+These maxima include startup as well as requests; raw timestamps and request-overlap
+summaries preserve that distinction. The 46,033 Pages/sec maximum is in g64/1280's first
+start (its long request reaches only 27.88); FP8/1280's second long request itself reaches
+27,212. A16 controls reach 737/612 Pages/sec. Classification: **system fault activity
+observed, process attribution unknown**, not paging-free and not proof the model paged.
+Three starts, variable desktop/clock/system conditions and polling limits make small
+speed differences inconclusive. The conservative unchanged-2048 decision does not require
+pretending the measurements are pollution-free.
+
+Evidence: camp `chunksweep-20261118/{measure.py,summarize.py,identity.json,summary.json}`,
+38 per-start directories with request/SSE/response/metrics/startup logs and
+`resource-samples.jsonl`; parent `infernix-port-p3-20261112/item2e-chunksweep.{log,receipt.json}`.
+The first analyzer attempt expected backend spelling `off`; actual startup telemetry
+correctly says `none`. Only that parser expectation was corrected; no GPU run was repeated.
+No ~122k arm was needed (it exceeds this fixed 68,096 profile); no ring/global-KV change,
+quality campaign or completed item-2c/2d test rerun. Since the chosen chunk remains 2048,
+the existing short MTP evidence is retained and no new MTP run is needed.
+Tooling protocol/results: `docs/plans/20261118-gemma4-q5-chunk-sweep.md`.
