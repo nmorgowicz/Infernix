@@ -541,36 +541,78 @@ It writes one A16Only artifact with FP8 vocabulary and the BF16-source MTP assis
 projections encoded FP8, outer projections BF16). It does not replace or rename best-medium.
 
 ```text
-python -m tools.convert.gemma4_build --preset q5-g64 --profile q5-quality --model "<BF16-dir>" --assistant "<assistant-dir>" --gptq-python "<gptq-python>" --out-dir "<camp>/q5-g64" --work-dir "<camp>/convert/q5-g64" --serve "<absolute-infernix-serve-path>" --gemma4-q5-prefill int8-g64 --yes
+python -m tools.convert.gemma4_build --preset q5-g64 --model "<BF16-dir>" --assistant "<assistant-dir>" --gptq-python "<gptq-python>" --out-dir "<camp>/q5-g64" --work-dir "<camp>/convert/q5-g64" --serve "<absolute-infernix-serve-path>" --yes
 ```
 
 Use `--dry-run` for exact commands and input/RAM/disk checks. Budget roughly 60 GB for the owned BF16
 text stage plus the checkpoint/artifact (85 GB minimum scratch, 115 GB comfortable); these estimates
 exclude the preserved original source. `--keep-work` retains logs/checkpoint/stage for qualification.
 
-Artifact selection and compute selection are independent. Historical `a16` remains the default in
-all profiles. Explicit `--gemma4-q5-prefill int8-g64` is the recommended speed/fidelity opt-in;
-`fp8` is faster but less faithful, `int8-g32` is another measured opt-in, and `a16` preserves
-artifact policy. All narrow trunk decode/MTP verification remains A16. Do not rebuild weights
-to change compute: regenerate the launcher with the desired selector on the same artifact.
+Artifact selection and compute selection are independent. Since the 2026-11-18 operator decision,
+**Q5 profiles default to `int8-g64`**, the measured speed/fidelity balance; explicit
+`--gemma4-q5-prefill a16|fp8|int8-g32|int8-g64` always wins. `fp8` is faster but less faithful;
+`a16` preserves artifact policy (A16 on the builder's A16Only artifact). Narrow trunk decode/MTP
+verification stays A16. Do not rebuild or duplicate weights to change compute.
 
-| Serving profile | Sliding ring | Context / chunk | Global KV |
-|---|---|---|---|
-| `q5-quality` | BF16 | auto / 2048 | normal stored FP8 K/V |
-| `q5-long-context` | opt-in FP8 | auto / 2048 | normal stored FP8 K/V |
+Omitting `--profile` selects `q5-quality` for `--preset q5-g64` and for `launcher` when the artifact
+directory contains native Q5 weights; the filename/HF model name is not used. Explicit `--profile default`
+retains the historical general settings, including `a16`, 131072 context and automatic chunk.
+Q4/IQ3 and `memory-16gb` defaults do not change. Direct Python callers use
+`ServeSettings(profile="q5-quality")` or `ServeProfile(profile="q5-long-context")`; unspecified fields
+resolve in the same place as the CLI. `write_launcher(..., profile=None)` detects the artifact.
 
-Both reuse the existing launcher profiles, retain 1024 MiB headroom, thinking on, MTP d1, BF16 logits,
-host-only prefix cache and operator overrides. Explicit `--gemma4-sliding-kv bf16` overrides either
-profile. Neither silently enables key-only KV: add `--gemma4-key-only-kv` only when the required
-context needs that additional capacity, after reading the measured quality/performance costs.
-Auto context reports the actual resolved limit at startup; it does not guarantee 131k.
-Chunk 1536 is a memory tradeoff (about 884 MiB savings), not a new speed default.
+| Serving profile | Prefill compute | Sliding ring | Context / chunk | Global KV |
+|---|---|---|---|---|
+| `q5-quality` (Q5 default) | INT8 g64 | BF16 | auto / 2048 | normal stored FP8 K/V |
+| `q5-long-context` | INT8 g64 | FP8 | auto / 2048 | normal stored FP8 K/V |
+
+Both retain 1024 MiB headroom, thinking on, top-k 64, MTP d1, BF16 logits and an 8192 MiB host-only
+prefix cache. **“Quality” means the higher-quality Q5 tier with BF16 rings, not maximum-fidelity
+arithmetic:** FP8 global QK remains the existing roleplay/prose choice, faster on long prompts but
+measurably less faithful. For coding/tools or fidelity-first use, explicitly add `--gemma4-qk bf16`;
+also add `--gemma4-q5-prefill a16` to avoid the lossy projection choice. No coding/tool configuration
+is silently migrated. Explicit BF16 ring, QK, compute, sampling and capacity overrides win.
+Neither Q5 profile implicitly enables key-only KV. Auto context fits actual available resident
+VRAM at startup (minimum 9216), not a promise of 131k; read startup and `/v1/models`.
+
+#### Lower-VRAM Q5 ladder (same artifact)
+
+Generate a **new** CMD for the choice you need, then run that CMD. These are alternatives, not
+automatically enabled fallbacks; combine options only deliberately. `<Q5.ninfer>` is the one
+verified A16Only file and `<serve>` is the absolute `infernix-serve` executable path.
+
+| Choice | Cost / limit |
+|---|---|
+| `q5-quality` | Recommended balance; BF16 ring, chunk 2048. |
+| `q5-long-context` | FP8 ring saves about 1191 MiB at chunk 2048; measured short-protocol KL increases and prefill slows up to 12.5% in the ring study. Not long-context quality qualification. |
+| Chunk 1536 | Measured BF16-ring reservation saving **884.129 MiB = 478.875 workspace + 400 ring + 5.254 other sequence reservation** versus 2048. Not all KV and not measured extra token capacity; g64's +0.64% long-prompt median is inconclusive, not a speed gain. FP8-ring combinations do not inherit that exact saving. |
+| `--no-mtp` | Leaves the embedded assistant unloaded; forfeits speculative decode speed for more room. |
+| Shorter `--context 16384` | Limits conversation capacity; explicit context must fit unchanged. Auto already chooses what fits. |
+| Explicit `--gemma4-key-only-kv` | Experimental extra global capacity; changes attention arithmetic and has measured fidelity/long-context speed costs. Never implicit. |
+| `--allow-shared-memory` | Explicit **last resort**, system RAM over PCIe, potentially much slower. Q5 does not automatically try no-MTP first: choose it explicitly. Not resident operation. |
+
+```text
+python -m tools.convert.gemma4_build launcher --artifact "<Q5.ninfer>" --serve "<serve>" --out "<camp>/serve-q5.cmd"
+python -m tools.convert.gemma4_build launcher --profile q5-long-context --artifact "<Q5.ninfer>" --serve "<serve>" --out "<camp>/serve-q5-fp8-ring.cmd"
+python -m tools.convert.gemma4_build launcher --artifact "<Q5.ninfer>" --serve "<serve>" --out "<camp>/serve-q5-1536.cmd" --prefill-chunk 1536
+python -m tools.convert.gemma4_build launcher --artifact "<Q5.ninfer>" --serve "<serve>" --out "<camp>/serve-q5-no-mtp.cmd" --no-mtp
+python -m tools.convert.gemma4_build launcher --artifact "<Q5.ninfer>" --serve "<serve>" --out "<camp>/serve-q5-16k.cmd" --context 16384
+python -m tools.convert.gemma4_build launcher --profile q5-long-context --artifact "<Q5.ninfer>" --serve "<serve>" --out "<camp>/serve-q5-key-only.cmd" --gemma4-key-only-kv
+python -m tools.convert.gemma4_build launcher --profile q5-long-context --artifact "<Q5.ninfer>" --serve "<serve>" --out "<camp>/serve-q5-shared.cmd" --prefill-chunk 1536 --no-mtp --context 16384 --allow-shared-memory
+python -m tools.convert.gemma4_build launcher --profile q5-long-context --artifact "<Q5.ninfer>" --serve "<serve>" --out "<camp>/serve-q5-fidelity.cmd" --gemma4-sliding-kv bf16 --gemma4-qk bf16 --gemma4-q5-prefill a16
+```
+
+Q5's roughly **21.15 GB native file** (about 20.63 GB device weights without MTP in the measured plain
+artifact) cannot fit resident on a **16 GB card regardless of KV changes**. For resident 16 GB serving
+use the smaller IQ3_XXS `memory-16gb` tier below, accepting its quality tradeoff. The ladder is useful
+when Q5 weights fit but context/workspace do not; it is not a 16 GB Q5 fit claim.
 
 The historical plain-model short block-prefill KL is A16 0.0199 / INT8-g64 0.0203 / FP8 0.0296.
 The separate 276-position incremental sample is g64 0.0104 / A16 0.00995; overlapping-window
 uncertainty is not equivalence. G32 has a significant measured incremental delta-NLL increase.
-Long-context INT8 quality is unmeasured, and plain evidence does not qualify diode quality.
-See [the measured protocols and limitations](maintainer/gemma4-q5-prefill.md).
+Long-context INT8 quality is unmeasured. Matched diode own-Q8 short block-prefill KL is 0.0331
+A16 / 0.0336 g64 versus 0.0941 best-medium; that does not qualify diode incremental or long-context
+quality. See [the measured protocols and limitations](maintainer/gemma4-q5-prefill.md).
 
 The lower-level explicit conversion alternatives remain available: `q5_g64_a16` keeps A16Only Uses,
 while `q5_g64` permits the historical wide A8 policy. Every target text projection uses
@@ -598,22 +640,22 @@ the multimodal tree directly:
 "<converter-python-3.11>" -m tools.convert.gemma4_q4 verify --artifact "<out>/gemma4-gptq5-g64-a16.ninfer"
 ```
 
-To permit the separate wide-prefill A8 route, import that **same** GPTQ5 checkpoint into a new
-artifact with `--weights q5_g64` instead of `q5_g64_a16`:
+To select the wide-prefill FP8 route, keep that **same A16Only artifact** and generate a launcher:
 
 ```text
-"<converter-python-3.11>" -m tools.convert.gemma4_q4 convert --model "<BF16-dir>" --text-only --no-mtp --weights q5_g64 --gptq-source "<work>/gptq5-g64" --out "<out>/gemma4-gptq5-g64-a8.ninfer"
+"<converter-python-3.11>" -m tools.convert.gemma4_build launcher --artifact "<out>/gemma4-gptq5-g64-a16.ninfer" --serve "<absolute-infernix-serve-path>" --gemma4-q5-prefill fp8 --out "<out>/serve-gemma4-gptq5-fp8.cmd"
 ```
 
-The stored Q5 codes/scales are identical; the difference is the target projection Uses:
+The lower-level `q5_g64` import remains a storage-permission alternative, not a required duplicate:
 
 | Explicit weights recipe | Target projection Uses | Execution permission |
 |---|---|---|
 | `q5_g64_a16` | `A16Only` | Native Q5 with 16-bit activations at every width |
 | `q5_g64` | `AllowA8` | Wide prefill (64 columns and above) may bake Q5 to FP8-row for FP8 GEMM; narrower calls stay native Q5 A16 |
 
-Vocabulary, assistant and other non-target-projection Uses do not acquire `AllowA8`. Loading
-an existing `A16Only` artifact never opts it into A8. There is no Q5 narrow/decode A8 route.
+Vocabulary, assistant and other non-target-projection Uses do not acquire `AllowA8`. Native server
+defaults preserve stored policy; the Q5 launcher profile explicitly selects INT8 g64 unless overridden.
+There is no Q5 narrow/decode A8 route.
 The wide A8 composition belongs to Gemma's projection dispatcher (`project()`), not a new
 generic Linear Q5-A8 kernel: generic `ops::linear` on Q5 remains A16 even with `AllowA8`.
 
@@ -742,8 +784,8 @@ Sliding rings remain BF16 for the general profile and native commands. Since the
 The FP8 ring saves 446 MiB at chunk 128 or 1,191 MiB at chunk 2048, but short-context KL increases and prefill slows:
 see the [FP8-ring measurements and limits](maintainer/gemma4-benchmarks.md#fp8-sliding-ring-experimental-off-by-default).
 Planning/fallback commands preserve the selected ring, and `serve-check` records the effective selection.
-`--gemma4-q5-prefill a16|fp8|int8-g32|int8-g64` (default `a16`, preserves artifact policy; other choices lossy,
-no profile enables them) is forwarded to every serve command only when not `a16`; `serve-check` records it.
+`--gemma4-q5-prefill a16|fp8|int8-g32|int8-g64` defaults to `int8-g64` for Q5 profiles and `a16`
+for others. Non-`a16` selections are forwarded to every serve command; `serve-check` records them.
 `fp8` enables the existing wide Q5 row-E4M3 bake on the same A16Only artifact; narrow decode/MTP remains A16.
 
 ```text

@@ -944,3 +944,33 @@ text60 and all earlier artifacts were left in place.
 Evidence: camp `q5-20261117/builder-20261118/{qualify.py,variant/,quality-*,quality-summary.json,
 artifact-identity.json,launcher-smoke.json,owned-stage-sha256.json,work/logs}`; parent
 `infernix-port-p3-20261112/item3-*.receipt.json`.
+
+## Q5 recommended-profile adoption (2026-11-18)
+
+New operator approval makes the recommendation a **Q5-specific launcher default**, not a new
+native Engine/CLI/perplexity precision default. Historical opt-in/default statements above describe
+their respective experiments. The general profile and Q4/IQ3 tiers remain unchanged.
+
+`q5-quality` now defaults to INT8 g64 prefill, BF16 rings, FP8 global KV/QK, auto context, chunk 2048,
+1024 MiB headroom, top-k 64, thinking enabled, MTP d1 and host-only prefix caching.
+`q5-long-context` changes only the default ring to FP8. Explicit compute/ring/QK/sampling/context
+choices win; no Q5 profile implicitly enables key-only KV. Omitted `--profile` on a Q5 preset build
+or native-Q5 artifact launcher selects `q5-quality`; explicit `--profile default` retains the old
+general roleplay profile. Python `ServeSettings`/`ServeProfile` constructors share the same named
+profile resolution, rather than relying on argparse to fill them in.
+
+This is a measured tradeoff, **not numerical equivalence or a maximum-fidelity mode**. Item 2c's
+g64 chunk-2048 prefill is 1.93x A16 short / 1.51x long, but 14.8% / 12.6% slower than FP8.
+Plain short KL is 0.0203 g64 / 0.0199 A16 / 0.0296 FP8. Item 2d's bounded incremental g64
+uncertainty crosses zero but does not establish equivalence; g32 has a resolved incremental NLL
+increase. The real diode builder's own-Q8 short KL is 0.0336 g64 / 0.0331 A16 versus 0.0941
+best-medium. Neither model has qualified long-context INT8 quality; diode incremental quality
+remains unmeasured. MTP speed variation and all original measurement caveats remain above.
+
+“Quality” identifies Q5 plus BF16 rings. The existing FP8 QK setting is retained **for roleplay/prose**;
+it has a measurable fidelity cost. Coding/tool and fidelity-first launchers can explicitly choose
+`--gemma4-qk bf16 --gemma4-q5-prefill a16`; no such existing launcher is rewritten.
+Chunk 1536, FP8 rings, no MTP, shorter context, explicit experimental key-only KV and explicit
+last-resort shared memory form the user option ladder, not a dynamic new profile framework.
+Commands and exact memory/performance costs live in the
+[conversion guide](../weight-conversion.md#lower-vram-q5-ladder-same-artifact).

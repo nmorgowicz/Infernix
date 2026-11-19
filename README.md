@@ -680,11 +680,16 @@ python -m tools.convert.gemma4_build serve-check --launcher <dir>\serve-<name>.c
 
 The explicit higher-quality `q5-g64` preset builds native GPTQ5 group64 with own-model Hessians,
 FP8 vocabulary and the BF16-source assistant in one A16Only artifact. Select prefill compute separately:
-`--gemma4-q5-prefill a16|fp8|int8-g32|int8-g64` (historical default `a16`; recommended explicit opt-in
-`int8-g64`). `--profile q5-quality` uses BF16 rings; `q5-long-context` opts into FP8 rings; both use
-auto context and chunk 2048, never implicit key-only KV. Explicit ring/operator overrides are retained.
-See [Q5 creation and serving choices](docs/weight-conversion.md#native-gptq5-group64-explicit-a16a8-permissions)
-for the single-call command and bounded quality evidence; plain results do not qualify diode or long INT8.
+`--gemma4-q5-prefill a16|fp8|int8-g32|int8-g64`. Q5 builds and existing native-Q5 launcher generation
+select `q5-quality` when `--profile` is omitted: **INT8 g64 prefill, BF16 rings, auto context, chunk
+2048 and top-k 64**. `q5-long-context` uses FP8 rings for more room. Neither enables key-only KV.
+Explicit compute/ring/operator choices win; explicit `--profile default` and other tiers retain the
+historical general settings (`a16`, 131k, auto chunk). FP8 QK remains the roleplay/prose default, not a
+maximum-fidelity promise: coding/tool or fidelity-first launchers should explicitly use
+`--gemma4-qk bf16` (and `--gemma4-q5-prefill a16` for A16 projection arithmetic).
+See [Q5 creation and the lower-VRAM ladder](docs/weight-conversion.md#native-gptq5-group64-explicit-a16a8-permissions)
+for commands, costs and bounded evidence. Diode short KL is 0.0331 A16 / 0.0336 g64 versus 0.0941
+best-medium; neither that nor the plain incremental sample qualifies long-context INT8 quality.
 
 The smaller `iq3-xs` and `iq3-xxs` presets take `--llama-cpp <binary dir> --llama-cpp-source <source dir>`, collect the BF16 model's own
 importance matrix through a Q8_0 copy and import the resulting IQ3 blocks. No GPTQ environment is needed.
@@ -694,7 +699,7 @@ The [canonical four-tier comparison](docs/maintainer/gemma4-benchmarks.md#four-t
 measured sizes, matched quality/serving protocols and limitations. The converter embeds the fixed Gemma
 chat template (`tools/chat_templates/gemma4_fixed.jinja`); `--chat-template FILE` replaces it at serve time.
 
-**Serve it.** The generated launcher runs the profile below (`0.0.0.0:8001`, alias `131k`, any model name accepted):
+**Serve it.** Q4/IQ3 (or explicit `--profile default`) generated launchers use the profile below (`0.0.0.0:8001`, alias `131k`, any model name accepted); Q5 uses the defaults above with alias `gemma4-q5`:
 `--max-context 131072 --kv-dtype fp8 --gemma4-qk fp8 --prefill-chunk auto --logits-dtype bf16 --max-concurrency 1
 --spec mtp --draft-tokens 1 --device-snapshot-slots 0 --host-context-mib 8192`. Bound beyond loopback with no API key,
 so on Windows the serving executable needs an inbound firewall rule for its path.

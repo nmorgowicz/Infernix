@@ -60,24 +60,26 @@ class ArtifactInfo:
     vision: bool
     max_context: int
     iq3_xxs: bool = False
+    q5: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class ServeProfile:
     """The `infernix-serve` settings a launcher decides; `alias` None means `<context/1000>k`."""
 
+    profile: str = "default"
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
     alias: str | None = None
-    context: int | str = DEFAULT_CONTEXT
+    context: int | str | None = None
     kv_dtype: str = "fp8"
     model_match: str = DEFAULT_MODEL_MATCH
     gemma4_qk: str = DEFAULT_GEMMA4_QK
-    prefill_chunk: str = DEFAULT_PREFILL_CHUNK
+    prefill_chunk: str | None = None
     draft_tokens: str = DEFAULT_DRAFT_TOKENS
     logits_dtype: str = DEFAULT_LOGITS_DTYPE
     host_context_mib: int = DEFAULT_HOST_CONTEXT_MIB
-    vram_headroom_mib: int = DEFAULT_VRAM_HEADROOM_MIB
+    vram_headroom_mib: int | None = None
     top_k: int | None = None  # None: no flag, the artifact's sampling preset applies
     chat_template: Path | None = None  # runtime override of the artifact's template (--chat-template)
     # Thinking control (none by default: the server's answer room already ends a long thought, and the loop guard is
@@ -86,10 +88,40 @@ class ServeProfile:
     thinking_budget_message: str | None = None
     reasoning_loop: str | None = None
     gemma4_key_only_kv: bool = False
-    gemma4_sliding_kv: str = "bf16"
-    gemma4_q5_prefill: str = "a16"
-    mtp_fallback: bool = False  # memory-16gb: plan with MTP first, start without it when only that does not fit
+    gemma4_sliding_kv: str | None = None
+    gemma4_q5_prefill: str | None = None
+    mtp_fallback: bool | None = None  # memory-16gb: start without MTP when only that fits
     allow_shared_memory: bool = False  # --allow-shared-memory: start with the shortfall in shared GPU memory (slow)
+
+    def __post_init__(self) -> None:
+        """Resolve only unspecified fields; CLI and Python callers share these defaults."""
+        if self.profile not in SERVE_PROFILES:
+            raise ValueError(f"--profile must be one of {SERVE_PROFILES}")
+        small = self.profile == "memory-16gb"
+        q5 = self.profile in ("q5-quality", "q5-long-context")
+        defaults = {
+            "context": "auto" if small or q5 else DEFAULT_CONTEXT,
+            "prefill_chunk": "128" if small else "2048" if q5 else DEFAULT_PREFILL_CHUNK,
+            "vram_headroom_mib": SMALL_VRAM_HEADROOM_MIB if small else DEFAULT_VRAM_HEADROOM_MIB,
+            "gemma4_sliding_kv": "fp8" if small or self.profile == "q5-long-context" else "bf16",
+            "gemma4_q5_prefill": "int8-g64" if q5 else "a16",
+            "mtp_fallback": small,
+        }
+        if q5:
+            defaults.update(alias="gemma4-q5", top_k=64)
+        for name, value in defaults.items():
+            if getattr(self, name) is None:
+                object.__setattr__(self, name, value)
+        if small:
+            object.__setattr__(self, "gemma4_key_only_kv", True)
+            if self.kv_dtype != "fp8" or self.logits_dtype != "bf16":
+                raise ValueError("--profile memory-16gb requires --kv-dtype fp8 and --logits-dtype bf16")
+            if self.prefill_chunk not in ("128", "256", "512"):
+                raise ValueError("--profile memory-16gb supports --prefill-chunk 128, 256 or 512 (default 128)")
+            if self.context != "auto" and self.context < 9216:
+                raise ValueError("--profile memory-16gb needs --context auto or at least 9216 tokens")
+            if self.draft_tokens != "1":
+                raise ValueError("--profile memory-16gb supports --draft-tokens 1 only; use --no-mtp for more context")
 
     @property
     def model_id(self) -> str:
@@ -259,9 +291,9 @@ def launcher_lines(
     if profile.gemma4_key_only_kv:
         lines.append("rem Experimental key-only global FP8 KV. Default launches do not enable it.")
     if profile.gemma4_sliding_kv == "fp8":
-        lines.append("rem Experimental FP8 sliding K/V ring: lower memory, measurable fidelity and prefill cost; memory-16gb default, explicit bf16 overrides it.")
+        lines.append("rem Experimental FP8 sliding K/V ring: lower memory, measurable fidelity and prefill cost; explicit bf16 overrides the profile.")
     if profile.gemma4_q5_prefill != "a16":
-        lines.append(f"rem Experimental Q5 prefill {profile.gemma4_q5_prefill} (lossy, opt-in): calls of 64+ columns; narrow decode/MTP verification stays A16. Artifact unchanged.")
+        lines.append(f"rem Q5 prefill {profile.gemma4_q5_prefill} (lossy; int8-g64 is the Q5 profile default): calls of 64+ columns; narrow decode/MTP verification stays A16. Artifact unchanged.")
     if profile.context == "auto":
         lines.append("rem Context is fitted at startup to available VRAM; refuses below 9216 tokens. Read /v1/models for the resolved limit.")
     if profile.gemma4_qk == "fp8":
@@ -307,18 +339,27 @@ def launcher_lines(
 def artifact_info(path: Path) -> ArtifactInfo:
     """Components and context limit of a Gemma 4 artifact (reads the directory only)."""
     from tools.artifact.reader import Artifact
+    from tools.artifact.schema import binding_parts
 
     with Artifact(path) as artifact:
         components = artifact.directory.components
         config = components["text"]["config"]
         if config.get("architectures") != ["Gemma4ForCausalLM"]:
             raise ValueError(f"{path} is not a Gemma 4 text artifact")
+        objects = {obj.id: obj for obj in artifact.objects}
+        q5 = any(
+            objects[object_id].format == "q5_g64_fp16"
+            for name, binding in artifact.directory.bindings.items()
+            if name.startswith("text/layers/")
+            for object_id, _, _ in binding_parts(binding, objects, name)
+        )
         return ArtifactInfo(
             mtp="mtp" in components,
             vision="vision" in components,
             iq3_xxs=sum(obj.bytes for obj in artifact.objects if getattr(obj, "format", None) == "ggml_iq3_xxs")
             > sum(obj.bytes for obj in artifact.objects if getattr(obj, "format", None) == "ggml_iq3_s"),
             max_context=int(config["max_position_embeddings"]),
+            q5=q5,
         )
 
 
@@ -334,16 +375,16 @@ def write_launcher(
     overwrite: bool = False,
 ) -> ArtifactInfo:
     """Write `out` (CRLF, refuses an existing file unless `overwrite`) and return what it detected."""
-    profile = profile or ServeProfile()
     if not server.is_file():
         raise ValueError(f"server binary not found: {server}")
     if not artifact.is_file():
         raise ValueError(f"artifact not found: {artifact}")
-    if profile.chat_template is not None and not profile.chat_template.is_file():
-        raise ValueError(f"--chat-template file not found: {profile.chat_template}")
     if out.exists() and not overwrite:
         raise FileExistsError(f"Launcher already exists: {out}")
     info = info or artifact_info(artifact)
+    profile = profile or ServeProfile(profile="q5-quality" if info.q5 else "default")
+    if profile.chat_template is not None and not profile.chat_template.is_file():
+        raise ValueError(f"--chat-template file not found: {profile.chat_template}")
     if profile.context != "auto" and profile.context > info.max_context:
         raise ValueError(f"--context {profile.context} exceeds the artifact's position limit {info.max_context}")
     lines = launcher_lines(

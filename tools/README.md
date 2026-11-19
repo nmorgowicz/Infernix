@@ -91,8 +91,8 @@ by the references linked from the [documentation map](../docs/README.md).
 ### Gemma sliding-ring memory opt-in
 
 The existing `python -m tools.convert.gemma4_build` build and `launcher` commands accept
-`--gemma4-sliding-kv bf16|fp8`. General/Q5 defaults stay **BF16**. `--profile memory-16gb` defaults to FP8
-since the 2026-11-18 operator decision; explicit `--gemma4-sliding-kv bf16` overrides that profile.
+`--gemma4-sliding-kv bf16|fp8`. General/`q5-quality` defaults stay **BF16**; `q5-long-context` and
+`memory-16gb` use FP8 rings. Explicit `--gemma4-sliding-kv bf16` overrides either profile.
 For an existing artifact, generate an explicitly experimental launcher:
 
 ```text
@@ -107,10 +107,15 @@ The ring saves 446 MiB at chunk 128 or 1,191 MiB at chunk 2048, but measured sho
 prefill slows; it is not a free quality/speed improvement. See the
 [measured trade-offs](../docs/maintainer/gemma4-benchmarks.md#fp8-sliding-ring-experimental-off-by-default).
 
-`--gemma4-q5-prefill a16|fp8|int8-g32|int8-g64` is a separate opt-in (default `a16`, no flag emitted, every profile):
-the launcher passes nondefault selections to every serve command. `a16` preserves artifact policy; `fp8`
-enables wide row-E4M3 bake on one A16Only Q5 artifact; INT8 retains exact stored codes. All overrides are lossy,
-Gemma4 native-Q5-only, with A16 narrow decode/MTP; see the [CLI reference](../docs/cli.md).
+`--gemma4-q5-prefill a16|fp8|int8-g32|int8-g64` is independent of stored weights. Q5 builds and
+existing native-Q5 launcher generation select `q5-quality` when `--profile` is omitted: **INT8 g64**
+prefill, BF16 ring, auto context, chunk 2048, top-k 64, no implicit key-only KV. `q5-long-context`
+changes the ring to FP8. Explicit compute/ring choices win; explicit `--profile default` and other
+tiers retain the historical A16 artifact policy. Narrow decode/MTP stays A16.
+FP8 QK remains the roleplay/prose choice, measurably less faithful than BF16; fidelity-first/coding/tools
+can explicitly select `--gemma4-qk bf16 --gemma4-q5-prefill a16`.
+See the [Q5 defaults and lower-VRAM ladder](../docs/weight-conversion.md#native-gptq5-group64-explicit-a16a8-permissions)
+for exact commands, measured costs and quality limits. Q5 is not resident-fit on a 16 GB card.
 
 
 ## Benchmark orchestration

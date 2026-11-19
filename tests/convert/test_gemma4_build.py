@@ -1599,16 +1599,106 @@ def test_q5_preset_builds_own_hessians_and_one_a16_artifact(env):
 
 
 @pytest.mark.parametrize("profile, ring", [("q5-quality", "bf16"), ("q5-long-context", "fp8")])
-def test_q5_profiles_preserve_compute_and_explicit_ring_choices(env, profile, ring):
+def test_q5_profiles_recommend_int8_and_preserve_explicit_ring_choices(env, profile, ring):
     args = cli.build_parser().parse_args(env.argv("q5-g64", "--profile", profile))
     cfg, serve, _ = cli.resolve_config(args)
     assert cfg.preset.bits == 5 and serve.gemma4_sliding_kv == ring
-    assert serve.gemma4_q5_prefill == "a16" and not serve.gemma4_key_only_kv
+    assert serve.gemma4_q5_prefill == "int8-g64" and not serve.gemma4_key_only_kv
     assert serve.context == "auto" and serve.prefill_chunk == "2048"
     assert serve.draft_tokens == "1" and not serve.mtp_fallback
     args = cli.build_parser().parse_args(env.argv(
         "q5-g64", "--profile", profile, "--gemma4-sliding-kv", "bf16",
-        "--gemma4-q5-prefill", "int8-g64", "--alias", "own", "--top-k", "64"))
+        "--gemma4-q5-prefill", "a16", "--alias", "own", "--top-k", "64"))
     _, serve, _ = cli.resolve_config(args)
-    assert serve.gemma4_sliding_kv == "bf16" and serve.gemma4_q5_prefill == "int8-g64"
+    assert serve.gemma4_sliding_kv == "bf16" and serve.gemma4_q5_prefill == "a16"
     assert serve.alias == "own" and serve.top_k == 64 and not serve.gemma4_key_only_kv
+
+
+@pytest.mark.parametrize("profile", [None, "default", "q5-quality", "q5-long-context"])
+@pytest.mark.parametrize("compute", [None, "a16", "fp8", "int8-g32", "int8-g64"])
+def test_q5_defaults_and_overrides_agree_for_build_api_and_launcher(env, tmp_path, monkeypatch, profile, compute):
+    options = ([] if profile is None else ["--profile", profile])
+    options += [] if compute is None else ["--gemma4-q5-prefill", compute]
+    _, settings, _ = cli.resolve_config(cli.build_parser().parse_args(env.argv("q5-g64", *options)))
+    selected = profile or "q5-quality"
+    direct = build.ServeSettings(profile=selected, gemma4_q5_prefill=compute, server_exe=env.server)
+    assert settings == direct
+    expected = compute or ("a16" if selected == "default" else "int8-g64")
+    assert settings.gemma4_q5_prefill == expected
+    assert settings.top_k == (None if selected == "default" else 64)
+    assert settings.context == (131072 if selected == "default" else "auto")
+    assert settings.prefill_chunk == ("auto" if selected == "default" else "2048")
+    assert settings.vram_headroom_mib == 1024 and not settings.gemma4_key_only_kv
+    artifact = tmp_path / "arbitrary-name.ninfer"
+    artifact.write_bytes(b"x")
+    monkeypatch.setattr(launcher, "artifact_info", lambda path: launcher.ArtifactInfo(True, False, 262144, q5=True))
+    out = tmp_path / "serve-q5.cmd"
+    assert cli.main(["launcher", "--artifact", str(artifact), "--serve", str(env.server),
+                     "--out", str(out), *options]) == 0
+    plan = build.parse_launcher(out)
+    assert plan.gemma4_q5_prefill == expected and plan.context == settings.context
+    assert plan.gemma4_sliding_kv == settings.gemma4_sliding_kv
+    assert list(plan.flags) == launcher.serve_argv(
+        env.server, artifact, direct, mtp=True, vision=False)[2:]
+    api_out = tmp_path / "api.cmd"
+    launcher.write_launcher(api_out, artifact, env.server)
+    assert build.parse_launcher(api_out).gemma4_q5_prefill == "int8-g64"
+
+
+@pytest.mark.parametrize("profile", ["q5-quality", "q5-long-context"])
+def test_q5_profile_explicit_fidelity_and_memory_choices_survive_generation(env, tmp_path, profile):
+    args = cli.build_parser().parse_args(env.argv(
+        "q5-g64", "--profile", profile, "--gemma4-qk", "bf16", "--gemma4-sliding-kv", "bf16",
+        "--gemma4-q5-prefill", "a16", "--context", "16384", "--prefill-chunk", "1536",
+        "--vram-headroom-mib", "512", "--top-k", "20", "--gemma4-key-only-kv",
+        "--allow-shared-memory", "--alias", "coding"))
+    _, settings, _ = cli.resolve_config(args)
+    direct = build.ServeSettings(
+        profile=profile, server_exe=env.server, gemma4_qk="bf16", gemma4_sliding_kv="bf16",
+        gemma4_q5_prefill="a16", context=16384, prefill_chunk="1536", vram_headroom_mib=512,
+        top_k=20, gemma4_key_only_kv=True, allow_shared_memory=True, alias="coding")
+    assert settings == direct
+    plan = lines_profile(launcher.launcher_lines("S", "A", settings, mtp=False, vision=False), tmp_path)
+    assert plan.gemma4_qk == "bf16" and plan.gemma4_sliding_kv == "bf16"
+    assert plan.gemma4_q5_prefill == "a16" and plan.context == 16384 and plan.alias == "coding"
+    assert plan.prefill_chunk == "1536" and "--spec" not in plan.flags
+    assert "--gemma4-key-only-kv" in plan.flags and "--allow-shared-memory" in plan.flags
+    assert plan.flags[plan.flags.index("--top-k") + 1] == "20"
+    assert plan.flags[plan.flags.index("--vram-headroom-mib") + 1] == "512"
+
+
+@pytest.mark.parametrize("preset", ["best-small", "best-medium", "draft", "iq3-xs", "iq3-xxs"])
+def test_non_q5_presets_keep_the_general_profile(env, preset):
+    settings = cli.resolve_config(cli.build_parser().parse_args(env.argv(preset)))[1]
+    assert settings == build.ServeSettings(server_exe=env.server)
+    assert settings.gemma4_q5_prefill == "a16" and settings.gemma4_sliding_kv == "bf16"
+
+
+@pytest.mark.parametrize("parameter, q5", [
+    ("text/layers/0/mlp/down", True),
+    ("mtp/layers/0/mlp/down", False),
+    ("text/output_head", False),
+])
+@pytest.mark.parametrize("split", [False, True])
+def test_launcher_detects_native_q5_trunk_from_directory_not_names_or_receipts(tmp_path, parameter, q5, split):
+    from tools.artifact.schema import TensorSpec, plan_objects
+    from tools.artifact.writer import ArtifactWriter
+
+    artifact = tmp_path / "looks-like-iq3.ninfer"
+    spec = TensorSpec("unrelated-object-name", (1, 128), "q5_g64_fp16", "row_split_k128_v1")
+    binding = {"parts": [{"object": spec.id, "range": [0, 64]}, {"object": spec.id, "range": [64, 128]}]} if split else {
+        "object": spec.id}
+    components = {"text": {"config": {"architectures": ["Gemma4ForCausalLM"], "max_position_embeddings": 262144}}}
+    if parameter.startswith("mtp/"):
+        components["mtp"] = {"config": {}}
+    with ArtifactWriter(artifact, [spec], components=components, bindings={parameter: binding}, uses=[]) as writer:
+        writer.write_object(spec.id, bytes(plan_objects([spec])[0].bytes))
+    info = launcher.artifact_info(artifact)
+    assert info.q5 == q5
+    server = tmp_path / "infernix-serve.exe"
+    server.write_bytes(b"x")
+    out = tmp_path / "detected.cmd"
+    assert cli.main(["launcher", "--artifact", str(artifact), "--serve", str(server), "--out", str(out)]) == 0
+    plan = build.parse_launcher(out)
+    assert plan.gemma4_q5_prefill == ("int8-g64" if q5 else "a16")
+    assert plan.context == ("auto" if q5 else 131072)

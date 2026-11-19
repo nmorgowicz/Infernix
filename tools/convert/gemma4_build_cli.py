@@ -102,10 +102,11 @@ def context_value(text: str) -> int | str:
 def add_serve_arguments(parser: argparse.ArgumentParser, *, prefix: str) -> None:
     """The launcher flags shared by a build and the `launcher` subcommand; `prefix` names the command in help."""
     add = parser.add_argument
-    add("--profile", choices=launcher_tools.SERVE_PROFILES, default="default",
-        help="default: unchanged 131k roleplay; q5-quality: BF16 ring; q5-long-context: opt-in FP8 ring. "
-        "Both Q5 profiles fit context at startup, use chunk 2048, and never implicitly enable key-only KV. "
-        "memory-16gb: IQ3_XXS, key-only FP8 globals/ring, chunk 128, auto context")
+    add("--profile", choices=launcher_tools.SERVE_PROFILES, default=None,
+        help="omitted: q5-quality for q5-g64 builds/native Q5 artifacts, default for other tiers. "
+        "Explicit default keeps the historical 131k roleplay settings. Q5 profiles default to int8-g64 "
+        "prefill, auto context, chunk 2048, top-k 64 and no key-only KV: q5-quality has BF16 rings; "
+        "q5-long-context has FP8 rings. memory-16gb: IQ3_XXS, key-only FP8 globals/ring, chunk 128")
     add("--context", type=context_value,
         help=f"{prefix} --max-context: positive tokens or auto (default 131072; memory-16gb: auto)")
     add("--alias", help=f"{prefix} --model-id, the name /v1/models reports and requests must use unless "
@@ -129,7 +130,8 @@ def add_serve_arguments(parser: argparse.ArgumentParser, *, prefix: str) -> None
         "about half the ring memory, measurable fidelity and prefill cost; requires --kv-dtype fp8). Explicit bf16 overrides the profile")
     add("--gemma4-q5-prefill", choices=("a16", "fp8", "int8-g32", "int8-g64"), default=None,
         help="Gemma4 native Q5 trunk calls of 64+ columns: fp8 row-E4M3 bake or int8-g32/g64 groupwise INT8 "
-        "activations (lossy opt-ins); a16 (default) preserves artifact policy and emits no flag; narrow calls stay A16")
+        "activations; Q5 profiles default to int8-g64 (lossy speed/fidelity balance), others to a16 "
+        "(preserves artifact policy, no flag). Explicit choices override profiles; narrow calls stay A16")
     add("--allow-shared-memory", action="store_true",
         help="opt in to starting when the model does not fit the free VRAM: the shortfall runs in shared GPU memory "
         "(system RAM over PCIe, much slower; default off = the server refuses). memory-16gb tries resident starts first")
@@ -159,36 +161,20 @@ def add_serve_arguments(parser: argparse.ArgumentParser, *, prefix: str) -> None
     add("--cuda-bin", type=Path, help="directory the launcher puts on PATH (if the DLLs are not beside the exe)")
 
 
-def serve_kwargs(args: argparse.Namespace) -> dict:
-    """`ServeProfile` fields from parsed arguments."""
-    small = args.profile == "memory-16gb"
-    q5 = args.profile in ("q5-quality", "q5-long-context")
-    headroom = args.vram_headroom_mib if args.vram_headroom_mib is not None else (
-        launcher_tools.SMALL_VRAM_HEADROOM_MIB if small else launcher_tools.DEFAULT_VRAM_HEADROOM_MIB)
-    context = args.context if args.context is not None else ("auto" if small or q5 else launcher_tools.DEFAULT_CONTEXT)
-    chunk = args.prefill_chunk if args.prefill_chunk is not None else (
-        "128" if small else "2048" if q5 else launcher_tools.DEFAULT_PREFILL_CHUNK)
-    if small:
-        if args.kv_dtype != "fp8" or args.logits_dtype != "bf16":
-            raise ValueError("--profile memory-16gb requires --kv-dtype fp8 and --logits-dtype bf16")
-        if chunk not in ("128", "256", "512"):
-            raise ValueError("--profile memory-16gb supports --prefill-chunk 128, 256 or 512 (default 128)")
-        if context != "auto" and context < 9216:
-            raise ValueError("--profile memory-16gb needs --context auto or at least 9216 tokens")
-        if args.draft_tokens != "1":
-            raise ValueError("--profile memory-16gb supports --draft-tokens 1 only; use --no-mtp for more context")
+def serve_kwargs(args: argparse.Namespace, *, default_profile: str = "default") -> dict:
+    """Explicit arguments plus profile selection; ServeProfile owns unspecified-field defaults."""
     return {
-        "host": args.host, "port": args.port, "alias": args.alias or ("gemma4-q5" if q5 else None), "context": context,
+        "profile": args.profile if args.profile is not None else default_profile,
+        "host": args.host, "port": args.port, "alias": args.alias, "context": args.context,
         "kv_dtype": args.kv_dtype, "model_match": args.model_match, "gemma4_qk": args.gemma4_qk,
-        "prefill_chunk": chunk, "draft_tokens": args.draft_tokens, "logits_dtype": args.logits_dtype,
-        "host_context_mib": args.host_context_mib, "vram_headroom_mib": headroom,
+        "prefill_chunk": args.prefill_chunk, "draft_tokens": args.draft_tokens, "logits_dtype": args.logits_dtype,
+        "host_context_mib": args.host_context_mib, "vram_headroom_mib": args.vram_headroom_mib,
         "top_k": args.top_k, "chat_template": args.chat_template.resolve() if args.chat_template else None,
         "default_thinking_budget": args.default_thinking_budget,
         "thinking_budget_message": args.thinking_budget_message, "reasoning_loop": args.reasoning_loop,
-        "gemma4_key_only_kv": small or args.gemma4_key_only_kv, "mtp_fallback": small, "allow_shared_memory": args.allow_shared_memory,
-        "gemma4_sliding_kv": args.gemma4_sliding_kv if args.gemma4_sliding_kv is not None else (
-            "fp8" if small or args.profile == "q5-long-context" else "bf16"),
-        "gemma4_q5_prefill": args.gemma4_q5_prefill if args.gemma4_q5_prefill is not None else "a16",
+        "gemma4_key_only_kv": args.gemma4_key_only_kv, "allow_shared_memory": args.allow_shared_memory,
+        "gemma4_sliding_kv": args.gemma4_sliding_kv,
+        "gemma4_q5_prefill": args.gemma4_q5_prefill,
     }
 
 
@@ -323,7 +309,7 @@ def resolve_config(args: argparse.Namespace) -> tuple[BuildConfig, ServeSettings
     work_dir = (args.work_dir or out_dir / f"work-{name}").resolve()
     if work_dir == out_dir:
         raise ValueError("--work-dir must not be the output directory itself")
-    kwargs = serve_kwargs(args)
+    kwargs = serve_kwargs(args, default_profile="q5-quality" if preset.bits == 5 else "default")
     launcher_tools.check_serve_settings(launcher_tools.ServeProfile(**kwargs))
     if args.score and args.no_launcher and args.serve is None:
         raise ValueError("--score needs infernix-perplexity beside the server: pass --serve")
@@ -447,8 +433,8 @@ def run_launcher(args: argparse.Namespace) -> int:
     if server is None:
         raise ValueError("no infernix-serve found in apps/Release or build*/apps/Release; build it "
                          "(build_native.bat) or pass --serve")
-    profile = launcher_tools.ServeProfile(**serve_kwargs(args))
     info = launcher_tools.artifact_info(args.artifact.resolve())
+    profile = launcher_tools.ServeProfile(**serve_kwargs(args, default_profile="q5-quality" if info.q5 else "default"))
     if args.profile == "memory-16gb" and (not info.iq3_xxs or info.vision):
         raise ValueError("--profile memory-16gb requires a text-only IQ3_XXS artifact; build with "
                          "--profile memory-16gb or select its IQ3_XXS .ninfer")
@@ -457,7 +443,8 @@ def run_launcher(args: argparse.Namespace) -> int:
     )
     print(f"Wrote {args.out}: server {server}; MTP {'on' if info.mtp and not args.no_mtp else 'off'}; "
           f"vision {'on' if info.vision else 'off'}; --model-id {profile.model_id}; context {profile.context}; "
-          f"KV {args.kv_dtype}; QK {args.gemma4_qk}; http://{args.host}:{args.port}")
+          f"KV {profile.kv_dtype}; QK {profile.gemma4_qk}; Q5 prefill {profile.gemma4_q5_prefill}; "
+          f"ring {profile.gemma4_sliding_kv}; http://{args.host}:{args.port}")
     return 0
 
 
