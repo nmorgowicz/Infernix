@@ -26,6 +26,14 @@ Q4_REGIONS = (
 Q4_WEIGHTS = ("q4_g32", "q4_g32_a16", "q5_g64", "q5_g64_a16", "fp8_row")
 SCALE_SEARCHES = ("absmax", "mse", "weighted")
 MTP_WEIGHTS = ("bf16", "fp8", "q4")
+# Allocation units of a mixed Q4/Q5 build: a fused projection group per layer. q,k,v and gate,up are stored as one
+# matrix, so their members share a format; the roles below name the groups (each tuple lists the member parameters).
+Q5_UNIT_ROLES = {
+    "qkv": ("attention/query", "attention/key", "attention/value"),
+    "o": ("attention/output",),
+    "gate_up": ("mlp/gate", "mlp/up"),
+    "down": ("mlp/down",),
+}
 IMATRIX_ROLES = {
     "attention/query": "attn_q",
     "attention/key": "attn_k",
@@ -80,6 +88,52 @@ def q4_group_for(
         if member[region]:
             return size
     return default
+
+
+def parse_q5_units(items) -> list[tuple[str, tuple[int, ...] | None]]:
+    """Parse ROLE[@LAYERS] selectors; LAYERS is a comma list of layer numbers or inclusive A-B ranges.
+
+    A selector without LAYERS names every layer (None). Bounds are checked against the model by `resolve_q5_units`.
+    """
+    parsed = []
+    for item in items:
+        role, at, layers = item.partition("@")
+        if role not in Q5_UNIT_ROLES or (at and not layers):
+            raise ValueError(
+                f"--q5-unit expects ROLE[@LAYERS] with ROLE in {tuple(Q5_UNIT_ROLES)} and LAYERS like 0-19,40, got {item!r}"
+            )
+        chosen = None
+        if at:
+            found = set()
+            for part in layers.split(","):
+                first, dash, last = part.partition("-")
+                if not first.isdigit() or (dash and not last.isdigit()) or (dash and int(last) < int(first)):
+                    raise ValueError(f"--q5-unit {item!r}: layers must be numbers or ascending A-B ranges")
+                found.update(range(int(first), int(last if dash else first) + 1))
+            chosen = tuple(sorted(found))
+        parsed.append((role, chosen))
+    return parsed
+
+
+def resolve_q5_units(items, layer_count: int) -> set[tuple[str, int]]:
+    """The (role, layer) cells the selectors name; a layer outside the model is refused."""
+    cells = set()
+    for role, layers in parse_q5_units(items):
+        for layer in range(layer_count) if layers is None else layers:
+            if layer >= layer_count:
+                raise ValueError(f"--q5-unit {role}: layer {layer} is outside the model's {layer_count} text layers")
+            cells.add((role, layer))
+    return cells
+
+
+def q5_unit_of(name: str) -> tuple[str, int]:
+    """The (role, layer) cell of a text-layer projection id such as text/layers/7/mlp/gate."""
+    parts = name.split("/")
+    layer, tail = int(parts[2]), "/".join(parts[3:])
+    for role, members in Q5_UNIT_ROLES.items():
+        if tail in members:
+            return role, layer
+    raise ValueError(f"{name} is not a Gemma text-layer projection")
 
 
 def read_imatrix(path: Path) -> dict[str, tuple]:
@@ -225,6 +279,8 @@ class Q4Options:
     mtp_weights: str | None = None
     gptq_source: Path | None = None
     gguf_source: Path | None = None
+    q5_gptq_source: Path | None = None
+    q5_units: tuple[str, ...] = ()
 
     def __post_init__(self):
         if self.weights not in Q4_WEIGHTS:
@@ -281,6 +337,15 @@ class Q4Options:
                     "--gguf-source is mutually exclusive with --gptq-source/--scale-search/--imatrix/--group-size/"
                     "--region-group/--native-groups (the GGUF decides every projection's stored blocks)"
                 )
+        if bool(self.q5_units) != (self.q5_gptq_source is not None):
+            raise ValueError("--q5-unit and --q5-gptq-source come together")
+        if self.q5_units:
+            if self.weights not in ("q4_g32", "q4_g32_a16") or self.gptq_source is None or self.native_groups:
+                raise ValueError(
+                    "--q5-unit/--q5-gptq-source move named fused projection groups of a Q4 --gptq-source build to "
+                    "Q5: they need --weights q4_g32 or q4_g32_a16 and --gptq-source, without --native-groups"
+                )
+            parse_q5_units(self.q5_units)
 
     @property
     def quantized(self) -> bool:
@@ -318,6 +383,9 @@ def build_recipe(model, source, options: Q4Options, *, device: str, rows_per_chu
     its logical group's format and method. Emulated groups keep g32 storage (`q4_g32_fp16`) with the
     coarse scale repeated; `native_groups` stores `q4_g128_fp16`/`q4_g256_fp16`. `q4_g32` additionally
     applies the W4A8 override. Weighted search registers per-column importance from the imatrix.
+    With `q5_units` the named (role, layer) fused groups are read from `q5_gptq_source` as native `q5_g64_fp16`
+    with an A16Only Use; every other projection follows the Q4 import unchanged and the A8 override skips the Q5
+    cells (it only names Q4 and GGUF formats).
     """
     from tools.artifact.layouts import encoded_size
 
@@ -330,6 +398,8 @@ def build_recipe(model, source, options: Q4Options, *, device: str, rows_per_chu
     layer_types = model.config["layer_types"]
     scale_search = {"method": options.scale_search}
     groups = {}
+    q5_cells: set[tuple[str, int]] = set()
+    q5_names: set[str] = set()
     if options.quantized:
         projections = {
             name: parameter
@@ -408,8 +478,38 @@ def build_recipe(model, source, options: Q4Options, *, device: str, rows_per_chu
                 else [],
                 "note": "codes and binary16 scales copied exactly from the external checkpoint; nothing re-rounded",
             }
+        imported_q5 = {}
+        if options.q5_units:
+            from .gemma4_gptq import gptq_projection_sources
+
+            q5_cells = resolve_q5_units(options.q5_units, len(layer_types))
+            imported_q5, group_q5, _ = gptq_projection_sources(model, options.q5_gptq_source, native=True, bits=5)
+            if set(imported_q5) != set(projections):
+                raise ValueError("the Q5 GPTQ source does not cover exactly the model's text-layer projections")
+            scale_search["q5_source"] = {
+                "gptq_source": str(options.q5_gptq_source.resolve()),
+                "group_size": group_q5,
+                "num_bits": 5,
+                "packing": "dense_cross_word_int32",
+                "compressor": json.loads((options.q5_gptq_source / "config.json").read_text(encoding="utf-8")).get(
+                    "infernix_gptq", {}
+                ),
+                "units": list(options.q5_units),
+                "cells": {
+                    role: sorted(layer for cell_role, layer in q5_cells if cell_role == role)
+                    for role in Q5_UNIT_ROLES
+                },
+            }
         for name in projections:
             if options.gguf_source is not None:
+                continue
+            if q5_cells and q5_unit_of(name) in q5_cells:
+                groups[name] = 64
+                q5_names.add(name)
+                recipe.assign(
+                    name, format="q5_g64_fp16", layout="auto", method="import_encoded", source=imported_q5[name],
+                    activation_policy="A16Only",
+                )
                 continue
             if name in imported:
                 target = imported_formats[name]
@@ -449,6 +549,10 @@ def build_recipe(model, source, options: Q4Options, *, device: str, rows_per_chu
                     method="grouped_absmax_emulated",
                     parameters={"group_size": groups[name]},
                 )
+        if q5_names:
+            formats = [recipe.selections[name][0].format for name in projections]
+            scale_search["storage_formats"] = {fmt: formats.count(fmt) for fmt in sorted(set(formats))}
+            scale_search["q5_source"]["projections"] = len(q5_names)
     mtp_weights = options.mtp_weights or ("fp8" if options.quantized else "bf16")
     if "mtp" not in model.components:
         if options.mtp_weights is not None:
@@ -477,8 +581,11 @@ def build_recipe(model, source, options: Q4Options, *, device: str, rows_per_chu
         name = name.replace("absmax", "gptq_import")
     if options.gguf_source is not None:
         name = name.replace("absmax", "gguf_import")
-    if not options.q5 and any(size != 32 for size in groups.values()):
+    q4_sizes = [size for key, size in groups.items() if key not in q5_names]
+    if not options.q5 and any(size != 32 for size in q4_sizes):
         name += "_native_groups" if options.native_groups else "_virtual_groups"
+    if q5_names:
+        name += "_q5mix"
     if options.scale_search != "absmax":
         name = name.replace("absmax", options.scale_search + "_search")
     if mtp_weights != "bf16":
@@ -499,6 +606,7 @@ def build_recipe(model, source, options: Q4Options, *, device: str, rows_per_chu
         "default": 64 if options.q5 else options.group_size,
         "regions": list(options.region_groups),
         "native": options.native_groups or options.q5,
+        "q5_mixed_projections": len(q5_names),
         "tensors_by_group": {str(size): count for size, count in sorted(histogram.items())},
         "projected_real_weight_bytes": round(payload - saved),
         "projection_note": (

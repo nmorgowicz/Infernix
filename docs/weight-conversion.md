@@ -700,6 +700,28 @@ baseline rerun with `--bits 4 --group-size 32`, the **same** text tree/calibrati
 separate fresh output/offload directories; import with `--weights q4_g32_a16` for A16 or the
 unchanged `--weights q4_g32` for its separate W4A8 performance arm.
 
+#### Mixed Q4 / Q5 artifacts (per fused projection group and layer)
+
+One artifact may hold native `q4_g32_fp16` and `q5_g64_fp16` projections side by side. The unit is a fused
+projection group of one layer, because q/k(/v) and gate/up are stored as one matrix and so share a format:
+`qkv` (sliding q,k,v; global q,k), `o`, `gate_up` and `down`, across all 60 layers. Start from an INT4 g32 import and
+name the groups that come from a matching INT5 group64 checkpoint of the same model (same text tree and calibration):
+
+```text
+"<converter-python-3.11>" -m tools.convert.gemma4_q4 convert --model "<BF16-dir>" --text-only --mtp-assistant "<assistant-BF16-dir>" --weights q4_g32_a16 --gptq-source "<work>/gptq4-g32" --q5-gptq-source "<work>/gptq5-g64" --q5-unit down --q5-unit qkv@0-19 --out "<out>/gemma4-mixed.ninfer"
+```
+
+`--q5-unit ROLE[@LAYERS]` repeats; `LAYERS` is a comma list of layer numbers or inclusive ranges (default all
+layers) and overlapping selectors are a union. Every named group is stored `q5_g64_fp16` with an `A16Only` Use; every
+other projection follows the INT4 import unchanged, and `--weights q4_g32` still gives those Q4 projections
+`AllowA8` (the Q5 groups stay `A16Only`; `--gemma4-q5-prefill` selects their prefill compute at launch, and applies
+to the Q5 groups only). Each group costs `0.75` bit per weight over Q4 (4.5 vs 5.25 bit including scales), so
+all four roles over all layers reproduce the full Q5 artifact's size. The flags need `--weights q4_g32|q4_g32_a16`
+with `--gptq-source`, refuse `--native-groups`, unknown roles, malformed or out-of-range layers and a source that
+is not INT5 g64, and the build receipt lists the cells (`scale_search.q5_source`) and the per-format tensor counts.
+The loader, the per-layer workspace arena and the route selection work per prepared projection, so no engine
+option is involved.
+
 ### Create the smaller IQ3 files from HF BF16
 
 Start with the complete local BF16 Gemma 4 **31B dense** HF tree (including its tokenizer/config files), a clean

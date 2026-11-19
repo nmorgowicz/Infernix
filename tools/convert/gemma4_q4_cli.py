@@ -86,6 +86,8 @@ def options_from(args: argparse.Namespace) -> Q4Options:
         mtp_weights=args.mtp_weights,
         gptq_source=args.gptq_source,
         gguf_source=args.gguf_source,
+        q5_gptq_source=args.q5_gptq_source,
+        q5_units=tuple(args.q5_unit),
     )
 
 
@@ -377,6 +379,23 @@ def build_parser() -> argparse.ArgumentParser:
         "the 8-bit GGUF route at decode), --weights q4_g32_a16 keeps the exact 16-bit routes. Vocabulary, norms and "
         "MTP come from --model as before. Mutually exclusive with "
         "--gptq-source/--scale-search/--imatrix/--group-size/--region-group/--native-groups",
+    )
+    build.add_argument(
+        "--q5-gptq-source",
+        type=Path,
+        help="Mixed Q4/Q5 build: directory of an INT5 group64 compressed-tensors checkpoint (dense cross-word "
+        "packing) of the same model, read for the cells named by --q5-unit. Needs --weights q4_g32 or q4_g32_a16 "
+        "with the INT4 --gptq-source; every other projection stays Q4",
+    )
+    build.add_argument(
+        "--q5-unit",
+        action="append",
+        default=[],
+        metavar="ROLE[@LAYERS]",
+        help="Store this fused projection group in native q5_g64_fp16 (A16Only Use) from --q5-gptq-source. ROLE: "
+        "qkv (q,k[,v]), o, gate_up or down; LAYERS: comma list of layer numbers or inclusive ranges such as "
+        "0-19,40 (default: all 60). Repeat for several cells. Members of one stored matrix share a format, so "
+        "the unit is never smaller than the group",
     )
     build.add_argument(
         "--resource",
