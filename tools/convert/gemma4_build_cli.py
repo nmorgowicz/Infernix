@@ -73,6 +73,9 @@ The serve launcher runs infernix-serve with the operator profile: 131072 context
 attention QK, one lane, --prefill-chunk auto, MTP with one draft token when the file has it, BF16 logits, a host-only
 prefix cache of 8192 MiB, listening on 0.0.0.0:8001. The server accepts any API key. With --model-match any (the
 default) it also accepts any model name; with exact, OpenAI-style requests must use the --alias model name.
+For Q5 builds/native-Q5 artifacts, omitted --profile selects q5-quality instead: int8-g64 prefill,
+BF16 rings, auto context, chunk 2048, top-k 64, alias gemma4-q5. Explicit --profile default keeps
+the general settings above. See docs/weight-conversion.md for the lower-VRAM option ladder.
 """
 
 
@@ -108,9 +111,9 @@ def add_serve_arguments(parser: argparse.ArgumentParser, *, prefix: str) -> None
         "prefill, auto context, chunk 2048, top-k 64 and no key-only KV: q5-quality has BF16 rings; "
         "q5-long-context has FP8 rings. memory-16gb: IQ3_XXS, key-only FP8 globals/ring, chunk 128")
     add("--context", type=context_value,
-        help=f"{prefix} --max-context: positive tokens or auto (default 131072; memory-16gb: auto)")
+        help=f"{prefix} --max-context: positive tokens or auto (general default 131072; Q5/memory-16gb: auto)")
     add("--alias", help=f"{prefix} --model-id, the name /v1/models reports and requests must use unless "
-        "--model-match any (default <context/1000>k, for example 131k)")
+        "--model-match any (general default <context/1000>k; Q5: gemma4-q5; memory-16gb: gemma4-16gb)")
     add("--host", default=launcher_tools.DEFAULT_HOST, help=f"{prefix} --host (default {launcher_tools.DEFAULT_HOST}, "
         "all interfaces; 127.0.0.1 for this machine only)")
     add("--port", type=int, default=launcher_tools.DEFAULT_PORT,
@@ -136,8 +139,8 @@ def add_serve_arguments(parser: argparse.ArgumentParser, *, prefix: str) -> None
         help="opt in to starting when the model does not fit the free VRAM: the shortfall runs in shared GPU memory "
         "(system RAM over PCIe, much slower; default off = the server refuses). memory-16gb tries resident starts first")
     add("--prefill-chunk",
-        help="prefill chunk: auto (default: the server picks the largest of 2048/1024/512/256/128 that fits the "
-        "full context after the weights load) or a multiple of 128 up to 16384")
+        help="prefill chunk: Q5 default 2048; memory-16gb 128; general default auto (the server picks the largest "
+        "of 2048/1024/512/256/128 that fits full context after weights load), or a multiple of 128 up to 16384")
     add("--draft-tokens", default=launcher_tools.DEFAULT_DRAFT_TOKENS,
         help="MTP drafts per round: 1 (default, best for growing roleplay context), 2..7, or auto (6). Ignored "
         "without an MTP assistant")
@@ -148,8 +151,8 @@ def add_serve_arguments(parser: argparse.ArgumentParser, *, prefix: str) -> None
         "snapshot slots")
     add("--vram-headroom-mib", type=int, default=None,
         help="VRAM in MiB the KV sizing leaves free for the display and other programs (default 1024; memory-16gb: 64)")
-    add("--top-k", type=int, help="process-level top-k, 0..64 for Gemma (default: no flag; the artifact's sampling "
-        "preset applies)")
+    add("--top-k", type=int, help="process-level top-k, 0..64 for Gemma (Q5 default 64; otherwise no flag, "
+        "the artifact's sampling preset applies)")
     add("--chat-template", type=Path, help="Jinja chat template file that replaces the artifact's (--chat-template)")
     add("--default-thinking-budget", type=int, help="process-level thinking cap for requests that set none, in tokens "
         "(default: no flag; the server's answer room still ends a long thought). A thought that reaches it is closed "
@@ -241,8 +244,9 @@ def launcher_parser() -> argparse.ArgumentParser:
         prog="python -m tools.convert.gemma4_build launcher",
         description="Write a Windows .cmd that starts infernix-serve on a .ninfer with the operator profile: FP8 KV "
         "cache, FP8 attention QK, --prefill-chunk auto, MTP with one draft token, BF16 logits, a host-only prefix "
-        "cache, 0.0.0.0:8001, alias 131k. MTP and vision are detected from the artifact; every setting can be "
-        "changed.",
+        "cache, 0.0.0.0:8001, alias 131k. Native-Q5 artifacts instead default to q5-quality: int8-g64 prefill, "
+        "BF16 ring, auto context, chunk 2048, top-k 64, alias gemma4-q5. Explicit --profile default keeps "
+        "the general profile. MTP and vision are detected; every setting can be changed.",
     )
     parser.add_argument("--artifact", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path, help="new .cmd file (never overwritten)")

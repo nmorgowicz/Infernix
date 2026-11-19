@@ -974,3 +974,32 @@ Chunk 1536, FP8 rings, no MTP, shorter context, explicit experimental key-only K
 last-resort shared memory form the user option ladder, not a dynamic new profile framework.
 Commands and exact memory/performance costs live in the
 [conversion guide](../weight-conversion.md#lower-vram-q5-ladder-same-artifact).
+
+### Profile acceptance evidence
+
+Implementation `0dca0b55`; Python behavior suite **202 passed in 16.62 s** with the tooling
+Python 3.13.10 environment, plus Python 3.11.9 `py_compile` of both changed modules. The initial
+Python 3.11 pytest invocation could not run because that interpreter has no pytest; no dependency
+was installed. Tests cover omitted versus explicit profile precedence, all compute overrides,
+BF16 ring/QK overrides, direct Python construction, generated commands, native-Q5 trunk-directory
+detection (including split bindings, excluding assistant/head-only Q5) and unchanged other tiers.
+
+The actual generated CMDs were run on the verified diode artifact above, with the unchanged
+approved absolute server (SHA-256 `63af2c0d…10c8c`), RTX 5090 / CUDA 13.5:
+`q5-quality` resolved **81,792** context, INT8 g64 / BF16 ring; `q5-long-context` resolved
+**109,376**, INT8 g64 / FP8 ring. Each completed one **174-token prompt** (wide prefill exercised)
+with default thinking and MTP d1: 341 / 269 reasoning tokens, 178/205 / 139/168 accepted/drafted,
+both finish `stop`. BF16 ring/QK plus A16 compute overrides and explicit general `default` were
+proved through parser/direct-API/generated-config agreement, not additional GPU runs.
+These are startup/short-function checks, not long-context quality or new performance measurements.
+
+The first smoke lease failed its second start because its harness stopped only `cmd.exe`, leaving
+its own first server resident. That server was identified and terminated; cleanup now stops the
+owned process tree. Completed recommended-profile evidence was retained; only the refused
+long-context start was retried successfully. No server remained afterward. Lease durations
+65.81 / 44.37 s, minimum physical RAM 25.58 / 29.03 GiB, unchanged 8 GiB floor; artifact and
+server SHA-256 values match before/after both leases. No build or quality campaign was repeated.
+
+Evidence: camp `q5-20261117/profiles-20261118/{configuration-proof.json,acceptance.json,
+verify_profiles.py,*.cmd,*response.json,*metrics.txt,*.log}`; parent
+`infernix-port-p3-20261112/q5-profiles-20261118*.receipt.json`.

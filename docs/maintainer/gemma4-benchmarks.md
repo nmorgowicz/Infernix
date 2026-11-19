@@ -834,8 +834,10 @@ not rerun; the serving/perplexity binaries used for the measurements were not re
 ### Adoption decision and coverage limits
 
 Initial 2026-11-18 recommendation was BF16 for every default. The later operator decision accepts the measured
-memory/fidelity/speed trade for **`memory-16gb` IQ3_XXS only**, now FP8-ring by default; explicit
-`--gemma4-sliding-kv bf16` overrides it. General/Q5/native defaults remain BF16. Planning and fallback stages
+memory/fidelity/speed trade for **`memory-16gb` IQ3_XXS**, now FP8-ring by default. The subsequent
+[Q5 adoption](gemma4-q5-prefill.md#q5-recommended-profile-adoption-2026-11-18) also makes the explicit
+`q5-long-context` profile FP8-ring; general/`q5-quality`/native rings remain BF16. Explicit
+`--gemma4-sliding-kv bf16` overrides either FP8-ring profile. Planning and fallback stages
 preserve the selection ([usage](../../tools/README.md#gemma-sliding-ring-memory-opt-in)). No quality gate changes.
 The short plain-GPTQ5 KL increase of 9.3-11.2 % exceeds the plan's order-of-magnitude warning relative
 to key-only's historical +0.45 %, and the speed gates above fail.
