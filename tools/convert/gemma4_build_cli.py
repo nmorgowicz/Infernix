@@ -129,8 +129,8 @@ def add_serve_arguments(parser: argparse.ArgumentParser, *, prefix: str) -> None
     add("--gemma4-key-only-kv", action="store_true",
         help="experimental global key-only FP8 KV (default off; memory-16gb enables it)")
     add("--gemma4-sliding-kv", choices=("bf16", "fp8"), default=None,
-        help="sliding K/V ring storage: bf16 (general default), or experimental fp8 (memory-16gb default; "
-        "about half the ring memory, measurable fidelity and prefill cost; requires --kv-dtype fp8). Explicit bf16 overrides the profile")
+        help="sliding K/V ring storage: bf16 (general and q5-quality default), or experimental fp8 (default of memory-16gb and "
+        "q5-long-context; about half the ring memory, measurable fidelity and prefill cost; requires --kv-dtype fp8). Explicit bf16 overrides the profile")
     add("--gemma4-q5-prefill", choices=("a16", "fp8", "int8-g32", "int8-g64"), default=None,
         help="Gemma4 native Q5 trunk calls of 64+ columns: fp8 row-E4M3 bake or int8-g32/g64 groupwise INT8 "
         "activations; Q5 profiles default to int8-g64 (lossy speed/fidelity balance), others to a16 "

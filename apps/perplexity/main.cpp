@@ -437,7 +437,7 @@ struct EvaluationStream {
 
 namespace kl = infernix::perplexity::kl;
 
-// Ported from ninfer.spo: exact paired full-vocabulary KL. Receives widened BF16 logits, turns
+// Exact paired full-vocabulary KL (NKLREF01 cache format and statistics). Receives widened BF16 logits, turns
 // them into F32 log-probabilities and either appends them to the reference cache or compares them
 // with the cached reference rows. The cache stores no logits and is bound to the run protocol.
 class KlRun {

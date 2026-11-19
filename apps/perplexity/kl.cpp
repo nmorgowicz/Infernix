@@ -1,4 +1,4 @@
-// Ported from ninfer.spo full-vocabulary KL (NKLREF01 format and statistics preserved).
+// Exact paired full-vocabulary KL (NKLREF01 cache format and statistics).
 #include "kl.h"
 
 #include <algorithm>

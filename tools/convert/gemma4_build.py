@@ -99,7 +99,7 @@ PRESETS: dict[str, Preset] = {
     ),
     "q5-g64": Preset(
         "q5-g64", "gptq", "GPTQ 5-bit, group 64, A16Only",
-        "Higher-quality Q5 tier; independent opt-in prefill compute choices on one artifact. "
+        "Higher-quality Q5 tier; prefill compute (a16, fp8, int8-g32, int8-g64) is chosen at launch on one artifact. "
         "Historical KL is plain-model A16 versus own Q8_0, not a diode qualification.",
         "quality", 21.15, 0.0199, "about 40 min", 64, False, "q5_g64_fp16", 85, 115, 22,
         {"calibration-source": 1, "calibration-render": 1, "calibration-tokens": 1, "text-tree": 2, "gptq": 25,
