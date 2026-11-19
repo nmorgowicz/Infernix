@@ -1,8 +1,29 @@
 # Gemma 4 GPTQ5 prefill attribution (2026-11-18)
 
+**Current state (read first).** The sections below are dated measurements; statements about defaults,
+opt-in status or what remains to be done describe the state when that measurement was made, and instrument
+and receipt identifiers (`item2a-http-v1/clean`, `item2d-*.receipt.json`, ...) keep their original campaign labels.
+
+- Builder: `--preset q5-g64` builds one A16Only artifact (native GPTQ5 group 64, FP8 vocabulary, BF16-source
+  MTP assistant). Compute is chosen at launch on that same artifact, never by rewriting weights.
+- Launcher profiles: omitted `--profile` selects `q5-quality` for a `q5-g64` build or a native-Q5 artifact.
+  `q5-quality` and `q5-long-context` both select `--gemma4-q5-prefill int8-g64`, auto context, chunk 2048,
+  1024 MiB headroom, top-k 64, MTP d1 and a host-only prefix cache; `q5-quality` keeps the BF16 sliding ring,
+  `q5-long-context` uses the FP8 ring. Neither enables key-only KV. Explicit flags win; explicit
+  `--profile default` keeps the general profile.
+- Engine, CLI and perplexity: `--gemma4-q5-prefill` accepts `a16|fp8|int8-g32|int8-g64`; the default `a16`
+  preserves the artifact's stored A16Only/AllowA8 policy. The general profile, Q4 and IQ3 tiers pass no flag
+  (`a16`). `memory-16gb` (IQ3_XXS only) defaults to the FP8 ring; other rings default to BF16.
+- Chunk 2048 is retained; chunk 1536 saves a measured 884 MiB of reservation but is not faster.
+- The plain text60 tree and the Q5 A8-tagged artifact used in some measurements below were deleted later;
+  they are reproducible (`tools/gptq/make_text_tree.py`; the A8 behavior as the one A16Only artifact with
+  `--gemma4-q5-prefill fp8`, bit-identical to it on the bounded incremental protocol below).
+- Open caveats that remain: INT8 long-context quality and the diode artifact's incremental quality are
+  unmeasured; g32 shows a resolved incremental NLL increase; no blanket numerical-equivalence claim is made.
+
 ## Scope and implementation diagnosis
 
-Item 2a is measurement and diagnosis only: the existing plain GPTQ5 group-64 A16 and W5A8
+This attribution is measurement and diagnosis only: the existing plain GPTQ5 group-64 A16 and W5A8
 artifacts, identical weights and other precision settings, natural ~1k/~65k prompts, chunk
 2048 with chunk 128 as a sensitivity arm. No kernel implementation or default change belongs
 to this item. The BF16 sliding ring, normal stored global FP8 K/V, FP8 global QK and BF16 logits
@@ -39,9 +60,9 @@ uses 8-bit tensor-core operands, wider output-row reuse, larger K steps, TMA and
 final-wave schedule. A source-level explanation is not a measurement of stall cycles, achieved
 occupancy, DRAM throughput or tensor-core utilization.
 
-## Shared-tile external concept
+## Alternative shared-tile design
 
-The local NInferno `generic_tiled.cuh` at `e99ce56a3918d6f86427cc8cecc3b2b0597a021c`
+A reference generic tiled kernel (a design with a non-Volta path that decodes packed weights differently)
 is not evidence that shared-tile fusion is missing here.
 Both implementations already decode packed weights into a shared BF16 tile. Its non-Volta
 path instead stores exact integer codes in that tile and scales an FP32 partial at each group
@@ -50,7 +71,7 @@ The current native wide ring scales/rounds weights before the MMA, overlaps prod
 warps, and keeps one complete-K FP32 chain. The external grouped accumulation therefore changes
 rounding/reduction semantics as well as scheduling; it is not a drop-in removal of a redundant
 BF16 global pass. Relevant mechanisms must be compared against these actual routes and Gemma
-shapes, not the name “fused dequant.” No port is implemented or authorized by this attribution.
+shapes, not the name “fused dequant.” No such kernel is implemented by this attribution.
 
 ## Interpretation rule
 
@@ -131,7 +152,7 @@ an N x K BF16 native-Q5 dequant matrix. Device weight allocations match at **20,
 
 Evidence lives in the model camp `convert/iq3xs-20261115/q5-20261117/prefill-attribution-20261118/`:
 `measure.py`, `identity.py`, `artifact-comparison.json`, `summarize.py`, per-cell results,
-request/SSE/metrics/logs, and the parent `infernix-port-p3-20261112/item2a-*.receipt.json`.
+request/SSE/metrics/logs, and the lease receipts `infernix-port-p3-20261112/item2a-*.receipt.json`.
 The generic tooling comparability reader refuses these native-performance directories (exit 2:
 it accepts Sixcat/gate artifacts only); the campaign analyzer instead asserts exact request
 hash/count identity, no prefix reuse, completed rows and the named instrument before aggregation.
@@ -281,10 +302,10 @@ precision/default change, source-wiring test or relaxed numerical threshold is r
 
 Unresolved: achieved hardware occupancy/read bandwidth/stall attribution, all-MTP behavior,
 other GPUs/power limits, longer prompts and quality of any proposed alternative. Existing
-quality gates and artifact/reference identities remain binding. Parent review precedes 2c or
-the separately approved serving-profile changes.
+quality gates and artifact/reference identities remain binding. Proposals 2 and 3 were pursued in the
+compute-precision and INT8 kernel sections below.
 
-## Compute-precision emulation (item 2b, 2026-11-18)
+## Compute-precision emulation (2026-11-18)
 
 Quality-only, offline study of which compute precision explains the plain GPTQ5 W5A8 gap to A16.
 No optimized kernel, default or artifact changed. A temporary emulation route (an explicit
@@ -329,22 +350,22 @@ W5A8 in aggregate (paired -0.00010 [-0.00136, +0.00105]) but not per position (p
 
 Reading: the W5A8 gap is two additive halves (weight bake +0.0045, activation rounding +0.0047); INT8
 per-32 activations on exact codes remove both and reach the A16 ceiling; E4M3 block scaling does not.
-Speed was measured separately in the next section (item 2c phase 1).
+Speed was measured separately in the next section (INT8 kernel microbenchmark).
 Limits: one plain model, short pinned protocol, intervals about +-0.0025 KL, MTP off, no long-context
-re-measurement; Brontir's cross-model KL numbers are not evidence here. Plan and full record:
+re-measurement; KL numbers measured on other models are not evidence here. Plan and full record:
 tooling `docs/plans/20261118-gemma4-q5-compute-precision.md`; evidence in the camp's `q5-precision-20261118/`.
 
-## INT8 per-32 kernel microbenchmark (item 2c phase 1, 2026-11-18)
+## INT8 per-32 kernel microbenchmark (phase 1, 2026-11-18)
 
 Standalone CUDA microbenchmark, **no engine change during phase 1**. The per-32 soft gate was not met;
-the parent subsequently chose to proceed with both group sizes in phase 2 below. Sources live in the camp (`q5-int8-20261118/`: `q5_i8.cuh` kernel, `bench.cu`, `probe.cu`,
+both group sizes were then implemented in phase 2 below. Sources live in the camp (`q5-int8-20261118/`: `q5_i8.cuh` kernel, `bench.cu`, `probe.cu`,
 `oracle_check.py`, `summarize.py`, runner logs). The baseline is the engine's own native A16 code, instantiated from
 the same headers: `launch_rowsplit_ring_linear<Q5RingFormat, RowSplitRingTile128, 3, 4>` for T = 2048 and
 `q5_a16_mma_kernel<MmaR32T128>` for T = 128. RTX 5090 (170 SMs), CUDA 13.5 `sm_120a`, plain GPTQ5 g64 layout on
 the six real shapes with random weights/activations; L2 flushed before each of 15 events-timed repetitions, median of
 three serial lease cells (`item2c-final-r1..3`, exit 0, 9.1 s each, minimum free RAM 42.2 GiB, floor 8 GiB, no
 build or other heavy job overlapped; Pages/sec samples 15.9 / 16.0 / 1,601.9 with >= 43.2 GiB available, so no
-paging-free claim). Native A16 reproduces the in-situ rates of item 2a (191-208 TFLOP/s versus 177-193).
+paging-free claim). Native A16 reproduces the in-situ rates of the attribution above (191-208 TFLOP/s versus 177-193).
 
 **Tensor-core peaks** (register-only probe, 170 SMs): INT8 `mma.m16n8k32` s32 **1,002 TOPS**; MX block-scaled E4M3
 (`kind::mxf8f6f4`, the production W5A8 GEMM's instruction) **998 TFLOP/s**; plain E4M3 `mma.sync` FP32-accumulate
@@ -362,15 +383,15 @@ K group, scale `max|x|/127` (FP32, low two mantissa bits cleared), FP32 reciproc
 clamp +-127. Pipeline: mbarrier stages of K = 128 (64 also tried), 8 consumer warps (64 x 32 warp tiles of a
 128 x 128 CTA tile, one CTA per SM) plus 4 producer warps; optional TMA copy of the activation tile and scales.
 
-**Verification before timing.** Independent NumPy/FP64 oracle (`oracle_check.py`; real captured 2b operands tiled to
+**Verification before timing.** Independent NumPy/FP64 oracle (`oracle_check.py`; real captured emulation-study operands tiled to
 the full N and T with per-row scale and per-token magnitude variation; 46 configuration/T combinations over both
 group sizes, fused / TMA / pre-baked / K64 variants): the activation quantizer matches the independent NumPy rule
 with **0** mismatching codes or scales; 979,695 sampled BF16 outputs match the FP32 group-chain emulation
 (`t = fl32(dot*as)`, `run = fl32(t*ws + run)`, ascending groups) with **0** disagreements; worst relative L2 to the
-FP64 ideal 0.00199 (the BF16 output rounding; native A16 versus exact Q5 x BF16 is 0.0016-0.0021). Against the 2b
+FP64 ideal 0.00199 (the BF16 output rounding; native A16 versus exact Q5 x BF16 is 0.0016-0.0021). Against the study's
 emulator captures (real rows/tokens, 256 elements per shape) 4-19 elements per shape differ by one BF16 ulp
 (relative L2 4e-5 to 4.3e-4): the 22-bit activation-scale mantissa and the association of the FP32 scale products,
-as 2b predicted; 4-48 of 43k-172k int8 codes per shape differ from the 2b quantizer for the truncated scale.
+as the emulation study predicted; 4-48 of 43k-172k int8 codes per shape differ from its quantizer for the truncated scale.
 
 **Per-shape time at T = 2048** (median of three cells; effective TOP/s = `2*N*K*T / time`; best per shape):
 
@@ -387,7 +408,7 @@ At T = 128 the native A16 route runs 92-138 TOP/s and the best INT8 per-32 kerne
 0.064 / 0.111 / 0.199 / 0.156 ms in the order above; native 0.205 / 0.209 / 0.123 / 0.234 / 0.429 / 0.312 ms).
 
 **Gate projection at T = 2048.** Each candidate's per-shape time relative to native A16 in the same session
-scales item 2a's in-situ cumulative A16 projection time of that shape (20.62 s); quantizer and bake calls are counted
+scales the attribution's in-situ cumulative A16 projection time of that shape (20.62 s); quantizer and bake calls are counted
 per layer and chunk (50 sliding + 10 global layers, 32 chunks). The standalone quantizer is unfused and about 2x
 its memory floor [INFERENCE: roughly 0.3 s fused, not measured]. Reference: W5A8 GEMM 5.85 s + bake 1.02 s + quant
 0.31 s = 7.18 s.
@@ -401,15 +422,15 @@ its memory floor [INFERENCE: roughly 0.3 s fused, not measured]. Reference: W5A8
 
 At chunk 128 (A16 33.87 s; W5A8 stack 9.64 + 14.97 + 0.74 = 25.35 s) the fused per-32 kernel projects to 16.43 s
 GEMM + 0.95 s quantizer = 17.38 s (1.95x faster than native, **0.69x** of the W5A8 stack because W5A8 rebakes every
-chunk), per-64 16.12 s. These chunk-128 projections split item 2a's A16 total by call-weighted measured per-call time
+chunk), per-64 16.12 s. These chunk-128 projections split the attribution's A16 total by call-weighted measured per-call time
 [INFERENCE for the split]; the 65k layer-interval projection (not measured) is 23.55 s for per-32 and 21.76 s for
 per-64, against 32.49 s native A16 and 19.06 s W5A8.
 
 **Verdict: the per-32 gate is not met.** It projects 1.77x faster than native A16 at T = 2048 (the 1.3x criterion
 holds) but 1.63x the W5A8 stack (the ~1.5x criterion fails by 8 %; a fused quantizer at the memory floor would give
-about 1.59x [INFERENCE]). Per-64 (KL 0.0204 in 2b against 0.0200, not separable at that sample size) projects 1.38x and passes.
-The parent assistant (not the operator) then decided to proceed with both group sizes behind an explicit opt-in load-time compute mode
-(A16 stays the default); the engine kernel, the mode and their model-level checks are the next section.
+about 1.59x [INFERENCE]). Per-64 (KL 0.0204 in the emulation study against 0.0200, not separable at that sample size) projects 1.38x and passes.
+Per-32 narrowly missed the ~1.5x soft criterion; both group sizes were then implemented behind an explicit opt-in load-time compute mode
+(A16 was the default at that time; the current Q5 profile default is stated at the top); the engine kernel, the mode and their model-level checks are the next section.
 
 **Where the per-32 rate goes** (gate/up shape, T = 2048, one 128 x 128 tile configuration, effective TOP/s):
 consumers alone (staging replaced by barrier pacing) 548; plus real MMA/staging without scale apply 536;
@@ -426,14 +447,14 @@ copies (+2-3 %, kept as the best per-32 for four shapes), mbarrier wait policies
 
 Phase-1 limits: synthetic weights and activations ([INFERENCE]: timing does not depend on data values except through power), one GPU and power
 limit; engine partial tiles, bounds, graphs, arena fit, quality and HTTP were not yet measured at that stage.
-The FP8 reference is item 2a's in-situ number rather than the same harness. Phase 2 supplies the engine checks below.
+The FP8 reference is the attribution's in-situ number rather than the same harness. Phase 2 supplies the engine checks below.
 Tooling plan: `docs/plans/20261118-gemma4-q5-int8-per32-microbench.md`.
 
-## INT8 prefill engine kernel (item 2c phase 2, 2026-11-18)
+## INT8 prefill engine kernel (phase 2, 2026-11-18)
 
 Implemented in `74eff759`: `--gemma4-q5-prefill a16|int8-g32|int8-g64`, default `a16`, across Engine,
-CLI, serving, native perplexity and the builder-generated launcher/serve-check profile. No profile enables INT8
-implicitly. **The default preserves the artifact's existing A16Only/AllowA8 policy**: an A16 artifact stays A16;
+CLI, serving, native perplexity and the builder-generated launcher/serve-check profile. At that commit no profile enabled INT8
+implicitly (the Q5 profiles now do; see the last section). **The default preserves the artifact's existing A16Only/AllowA8 policy**: an A16 artifact stays A16;
 an AllowA8 artifact still uses the existing W5A8 bake. The INT8 choices override the six native Q5 trunk
 shapes at **T >= 64** only, using the existing Q5 group-64 artifact without rewriting or duplicating weights.
 They are refused with lossless execution, other model families or an artifact without native Q5 trunk weights.
@@ -463,7 +484,7 @@ Receipts: `int8-phase2-optest-2` / `int8-phase2-q5proj-1`, exit 0, minimum free 
 The saved implementation session additionally ran the native CLI/serve parsers and affected Python builder
 tests; those checks were not repeated during recovery.
 
-Pinned native full-vocabulary KL: the same plain A16 artifact and Q8 reference as 2b, context 512,
+Pinned native full-vocabulary KL: the same plain A16 artifact and Q8 reference as the emulation study, context 512,
 stride 256, chunk 128, chat prefix, FP8 global KV, BF16 ring/QK/logits; **47 windows / 13,728 positions**,
 4000-resample paired window bootstrap:
 
@@ -472,9 +493,9 @@ stride 256, chunk 128, chat prefix, FP8 global KV, BF16 ring/QK/logits; **47 win
 | default A16 | 0.019914 [0.017267, 0.022466] | 0 | 0 | 0.04422 |
 | INT8 g32 | 0.020425 [0.017716, 0.022952] | +0.000511 [-0.000095, +0.001127] | +0.002021 | 0.04538 |
 | INT8 g64 | 0.020305 [0.017541, 0.022987] | +0.000391 [-0.000416, +0.001178] | +0.001506 | 0.04356 |
-| W5A8 (retained matched 2b result) | 0.029649 [0.026021, 0.033243] | +0.009735 | +0.003517 | 0.05427 |
+| W5A8 (retained matched emulation-study result) | 0.029649 [0.026021, 0.033243] | +0.009735 | +0.003517 | 0.05427 |
 
-Default A16 reproduces every retained 2b position bit for bit. Native g32 versus its 2b emulator is
+Default A16 reproduces every retained emulation-study position bit for bit. Native g32 versus its emulator is
 +0.000422 [-0.000149, +0.000997] KL; g64 -0.000081 [-0.000647, +0.000426]. Neither is bit-identical to
 the emulator (truncated scale/FP32 association), but this sample does not resolve an aggregate difference.
 Nor does it establish exact equivalence to A16 or a quality ranking between g32/g64 (paired g64 minus g32
@@ -485,7 +506,7 @@ the mean. Long-context quality is unmeasured. The KL lease exits 0 in 166 s with
 ### Clean HTTP prefill
 
 All arms use the same executable SHA-256 `ec6905ca4cc799623862814439316d56083d0bf68f1a2967e71b37bdeb83db53`,
-with no event-instrumentation switch. Same hardware/power, artifacts and requests as item 2a; context/KV 68,096,
+with no event-instrumentation switch. Same hardware/power, artifacts and requests as the attribution; context/KV 68,096,
 headroom 1024 MiB, normal global FP8 K/V and FP8 QK, **BF16 sliding ring**, BF16 logits, one lane,
 graphs on, prefix reuse/Host cache off, `free-cache-resume` off, greedy/seed 1234/thinking off.
 Four measured requests per arm/length at chunk 2048 (forward/reverse starts), two at chunk 128; one excluded
@@ -507,14 +528,14 @@ Median prompt times in arm order A16/W5A8/g32/g64: 353/156/212/183 ms short and
 33.014/19.050/23.769/21.793 s long at 2048; 568/434/298/266 ms and 49.041/39.187/31.379/30.251 s at 128.
 Wire TTFT: 378/183/275/211 ms and 33.146/19.192/23.932/21.923 s at 2048;
 597/463/315/291 ms and 49.169/39.307/31.505/30.387 s at 128.
-All **60** prefill requests return the same first token (818), also matching the retained A16/W5A8 item-2a
+All **60** prefill requests return the same first token (818), also matching the retained A16/W5A8 attribution
 requests. That is a smoke observation, not proof of full-output/logit equivalence.
 
 The three saved cold-L2 microbench repetitions of the integrated configurations (15 CUDA-event samples each)
 give T=2048 GEMM medians in shape order sliding QKV/global QK/sliding out/global out/gate-up/down:
 g32 **1.036/1.148/0.506/0.981/2.879/1.301 ms**, g64 **0.873/0.963/0.418/0.809/2.458/1.080 ms**.
 G32 quantization costs 0.029/0.029/0.046/0.083/0.030/0.108 ms; these are kernel numbers, not HTTP totals.
-The harness's `projection_65k_ms` rows are ratio-based projections using item-2a chunk-2048 weights, not
+The harness's `projection_65k_ms` rows are ratio-based projections using the attribution's chunk-2048 weights, not
 measured engine intervals; its T=128 projection uses that same weighting and is not a valid chunk-128
 end-to-end estimate. The clean HTTP table, not those projected rows, is the performance result.
 
@@ -553,9 +574,9 @@ as BF16; that logging-only change was rebuilt separately and is not the measured
 
 **Disposition:** the opt-in routes provide near-A16 short-protocol KL at materially faster prefill, not
 W5A8 parity at chunk 2048. G64 is faster with no resolved quality loss versus g32 on this sample; neither
-becomes a default. No tuning campaign, item 2d, model promotion, artifact rewrite or production build change.
+was made a default by this work (the later Q5 profile adoption selects g64 for the Q5 profiles only). No tuning campaign, model promotion, artifact rewrite or production build change.
 Evidence: `q5-int8-20261118/phase2/{oracle-engine,kl-summary,http-summary}.json`, test dumps, benchmark
-sources, request/SSE/metrics/logs, and parent `int8-phase2-*.receipt.json`. Plan:
+sources, request/SSE/metrics/logs, and lease receipts `int8-phase2-*.receipt.json`. Plan:
 tooling `docs/plans/20261118-gemma4-q5-int8-per32-microbench.md`.
 
 ### Final rebuild and path incident
@@ -577,15 +598,15 @@ unchanged 8 GiB floor, no named heavy overlap. No quality/timing campaign was re
 `phase2/startup-scope-summary.json` connects the measured and rebuilt hashes to the implementation/logging
 commits; `int8-phase2-log-scope-approved.*` and `int8-phase2-startup-scope.receipt.json` retain build/smoke evidence.
 
-## Single-artifact compute selection and incremental scoring (item 2d, 2026-11-18)
+## Single-artifact compute selection and incremental scoring (2026-11-18)
 
-Item 2c already implemented INT8 launch-time selection, scoped workspace, graph routing, cache signatures,
-CLI/serve/perplexity/builder propagation and the narrow A16 split. Item 2d reuses those mechanisms.
+The INT8 phase-2 work already implemented launch-time selection, scoped workspace, graph routing, cache signatures,
+CLI/serve/perplexity/builder propagation and the narrow A16 split. This study reuses those mechanisms.
 The same `--gemma4-q5-prefill` now accepts `fp8`, enabling the existing W5A8 bake for all four prepared
 native Q5 trunk projections (QKV/QK, output, gate/up, down), including trunk verification. No second flag,
 artifact rewrite, copied artifact or persistent extra weight representation is needed.
 
-The historical `a16` default remains **artifact policy**, not a forced override: an A16Only artifact runs
+The Engine/CLI `a16` default remains **artifact policy** (Q5 launcher profiles pass `int8-g64` explicitly), not a forced override: an A16Only artifact runs
 A16; an AllowA8 artifact keeps W5A8. For an actual launch-time A16/FP8/INT8 choice, use the **one A16Only
 Q5 artifact** and select `a16|fp8|int8-g32|int8-g64`. All lossy routes apply at 64+ columns only; single-token
 decode and narrow MTP verification remain native A16. Assistant/head representations stay unchanged.
@@ -603,7 +624,7 @@ reference writer inherits the same prefix/chunk/one-token schedule from that pro
 Compare identical token IDs, window boundaries and target positions against the plain model's own Q8
 reference. Cross-mode incremental differences include changed prefill KV; an identical narrow A16 prefix
 control separately isolates whether the decode arithmetic itself changed. Short bounded evidence and
-verification are reported below; no default, promotion, long-context qualification or item-2e sweep follows
+verification are reported below; no default, promotion, long-context qualification or chunk sweep follows
 from this instrumentation.
 
 ### Behavioral verification
@@ -694,29 +715,29 @@ Incremental top-1 disagreements with Q8: A16/FP8/g32/g64 **2.90%/4.35%/2.17%/2.9
 Worst window-mean incremental ΔKL versus A16: FP8 +0.015007, g32 +0.013925, g64 +0.004331.
 The negative FP8 NLL change on the tiny final-prefill slice alongside worse KL also illustrates why NLL
 alone is not a distribution-quality criterion. These are different target positions and a different
-schedule from item 2c's 13,728-position block-prefill protocol; their absolute KL means are not comparable.
+schedule from the INT8 phase-2 13,728-position block-prefill protocol; their absolute KL means are not comparable.
 
 The new single-artifact `fp8` route and legacy A8-tagged artifact produce **all 18 full-logit window hashes
 and all 294 per-position records bit-identically**. Default A16's protocol-write and comparison logit
 hashes also match exactly. This is a bounded numerical equivalence proof for the new selection path,
-not a reason to repeat item 2c's completed ~65k timing campaign.
+not a reason to repeat the completed INT8 phase-2 ~65k timing campaign.
 
 The byte-exact quality lease exits 0 in 224 s, minimum free RAM **32.27 GiB**, unchanged executable hash,
 8 GiB floor. The earlier refused reference lease retained >=36.09 GiB and proved both original artifact
 hashes unchanged. No model deletion, promotion, production build, long-context campaign or chunk sweep.
 Explicit refusal checks pass for a real Q4 artifact, non-Gemma/unknown-artifact configuration, and incremental
-top-token references whose format cannot bind the schedule (exit 1 with the intended errors; parent lease
+top-token references whose format cannot bind the schedule (exit 1 with the intended errors; the lease
 exit 0, >=37.67 GiB). The first Q4 refusal harness hit the unrelated FP32-logits guard; its corrected BF16
 configuration reaches the intended native-Q5 artifact guard.
 
 Evidence: camp `q5-20261117/item2d-20261118/` (`run.py`, `quality.py`, `summarize.py`, `quality-summary.json`,
 `token-window-equivalence.json`, `reference.identity.json`, `refusals.json`, independent protocol/reference
-caches, all window/position records and command/log files); parent `item2d-*.receipt.json` and build logs.
+caches, all window/position records and command/log files); lease receipts `item2d-*.receipt.json` and build logs.
 
 ### New-path short HTTP/MTP smoke and resource equivalence
 
 Only the genuinely new `A16Only artifact + fp8` path gets a short serving comparison against the legacy
-AllowA8 artifact; prior item-2c long and INT8 timings above are retained, not rerun. Same clean development
+AllowA8 artifact; the prior INT8 phase-2 long and INT8 timings above are retained, not rerun. Same clean development
 server SHA-256 `63af2c0d78a6788ee5b97ba16d8206a1d503e4d78c9abe106fa527925c010c8c`, default graphs,
 context/KV 68,096, chunk 2048, FP8 global KV/QK, BF16 ring/logits, headroom 1,024 MiB, cache/reuse off,
 MTP d1. Each start has one excluded 982-token/one-output warmup and the same 987-token/32-output request.
@@ -724,7 +745,7 @@ All tokens match across starts, including all 32 MTP outputs; both accept **14/1
 
 Single-artifact / legacy observations: prompt **163.84 / 175.32 ms** (6024 / 5630 tok/s), MTP decode
 **85.59 / 83.96 tok/s**, wire TTFT **191.59 / 191.52 ms**. One pair is a smoke, not a performance
-confidence interval, speedup claim or replacement for item 2c. Startup/request records correctly expose
+confidence interval, speedup claim or replacement for the phase-2 measurements. Startup/request records correctly expose
 `fp8` versus historical `a16` artifact routing, with distinct `q5=fp8` execution signatures.
 
 With the assistant loaded, **both** starts allocate weights **21,118,694,400 B**, workspace capacity/peak
@@ -735,22 +756,22 @@ Lease exit 0, 33 s, minimum free physical RAM **36.12 GiB**, unchanged server ha
 No named heavy-process overlap was sampled; Pages/sec reaches **4930.25**, so no paging-free claim.
 Evidence: `http-summary.json`, both starts' request/SSE/metrics/logs and `item2d-fp8-http-smoke.receipt.json`.
 
-**Disposition:** item 2d complete. One A16Only Q5 artifact supports the explicit A16/FP8/INT8 launch choices;
+**Disposition:** one A16Only Q5 artifact supports the explicit A16/FP8/INT8 launch choices;
 default artifact behavior, production artifacts/builds and staging models remain untouched. The new path
 is numerically equivalent to the prior A8-tagged artifact on the bounded protocol and MTP smoke.
 True incremental quality is now measured separately from final-prefill state; narrow A16 arithmetic is
 unchanged on the shared-prefix control, but prefill history still changes decode distributions and g32 shows
-a measured NLL increase. No new default, general quality equivalence, long-context claim or item 2e.
+a measured NLL increase. No new default, general quality equivalence or long-context claim follows from this study.
 
-## Matched Q5 chunk sweep (item 2e, 2026-11-18)
+## Matched Q5 chunk sweep (2026-11-18)
 
 **Recommendation: retain chunk 2048.** On this RTX 5090 (170 SMs), FP8's highest measured
 ~65k median is at 2048. INT8 g64's 1536 median is only **0.64%** higher than 2048, with
 overlapping repetition ranges; g32's 1536 median is 2.08% higher but also within its much
 wider range. Neither is a clear speed winner. Chunk **1536 is an explicit memory tradeoff**,
 not a new default or a demonstrated speed improvement. Compute modes remain independent
-choices: these timings do not qualify quality or erase item 2d's significant g32 incremental
-NLL increase. No source, kernel, artifact, preset, automatic chunk or production-build change.
+choices: these timings do not qualify quality or erase the significant g32 incremental
+NLL increase. No source, kernel, artifact, preset, automatic chunk or production-build change; the Q5 profiles keep chunk 2048.
 
 ### Instrument and fixed serving profile
 
@@ -767,13 +788,13 @@ no clock lock or hardware-profiler claim. Campaign driver SHA-256
 `identity.json` also binds the reused HTTP helper and fixed template
 (`dc99c0bae1b6113b7756e74fe119ad5933e8a181f99f152976cc650ff9104232`).
 
-Same profile as item 2c: context/KV **68,096**, 1024 MiB headroom, normal global FP8 K/V,
+Same profile as the INT8 phase-2 measurements: context/KV **68,096**, 1024 MiB headroom, normal global FP8 K/V,
 FP8 QK, **BF16 sliding ring**, BF16 logits, one lane, graphs on, MTP off, prefix reuse
 and Host cache off, `free-cache-resume` off. “Cold” means **zero retained-prefix reuse**,
 not cold disk or cold L2: startup warmup and one excluded 982-token HTTP warmup remain.
 No temporary inference environment switches were set.
 
-The retained item-2a/2c English request bodies, greedy/top-k 20/seed 1234/thinking off,
+The retained attribution/phase-2 English request bodies, greedy/top-k 20/seed 1234/thinking off,
 are identical across cells: short **986/987** tokens, long **64,985**, one output token.
 Each route/chunk has **three independent starts**, two measured shorts and one identical
 long per start: **six short / three long observations**. Chunk orders are forward,
@@ -813,7 +834,7 @@ smaller long-prefill chunks accelerate this workload. Long FP8 medians at 1024/1
 are **6.68%/3.14%/2.03% below 2048**. G64 at 1024/1280 is 2.90%/1.31% below 2048;
 1536 saves only 139 ms median prompt time. A16 controls themselves span **1734–1997 tok/s**
 long and **2318–2787** short (before/after long 1997/1734), demonstrating uncontrolled
-variation. Historical item-2c A16/2048 remains the reliable larger baseline; these two
+variation. The historical phase-2 A16/2048 measurement remains the reliable larger baseline; these two
 controls are not pooled into it or used to claim a fresh cross-precision speedup.
 No timing outlier is silently discarded or causally attributed to paging.
 
@@ -873,15 +894,15 @@ pretending the measurements are pollution-free.
 
 Evidence: camp `chunksweep-20261118/{measure.py,summarize.py,identity.json,summary.json}`,
 38 per-start directories with request/SSE/response/metrics/startup logs and
-`resource-samples.jsonl`; parent `infernix-port-p3-20261112/item2e-chunksweep.{log,receipt.json}`.
+`resource-samples.jsonl`; lease receipt `infernix-port-p3-20261112/item2e-chunksweep.{log,receipt.json}`.
 The first analyzer attempt expected backend spelling `off`; actual startup telemetry
 correctly says `none`. Only that parser expectation was corrected; no GPU run was repeated.
 No ~122k arm was needed (it exceeds this fixed 68,096 profile); no ring/global-KV change,
-quality campaign or completed item-2c/2d test rerun. Since the chosen chunk remains 2048,
+quality campaign or rerun of the completed phase-2/selection tests. Since the chosen chunk remains 2048,
 the existing short MTP evidence is retained and no new MTP run is needed.
 Tooling protocol/results: `docs/plans/20261118-gemma4-q5-chunk-sweep.md`.
 
-## Calibrated builder on the diode model (item 3, 2026-11-18)
+## Calibrated builder on the diode model (2026-11-18)
 
 The canonical `q5-g64` preset was run for real on the immutable BF16 variant `diode-s15-t005`,
 with Hessians collected on **that model** (the plain model's calibration is never reused), the
@@ -922,7 +943,7 @@ Paired against best-medium: A16 KL **−0.0610 [−0.0729, −0.0501]**, ΔNLL �
 is a historical context number, not a paired comparison. The two compute modes' KL
 intervals overlap almost entirely; this short block-prefill instrument does not separate them.
 **Not measured:** long-context quality, incremental-decode quality or INT8 long-context
-quality of this diode artifact [INFERENCE: item 2d's plain-model incremental figures are
+quality of this diode artifact [INFERENCE: the plain-model incremental figures above are
 expected to transfer but were not re-measured here]. No promotion.
 
 ### Generated-launcher smoke
@@ -939,17 +960,17 @@ measurement.
 The builder-owned `work/text60` tree (61,427,043,204 B, 20 files) was deleted after
 recording per-file SHA-256 in `owned-stage-sha256.json`; it is reconstructible from the
 immutable BF16 variant. The GPTQ checkpoint, calibration, build receipts, BF16 sources, plain
-text60 and all earlier artifacts were left in place.
+text60 and all earlier artifacts were left in place at that time. The plain text60 tree and the Q5 A8-tagged artifact were deleted later; see the current-state note at the top for how to reproduce them.
 
 Evidence: camp `q5-20261117/builder-20261118/{qualify.py,variant/,quality-*,quality-summary.json,
-artifact-identity.json,launcher-smoke.json,owned-stage-sha256.json,work/logs}`; parent
+artifact-identity.json,launcher-smoke.json,owned-stage-sha256.json,work/logs}`; lease receipts
 `infernix-port-p3-20261112/item3-*.receipt.json`.
 
 ## Q5 recommended-profile adoption (2026-11-18)
 
-New operator approval makes the recommendation a **Q5-specific launcher default**, not a new
-native Engine/CLI/perplexity precision default. Historical opt-in/default statements above describe
-their respective experiments. The general profile and Q4/IQ3 tiers remain unchanged.
+The measured recommendation is a **Q5-specific launcher default**, not a new
+native Engine/CLI/perplexity precision default (those keep `a16`, artifact policy). Historical opt-in/default statements above describe
+their respective experiments. The general profile and the Q4/IQ3 tiers remain unchanged (`memory-16gb` is separate: IQ3_XXS only, FP8 ring by default).
 
 `q5-quality` now defaults to INT8 g64 prefill, BF16 rings, FP8 global KV/QK, auto context, chunk 2048,
 1024 MiB headroom, top-k 64, thinking enabled, MTP d1 and host-only prefix caching.
@@ -959,9 +980,9 @@ or native-Q5 artifact launcher selects `q5-quality`; explicit `--profile default
 general roleplay profile. Python `ServeSettings`/`ServeProfile` constructors share the same named
 profile resolution, rather than relying on argparse to fill them in.
 
-This is a measured tradeoff, **not numerical equivalence or a maximum-fidelity mode**. Item 2c's
+This is a measured tradeoff, **not numerical equivalence or a maximum-fidelity mode**. The INT8 phase-2
 g64 chunk-2048 prefill is 1.93x A16 short / 1.51x long, but 14.8% / 12.6% slower than FP8.
-Plain short KL is 0.0203 g64 / 0.0199 A16 / 0.0296 FP8. Item 2d's bounded incremental g64
+Plain short KL is 0.0203 g64 / 0.0199 A16 / 0.0296 FP8. The single-artifact study's bounded incremental g64
 uncertainty crosses zero but does not establish equivalence; g32 has a resolved incremental NLL
 increase. The real diode builder's own-Q8 short KL is 0.0336 g64 / 0.0331 A16 versus 0.0941
 best-medium. Neither model has qualified long-context INT8 quality; diode incremental quality
@@ -1001,5 +1022,5 @@ long-context start was retried successfully. No server remained afterward. Lease
 server SHA-256 values match before/after both leases. No build or quality campaign was repeated.
 
 Evidence: camp `q5-20261117/profiles-20261118/{configuration-proof.json,acceptance.json,
-verify_profiles.py,*.cmd,*response.json,*metrics.txt,*.log}`; parent
+verify_profiles.py,*.cmd,*response.json,*metrics.txt,*.log}`; lease receipts
 `infernix-port-p3-20261112/q5-profiles-20261118*.receipt.json`.

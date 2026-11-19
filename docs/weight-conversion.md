@@ -548,7 +548,7 @@ Use `--dry-run` for exact commands and input/RAM/disk checks. Budget roughly 60 
 text stage plus the checkpoint/artifact (85 GB minimum scratch, 115 GB comfortable); these estimates
 exclude the preserved original source. `--keep-work` retains logs/checkpoint/stage for qualification.
 
-Artifact selection and compute selection are independent. Since the 2026-11-18 operator decision,
+Artifact selection and compute selection are independent.
 **Q5 profiles default to `int8-g64`**, the measured speed/fidelity balance; explicit
 `--gemma4-q5-prefill a16|fp8|int8-g32|int8-g64` always wins. `fp8` is faster but less faithful;
 `a16` preserves artifact policy (A16 on the builder's A16Only artifact). Narrow trunk decode/MTP
@@ -779,8 +779,8 @@ file carries the assistant, `--logits-dtype bf16`, a host-only prefix cache (`--
 --host-context-mib 8192`), `--any-model-name`, and `0.0.0.0:8001`. The server binary is
 `apps/Release/infernix-serve.exe` (or a `build*/apps/Release` of the checkout) unless `--serve` names another.
 Every setting has a flag; `--gemma4-qk bf16` omits the QK flag.
-Sliding rings remain BF16 for the general profile and native commands. Since the 2026-11-18 operator decision,
-`memory-16gb` defaults to FP8 ring; explicit `--gemma4-sliding-kv bf16` overrides it. FP8 requires `--kv-dtype fp8`.
+Sliding rings are BF16 for the general profile, `q5-quality` and native commands; `memory-16gb` and `q5-long-context`
+default to the FP8 ring, and an explicit `--gemma4-sliding-kv bf16` overrides it. FP8 requires `--kv-dtype fp8`.
 The FP8 ring saves 446 MiB at chunk 128 or 1,191 MiB at chunk 2048, but short-context KL increases and prefill slows:
 see the [FP8-ring measurements and limits](maintainer/gemma4-benchmarks.md#fp8-sliding-ring-experimental-off-by-default).
 Planning/fallback commands preserve the selected ring, and `serve-check` records the effective selection.

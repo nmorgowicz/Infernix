@@ -3,13 +3,13 @@
 The workloads in `tools/bench/kv_eval/`, `rp_ladder.py`, `bench_tail.py`,
 `fixed_tail.py`, `decode_abab.py`, and `retrieval-smoke.py`
 run from this checkout,
-use local artifacts and corpus files, and do not import an operator/tooling checkout.
+use local artifacts and corpus files, and do not import any checkout outside this repository.
 They do not download models or corpus data. Run commands from the repository root
 with Python 3.11 and the dependencies in `tools/bench/kv_eval/requirements.txt`.
 `derive_prefix_ids` additionally uses Transformers, with local files only.
 
 All executable, artifact, corpus, reference and output paths below are placeholders
-chosen explicitly by the operator. Use a fresh output directory for each campaign.
+chosen explicitly by the user. Use a fresh output directory for each campaign.
 Do not benchmark alongside another GPU workload. The process-owning runners share
 an exclusive lock in the OS temporary directory (`infernix-bench-gpu.lock`); `--lock`
 can select another common path. A stale lock must be inspected before removal.
@@ -317,7 +317,7 @@ auto-chunk profile, closed at **6,144 model thinking + 24 control** and emitted 
 8,192 total with `length`. Its 8,432-byte final answer **still loops** (periodic-tail score 1.0, zlib ratio 0.0275,
 distinct-word fraction 0.034). Closing the thought is enforced; a good or non-looping final answer is not guaranteed.
 
-Real loopback HTTP also passed after the operator approved the development executable in the app firewall.
+Real loopback HTTP also passed once the development executable was allowed in the app firewall.
 With `--default-thinking-budget 24 --thinking-budget-message "Time to act now:"`, a 128-token request with no budget
 overrides produced **24 model thinking + 7 control + 51 post-close = 82 tokens**, natural `stop`. Sending
 `"thinking_budget_tokens": 8` produced **8 + 7 + 113 = 128**, `length`. Both reasoning fields ended with the custom
@@ -424,7 +424,7 @@ at chunk 128, KV 0.0197 MiB per token); prefill workspace 274; graph allowance 6
 server-added 14,176. The engine's ledger shows 103-146 MiB past the plan at startup (modules loaded at first use, graph state)
 plus about 3 KiB per context token (23.2 against 20.2 MiB per 1k tokens). Scaling with chunk (plan, 9,216 tokens): ring+KV 1,081 / 1,181 /
 1,381 / 1,781 MiB and workspace 274 / 306 / 370 / 765 MiB at chunk 128 / 256 / 512 / 1024, so minimum reservation 1,264 / 1,400 / 1,672 / 2,482 MiB.
-Chunks are multiples of 128: 64 is not supported. The measurements of this section use the default BF16 sliding ring; `--gemma4-sliding-kv fp8` halves it ([FP8 sliding ring](#fp8-sliding-ring-experimental-off-by-default));
+Chunks are multiples of 128: 64 is not supported. The measurements of this section use the BF16 sliding ring (`memory-16gb` now defaults to the FP8 ring: see [Adoption decision](#adoption-decision-and-coverage-limits)); `--gemma4-sliding-kv fp8` halves it ([FP8 sliding ring](#fp8-sliding-ring-experimental-off-by-default));
 `--no-cuda-graph` saves the 24 MiB graph state at about -15-20 % decode.
 
 **Context ladder** (explicit context and KV capacity, headroom 0, 48-token request at near-capacity prompt; `fit` = starts, answers, no spill;
@@ -473,7 +473,7 @@ no quality rating follows. Rates belong to the RTX 5090.
 (the engine plan with ring, workspace and graphs), 1,169 MiB are available after weights: **short by about 253 MiB** with no headroom and no
 margin, 512 MiB at the profile default; MTP adds 464 MiB of weights (short about 717 MiB). This historical result
 used BF16 rings. The later [FP8-ring ladder](#fp8-ring-desktop-ladders-2026-11-18) demonstrates conservative
-9,216/12,288-token starts without MTP; it remains opt-in because of the measured fidelity and prefill costs.
+9,216/12,288-token starts without MTP; `memory-16gb` now defaults to the FP8 ring on the strength of that ladder, accepting the measured fidelity and prefill costs.
 Smaller weight tiers and unsupported chunk 64 were not implemented by that study; `--no-cuda-graph` saved 24 MiB at
 about -15-20 % decode, and moving the display to an iGPU was not tested.
 The vocabulary/output head (FP8, ~1.3 GiB) cannot leave the device without paging.
@@ -661,10 +661,12 @@ outputs differ from K==V FP8 (a different lossy V) but are identical across AB a
 
 ## FP8 sliding ring (experimental, off by default)
 
-`--gemma4-sliding-kv fp8` (explicit opt-in; `bf16`, the default, keeps the BF16 ring) stores the sliding (D256) layers'
+`--gemma4-sliding-kv fp8` (`bf16` keeps the BF16 ring) stores the sliding (D256) layers'
 K and V ring as FP8 E4M3 codes with one FP16 scale per 256-value row, the codec of the global FP8 path (amax / 448, FP16
 rounded and bounded scale, round-to-nearest-even saturating codes; a row with any nonfinite value stores NaN codes and a
 unit scale). It requires `--kv-dtype fp8` and combines with `--gemma4-key-only-kv` and `--gemma4-qk fp8`.
+
+Current default: BF16 for the general profile, `q5-quality` and native commands; FP8 for `memory-16gb` and `q5-long-context` (see [Adoption decision](#adoption-decision-and-coverage-limits)). The measurements below were made while the FP8 ring was opt-in only.
 
 **What runs.** `gemma4_qkv_prep` quantizes each sliding K and V row once as it writes its ring slot. The decode SIMT
 kernel (T < 64: decode, MTP verify and the drafter) expands codes on load; the D256 tensor-core prefill kernel stages
@@ -833,10 +835,10 @@ not rerun; the serving/perplexity binaries used for the measurements were not re
 
 ### Adoption decision and coverage limits
 
-Initial 2026-11-18 recommendation was BF16 for every default. The later operator decision accepts the measured
-memory/fidelity/speed trade for **`memory-16gb` IQ3_XXS**, now FP8-ring by default. The subsequent
-[Q5 adoption](gemma4-q5-prefill.md#q5-recommended-profile-adoption-2026-11-18) also makes the explicit
-`q5-long-context` profile FP8-ring; general/`q5-quality`/native rings remain BF16. Explicit
+The initial 2026-11-18 recommendation was BF16 for every default. The measured memory/fidelity/speed trade was then
+accepted for **`memory-16gb` IQ3_XXS**, which now defaults to the FP8 ring, and for the explicit
+`q5-long-context` profile ([Q5 adoption](gemma4-q5-prefill.md#q5-recommended-profile-adoption-2026-11-18)).
+The general profile, `q5-quality` and native rings remain BF16. Explicit
 `--gemma4-sliding-kv bf16` overrides either FP8-ring profile. Planning and fallback stages
 preserve the selection ([usage](../../tools/README.md#gemma-sliding-ring-memory-opt-in)). No quality gate changes.
 The short plain-GPTQ5 KL increase of 9.3-11.2 % exceeds the plan's order-of-magnitude warning relative
@@ -849,7 +851,7 @@ first appears in `e03a5e26`. That commit raised the cutoff to **0.25**, after ob
 that relaxed gross-error tripwire does **not** pass the original criterion or qualify quality. The completion
 change removes the unjustified bound altogether and keeps these comparisons as measurements. The original
 0.10 failure remains the result; exact codec checks and the unchanged FP64 represented-value attention
-criterion establish kernel correctness only, and the independent KL/speed adoption findings reject promotion.
+criterion establish kernel correctness only; the independent KL/speed findings did not support making the FP8 ring a general default.
 The earlier successful Op receipts ran the 0.25 revision; they are not relabelled as an original-criterion pass.
 Retained random-token diagnostics report final-position KL 1.15148 (chunk 128) / 0.489734 (2048) between
 the rings, changed argmaxes and causal-score differences; their NLL is ~19.8, so they are adversarial
@@ -872,7 +874,7 @@ codes) uses both global and sliding layers; a tail success cannot be attributed 
 
 ## Five-bit text projections: quality, speed and 32 GB capacity (2026-11-17)
 
-Explicit alternatives to best-medium, not defaults. Each arm is scored on the pinned full-vocabulary protocol
+Explicit alternatives to best-medium when measured (2026-11-17), not defaults at that time. Current default: the `q5-g64` preset builds one A16Only artifact and the Q5 serving profiles select `int8-g64` prefill ([Q5 adoption](gemma4-q5-prefill.md#q5-recommended-profile-adoption-2026-11-18)); the rows below were measured with the then-explicit `a16`/A8 routes. Each arm is scored on the pinned full-vocabulary protocol
 (context 512, stride 256, chunk 128, chat prefix, BF16 QK, FP8 KV, BF16 logits; 47 windows, 13,728 positions)
 against the Q8_0 reference of its **own** model; plain-HF rows and additive-diode rows are never compared with each
 other. Artifacts include the FP8 vocabulary and FP8 MTP assistant. Routes: own-imatrix `llama-quantize` Q5_K_S/Q5_K_M
@@ -1102,7 +1104,7 @@ py -3.11 -m tools.bench.kv_eval.kl_compare --baseline <baseline/report.json> --c
 
 `kl_compare` runs a paired whole-window bootstrap: 2000 resamples by
 default, seed 20261105, overall and per domain. `--delta` has no default: only the
-operator chooses an acceptance factor. When supplied, acceptance still requires the
+user chooses an acceptance factor. When supplied, acceptance still requires the
 upper 95% mean-KL ratio bound to be at most `1 + delta` overall and in every domain,
 and the point-estimate p999-KL ratio to be within that same factor. Protocol, cache,
 reference artifact and scored window/domain identities must match.
