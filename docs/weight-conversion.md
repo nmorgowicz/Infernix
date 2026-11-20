@@ -732,7 +732,7 @@ calibration/render/tokenize/text-tree steps, a group-32 GPTQ pass (`gptq`, `gptq
 checkpoints therefore use Hessians of **your actual model**. The artifact is the best-medium file plus about 0.94 GB
 (0.9393 GB measured on the plain model; 19.34 GB with MTP): Q4 projections keep `AllowA8`, the Q5 projections are `A16Only`.
 
-**Experimental; measured once on a diode variant.** The allocation was selected on the plain model (its own Q8_0
+**Experimental; measured on a diode variant.** The allocation was selected on the plain model (its own Q8_0
 reference, plain-model Hessians; prose KL against best-medium on that model fell from 0.0684 to 0.0485 on the default
 route, FULL KL 0.0458 against 0.0687 for best-medium and 0.0203 for full Q5). It was then built from the deployed
 diode's own Hessians (19,344,788,484 B, byte-identical size) and scored against the diode's own Q8_0 reference on
@@ -744,6 +744,13 @@ FP8 KV/QK): decode 64.5 against 72.6 tok/s at 1k, prefill 3,263 against 3,424 to
 MTP off and 122,432 with MTP d1. Nothing is promoted and the hint column is still the plain-model figure: the build
 summary, `--list-presets` and the dry run keep the experimental mark. Measure your own build before relying on it.
 Evidence: llama-local-tooling `docs/plans/20261123-gemma4-diode-mixed-a.md`.
+
+**Fresh held-out roleplay text.** On the reproducible [held-out roleplay corpus](roleplay-heldout.md) (36 forum threads, 72
+windows, disjoint from the development windows and every calibration text) the same diode artifact on the default route
+scored KL 0.0405 against 0.0547 for the promoted best-medium: ratio 0.740 (95 % thread-cluster interval 0.722-0.759), below
+best-medium in all 36 threads; the A16-compute plain-model rebuild scored 0.0272 against 0.0381 for plain Q4, ratio 0.713
+(0.697-0.727). Same limits as above: block-prefill KL at context 512 against each model's own Q8_0, and the finetune may
+have seen these forums. Evidence: llama-local-tooling `docs/plans/20261125-gemma4-fresh-heldout.md`.
 
 The serve settings are the unchanged `default` profile (`--profile` omitted), and no Q5 profile is selected by this
 preset. The Q5 cells' prefill compute is a launch choice on the same artifact; the measured route lets the Q4 cells

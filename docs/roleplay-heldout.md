@@ -77,7 +77,7 @@ Six strata, one raw file each: Elliquiy non-adult RP, Elliquiy one-shot stories,
 fan-based 1x1, RPNation quests, RPNation one-on-one (part 1). **6 threads per stratum, one excerpt per thread,
 36 excerpts of 2,420-2,982 characters (98,820 in all).** With the Gemma 4 tokenizer an excerpt is 515-722
 tokens (`tokenizers`, no special tokens), which gives two windows per excerpt at context 512 / stride 256: 72
-windows, 22,877 scored positions.
+windows, 22,877 scored positions (`infernix-perplexity` reports the same counts, with token-window hash `8a7974c8751af8cd`).
 
 1. Threads of each file are ordered by `sha256(seed + ":" + thread_url)`, seed `20261125`.
 2. In that order each thread is dropped or kept by the frozen rules below; the first six survivors of a file
@@ -139,8 +139,10 @@ BF16 logits.
 1. **Reference.** Write a full-vocabulary `.nklref` of the model's own Q8_0 (a libllama reference through
    llama-local-tooling's `scripts/llamacpp/token_logprobs.py reference --protocol-from <stub>`, or
    `infernix-perplexity ... --full-vocab-reference-write <cache>` for an infernix reference artifact) on this
-   corpus's windows. The cache holds one F32 row per scored position, about 1.05 MB at vocabulary 262,144, so
-   about 24 GB for the 22,877 positions. Use the same prefix ids for every cache and every arm.
+   corpus's windows. `<stub>` is any `.nklref` that `infernix-perplexity --full-vocab-reference-write` wrote on this
+   corpus with the protocol flags below (only its protocol header is read). The cache holds one F32 row per scored
+   position, about 1.05 MB at vocabulary 262,144: 23,988,277,248 bytes for the 22,877 positions. Use the same prefix
+   ids for every cache and every arm.
 2. **Score** each arm against the reference of its own model (diode against diode, plain against plain):
 
    ```bash
