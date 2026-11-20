@@ -691,6 +691,11 @@ See [Q5 creation and the lower-VRAM ladder](docs/weight-conversion.md#native-gpt
 for commands, costs and bounded evidence. Diode short KL is 0.0331 A16 / 0.0336 g64 versus 0.0941
 best-medium; neither that nor the plain incremental sample qualifies long-context INT8 quality.
 
+`q4q5-mixed-a` (experimental, unverified on diode variants; measured on the plain model only) is best-medium with Q5
+attention-output and `down` projections in every layer (+0.94 GB, two GPTQ passes on your own model). It keeps the
+`default` profile; add `--gemma4-q5-prefill int8-g64` for the measured Q5 prefill route. See
+[Builder preset `q4q5-mixed-a`](docs/weight-conversion.md#builder-preset-q4q5-mixed-a-experimental).
+
 The smaller `iq3-xs` and `iq3-xxs` presets take `--llama-cpp <binary dir> --llama-cpp-source <source dir>`, collect the BF16 model's own
 importance matrix through a Q8_0 copy and import the resulting IQ3 blocks. No GPTQ environment is needed.
 Follow [HF BF16 → IQ3 creation](docs/weight-conversion.md#create-the-smaller-iq3-files-from-hf-bf16) for both

@@ -512,6 +512,7 @@ is needed. Source weights are read-only, outputs are never overwritten, and a fa
 | `best-small` (recommended q4) | calibrated GPTQ, group 256 | `q4_g256_fp16` plus permutation-safe g32 global output projections |
 | `best-medium` | calibrated GPTQ, group 32 | `q4_g32_fp16` |
 | `q5-g64` (higher-quality Q5) | own-model calibrated GPTQ, 5 bits, group 64 | `q5_g64_fp16`, A16Only |
+| `q4q5-mixed-a` (experimental) | own-model calibrated GPTQ g32 plus GPTQ 5-bit g64 for the Q5 groups | `q4_g32_fp16` with `q5_g64_fp16` (A16Only) attention output and `down` in all 60 layers |
 | `iq3-xs` | own-model importance matrix, IQ3_XS allocation | GGUF IQ3_S / IQ3_XXS / Q6_K blocks |
 | `iq3-xxs` | own-model importance matrix, IQ3_XXS allocation | GGUF IQ3_XXS / IQ2_S / IQ3_S blocks |
 | `draft` | uncalibrated absmax, group 32 | `q4_g32_fp16`; a quick conversion smoke, not a calibrated tier |
@@ -721,6 +722,36 @@ with `--gptq-source`, refuse `--native-groups`, unknown roles, malformed or out-
 is not INT5 g64, and the build receipt lists the cells (`scale_search.q5_source`) and the per-format tensor counts.
 The loader, the per-layer workspace arena and the route selection work per prepared projection, so no engine
 option is involved.
+
+##### Builder preset `q4q5-mixed-a` (experimental)
+
+`--preset q4q5-mixed-a` is best-medium with Q5 `o` and `down` in every layer, built in one call: the shared
+calibration/render/tokenize/text-tree steps, a group-32 GPTQ pass (`gptq`, `gptq-check`), a 5-bit group-64 pass
+(`gptq-q5`, `gptq-q5-check`, checkpoint `gptq-q5`) from the same text tree and calibration tensor, then
+`gemma4_q4 convert --weights q4_g32 --gptq-source <gptq> --q5-gptq-source <gptq-q5> --q5-unit o --q5-unit down`. Both
+checkpoints therefore use Hessians of **your actual model**. The artifact is the best-medium file plus about 0.94 GB
+(0.9393 GB measured on the plain model; 19.34 GB with MTP): Q4 projections keep `AllowA8`, the Q5 projections are `A16Only`.
+
+**Experimental, unverified on diode variants.** The allocation was selected and measured on the plain model only
+(its own Q8_0 reference, plain-model Hessians; prose KL against best-medium on that model fell from 0.0684 to 0.0485 on the
+default route, FULL KL 0.0458 against 0.0687 for best-medium and 0.0203 for full Q5). No diode Hessian
+measurement exists, so the build summary, `--list-presets` and the dry run all mark the preset experimental and the
+hint column is a plain-model figure, not a diode claim. Measure your own build before relying on it.
+
+The serve settings are the unchanged `default` profile (`--profile` omitted), and no Q5 profile is selected by this
+preset. The Q5 cells' prefill compute is a launch choice on the same artifact; the measured route lets the Q4 cells
+keep their A8 paths and runs Q5 prefill as INT8 g64:
+
+```text
+python -m tools.convert.gemma4_build --preset q4q5-mixed-a --model "<BF16-dir>" --assistant "<assistant-dir>" --gptq-python "<gptq-python>" --out-dir "<camp>/q4q5-mixed-a" --gemma4-q5-prefill int8-g64 --serve "<absolute-infernix-serve-path>" --yes
+```
+
+`--gemma4-q5-prefill` applies to the Q5 groups only (narrow decode stays A16 there). `launcher --artifact` without
+`--profile` selects `q5-quality` for any artifact that holds native Q5 weights, this one included; pass
+`--profile default` to keep the general settings. The builder needs a server that knows both `q4_g32_fp16` and
+`q5_g64_fp16`, a second GPTQ pass (about 25 more minutes) and about 102 GB minimum scratch (132 GB comfortable) on the work
+drive. `--score` measures the Q4 cells on their exact W4A8 route and the Q5 cells on A16, so it is not the default-route
+figure above.
 
 ### Create the smaller IQ3 files from HF BF16
 

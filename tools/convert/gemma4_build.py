@@ -8,7 +8,8 @@ GPTQ scripts run in their own interpreter (`tools/gptq/requirements.txt`), never
 are only read.
 
 Presets: best-small (GPTQ group 256, `q4_g256_fp16`), best-medium (GPTQ group 32, `q4_g32_fp16`),
-q5-g64 (GPTQ5 group 64, A16Only), draft (uncalibrated absmax, group 32), and iq3-xs / iq3-xxs
+q5-g64 (GPTQ5 group 64, A16Only), q4q5-mixed-a (best-medium with Q5 `o` and `down` in every layer, experimental),
+draft (uncalibrated absmax, group 32), and iq3-xs / iq3-xxs
 (llama.cpp IQ3_XS / IQ3_XXS blocks quantized with the model's own
 importance matrix and imported verbatim; they need a llama.cpp build and its source tree for `convert_hf_to_gguf.py`).
 The two-level 6-bit scale format `q4_g32_s6_fp16` and calibrated round-to-nearest presets are not built here.
@@ -58,6 +59,9 @@ GPTQ_PYTHON_ENV = "INFERNIX_GPTQ_PYTHON"
 LLAMA_CPP_ENV = "INFERNIX_LLAMA_CPP"  # llama.cpp binaries (llama-quantize, llama-imatrix)
 LLAMA_CPP_SOURCE_ENV = "INFERNIX_LLAMA_CPP_SOURCE"  # llama.cpp source tree (convert_hf_to_gguf.py, gguf-py)
 EXACT_ROUTE_ENV = "INFERNIX_TMP_Q4_EXACT"  # Gemma scope temporary switch: exact W4A8 prefill for scoring
+Q5_FORMAT = "q5_g64_fp16"  # tensor format of the Q5 cells of a `q5_units` preset
+Q5_GROUP_SIZE = 64
+Q5_CHECKPOINT = "gptq-q5"  # work-dir name of the 5-bit GPTQ checkpoint a `q5_units` preset reads
 SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -82,6 +86,13 @@ class Preset:
     minutes: dict[str, float]  # per step, typical RTX 5090 + NVMe
     gguf_type: str = ""  # method "gguf": the llama-quantize type (IQ3_XS, IQ3_XXS)
     bits: int = 4
+    q5_units: tuple[str, ...] = ()  # `--q5-unit` selectors: fused groups read from a second, 5-bit GPTQ checkpoint
+    experimental: bool = False  # not measured on the model this builder is normally run on
+
+    @property
+    def formats(self) -> tuple[str, ...]:
+        """Tensor formats the serving binary must know."""
+        return (self.format_name, Q5_FORMAT) if self.q5_units else (self.format_name,)
 
 
 PRESETS: dict[str, Preset] = {
@@ -105,6 +116,16 @@ PRESETS: dict[str, Preset] = {
         {"calibration-source": 1, "calibration-render": 1, "calibration-tokens": 1, "text-tree": 2, "gptq": 25,
          "gptq-check": 1, "convert": 6, "receipt-check": 0.5, "finalize": 0.5},
         bits=5,
+    ),
+    "q4q5-mixed-a": Preset(
+        "q4q5-mixed-a", "gptq", "GPTQ g32 Q4 with GPTQ5 g64 Q5 `o` and `down` in all layers (experimental)",
+        "Best-medium with the attention output and MLP down projections of every layer at Q5, about 0.94 GB "
+        "larger; both GPTQ checkpoints use your own model's Hessians. Experimental: the allocation was measured only "
+        "on the plain model (default route, plain-model own-Q8_0 reference), not on a diode variant.",
+        "medium+", 19.34, 0.0458, "about 70 min", 32, False, "q4_g32_fp16", 102, 132, 39,
+        {"calibration-source": 1, "calibration-render": 1, "calibration-tokens": 1, "text-tree": 2, "gptq": 18,
+         "gptq-q5": 25, "gptq-check": 1, "convert": 6, "receipt-check": 0.5, "finalize": 0.5},
+        q5_units=("o", "down"), experimental=True,
     ),
     "draft": Preset(
         "draft", "plain", "uncalibrated absmax, group 32 (the old default)",
@@ -237,16 +258,45 @@ def default_gptq_python() -> Path:
 
 
 def q4_convert_flags(cfg: BuildConfig, checkpoint: Path | None) -> list[str]:
-    """Storage recipe; Q5 is A16Only, independently selectable at serving time."""
+    """Storage recipe; Q5 is A16Only, independently selectable at serving time. `q5_units` presets keep the Q4 g32
+    import and move the named fused groups to the second checkpoint."""
     preset = cfg.preset
     flags = ["--weights", "q5_g64_a16" if preset.bits == 5 else "q4_g32"]
     if preset.method == "gptq":
         flags += ["--gptq-source", str(checkpoint)]
         if preset.native_groups:
             flags.append("--native-groups")
+        if preset.q5_units:
+            flags += ["--q5-gptq-source", str(cfg.work(Q5_CHECKPOINT))]
+            for unit in preset.q5_units:
+                flags += ["--q5-unit", unit]
     elif preset.method == "gguf":
         flags += ["--gguf-source", str(checkpoint)]
     return flags
+
+
+def gptq_steps(cfg: BuildConfig, tree: Path, calib: Path, checkpoint: Path, *, bits: int, group_size: int,
+               suffix: str, free_tree: bool) -> list[Step]:
+    """GPTQ and its importability check; `suffix` names the second (Q5) pass of a mixed preset. Only the last pass
+    may free the shared text tree."""
+    gpy = str(cfg.gptq_python)
+    gptq_dir = REPO_ROOT / "tools" / "gptq"
+    offload = cfg.work(f"offload{suffix.replace('-', '')}")
+    peak = cfg.work(f"gptq{suffix.replace('-', '.')}.peak.jsonl" if suffix else "gptq.peak.jsonl")
+    bit_flags = ["--bits", "5"] if bits == 5 else []
+    return [
+        Step(f"gptq{suffix}", f"GPTQ, {bits}-bit, group {group_size}, imatrix_mse observer (the long step)",
+             cfg.preset.minutes[f"gptq{suffix}"],
+             [gpy, str(gptq_dir / "run_gptq.py"), "--tree", str(tree), "--calib", str(calib), "--out",
+              str(checkpoint), "--recipe", GPTQ_RECIPE, "--observer", "imatrix_mse", "--group-size",
+              str(group_size), "--max-cpu-gb", str(cfg.gptq_max_cpu_gb), "--offload-dir", str(offload), "--peak-log",
+              str(peak)] + bit_flags,
+             outputs=(checkpoint, offload, peak), prune_always=(offload,)),
+        Step(f"gptq{suffix}-check", f"Check the {bits}-bit GPTQ checkpoint is importable (exact binary16 scales)",
+             cfg.preset.minutes["gptq-check"],
+             [gpy, str(gptq_dir / "check_checkpoint.py"), "--gptq", str(checkpoint), "--tree", str(tree)] + bit_flags,
+             prune_if_short=(tree,) if free_tree else ()),
+    ]
 
 
 # llama-quantize --tensor-type pins (regex searched in the tensor name) of the measured IQ3 recipes: the per-tensor
@@ -330,30 +380,24 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
             outputs=(templated, templated.with_suffix(".json")),
         ))
     if preset.method == "gptq":
-        gpy = str(cfg.gptq_python)
-        gptq_dir = REPO_ROOT / "tools" / "gptq"
         calib = cfg.work("calib.pt")
-        offload = cfg.work("offload")
+        gptq_dir = REPO_ROOT / "tools" / "gptq"
         steps += [
             Step("calibration-tokens", "Tokenize the calibration text for GPTQ", minutes["calibration-tokens"],
-                 [gpy, str(gptq_dir / "make_calib.py"), "--text", str(templated), "--tokenizer", str(tokenizer),
-                  "--out", str(calib), "--context", str(CALIBRATION_CONTEXT), "--prefix-ids", CHAT_PREFIX_IDS],
+                 [str(cfg.gptq_python), str(gptq_dir / "make_calib.py"), "--text", str(templated), "--tokenizer",
+                  str(tokenizer), "--out", str(calib), "--context", str(CALIBRATION_CONTEXT), "--prefix-ids",
+                  CHAT_PREFIX_IDS],
                  outputs=(calib,)),
             Step("text-tree", "Write the text-only 60-layer tree GPTQ loads (about 58 GB)", minutes["text-tree"],
-                 [gpy, str(gptq_dir / "make_text_tree.py"), "--model", str(cfg.model), "--out", str(tree)],
+                 [str(cfg.gptq_python), str(gptq_dir / "make_text_tree.py"), "--model", str(cfg.model), "--out",
+                  str(tree)],
                  outputs=(tree,)),
-            Step("gptq", f"GPTQ, group {preset.group_size}, imatrix_mse observer (the long step)", minutes["gptq"],
-                 [gpy, str(gptq_dir / "run_gptq.py"), "--tree", str(tree), "--calib", str(calib), "--out",
-                  str(checkpoint), "--recipe", GPTQ_RECIPE, "--observer", "imatrix_mse", "--group-size",
-                  str(preset.group_size), "--max-cpu-gb", str(cfg.gptq_max_cpu_gb), "--offload-dir", str(offload), "--peak-log",
-                  str(cfg.work("gptq.peak.jsonl"))] + (["--bits", "5"] if preset.bits == 5 else []),
-                 outputs=(checkpoint, offload, cfg.work("gptq.peak.jsonl")), prune_always=(offload,)),
-            Step("gptq-check", f"Check the GPTQ checkpoint is importable ({preset.bits}-bit codes, exact binary16 scales)",
-                 minutes["gptq-check"],
-                 [gpy, str(gptq_dir / "check_checkpoint.py"), "--gptq", str(checkpoint), "--tree", str(tree)]
-                 + (["--bits", "5"] if preset.bits == 5 else []),
-                 prune_if_short=(tree,)),
         ]
+        steps += gptq_steps(cfg, tree, calib, checkpoint, bits=preset.bits, group_size=preset.group_size, suffix="",
+                            free_tree=not preset.q5_units)
+        if preset.q5_units:
+            steps += gptq_steps(cfg, tree, calib, cfg.work(Q5_CHECKPOINT), bits=5, group_size=Q5_GROUP_SIZE,
+                                suffix="-q5", free_tree=True)
     if preset.method == "gguf":
         steps += gguf_steps(cfg, templated, checkpoint)
     steps.append(Step(
@@ -409,7 +453,8 @@ def score_steps(cfg: BuildConfig, checkpoint: Path) -> list[Step]:
              convert_argv(cfg, candidate, scoring=True, checkpoint=checkpoint),
              outputs=(candidate, Path(str(candidate) + ".build.json"), Path(str(candidate) + ".conversion.json"))),
         Step("score-run", "Paired KL against the reference"
-             + (f" (W4A8 exact route, {EXACT_ROUTE_ENV}=1)" if cfg.preset.bits == 4 and cfg.preset.method != "gguf"
+             + (f" (W4A8 exact route, {EXACT_ROUTE_ENV}=1{'; Q5 cells A16' if cfg.preset.q5_units else ''})"
+                if cfg.preset.bits == 4 and cfg.preset.method != "gguf"
                 else " (Q5 A16)" if cfg.preset.bits == 5 else " (GGUF AllowA8)"),
              minutes["score-run"],
              [exe, str(candidate)] + common + ["--full-vocab-reference", str(nklref), "--output", str(run)],
@@ -428,7 +473,8 @@ def describe_plan(cfg: BuildConfig, steps: list[Step]) -> list[str]:
     preset = cfg.preset
     lines = [
         f"Preset      {preset.id}: {preset.summary} ({preset.size_class}; {gb(preset.file_gb)} with MTP; "
-        f"KL {preset.kl:.4f}, lower is better)",
+        f"KL {preset.kl:.4f}, lower is better)"
+        + ("; EXPERIMENTAL: not measured on diode variants" if preset.experimental else ""),
         f"            {preset.meaning}",
         f"Model       {cfg.model}",
         f"MTP         {cfg.assistant if cfg.assistant else 'none (--no-mtp)'}",
@@ -558,13 +604,20 @@ def render_summary(info: dict) -> str:
         f"- In plain words: {p['meaning']}",
         ("- Weights: IQ3 GGUF blocks, AllowA8 for prefill and decode; "
          if p["method"] == "gguf" else "- Weights: native GPTQ5 group 64, A16Only; "
-         if p["bits"] == 5 else "- Weights: W4A8 (4-bit weights, FP8 activations while reading the prompt); ")
+         if p["bits"] == 5 else "- Weights: GPTQ g32 Q4 (W4A8, FP8 activations while reading the prompt) with "
+         f"GPTQ5 g64 Q5 (A16Only, choose the Q5 prefill route at launch) for {', '.join(p['q5_units'])} in every layer; "
+         if p.get("q5_units") else "- Weights: W4A8 (4-bit weights, FP8 activations while reading the prompt); ")
         + f"{'with the MTP draft assistant (speculative decoding)' if info['mtp'] else 'no MTP assistant'}; "
         f"{'with the vision tower' if info['vision'] else 'text only'}.",
         f"- Historical hint (English, text only, RTX 5090): mean KL {p['kl']:.4f} from "
         + ("the plain model's own Q8_0 reference, A16 compute" if p["bits"] == 5 else
+           "the plain model's own Q8_0 reference, default route with int8-g64 Q5 prefill" if p.get("q5_units") else
            "the model's own Q8_0 reference" if p["method"] == "gguf" else "the near-lossless FP8-row reference")
         + ". This is not a quality measurement of your build.",
+    ] + ([
+        "- EXPERIMENTAL: this allocation was measured only on the plain model; it is unverified on diode variants. "
+        "Measure your own build before relying on it.",
+    ] if p.get("experimental") else []) + [
         "",
         "## Files",
         "",
@@ -606,7 +659,8 @@ def render_summary(info: dict) -> str:
             f"- Mean KL vs FP8-row reference: {s['mean_kl']:.4f}; delta NLL {s['mean_delta_nll']:+.3f}; "
             f"top-1 disagreement {s['top1_disagreement']:.4f}; perplexity {s['perplexity']:.3f}",
             "- Instrument: windows of 512 tokens (English subset), FP8 KV, "
-            + ("GGUF AllowA8" if p["method"] == "gguf" else "Q5 A16" if p["bits"] == 5 else "W4A8 exact route")
+            + ("GGUF AllowA8" if p["method"] == "gguf" else "Q5 A16" if p["bits"] == 5
+               else "W4A8 exact route, Q5 cells A16" if p.get("q5_units") else "W4A8 exact route")
             + ", no MTP, text only, native full-vocabulary KL.",
         ]
     return "\n".join(parts) + "\n"
@@ -632,7 +686,8 @@ def build_info(builder: "Builder") -> dict:
         )
     return {
         "name": cfg.name,
-        "preset": {k: getattr(cfg.preset, k) for k in ("id", "summary", "meaning", "size_class", "kl", "method", "bits")},
+        "preset": {k: getattr(cfg.preset, k) for k in ("id", "summary", "meaning", "size_class", "kl", "method", "bits",
+                                                        "q5_units", "experimental")},
         "mtp": info_artifact.mtp,
         "vision": info_artifact.vision,
         "artifact": str(cfg.artifact),

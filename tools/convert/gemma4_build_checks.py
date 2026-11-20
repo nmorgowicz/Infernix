@@ -391,13 +391,14 @@ def check_server(report: Report, cfg: BuildConfig, serve: ServeSettings, server:
                    "checkout)", f"build it (build_native.bat) or pass --serve <path to {name}>, or use "
                    "--no-launcher and serve elsewhere")
         return
-    found = probes.scan_binary(server, (cfg.preset.format_name,))
-    if not found[cfg.preset.format_name]:
-        report.add("fail", name, f"{server} does not know the {cfg.preset.format_name} tensor format "
+    found = probes.scan_binary(server, cfg.preset.formats)
+    unknown = [fmt for fmt in cfg.preset.formats if not found[fmt]]
+    if unknown:
+        report.add("fail", name, f"{server} does not know the {', '.join(unknown)} tensor format "
                    f"needed by {cfg.preset.id}", "rebuild the server from this checkout (build_native.bat) "
                    "or pass --serve of a newer build")
     else:
-        report.add("ok", name, f"{server} (knows {cfg.preset.format_name})")
+        report.add("ok", name, f"{server} (knows {', '.join(cfg.preset.formats)})")
     missing = probes.missing_dlls(server)
     if missing:
         report.add("warn", "server DLLs", f"not next to the exe or on PATH: {', '.join(missing)}",

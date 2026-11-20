@@ -1702,3 +1702,115 @@ def test_launcher_detects_native_q5_trunk_from_directory_not_names_or_receipts(t
     plan = build.parse_launcher(out)
     assert plan.gemma4_q5_prefill == ("int8-g64" if q5 else "a16")
     assert plan.context == ("auto" if q5 else 131072)
+
+
+MIXED_RECIPE = ("--q5-gptq-source", "gptq-q5", "--q5-unit", "o", "--q5-unit", "down")
+
+
+def mixed_convert(cfg: build.BuildConfig, *, mtp: bool = True) -> list[str]:
+    q5 = [w(cfg, part) if part == "gptq-q5" else part for part in MIXED_RECIPE]
+    return convert_expected(cfg, "--gptq-source", w(cfg, "gptq"), *q5, mtp=mtp)
+
+
+def test_mixed_preset_is_best_medium_plus_q5_o_and_down_and_marked_experimental():
+    mixed, medium = build.PRESETS["q4q5-mixed-a"], build.PRESETS["best-medium"]
+    assert mixed.experimental and not medium.experimental
+    assert (mixed.method, mixed.bits, mixed.group_size, mixed.native_groups) == ("gptq", 4, 32, False)
+    assert mixed.q5_units == ("o", "down") and mixed.formats == ("q4_g32_fp16", "q5_g64_fp16")
+    assert medium.formats == ("q4_g32_fp16",)
+    # Q5 over Q4 costs 0.75 bit/weight: o 289,017,856 B + down 650,285,056 B over the 60 layers.
+    assert abs(mixed.file_gb - (medium.file_gb + (289_017_856 + 650_285_056) / 1e9)) < 0.02
+    assert medium.file_gb < mixed.file_gb < build.PRESETS["q5-g64"].file_gb
+    assert medium.kl > mixed.kl > build.PRESETS["q5-g64"].kl
+
+
+def test_mixed_preset_runs_two_gptq_passes_on_one_tree_and_converts_with_q5_units(env):
+    cfg = env.config("q4q5-mixed-a", score=True)
+    steps = plan_by_id(cfg)
+    assert list(steps)[:9] == ["calibration-render", "calibration-tokens", "text-tree", "gptq", "gptq-check",
+                               "gptq-q5", "gptq-q5-check", "convert", "receipt-check"]
+    gptq_dir = build.REPO_ROOT / "tools" / "gptq"
+    gpy = str(env.gptq_python)
+    assert steps["gptq"].argv == [
+        gpy, str(gptq_dir / "run_gptq.py"), "--tree", w(cfg, "text60"), "--calib", w(cfg, "calib.pt"),
+        "--out", w(cfg, "gptq"), "--recipe", "gemma4_31b", "--observer", "imatrix_mse", "--group-size", "32",
+        "--max-cpu-gb", "32", "--offload-dir", w(cfg, "offload"), "--peak-log", w(cfg, "gptq.peak.jsonl")]
+    assert steps["gptq-q5"].argv == [
+        gpy, str(gptq_dir / "run_gptq.py"), "--tree", w(cfg, "text60"), "--calib", w(cfg, "calib.pt"),
+        "--out", w(cfg, "gptq-q5"), "--recipe", "gemma4_31b", "--observer", "imatrix_mse", "--group-size", "64",
+        "--max-cpu-gb", "32", "--offload-dir", w(cfg, "offloadq5"), "--peak-log", w(cfg, "gptq.q5.peak.jsonl"),
+        "--bits", "5"]
+    assert steps["gptq-check"].argv == [
+        gpy, str(gptq_dir / "check_checkpoint.py"), "--gptq", w(cfg, "gptq"), "--tree", w(cfg, "text60")]
+    assert steps["gptq-q5-check"].argv == [
+        gpy, str(gptq_dir / "check_checkpoint.py"), "--gptq", w(cfg, "gptq-q5"), "--tree", w(cfg, "text60"),
+        "--bits", "5"]
+    # The shared tree is only ever freed after the second pass has read it.
+    assert steps["gptq-check"].prune_if_short == () and steps["gptq-q5-check"].prune_if_short == (cfg.work("text60"),)
+    assert steps["gptq"].prune_always == (cfg.work("offload"),)
+    assert steps["gptq-q5"].prune_always == (cfg.work("offloadq5"),)
+    assert steps["convert"].argv == mixed_convert(cfg)
+    assert "--native-groups" not in steps["convert"].argv and "q5_g64_a16" not in steps["convert"].argv
+    assert steps["score-candidate"].argv[-2:] == ["--out", w(cfg, "score", "candidate.ninfer")]
+    twin = steps["score-candidate"].argv
+    assert twin[twin.index("--q5-gptq-source") + 1] == w(cfg, "gptq-q5")
+    assert [twin[i + 1] for i, item in enumerate(twin) if item == "--q5-unit"] == ["o", "down"]
+    assert steps["score-run"].env == {build.EXACT_ROUTE_ENV: "1"} and "Q5 cells A16" in steps["score-run"].title
+
+
+def test_other_gptq_presets_plan_no_second_pass(env):
+    for preset in ("best-small", "best-medium", "q5-g64"):
+        steps = plan_by_id(env.config(preset))
+        assert "gptq-q5" not in steps and "--q5-unit" not in steps["convert"].argv
+        assert steps["gptq-check"].prune_if_short == (env.out / "work" / "text60",)
+
+
+def test_mixed_preset_keeps_the_general_profile_and_refuses_q5_profiles(env):
+    args = cli.build_parser().parse_args(env.argv("q4q5-mixed-a"))
+    cfg, serve, _ = cli.resolve_config(args)
+    assert cfg.preset.id == "q4q5-mixed-a" and serve == build.ServeSettings(server_exe=env.server)
+    assert serve.gemma4_q5_prefill == "a16" and serve.context == 131072
+    args = cli.build_parser().parse_args(env.argv("q4q5-mixed-a", "--gemma4-q5-prefill", "int8-g64"))
+    assert cli.resolve_config(args)[1].gemma4_q5_prefill == "int8-g64"
+    for profile in ("q5-quality", "q5-long-context"):
+        args = cli.build_parser().parse_args(env.argv("q4q5-mixed-a", "--profile", profile))
+        with pytest.raises(ValueError, match="builds --preset q5-g64 only"):
+            cli.resolve_config(args)
+
+
+def test_mixed_preset_needs_a_server_that_knows_both_tensor_formats(env):
+    class Probes(FakeProbes):
+        def scan_binary(self, path, needles):
+            return {needle: needle == "q4_g32_fp16" for needle in needles}
+
+    item = finding(preflight(env, env.config("q4q5-mixed-a"), Probes()), launcher.SERVER_NAME)
+    assert item.level == "fail" and "q5_g64_fp16" in item.detail and "q4_g32_fp16" not in item.detail
+    assert finding(preflight(env, env.config("best-medium"), Probes()), launcher.SERVER_NAME).level == "ok"
+    ok = finding(preflight(env, env.config("q4q5-mixed-a")), launcher.SERVER_NAME)
+    assert ok.level == "ok" and "q4_g32_fp16, q5_g64_fp16" in ok.detail
+
+
+def test_mixed_preset_is_labelled_experimental_in_every_user_facing_text(env):
+    table = cli.preset_table().splitlines()
+    row = next(line for line in table if line.lstrip().startswith("q4q5-mixed-a"))
+    assert "experimental, unverified on diode" in row and "19.34 GB" in row
+    assert not any("experimental" in line for line in table if "q4q5-mixed-a" not in line)
+    assert "unverified on diode variants" in cli.EPILOG and "EXPERIMENTAL" in cli.EPILOG
+    cfg = env.config("q4q5-mixed-a")
+    plan = "\n".join(build.describe_plan(cfg, build.build_plan(cfg)))
+    assert "EXPERIMENTAL" in plan and "gptq-q5" in plan
+    plain = env.config("best-medium")
+    assert "EXPERIMENTAL" not in "\n".join(build.describe_plan(plain, build.build_plan(plain)))
+
+
+def test_mixed_build_runs_both_passes_and_the_summary_says_experimental(env):
+    cfg = env.config("q4q5-mixed-a")
+    builder, runner, _ = make_builder(env, cfg)
+    builder.run()
+    assert runner.calls == ["calibration-render", "calibration-tokens", "text-tree", "gptq", "gptq-check", "gptq-q5",
+                            "gptq-q5-check", "convert"]
+    assert not cfg.work("offload").exists() and not cfg.work("offloadq5").exists()
+    summary = (env.out / "BUILD-SUMMARY.md").read_text()
+    assert "EXPERIMENTAL" in summary and "unverified on diode variants" in summary
+    assert "GPTQ5 g64 Q5 (A16Only" in summary and "o, down" in summary and "mean KL 0.0458" in summary
+    assert "default route with int8-g64 Q5 prefill" in summary
