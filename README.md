@@ -704,6 +704,8 @@ commands, prerequisites, corpus/resume policy, disk/time costs, MTP and exact-A1
 The [canonical four-tier comparison](docs/maintainer/gemma4-benchmarks.md#four-tier-comparison) states
 measured sizes, matched quality/serving protocols and limitations. The converter embeds the fixed Gemma
 chat template (`tools/chat_templates/gemma4_fixed.jinja`); `--chat-template FILE` replaces it at serve time.
+Measure a Gemma quantization on unseen roleplay-forum prose with the reproducible
+[held-out roleplay corpus](docs/roleplay-heldout.md) (rebuilt from a pinned public dataset; no text is committed).
 
 **Serve it.** Q4/IQ3 (or explicit `--profile default`) generated launchers use the profile below (`0.0.0.0:8001`, alias `131k`, any model name accepted); Q5 uses the defaults above with alias `gemma4-q5`:
 `--max-context 131072 --kv-dtype fp8 --gemma4-qk fp8 --prefill-chunk auto --logits-dtype bf16 --max-concurrency 1

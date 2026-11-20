@@ -1,0 +1,5 @@
+# Held-out roleplay corpus (tools/eval/roleplay_heldout). The corpus SHA-256 was published from this parser stack:
+# a different HTML parser (lxml/libxml2) version can change the recovered markup and therefore the text, in which case
+# `check` reports a hash mismatch. `build` records the versions it ran with in provenance.json.
+lxml==6.1.2
+pyarrow==25.0.1

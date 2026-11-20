@@ -17,6 +17,8 @@ ownership contracts are defined in [Engine architecture](../docs/maintainer/engi
   Linear and fused Linear suites are separated by their supported weight/activation paths;
 - `runtime/` — scheduler fairness, cache resource policy, capacity and context-cost calculations;
 - `bench/ttft/` — HTTP measurements, campaign orchestration and workload construction;
+- `eval/` — held-out roleplay corpus tool: cleaning rules, deterministic selection, shingle check, corpus hash and
+  download verification on synthetic fixtures;
 - root C++ tests — core storage, public API, serving protocols, logging, benchmark reports and
   causal-scoring evaluation;
 - root `test_*.py` — corpus measurement consumption, and the schema-version agreement between
