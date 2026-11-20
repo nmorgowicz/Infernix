@@ -1102,8 +1102,13 @@ py -3.11 -m tools.bench.kv_eval.kl_corpus --source <manifest.json> --out <new-su
 py -3.11 -m tools.bench.kv_eval.kl_compare --baseline <baseline/report.json> --candidate <candidate/report.json> --out <paired.json>
 ```
 
-`kl_compare` runs a paired whole-window bootstrap: 2000 resamples by
-default, seed 20261105, overall and per domain. `--delta` has no default: only the
+`kl_compare` runs a paired bootstrap: 2000 resamples by default, seed 20261105,
+overall and per domain. The resampling unit is a whole window by default; `--cluster stream`
+resamples whole corpus streams instead (all windows of a stream move together), which is
+the honest unit when each stream is one independent document, because the overlapping
+windows of one stream are not independent (the roleplay corpus uses one forum thread per
+stream). The output records the unit (`cluster`) and the number of resampled units
+(`clusters`). `--delta` has no default: only the
 user chooses an acceptance factor. When supplied, acceptance still requires the
 upper 95% mean-KL ratio bound to be at most `1 + delta` overall and in every domain,
 and the point-estimate p999-KL ratio to be within that same factor. Protocol, cache,

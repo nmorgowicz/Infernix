@@ -1,8 +1,10 @@
 """Paired comparison of two ``infernix-perplexity --full-vocab-reference`` reports.
 
 Both reports must have scored the same windows against the same reference cache (identical
-``kl.protocol`` and ``kl.reference_cache`` provenance). The comparison resamples whole windows,
-the same ones in both arms, and reports the candidate/baseline mean-KL ratio and the paired
+``kl.protocol`` and ``kl.reference_cache`` provenance). The comparison resamples whole windows
+(``--cluster window``, default) or whole corpus streams (``--cluster stream``: all windows of a
+stream move together, the honest unit when each stream is one independent document), the same
+ones in both arms, and reports the candidate/baseline mean-KL ratio and the paired
 change in target NLL with 95% percentile intervals, overall and per domain.
 
     python -m tools.bench.kv_eval.kl_compare --baseline <g32/report.json> \
@@ -39,40 +41,53 @@ def percentile(values: list[float], q: float) -> float:
     return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
 
 
-def paired(baseline: list[dict], candidate: list[dict], resamples: int, seed: int) -> dict:
+def paired(baseline: list[dict], candidate: list[dict], resamples: int, seed: int,
+           clusters: list[list[int]] | None = None) -> dict:
+    """Paired bootstrap. ``clusters`` lists window-index groups resampled as one unit (default: each window)."""
     n = len(baseline)
-    counts = [w["count"] for w in baseline]
+    groups = clusters if clusters is not None else [[i] for i in range(n)]
+    counts = [sum(baseline[i]["count"] for i in g) for g in groups]
+    base_sums = [sum(baseline[i]["kl_sum"] for i in g) for g in groups]
+    cand_sums = [sum(candidate[i]["kl_sum"] for i in g) for g in groups]
+    base_nll = [sum(baseline[i]["delta_nll_sum"] for i in g) for g in groups]
+    cand_nll = [sum(candidate[i]["delta_nll_sum"] for i in g) for g in groups]
+    m = len(groups)
     rng = random.Random(seed)
     ratios: list[float] = []
     deltas: list[float] = []
     for _ in range(resamples):
-        picks = [rng.randrange(n) for _ in range(n)]
+        picks = [rng.randrange(m) for _ in range(m)]
         total = sum(counts[i] for i in picks)
-        base_kl = sum(baseline[i]["kl_sum"] for i in picks)
-        cand_kl = sum(candidate[i]["kl_sum"] for i in picks)
+        base_kl = sum(base_sums[i] for i in picks)
+        cand_kl = sum(cand_sums[i] for i in picks)
         ratios.append(cand_kl / base_kl if base_kl > 0 else float("inf"))
-        deltas.append(
-            (sum(candidate[i]["delta_nll_sum"] for i in picks)
-             - sum(baseline[i]["delta_nll_sum"] for i in picks)) / total
-        )
+        deltas.append((sum(cand_nll[i] for i in picks) - sum(base_nll[i] for i in picks)) / total)
     total = sum(counts)
-    base_kl = sum(w["kl_sum"] for w in baseline)
-    cand_kl = sum(w["kl_sum"] for w in candidate)
+    base_kl = sum(base_sums)
+    cand_kl = sum(cand_sums)
     return {
         "windows": n,
+        "clusters": m,
         "positions": total,
         "baseline_mean_kl": base_kl / total,
         "candidate_mean_kl": cand_kl / total,
         "kl_ratio": cand_kl / base_kl if base_kl > 0 else float("inf"),
         "kl_ratio_ci95": [percentile(ratios, 0.025), percentile(ratios, 0.975)],
-        "delta_nll_candidate_minus_baseline": (
-            sum(w["delta_nll_sum"] for w in candidate) - sum(w["delta_nll_sum"] for w in baseline)
-        ) / total,
+        "delta_nll_candidate_minus_baseline": (sum(cand_nll) - sum(base_nll)) / total,
         "delta_nll_ci95": [percentile(deltas, 0.025), percentile(deltas, 0.975)],
     }
 
 
-def compare(baseline: dict, candidate: dict, resamples: int, seed: int, delta: float | None) -> dict:
+def stream_clusters(windows: list[dict], members: list[int]) -> list[list[int]]:
+    """Window indices grouped by their corpus stream, in first-seen stream order."""
+    groups: dict[str, list[int]] = {}
+    for i in members:
+        groups.setdefault(windows[i]["stream"], []).append(i)
+    return list(groups.values())
+
+
+def compare(baseline: dict, candidate: dict, resamples: int, seed: int, delta: float | None,
+            cluster: str = "window") -> dict:
     if resamples <= 0:
         raise SystemExit("resamples must be positive")
     if baseline["protocol"] != candidate["protocol"]:
@@ -88,11 +103,22 @@ def compare(baseline: dict, candidate: dict, resamples: int, seed: int, delta: f
     keys = [(w["stream"], w["domain"], w["begin"], w["count"]) for w in base_windows]
     if keys != [(w["stream"], w["domain"], w["begin"], w["count"]) for w in cand_windows]:
         raise SystemExit("reports scored different windows; they are not paired")
-    result = {"overall": paired(base_windows, cand_windows, resamples, seed), "domains": []}
+    if cluster not in ("window", "stream"):
+        raise SystemExit("cluster must be window or stream")
+
+    def groups_of(members: list[int]) -> list[list[int]] | None:
+        return stream_clusters(base_windows, members) if cluster == "stream" else None
+
+    everything = list(range(len(base_windows)))
+    result = {"cluster": cluster,
+              "overall": paired(base_windows, cand_windows, resamples, seed, groups_of(everything)),
+              "domains": []}
     for domain in sorted({w["domain"] for w in base_windows}):
         members = [i for i, w in enumerate(base_windows) if w["domain"] == domain]
+        local = {i: k for k, i in enumerate(members)}
+        groups = groups_of(members)
         entry = paired([base_windows[i] for i in members], [cand_windows[i] for i in members],
-                       resamples, seed)
+                       resamples, seed, [[local[i] for i in g] for g in groups] if groups else None)
         entry["domain"] = domain
         result["domains"].append(entry)
     tails = {}
@@ -126,9 +152,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=20261105)
     parser.add_argument("--delta", type=float, default=None,
                         help="operator acceptance factor; omit to report without a verdict")
+    parser.add_argument("--cluster", choices=("window", "stream"), default="window",
+                        help="resampling unit: whole windows (default) or whole corpus streams; windows of one "
+                             "stream overlap in context, so a corpus whose streams are independent documents "
+                             "(for example one forum thread each) should use stream")
     parser.add_argument("--out", type=Path, default=None, help="write the JSON here as well")
     args = parser.parse_args(argv)
-    result = compare(load(args.baseline), load(args.candidate), args.resamples, args.seed, args.delta)
+    result = compare(load(args.baseline), load(args.candidate), args.resamples, args.seed, args.delta,
+                     args.cluster)
     text = json.dumps(result, indent=2)
     if args.out is not None:
         args.out.write_text(text + "\n", encoding="utf-8")
