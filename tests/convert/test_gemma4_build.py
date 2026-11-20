@@ -1793,9 +1793,9 @@ def test_mixed_preset_needs_a_server_that_knows_both_tensor_formats(env):
 def test_mixed_preset_is_labelled_experimental_in_every_user_facing_text(env):
     table = cli.preset_table().splitlines()
     row = next(line for line in table if line.lstrip().startswith("q4q5-mixed-a"))
-    assert "experimental, unverified on diode" in row and "19.34 GB" in row
+    assert "experimental, measured once on diode" in row and "19.34 GB" in row
     assert not any("experimental" in line for line in table if "q4q5-mixed-a" not in line)
-    assert "unverified on diode variants" in cli.EPILOG and "EXPERIMENTAL" in cli.EPILOG
+    assert "measured once on a diode variant" in cli.EPILOG and "EXPERIMENTAL" in cli.EPILOG
     cfg = env.config("q4q5-mixed-a")
     plan = "\n".join(build.describe_plan(cfg, build.build_plan(cfg)))
     assert "EXPERIMENTAL" in plan and "gptq-q5" in plan
@@ -1811,6 +1811,6 @@ def test_mixed_build_runs_both_passes_and_the_summary_says_experimental(env):
                             "gptq-q5-check", "convert"]
     assert not cfg.work("offload").exists() and not cfg.work("offloadq5").exists()
     summary = (env.out / "BUILD-SUMMARY.md").read_text()
-    assert "EXPERIMENTAL" in summary and "unverified on diode variants" in summary
+    assert "EXPERIMENTAL" in summary and "measured once on a diode variant" in summary
     assert "GPTQ5 g64 Q5 (A16Only" in summary and "o, down" in summary and "mean KL 0.0458" in summary
     assert "default route with int8-g64 Q5 prefill" in summary

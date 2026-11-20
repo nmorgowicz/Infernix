@@ -732,11 +732,18 @@ calibration/render/tokenize/text-tree steps, a group-32 GPTQ pass (`gptq`, `gptq
 checkpoints therefore use Hessians of **your actual model**. The artifact is the best-medium file plus about 0.94 GB
 (0.9393 GB measured on the plain model; 19.34 GB with MTP): Q4 projections keep `AllowA8`, the Q5 projections are `A16Only`.
 
-**Experimental, unverified on diode variants.** The allocation was selected and measured on the plain model only
-(its own Q8_0 reference, plain-model Hessians; prose KL against best-medium on that model fell from 0.0684 to 0.0485 on the
-default route, FULL KL 0.0458 against 0.0687 for best-medium and 0.0203 for full Q5). No diode Hessian
-measurement exists, so the build summary, `--list-presets` and the dry run all mark the preset experimental and the
-hint column is a plain-model figure, not a diode claim. Measure your own build before relying on it.
+**Experimental; measured once on a diode variant.** The allocation was selected on the plain model (its own Q8_0
+reference, plain-model Hessians; prose KL against best-medium on that model fell from 0.0684 to 0.0485 on the default
+route, FULL KL 0.0458 against 0.0687 for best-medium and 0.0203 for full Q5). It was then built from the deployed
+diode's own Hessians (19,344,788,484 B, byte-identical size) and scored against the diode's own Q8_0 reference on
+development windows (block-prefill KL at context 512, one GPTQ pass per width). Roleplay-forum text (42 threads, 84
+windows): KL 0.0340 against 0.0446 for best-medium on A16 compute, ratio 0.762 (95 % cluster interval 0.744-0.781; plain
+model 0.724), and 0.0383 against 0.0513 on the default route (ratio 0.747, interval 0.723-0.770); PG-19 prose ratio
+0.742 on A16 compute, 0.749 on the default route. Speed against the diode best-medium (default route, HTTP, chunk 2048,
+FP8 KV/QK): decode 64.5 against 72.6 tok/s at 1k, prefill 3,263 against 3,424 tok/s at 65k, capacity 131,072 tokens with
+MTP off and 122,432 with MTP d1. Nothing is promoted and the hint column is still the plain-model figure: the build
+summary, `--list-presets` and the dry run keep the experimental mark. Measure your own build before relying on it.
+Evidence: llama-local-tooling `docs/plans/20261123-gemma4-diode-mixed-a.md`.
 
 The serve settings are the unchanged `default` profile (`--profile` omitted), and no Q5 profile is selected by this
 preset. The Q5 cells' prefill compute is a launch choice on the same artifact; the measured route lets the Q4 cells

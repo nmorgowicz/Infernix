@@ -6,7 +6,7 @@ and receipt identifiers (`item2a-http-v1/clean`, `item2d-*.receipt.json`, ...) k
 
 - Builder: `--preset q5-g64` builds one A16Only artifact (native GPTQ5 group 64, FP8 vocabulary, BF16-source
   MTP assistant). Compute is chosen at launch on that same artifact, never by rewriting weights.
-- Builder: `--preset q4q5-mixed-a` (experimental, plain-model measurements only) builds best-medium with Q5 `o` and
+- Builder: `--preset q4q5-mixed-a` (experimental; plain-model selection, one diode measurement) builds best-medium with Q5 `o` and
   `down` in all layers from two GPTQ passes on the same tree and calibration; it keeps the `default` serve profile and
   takes `--gemma4-q5-prefill` for its Q5 cells only.
 - Launcher profiles: omitted `--profile` selects `q5-quality` for a `q5-g64` build or a native-Q5 artifact.

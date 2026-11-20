@@ -120,8 +120,9 @@ PRESETS: dict[str, Preset] = {
     "q4q5-mixed-a": Preset(
         "q4q5-mixed-a", "gptq", "GPTQ g32 Q4 with GPTQ5 g64 Q5 `o` and `down` in all layers (experimental)",
         "Best-medium with the attention output and MLP down projections of every layer at Q5, about 0.94 GB "
-        "larger; both GPTQ checkpoints use your own model's Hessians. Experimental: the allocation was measured only "
-        "on the plain model (default route, plain-model own-Q8_0 reference), not on a diode variant.",
+        "larger; both GPTQ checkpoints use your own model's Hessians. Experimental: selected on the plain model and "
+        "measured once on a diode variant (development windows, block-prefill KL at context 512): roleplay KL 0.76x "
+        "that of best-medium on A16 compute, against 0.72x on the plain model. Not promoted.",
         "medium+", 19.34, 0.0458, "about 70 min", 32, False, "q4_g32_fp16", 102, 132, 39,
         {"calibration-source": 1, "calibration-render": 1, "calibration-tokens": 1, "text-tree": 2, "gptq": 18,
          "gptq-q5": 25, "gptq-check": 1, "convert": 6, "receipt-check": 0.5, "finalize": 0.5},
@@ -474,7 +475,7 @@ def describe_plan(cfg: BuildConfig, steps: list[Step]) -> list[str]:
     lines = [
         f"Preset      {preset.id}: {preset.summary} ({preset.size_class}; {gb(preset.file_gb)} with MTP; "
         f"KL {preset.kl:.4f}, lower is better)"
-        + ("; EXPERIMENTAL: not measured on diode variants" if preset.experimental else ""),
+        + ("; EXPERIMENTAL: measured once on a diode variant, not promoted" if preset.experimental else ""),
         f"            {preset.meaning}",
         f"Model       {cfg.model}",
         f"MTP         {cfg.assistant if cfg.assistant else 'none (--no-mtp)'}",
@@ -615,8 +616,9 @@ def render_summary(info: dict) -> str:
            "the model's own Q8_0 reference" if p["method"] == "gguf" else "the near-lossless FP8-row reference")
         + ". This is not a quality measurement of your build.",
     ] + ([
-        "- EXPERIMENTAL: this allocation was measured only on the plain model; it is unverified on diode variants. "
-        "Measure your own build before relying on it.",
+        "- EXPERIMENTAL: this allocation was selected on the plain model and measured once on a diode variant "
+        "(development windows, block-prefill KL at context 512): roleplay KL ratio to best-medium on the diode 0.762 "
+        "on A16 compute and 0.747 on the default route, 0.724 on the plain model (A16). Measure your own build before relying on it.",
     ] if p.get("experimental") else []) + [
         "",
         "## Files",
