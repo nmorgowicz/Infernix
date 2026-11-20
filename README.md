@@ -691,11 +691,13 @@ See [Q5 creation and the lower-VRAM ladder](docs/weight-conversion.md#native-gpt
 for commands, costs and bounded evidence. Diode short KL is 0.0331 A16 / 0.0336 g64 versus 0.0941
 best-medium; neither that nor the plain incremental sample qualifies long-context INT8 quality.
 
-`q4q5-mixed-a` (experimental; selected on the plain model and measured on a diode variant, development and fresh held-out
-roleplay text, roleplay KL 0.74-0.76x that of best-medium) is best-medium with Q5
-attention-output and `down` projections in every layer (+0.94 GB, two GPTQ passes on your own model). It keeps the
-`default` profile; add `--gemma4-q5-prefill int8-g64` for the measured Q5 prefill route. See
-[Builder preset `q4q5-mixed-a`](docs/weight-conversion.md#builder-preset-q4q5-mixed-a-experimental).
+`q4q5-mixed-a` is a supported option, not the default (`best-medium` stays the general default): best-medium with Q5
+attention-output and `down` projections in every layer (+0.94 GB, two GPTQ passes on your own model, decode about -11 %).
+On fresh held-out roleplay text (36 forum threads, context-512 block KL against each model's own Q8_0, diode build on the
+default route) its KL is 0.74x that of best-medium (interval 0.72-0.76, lower in 36 of 36 threads). Long-context and
+incremental-decode KL are not measured for it. It keeps the `default` profile at build time; add
+`--gemma4-q5-prefill int8-g64` for the measured Q5 prefill route. See
+[Builder preset `q4q5-mixed-a`](docs/weight-conversion.md#builder-preset-q4q5-mixed-a-supported-option-not-the-default).
 
 The smaller `iq3-xs` and `iq3-xxs` presets take `--llama-cpp <binary dir> --llama-cpp-source <source dir>`, collect the BF16 model's own
 importance matrix through a Q8_0 copy and import the resulting IQ3 blocks. No GPTQ environment is needed.

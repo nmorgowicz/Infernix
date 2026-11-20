@@ -8,7 +8,7 @@ GPTQ scripts run in their own interpreter (`tools/gptq/requirements.txt`), never
 are only read.
 
 Presets: best-small (GPTQ group 256, `q4_g256_fp16`), best-medium (GPTQ group 32, `q4_g32_fp16`),
-q5-g64 (GPTQ5 group 64, A16Only), q4q5-mixed-a (best-medium with Q5 `o` and `down` in every layer, experimental),
+q5-g64 (GPTQ5 group 64, A16Only), q4q5-mixed-a (best-medium with Q5 `o` and `down` in every layer, a supported option),
 draft (uncalibrated absmax, group 32), and iq3-xs / iq3-xxs
 (llama.cpp IQ3_XS / IQ3_XXS blocks quantized with the model's own
 importance matrix and imported verbatim; they need a llama.cpp build and its source tree for `convert_hf_to_gguf.py`).
@@ -63,6 +63,17 @@ Q5_FORMAT = "q5_g64_fp16"  # tensor format of the Q5 cells of a `q5_units` prese
 Q5_GROUP_SIZE = 64
 Q5_CHECKPOINT = "gptq-q5"  # work-dir name of the 5-bit GPTQ checkpoint a `q5_units` preset reads
 SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
+MIXED_A_EVIDENCE = (
+    "on fresh held-out roleplay text (36 forum threads, 72 windows, disjoint from the development windows and every "
+    "calibration text; block-prefill KL at context 512 against each model's own Q8_0) the diode build on its default "
+    "route scored a KL ratio to best-medium of 0.740 (95 % thread-cluster interval 0.722-0.759), lower in 36 of 36 "
+    "threads; the plain model on A16 compute scored 0.713, and the earlier development windows gave 0.76 (A16) and 0.75 "
+    "(default route) on the diode, 0.72 on the plain model. Costs against best-medium: +0.94 GB, decode about -11 %, "
+    "prefill at 65k about -5 %, capacity 131,072 tokens with MTP off and 122,432 with MTP d1. Limits: context-512 block KL "
+    "only (long-context and incremental-decode KL are not measured for this allocation; the Q5 INT8-g64 prefill route has "
+    "a measured long-context cost, see llama-local-tooling docs/plans/20261124-gemma4-long-context-roleplay.md), a single GPTQ pass per width, one GPU, roleplay text "
+    "from three forums that the finetune may have seen, a keyword-only content screen. Measure your own build before relying on it."
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,7 +98,7 @@ class Preset:
     gguf_type: str = ""  # method "gguf": the llama-quantize type (IQ3_XS, IQ3_XXS)
     bits: int = 4
     q5_units: tuple[str, ...] = ()  # `--q5-unit` selectors: fused groups read from a second, 5-bit GPTQ checkpoint
-    experimental: bool = False  # not measured on the model this builder is normally run on
+    evidence: str = ""  # a supported non-default option: the measured evidence and its limits, shown in the plan and summary
 
     @property
     def formats(self) -> tuple[str, ...]:
@@ -118,15 +129,14 @@ PRESETS: dict[str, Preset] = {
         bits=5,
     ),
     "q4q5-mixed-a": Preset(
-        "q4q5-mixed-a", "gptq", "GPTQ g32 Q4 with GPTQ5 g64 Q5 `o` and `down` in all layers (experimental)",
+        "q4q5-mixed-a", "gptq", "GPTQ g32 Q4 with GPTQ5 g64 Q5 `o` and `down` in all layers (supported option)",
         "Best-medium with the attention output and MLP down projections of every layer at Q5, about 0.94 GB "
-        "larger; both GPTQ checkpoints use your own model's Hessians. Experimental: selected on the plain model and "
-        "measured once on a diode variant (development windows, block-prefill KL at context 512): roleplay KL 0.76x "
-        "that of best-medium on A16 compute, against 0.72x on the plain model. Not promoted.",
+        "larger; both GPTQ checkpoints use your own model's Hessians. A supported option, not the default: on fresh "
+        "held-out roleplay text its KL is 0.74x that of best-medium (diode, default route; context-512 block KL).",
         "medium+", 19.34, 0.0458, "about 70 min", 32, False, "q4_g32_fp16", 102, 132, 39,
         {"calibration-source": 1, "calibration-render": 1, "calibration-tokens": 1, "text-tree": 2, "gptq": 18,
          "gptq-q5": 25, "gptq-check": 1, "convert": 6, "receipt-check": 0.5, "finalize": 0.5},
-        q5_units=("o", "down"), experimental=True,
+        q5_units=("o", "down"), evidence=MIXED_A_EVIDENCE,
     ),
     "draft": Preset(
         "draft", "plain", "uncalibrated absmax, group 32 (the old default)",
@@ -475,7 +485,7 @@ def describe_plan(cfg: BuildConfig, steps: list[Step]) -> list[str]:
     lines = [
         f"Preset      {preset.id}: {preset.summary} ({preset.size_class}; {gb(preset.file_gb)} with MTP; "
         f"KL {preset.kl:.4f}, lower is better)"
-        + ("; EXPERIMENTAL: measured once on a diode variant, not promoted" if preset.experimental else ""),
+        + ("; supported option, not the default: roleplay KL 0.74x best-medium on fresh held-out text" if preset.evidence else ""),
         f"            {preset.meaning}",
         f"Model       {cfg.model}",
         f"MTP         {cfg.assistant if cfg.assistant else 'none (--no-mtp)'}",
@@ -616,10 +626,8 @@ def render_summary(info: dict) -> str:
            "the model's own Q8_0 reference" if p["method"] == "gguf" else "the near-lossless FP8-row reference")
         + ". This is not a quality measurement of your build.",
     ] + ([
-        "- EXPERIMENTAL: this allocation was selected on the plain model and measured once on a diode variant "
-        "(development windows, block-prefill KL at context 512): roleplay KL ratio to best-medium on the diode 0.762 "
-        "on A16 compute and 0.747 on the default route, 0.724 on the plain model (A16). Measure your own build before relying on it.",
-    ] if p.get("experimental") else []) + [
+        f"- Supported option, not the default (best-medium stays the general default): {p['evidence']}",
+    ] if p.get("evidence") else []) + [
         "",
         "## Files",
         "",
@@ -689,7 +697,7 @@ def build_info(builder: "Builder") -> dict:
     return {
         "name": cfg.name,
         "preset": {k: getattr(cfg.preset, k) for k in ("id", "summary", "meaning", "size_class", "kl", "method", "bits",
-                                                        "q5_units", "experimental")},
+                                                        "q5_units", "evidence")},
         "mtp": info_artifact.mtp,
         "vision": info_artifact.vision,
         "artifact": str(cfg.artifact),

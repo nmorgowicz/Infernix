@@ -6,9 +6,11 @@ and receipt identifiers (`item2a-http-v1/clean`, `item2d-*.receipt.json`, ...) k
 
 - Builder: `--preset q5-g64` builds one A16Only artifact (native GPTQ5 group 64, FP8 vocabulary, BF16-source
   MTP assistant). Compute is chosen at launch on that same artifact, never by rewriting weights.
-- Builder: `--preset q4q5-mixed-a` (experimental; plain-model selection, one diode measurement) builds best-medium with Q5 `o` and
-  `down` in all layers from two GPTQ passes on the same tree and calibration; it keeps the `default` serve profile and
-  takes `--gemma4-q5-prefill` for its Q5 cells only.
+- Builder: `--preset q4q5-mixed-a` (a supported option, not the default; fresh held-out roleplay KL 0.74x best-medium on the
+  diode default route, context-512 block KL only) builds best-medium with Q5 `o` and
+  `down` in all layers from two GPTQ passes on the same tree and calibration; it keeps the `default` serve profile at build
+  time and takes `--gemma4-q5-prefill` for its Q5 cells only. `launcher --artifact` on the finished mixed file detects its
+  native Q5 cells and selects `q5-quality` (Q5 cells INT8 g64, Q4 cells keep A8); `--profile default` selects the builder's settings.
 - Launcher profiles: omitted `--profile` selects `q5-quality` for a `q5-g64` build or a native-Q5 artifact.
   `q5-quality` and `q5-long-context` both select `--gemma4-q5-prefill int8-g64`, auto context, chunk 2048,
   1024 MiB headroom, top-k 64, MTP d1 and a host-only prefix cache; `q5-quality` keeps the BF16 sliding ring,

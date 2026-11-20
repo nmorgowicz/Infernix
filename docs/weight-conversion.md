@@ -512,7 +512,7 @@ is needed. Source weights are read-only, outputs are never overwritten, and a fa
 | `best-small` (recommended q4) | calibrated GPTQ, group 256 | `q4_g256_fp16` plus permutation-safe g32 global output projections |
 | `best-medium` | calibrated GPTQ, group 32 | `q4_g32_fp16` |
 | `q5-g64` (higher-quality Q5) | own-model calibrated GPTQ, 5 bits, group 64 | `q5_g64_fp16`, A16Only |
-| `q4q5-mixed-a` (experimental) | own-model calibrated GPTQ g32 plus GPTQ 5-bit g64 for the Q5 groups | `q4_g32_fp16` with `q5_g64_fp16` (A16Only) attention output and `down` in all 60 layers |
+| `q4q5-mixed-a` (supported option, not the default) | own-model calibrated GPTQ g32 plus GPTQ 5-bit g64 for the Q5 groups | `q4_g32_fp16` with `q5_g64_fp16` (A16Only) attention output and `down` in all 60 layers |
 | `iq3-xs` | own-model importance matrix, IQ3_XS allocation | GGUF IQ3_S / IQ3_XXS / Q6_K blocks |
 | `iq3-xxs` | own-model importance matrix, IQ3_XXS allocation | GGUF IQ3_XXS / IQ2_S / IQ3_S blocks |
 | `draft` | uncalibrated absmax, group 32 | `q4_g32_fp16`; a quick conversion smoke, not a calibrated tier |
@@ -723,7 +723,7 @@ is not INT5 g64, and the build receipt lists the cells (`scale_search.q5_source`
 The loader, the per-layer workspace arena and the route selection work per prepared projection, so no engine
 option is involved.
 
-##### Builder preset `q4q5-mixed-a` (experimental)
+##### Builder preset `q4q5-mixed-a` (supported option, not the default)
 
 `--preset q4q5-mixed-a` is best-medium with Q5 `o` and `down` in every layer, built in one call: the shared
 calibration/render/tokenize/text-tree steps, a group-32 GPTQ pass (`gptq`, `gptq-check`), a 5-bit group-64 pass
@@ -732,40 +732,55 @@ calibration/render/tokenize/text-tree steps, a group-32 GPTQ pass (`gptq`, `gptq
 checkpoints therefore use Hessians of **your actual model**. The artifact is the best-medium file plus about 0.94 GB
 (0.9393 GB measured on the plain model; 19.34 GB with MTP): Q4 projections keep `AllowA8`, the Q5 projections are `A16Only`.
 
-**Experimental; measured on a diode variant.** The allocation was selected on the plain model (its own Q8_0
-reference, plain-model Hessians; prose KL against best-medium on that model fell from 0.0684 to 0.0485 on the default
-route, FULL KL 0.0458 against 0.0687 for best-medium and 0.0203 for full Q5). It was then built from the deployed
-diode's own Hessians (19,344,788,484 B, byte-identical size) and scored against the diode's own Q8_0 reference on
-development windows (block-prefill KL at context 512, one GPTQ pass per width). Roleplay-forum text (42 threads, 84
-windows): KL 0.0340 against 0.0446 for best-medium on A16 compute, ratio 0.762 (95 % cluster interval 0.744-0.781; plain
-model 0.724), and 0.0383 against 0.0513 on the default route (ratio 0.747, interval 0.723-0.770); PG-19 prose ratio
-0.742 on A16 compute, 0.749 on the default route. Speed against the diode best-medium (default route, HTTP, chunk 2048,
-FP8 KV/QK): decode 64.5 against 72.6 tok/s at 1k, prefill 3,263 against 3,424 tok/s at 65k, capacity 131,072 tokens with
-MTP off and 122,432 with MTP d1. Nothing is promoted and the hint column is still the plain-model figure: the build
-summary, `--list-presets` and the dry run keep the experimental mark. Measure your own build before relying on it.
-Evidence: llama-local-tooling `docs/plans/20261123-gemma4-diode-mixed-a.md`.
+It is a supported option; `best-medium` stays the general default. Choose it when roleplay-text fidelity is worth +0.94 GB
+and about 11 % slower decode.
 
-**Fresh held-out roleplay text.** On the reproducible [held-out roleplay corpus](roleplay-heldout.md) (36 forum threads, 72
-windows, disjoint from the development windows and every calibration text) the same diode artifact on the default route
-scored KL 0.0405 against 0.0547 for the promoted best-medium: ratio 0.740 (95 % thread-cluster interval 0.722-0.759), below
-best-medium in all 36 threads; the A16-compute plain-model rebuild scored 0.0272 against 0.0381 for plain Q4, ratio 0.713
-(0.697-0.727). Same limits as above: block-prefill KL at context 512 against each model's own Q8_0, and the finetune may
-have seen these forums. Evidence: llama-local-tooling `docs/plans/20261125-gemma4-fresh-heldout.md`.
+**Evidence.** The instrument is block-prefill KL at context 512 against each model's own Q8_0 reference, on roleplay
+text from public forums.
 
-The serve settings are the unchanged `default` profile (`--profile` omitted), and no Q5 profile is selected by this
-preset. The Q5 cells' prefill compute is a launch choice on the same artifact; the measured route lets the Q4 cells
+- **Fresh held-out text** (the reproducible [held-out roleplay corpus](roleplay-heldout.md): 36 forum threads, 72 windows,
+  disjoint from the development windows and every calibration text). The deployed diode's candidate A on the default
+  route (Q4 cells keep A8, Q5 cells INT8 g64) scored KL 0.0405 against 0.0547 for the promoted best-medium: ratio **0.740**
+  (95 % thread-cluster interval 0.722-0.759), lower in all 36 threads. The A16-compute plain-model rebuild scored 0.0272
+  against 0.0381 for plain Q4, ratio 0.713 (0.697-0.727).
+- **Development windows** (42 threads, 84 windows; the allocation was selected on the plain model on these and PG-19
+  prose). Plain model ratio to Q4 0.724; diode ratio 0.762 on A16 compute (interval 0.744-0.781) and 0.747 on the default
+  route (0.723-0.770); PG-19 prose ratio 0.742 on A16 compute. Selection on those windows is why the held-out set above is the
+  confirmation, not them.
+- **Speed and capacity** against the diode best-medium (default route, HTTP, chunk 2048, FP8 KV/QK): decode 64.5 against
+  72.6 tok/s at 1k (about -11 %), prefill 3,263 against 3,424 tok/s at 65k (about -5 %), capacity 131,072 tokens with MTP off
+  and 122,432 with MTP d1.
+
+**Limits.** Context-512 block KL only: long-context and incremental-decode KL are not measured for this allocation. The
+Q5 INT8-g64 prefill route (the measured route above) has a resolved long-context cost on the full-Q5 diode at 65k (KL
+0.00108 on 0.0369, +2.9 %; llama-local-tooling `docs/plans/20261124-gemma4-long-context-roleplay.md`); neither route
+was measured at long context on this mixed artifact. One GPTQ pass per width (GPTQ is
+deterministic, so there is no seed variation), one GPU, roleplay text from three forums that the finetune may have seen,
+and a keyword-only content screen. Measure your own build before relying on it. Evidence: llama-local-tooling
+`docs/plans/20261123-gemma4-diode-mixed-a.md` and `docs/plans/20261125-gemma4-fresh-heldout.md`.
+
+The build keeps the `default` serve profile (`--profile` omitted), and no Q5 profile is selected by this preset at build
+time. The Q5 cells' prefill compute is a launch choice on the same artifact; the measured route lets the Q4 cells
 keep their A8 paths and runs Q5 prefill as INT8 g64:
 
 ```text
 python -m tools.convert.gemma4_build --preset q4q5-mixed-a --model "<BF16-dir>" --assistant "<assistant-dir>" --gptq-python "<gptq-python>" --out-dir "<camp>/q4q5-mixed-a" --gemma4-q5-prefill int8-g64 --serve "<absolute-infernix-serve-path>" --yes
 ```
 
-`--gemma4-q5-prefill` applies to the Q5 groups only (narrow decode stays A16 there). `launcher --artifact` without
-`--profile` selects `q5-quality` for any artifact that holds native Q5 weights, this one included; pass
-`--profile default` to keep the general settings. The builder needs a server that knows both `q4_g32_fp16` and
-`q5_g64_fp16`, a second GPTQ pass (about 25 more minutes) and about 102 GB minimum scratch (132 GB comfortable) on the work
-drive. `--score` measures the Q4 cells on their exact W4A8 route and the Q5 cells on A16, so it is not the default-route
-figure above.
+`--gemma4-q5-prefill` applies to the Q5 groups only (narrow decode stays A16 there). The builder needs a server that knows
+both `q4_g32_fp16` and `q5_g64_fp16`, a second GPTQ pass (about 25 more minutes) and about 102 GB minimum scratch (132 GB
+comfortable) on the work drive. `--score` measures the Q4 cells on their exact W4A8 route and the Q5 cells on A16, so it is not
+the default-route figure above.
+
+**Launcher for the finished artifact.** `launcher --artifact <file>` without `--profile` detects native Q5 cells in the
+artifact directory and selects `q5-quality` for this mixed file too. For it that means: Q5 cells INT8 g64 (the measured
+route; the Q4 cells keep their stored AllowA8 policy, since the override applies to Q5 trunk calls only), BF16 rings, FP8
+KV, context `auto` (fitted to the card, which matches the measured 122,432-token MTP d1 capacity rather than a fixed 131,072),
+chunk 2048 (the measured speed protocol), top-k 64, MTP d1, and the model alias `gemma4-q5`, a name only. Nothing in that
+profile is incompatible with the mixed file. The launcher the builder writes with `--serve` uses the `default` profile
+instead (context 131072, chunk auto, `a16` unless `--gemma4-q5-prefill` is given). To get the builder's settings from the
+`launcher` subcommand, pass `--profile default [--gemma4-q5-prefill int8-g64] [--context auto]`; both launchers are valid
+for this artifact and neither changes the weights.
 
 ### Create the smaller IQ3 files from HF BF16
 

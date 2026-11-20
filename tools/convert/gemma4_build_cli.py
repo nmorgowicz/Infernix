@@ -59,9 +59,10 @@ See docs/maintainer/gemma4-benchmarks.md#four-tier-comparison for matched diode 
 
 Recommended: best-small for most people (best quality per byte); best-medium for higher-quality Q4.
 q5-g64 is the explicit higher-quality Q5 tier (plain-model own-Q8 historical hint, not a diode claim).
-q4q5-mixed-a is EXPERIMENTAL: best-medium with Q5 attention-output and down projections in every layer (+0.94 GB);
-its allocation was selected on the plain model and measured once on a diode variant (development windows: roleplay
-KL 0.76x that of best-medium on A16 compute, 0.72x on the plain model); it runs two GPTQ passes.
+q4q5-mixed-a is a supported option, not the default: best-medium with Q5 attention-output and down projections in every
+layer (+0.94 GB, two GPTQ passes, decode about -11 %). On fresh held-out roleplay text (36 forum threads, context-512 block
+KL against each model's own Q8_0, diode build, default route) its KL is 0.74x that of best-medium (interval 0.72-0.76,
+lower in 36 of 36 threads). Not measured: long-context or incremental-decode KL, more than one GPTQ pass, other GPUs.
 iq3-xs and iq3-xxs trade quality for smaller files and collect their own importance matrix; draft is a quick
 test build only. The calibrated-RTN presets and the two-level 6-bit scale format (q4_g32_s6_fp16) are not built here.
 other commands:
@@ -89,7 +90,7 @@ def preset_table() -> str:
         rows.append(
             f"  {preset.id:<12} {METHODS[preset.id]:<28} {preset.size_class:<7} {f'{preset.file_gb:g} GB':<9} "
             f"{preset.kl:<7.4f} {preset.wait:<13} {NEEDS[preset.method]}"
-            + ("; experimental, measured once on diode" if preset.experimental else "")
+            + ("; supported option, not the default; roleplay KL 0.74x best-medium (held-out, diode)" if preset.evidence else "")
         )
     return "\n".join(rows)
 

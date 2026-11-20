@@ -1704,6 +1704,36 @@ def test_launcher_detects_native_q5_trunk_from_directory_not_names_or_receipts(t
     assert plan.context == ("auto" if q5 else 131072)
 
 
+def test_launcher_on_a_mixed_q4_q5_artifact_detects_native_q5_and_keeps_the_explicit_general_profile(tmp_path):
+    from tools.artifact.schema import TensorSpec, plan_objects
+    from tools.artifact.writer import ArtifactWriter
+
+    specs = [TensorSpec("q4-cell", (1, 128), "q4_g32_fp16", "row_split_k128_v1"),
+             TensorSpec("q5-cell", (1, 128), "q5_g64_fp16", "row_split_k128_v1")]
+    bindings = {"text/layers/0/self_attn/qkv": {"object": "q4-cell"}, "text/layers/0/mlp/down": {"object": "q5-cell"}}
+    components = {"text": {"config": {"architectures": ["Gemma4ForCausalLM"], "max_position_embeddings": 262144}},
+                  "mtp": {"config": {}}}
+    artifact = tmp_path / "mixed.ninfer"
+    with ArtifactWriter(artifact, specs, components=components, bindings=bindings, uses=[]) as writer:
+        for obj in plan_objects(specs):
+            writer.write_object(obj.id, bytes(obj.bytes))
+    assert launcher.artifact_info(artifact).q5
+    server = tmp_path / "infernix-serve.exe"
+    server.write_bytes(b"x")
+
+    def generated(*flags):
+        out = tmp_path / f"mixed-{len(flags)}.cmd"
+        assert cli.main(["launcher", "--artifact", str(artifact), "--serve", str(server), "--out", str(out), *flags]) == 0
+        return build.parse_launcher(out)
+
+    detected = generated()
+    assert detected.gemma4_q5_prefill == "int8-g64" and detected.context == "auto" and detected.prefill_chunk == "2048"
+    general = generated("--profile", "default")
+    assert general.gemma4_q5_prefill == "a16" and general.context == 131072
+    chosen = generated("--profile", "default", "--gemma4-q5-prefill", "int8-g64", "--context", "auto")
+    assert chosen.gemma4_q5_prefill == "int8-g64" and chosen.context == "auto"
+
+
 MIXED_RECIPE = ("--q5-gptq-source", "gptq-q5", "--q5-unit", "o", "--q5-unit", "down")
 
 
@@ -1712,9 +1742,9 @@ def mixed_convert(cfg: build.BuildConfig, *, mtp: bool = True) -> list[str]:
     return convert_expected(cfg, "--gptq-source", w(cfg, "gptq"), *q5, mtp=mtp)
 
 
-def test_mixed_preset_is_best_medium_plus_q5_o_and_down_and_marked_experimental():
+def test_mixed_preset_is_best_medium_plus_q5_o_and_down_and_carries_its_evidence():
     mixed, medium = build.PRESETS["q4q5-mixed-a"], build.PRESETS["best-medium"]
-    assert mixed.experimental and not medium.experimental
+    assert mixed.evidence and not medium.evidence
     assert (mixed.method, mixed.bits, mixed.group_size, mixed.native_groups) == ("gptq", 4, 32, False)
     assert mixed.q5_units == ("o", "down") and mixed.formats == ("q4_g32_fp16", "q5_g64_fp16")
     assert medium.formats == ("q4_g32_fp16",)
@@ -1790,20 +1820,22 @@ def test_mixed_preset_needs_a_server_that_knows_both_tensor_formats(env):
     assert ok.level == "ok" and "q4_g32_fp16, q5_g64_fp16" in ok.detail
 
 
-def test_mixed_preset_is_labelled_experimental_in_every_user_facing_text(env):
+def test_mixed_preset_is_a_supported_non_default_option_in_every_user_facing_text(env):
     table = cli.preset_table().splitlines()
     row = next(line for line in table if line.lstrip().startswith("q4q5-mixed-a"))
-    assert "experimental, measured once on diode" in row and "19.34 GB" in row
-    assert not any("experimental" in line for line in table if "q4q5-mixed-a" not in line)
-    assert "measured once on a diode variant" in cli.EPILOG and "EXPERIMENTAL" in cli.EPILOG
+    assert "supported option" in row and "not the default" in row and "0.74x" in row and "19.34 GB" in row
+    assert not any("supported option" in line for line in table if "q4q5-mixed-a" not in line)
+    assert "q4q5-mixed-a is a supported option" in cli.EPILOG and "36 of 36" in cli.EPILOG
     cfg = env.config("q4q5-mixed-a")
     plan = "\n".join(build.describe_plan(cfg, build.build_plan(cfg)))
-    assert "EXPERIMENTAL" in plan and "gptq-q5" in plan
+    assert "supported option" in plan and "gptq-q5" in plan
     plain = env.config("best-medium")
-    assert "EXPERIMENTAL" not in "\n".join(build.describe_plan(plain, build.build_plan(plain)))
+    assert "supported option" not in "\n".join(build.describe_plan(plain, build.build_plan(plain)))
+    assert not any("xperimental" in text for text in (*table, cli.EPILOG, plan, build.PRESETS["q4q5-mixed-a"].summary,
+                                                      build.PRESETS["q4q5-mixed-a"].meaning))
 
 
-def test_mixed_build_runs_both_passes_and_the_summary_says_experimental(env):
+def test_mixed_build_runs_both_passes_and_the_summary_states_the_evidence_and_limits(env):
     cfg = env.config("q4q5-mixed-a")
     builder, runner, _ = make_builder(env, cfg)
     builder.run()
@@ -1811,6 +1843,7 @@ def test_mixed_build_runs_both_passes_and_the_summary_says_experimental(env):
                             "gptq-q5-check", "convert"]
     assert not cfg.work("offload").exists() and not cfg.work("offloadq5").exists()
     summary = (env.out / "BUILD-SUMMARY.md").read_text()
-    assert "EXPERIMENTAL" in summary and "measured once on a diode variant" in summary
+    assert "Supported option, not the default" in summary and "0.740" in summary and "36 of 36" in summary
+    assert "long-context and incremental-decode KL are not measured" in summary and "xperimental" not in summary
     assert "GPTQ5 g64 Q5 (A16Only" in summary and "o, down" in summary and "mean KL 0.0458" in summary
     assert "default route with int8-g64 Q5 prefill" in summary
