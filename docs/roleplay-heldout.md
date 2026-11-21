@@ -7,7 +7,8 @@ full-vocabulary KL of a quantization on prose that was not used to choose or bui
 corpus text is **not** in this repository: it is generated on your machine from the dataset.
 
 It is evaluation only. It is never calibration text, never part of a conversion, and it is not a
-substitute for the calibration-disjoint pinned corpora of [Perplexity](perplexity.md).
+substitute for the calibration-disjoint pinned corpora of [Perplexity](perplexity.md). Roleplay text for importance
+matrices is a separate, thread-disjoint selection by its own tool ([Calibration text](#calibration-text)).
 
 ## Source, licence and attribution
 
@@ -160,10 +161,59 @@ BF16 logits.
      --cluster stream --out <paired.json>
    ```
 
+## Calibration text
+
+`tools/eval/roleplay_calibration` selects roleplay text for importance matrices from the same pinned raw files, with the
+frozen cleaning, minors-risk screen, excerpt cut and hash order of `roleplay_heldout` (it calls its `select_stratum`), and
+writes it to a camp: the text is never committed.
+
+```bash
+python -m tools.eval.roleplay_calibration build --raw <raw> --out <camp>/corpus \
+    --against <text-or-directory> [--against ...] --tokenizer <tokenizer.json>   # prints the counts and both SHA-256 values
+python -m tools.eval.roleplay_calibration check --corpus <camp>/corpus --against <text-or-directory> [--against ...]
+python -m tools.convert.gemma4_q4 calibration-text --tokenizer <tokenizer.json> --source <camp>/corpus/calibration-source.txt \
+    --prefix-ids <ids> --chunks 400 --ctx-size 512 --out <camp>/templated-rp-forum-400x512.txt
+python -m tools.eval.roleplay_calibration mix --first <200-chunk file> --second <200-chunk file> --out <mixed.txt>
+```
+
+Selection (`pins.py`): seed `20261130`; one excerpt per thread; per raw file a quota of threads (72 Elliquiy non-adult, 72
+Elliquiy one-shots, 72 Blue Moon group, 72 Blue Moon fan-based 1x1, 24 RPNation quests, 72 RPNation one-on-one: 384
+excerpts) taken in `sha256(seed + ":" + thread_url)` order after the thread rules, plus a reserve of 12 more survivors per
+file. Threads are excluded by URL from three groups: the 42 development and 32 long-context threads of
+`roleplay_heldout/excluded_threads.json` and the 36 fresh held-out threads (`fresh_heldout_threads.json`). `--against` is
+required: every excerpt that shares a 60-character shingle (lower-cased, whitespace-collapsed) with any text passed is
+dropped and the next survivor in hash order takes its place; `check` repeats the scan and also requires that no two
+excerpts share a shingle and that no thread sits in an exclusion group. `--tokenizer` makes `build` refuse a text with
+fewer tokens than the chunks need.
+
+The published build (lxml 6.1.2, libxml2 2.11.9, pyarrow 25.0.1, checked against the 158 calibration and evaluation texts of the
+Gemma studies: general English calibration, the earlier own-imatrix chunk files, 1M-token perplexity text, the 47-window English
+set, PG-19 and PX streams, the development, fresh and 65k roleplay windows) has 384 excerpts, 1,025,780 characters and
+235,640 Gemma 4 tokens (chunk stride 587 tokens for 400 chunks of 495 body tokens), 1 of 452 candidates dropped by the
+shingle check, 35,413,680 normalized characters scanned and corpus SHA-256
+
+```text
+2232e11f81f74c2f5284f576c8ed553501f5a7b03976dc46dd8d91a6c63506a2
+```
+
+(`pins.PUBLISHED_CORPUS_SHA256`, computed over the excerpt files in order, each followed by one NUL byte). The 384 thread URLs
+are committed in `calibration_threads.json`; a later evaluation draw must exclude them:
+`roleplay_heldout build ... --also-exclude tools/eval/roleplay_calibration/calibration_threads.json`.
+
+`calibration-text` cuts the source into evenly spread chunks that each start with the chat prefix; `mix` joins two such files
+(for example 200 forum chunks and 200 general-English chunks) and restores the BOS that `calibration-text` drops from the
+first chunk of the second file, so every chunk of the joined file still starts at a multiple of the chunk length. Both receipts
+must agree on tokenizer, chunk length and prefix.
+
+Limits: the keyword minors screen and the contamination and coverage caveats of the held-out corpus below apply unchanged; the
+excerpts are the first long run of posts of each thread, from the same three forums and six sections as the evaluation sets,
+so a model calibrated on them and scored on forum text measures in-domain transfer, not chat-format roleplay.
+
 ## Scope and limits
 
 - **Evaluation, not calibration.** Use it to measure arms that were selected and built without it. Selecting or
-  tuning an arm on these windows makes them development text; draw a new seed for the next confirmation.
+  tuning an arm on these windows makes them development text; draw a new seed for the next confirmation. Calibration
+  text comes only from the separate selection above, whose threads no later evaluation draw may contain.
 - **Mature content.** The corpus is human roleplay forum prose from adult and general forums. The keyword screen
   removes threads with minor-related terms; it is a conservative screen, not a guarantee, and no human reviewed
   the excerpts.
@@ -179,4 +229,6 @@ BF16 logits.
 
 `python -m pytest tests/eval` covers the cleaning rules, the minors screen, the deterministic selection (hash
 order, seed, exclusions, one excerpt per thread, removal counts), the corpus hash, the shingle check and the
-download verification on synthetic forum-shaped fixtures; no forum text is used.
+download verification on synthetic forum-shaped fixtures; no forum text is used. The calibration tool's tests cover
+its quotas, the three exclusion groups, the replacement of a thread that shares a shingle with an evaluation text,
+the corpus and source hashes, `check`, the token-length refusal and `mix`.

@@ -20,7 +20,7 @@ run the CLI or HTTP server.
 | [Gemma 4 higher-quality Q5 builder](weight-conversion.md#native-gptq5-group64-explicit-a16a8-permissions) | one-call own-model GPTQ5 g64; Q5-specific recommended INT8 g64 defaults, BF16/FP8 ring choices, explicit overrides and lower-VRAM ladder |
 | [Gemma 4 four-tier comparison](maintainer/gemma4-benchmarks.md#four-tier-comparison) | best-medium/best-small/IQ3_XS/IQ3_XXS measured sizes, matched quality, thinking-enabled serving and limits |
 | [Perplexity](perplexity.md) | fixed-corpus and custom-text causal perplexity, comparison rules, progress, and reports |
-| [Held-out roleplay corpus](roleplay-heldout.md) | rebuild a fresh roleplay-forum evaluation corpus from a pinned public dataset revision (fetch, build, shingle check, published SHA-256) for full-vocabulary KL |
+| [Held-out roleplay corpus](roleplay-heldout.md) | rebuild a fresh roleplay-forum evaluation corpus from a pinned public dataset revision (fetch, build, shingle check, published SHA-256) for full-vocabulary KL; the thread-disjoint [calibration text](roleplay-heldout.md#calibration-text) selected from the same files for importance matrices |
 | [CLI examples](../examples/cli/) | committed text, multimodal, thinking, long-decode, and long-context inputs |
 
 The executable `--help` output is the exact source for command-line option spelling and defaults.

@@ -75,6 +75,13 @@ def load_exclusions(extra: list[str] | None = None) -> dict[str, list[str]]:
     return groups
 
 
+def read_urls(path: Path) -> list[str]:
+    """Thread URLs of a text file (one per line) or of a ``calibration_threads.json`` (key ``thread_urls``)."""
+    if path.suffix == ".json":
+        return list(json.loads(path.read_text(encoding="utf-8"))["thread_urls"])
+    return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
 def verify_sources(raw: Path, sources) -> list[dict]:
     """Check presence, size and SHA-256 of every pinned raw file; returns their records."""
     records = []

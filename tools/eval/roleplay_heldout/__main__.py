@@ -8,7 +8,7 @@ from pathlib import Path
 
 from . import pins
 from .check import check
-from .corpus import build, describe, load_exclusions
+from .corpus import build, describe, load_exclusions, read_urls
 from .fetch import fetch
 
 
@@ -26,7 +26,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--seed", default=pins.SEED, help=f"selection seed (default {pins.SEED}; any other value is a different corpus)")
     p.add_argument("--per-stratum", type=int, default=pins.PER_STRATUM,
                    help=f"threads per file (default {pins.PER_STRATUM}; any other value is a different corpus)")
-    p.add_argument("--also-exclude", type=Path, help="text file of further thread URLs to exclude, one per line")
+    p.add_argument("--also-exclude", type=Path,
+                   help="further thread URLs to exclude: a text file, one per line, or a calibration_threads.json")
     p.add_argument("--no-default-exclusions", action="store_true",
                    help="do not apply the committed exclusion list of earlier evaluation sets")
 
@@ -47,8 +48,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             exclusions = load_exclusions()
         if args.also_exclude:
-            urls = [line.strip() for line in args.also_exclude.read_text(encoding="utf-8").splitlines() if line.strip()]
-            exclusions["extra"] = sorted(set(urls))
+            exclusions["extra"] = sorted(set(read_urls(args.also_exclude)))
         provenance = build(args.raw, args.out, seed=args.seed, per_stratum=args.per_stratum, exclusions=exclusions)
         print(describe(provenance))
         return 0
