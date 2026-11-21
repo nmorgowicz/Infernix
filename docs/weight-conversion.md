@@ -675,8 +675,8 @@ Its quality/performance require separate measurements; the A16 artifact retains 
 
 The converter requires a clean tracked checkout for its revision receipt. Replace `--no-mtp` with
 `--mtp-assistant "<assistant-BF16-dir>"` to include the separate assistant: its layer projections
-default to FP8, its outer projections stay BF16, and its head stays FP8 as before. GPTQ supplies
-**only target text projections**; the tied vocabulary is still FP8-row from `--model`, and norms,
+default to FP8, its outer projections stay BF16, and its head is FP8 unless `--mtp-head` says otherwise. GPTQ supplies
+**only target text projections**; the tied vocabulary is FP8-row from `--model` unless `--vocab-weights` says otherwise, and norms,
 frontend resources and optional components retain their existing explicit HF/BF16-source policy.
 
 The [pinned compressor](https://github.com/vllm-project/compressed-tensors/blob/0.18.0/src/compressed_tensors/compressors/pack_quantized/helpers.py)
@@ -955,7 +955,7 @@ python -m tools.convert.gemma4_build serve-check --launcher "<camp>/serve-model-
 
 For no MTP replace `--mtp-assistant "<assistant-dir>"` with `--no-mtp`. Every text-layer projection is
 copied **as GGUF blocks, not dequantized and requantized**. The GGUF vocabulary is **not** imported:
-the tied embedding/output vocabulary is encoded from HF BF16 into FP8-row storage. Norms, scalars,
+the tied embedding/output vocabulary is encoded from HF BF16 into FP8-row storage (or native Q4 with `--vocab-weights`). Norms, scalars,
 tokenizer/template and optional components likewise use their explicit HF sources. A published GGUF of a
 different base or a pre-edit variant is not an equivalent source. Projection blocks are stored in
 `ggml_rows_v1` in the GGUF's own format (IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, Q2_0, Q4_K, Q5_K or Q6_K) and run
@@ -982,6 +982,27 @@ attention output through a permutation of 64-element blocks. A 256-element block
 only exact way to keep those tensors. `--gguf-source` excludes `--gptq-source`, scale searches, imatrix,
 group sizes and `--native-groups`: the GGUF decides every projection's stored blocks. Code:
 `tools/convert/gemma4_gguf.py`; native test `infernix_gemma4_gguf_projection_test`.
+
+### Vocabulary and MTP-assistant storage
+
+The tied vocabulary table (the token-embedding gather and the output head are one stored object of
+262,144 x 5,376 rows) is FP8-row by default: 1,409,810,432 bytes. `--vocab-weights q4_g256|q4_g128|q4_g32`
+stores that same object, from the BF16 source, in the real native `q4_g256_fp16` / `q4_g128_fp16` /
+`q4_g32_fp16` format: 715,653,120 / 726,663,168 / 792,723,456 bytes, which is 694.2 / 683.1 / 617.1 MB smaller.
+`--vocab-scale-search absmax` (default) takes each group's absolute maximum; `mse` runs the exact unweighted
+squared-error search per group. The runtime gather multiplies the unscaled rows by the BF16 `sqrt(hidden)` as for
+FP8, and the head runs on 16-bit activations. The option applies to every Q4/Q5 `--weights` value and to
+`--gguf-source` imports (the GGUF's own vocabulary is never used) and is refused for `--weights fp8_row`. The
+receipt's `vocabulary` record gives the stored format, scale search and bytes, and the recipe name carries
+`q4_g256_vocab` (`q4_g256_mse_vocab`) in place of `fp8_vocab`. The format changes the target's logits and gathered
+embeddings, so its quality effect has to be measured; `--dry-run` prints the byte arithmetic without writing.
+
+The MTP assistant's storage has two independent choices, both on 16-bit activations. `--mtp-weights`
+(layer projections query, output, gate, up, down): `fp8` (default), `bf16`, `q4` (q4_g32) or `q4_g256` (native). `--mtp-head`
+(its own 262,144 x 1,024 vocabulary head): `fp8` (default, 268,959,744 bytes), `q4_g32` (150,994,944) or `q4_g256` (136,314,880).
+Its two outer projections and norms stay BF16 (33,067,536 bytes). From the tensor shapes the assistant is 486,806,032 bytes
+at the defaults, 287,871,504 with `--mtp-weights q4 --mtp-head q4_g32` and 263,098,896 with `--mtp-weights q4_g256
+--mtp-head q4_g256`. Only the draft's proposals depend on these choices; the target's output does not.
 
 ## Write a conversion method
 

@@ -1,7 +1,8 @@
 """Convert Gemma 4 31B BF16 into a Q4/Q5/FP8 artifact, verify it, and render calibration text.
 
 `python -m tools.convert.gemma4_q4 <command>`; run it from this checkout. `convert` uses the converter's
-Q4 group-32 kernels with an FP8 vocabulary, not QAT recovery or NVFP4 calibration. The MTP assistant
+Q4 group-32 kernels with an FP8 vocabulary by default (`--vocab-weights` stores the tied table in real native Q4),
+not QAT recovery or NVFP4 calibration. The MTP assistant
 (google/gemma-4-31B-it-assistant) is embedded as the `mtp` component unless --no-mtp is given. The chat
 template is embedded at conversion time (`--resource chat_template.jinja=PATH`; default
 tools/chat_templates/gemma4_fixed.jinja). Source files are read-only. Conversion receipts attest storage
@@ -19,10 +20,13 @@ import sys
 
 from .gemma4_q4 import (
     ASSISTANT_HINT,
+    MTP_HEADS,
     MTP_WEIGHTS,
     ASSISTANT_REPO,
     Q4_REGIONS,
     Q4_WEIGHTS,
+    VOCAB_SCALE_SEARCHES,
+    VOCAB_WEIGHTS,
     SCALE_SEARCHES,
     Q4Options,
     build_recipe,
@@ -84,6 +88,9 @@ def options_from(args: argparse.Namespace) -> Q4Options:
         native_groups=args.native_groups,
         imatrix=args.imatrix,
         mtp_weights=args.mtp_weights,
+        mtp_head=args.mtp_head,
+        vocab_weights=args.vocab_weights,
+        vocab_scale_search=args.vocab_scale_search,
         gptq_source=args.gptq_source,
         gguf_source=args.gguf_source,
         q5_gptq_source=args.q5_gptq_source,
@@ -122,8 +129,8 @@ def check_convert_arguments(args: argparse.Namespace) -> tuple[Q4Options, Path]:
         raise ValueError("Output must be outside the source checkpoint")
     if args.no_mtp == (args.mtp_assistant is not None):
         raise ValueError(f"Pass --mtp-assistant <dir> ({ASSISTANT_HINT}) or explicitly --no-mtp")
-    if args.no_mtp and args.mtp_weights is not None:
-        raise ValueError("--mtp-weights needs the MTP assistant; it cannot be combined with --no-mtp")
+    if args.no_mtp and (args.mtp_weights is not None or args.mtp_head != "fp8"):
+        raise ValueError("--mtp-weights/--mtp-head need the MTP assistant; they cannot be combined with --no-mtp")
     options = options_from(args)
     resource_overrides(args)
     if args.mtp_assistant is not None:
@@ -177,6 +184,7 @@ def convert_model(args: argparse.Namespace) -> None:
                     "weight_bytes": built.payload,
                     "weight_gib": built.payload / 2**30,
                     "q4_groups": built.q4_groups,
+                    "vocabulary": built.vocabulary,
                     "global_head_dim": model.config["global_head_dim"],
                     "num_global_key_value_heads": model.config["num_global_key_value_heads"],
                 },
@@ -208,6 +216,7 @@ def convert_model(args: argparse.Namespace) -> None:
             "recipe": built.name,
             "q4_groups": built.q4_groups,
             "scale_search": built.scale_search,
+            "vocabulary": built.vocabulary,
             "mtp": (
                 {
                     "source": str(args.mtp_assistant.resolve()),
@@ -217,7 +226,7 @@ def convert_model(args: argparse.Namespace) -> None:
                             set(assistant.weight_map.values()) | {args.mtp_assistant / "config.json"}
                         )
                     },
-                    "recipe": "gemma4_31b_fp8 base; layer projections per --mtp-weights",
+                    "recipe": "gemma4_31b_fp8 base; layer projections per --mtp-weights, head per --mtp-head",
                 }
                 if assistant
                 else "omitted (--no-mtp)"
@@ -355,9 +364,35 @@ def build_parser() -> argparse.ArgumentParser:
         choices=MTP_WEIGHTS,
         default=None,
         help="Storage of the MTP assistant's layer projections (query, output, gate, up, down): fp8 (FP8 per-row; "
-        "the default for Q4/Q5 weights), bf16 (the old layout, 184 MB larger) or q4 (q4_g32; 81 MB smaller than "
-        "fp8 but about 1 point lower draft acceptance). They run on 16-bit activations; the assistant's FP8 head and "
-        "outer projections are unchanged. Draft quality, not target output, is at risk",
+        "the default for Q4/Q5 weights), bf16 (the old layout, 184 MB larger), q4 (q4_g32; 81 MB smaller than "
+        "fp8 but about 1 point lower draft acceptance) or q4_g256 (native q4_g256_fp16, 91 MB smaller than fp8). "
+        "They run on 16-bit activations; the assistant's outer projections are unchanged and its head follows "
+        "--mtp-head. Draft quality, not target output, is at risk",
+    )
+    build.add_argument(
+        "--mtp-head",
+        choices=MTP_HEADS,
+        default="fp8",
+        help="Storage of the MTP assistant's own 262,144 x 1,024 vocabulary head: fp8 (FP8 per-row; the default), "
+        "q4_g32 (118 MB smaller) or q4_g256 (native q4_g256_fp16, 133 MB smaller). Needs the assistant and Q4/Q5 weights. "
+        "Draft quality, not target output, is at risk",
+    )
+    build.add_argument(
+        "--vocab-weights",
+        choices=VOCAB_WEIGHTS,
+        default="fp8",
+        help="Storage of the tied vocabulary table (token embedding and output head, one stored object, 262,144 x "
+        "5,376): fp8 (FP8 per-row, 1,409,810,432 bytes; the default), or the real native "
+        "q4_g256_fp16 / q4_g128_fp16 / q4_g32_fp16 (715,653,120 / 726,663,168 / 792,723,456 bytes: 694 / 683 / 617 MB "
+        "smaller). The output head runs on 16-bit activations. Changes the target's logits and gathered embeddings: "
+        "measure it",
+    )
+    build.add_argument(
+        "--vocab-scale-search",
+        choices=VOCAB_SCALE_SEARCHES,
+        default="absmax",
+        help="Scale choice of a q4 --vocab-weights table: absmax (default) or mse (exact unweighted squared-error "
+        "search per group)",
     )
     build.add_argument(
         "--gptq-source",

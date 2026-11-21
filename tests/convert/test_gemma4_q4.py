@@ -9,6 +9,10 @@ import numpy as np
 import pytest
 import torch
 
+from tools.artifact.codecs.row_split import dequantize_row_split
+from tools.artifact.reader import Artifact
+from tools.artifact.tensor_output import TensorOutput
+from tools.artifact.writer import ArtifactWriter
 from tools.convert import gemma4_q4
 from tools.convert.gemma4 import prope_perm
 from tools.convert.gemma4_q4 import (
@@ -340,6 +344,66 @@ def test_vocabulary_and_non_projections_stay_on_the_fp8_base():
     assert selection(built, "text/layers/0/norm").format == "bf16"
 
 
+@pytest.mark.parametrize(("weights", "group"), [("q4_g256", 256), ("q4_g128", 128), ("q4_g32", 32)])
+def test_q4_vocabulary_is_one_native_object_shared_by_the_gather_and_the_head(tmp_path, weights, group):
+    errors = {}
+    for search in ("absmax", "mse"):
+        model, _, built = build(Q4Options(weights="q4_g32_a16", vocab_weights=weights, vocab_scale_search=search))
+        rows, width = model.parameters["text/output_head"].shape
+        assert selection(built, "text/output_head").format == f"q4_g{group}_fp16"
+        assert selection(built, "text/token_embedding").format == f"q4_g{group}_fp16"
+        # One stored object: 4-bit codes plus one binary16 scale per group and row.
+        assert built.vocabulary["stored_format"] == f"q4_g{group}_fp16"
+        assert built.vocabulary["bytes"] == rows * width // 2 + rows * (width // group) * 2
+        prepared = built.recipe.prepare(device="cpu", rows_per_chunk=3)
+        (job,) = [job for job in prepared.weights if "text/output_head" in job.parameters]
+        assert prepared.bindings["text/token_embedding"] == prepared.bindings["text/output_head"]
+        path = tmp_path / f"{search}.ninfer"
+        with ArtifactWriter(
+            path, [job.spec for job in prepared.weights], components=model.components,
+            bindings=prepared.bindings, uses=prepared.uses,
+        ) as writer:
+            for each in prepared.weights:
+                each.prepared.produce(TensorOutput(writer, each.spec.id))
+        with Artifact(path) as artifact:
+            payload = artifact.read_object(job.spec.id)
+        decoded = dequantize_row_split(payload, job.spec.format, job.spec.shape, dtype=torch.float32)
+        source = model.parameters["text/output_head"].source.values(0, rows * width).reshape(rows, width).float()
+        groups = source.reshape(rows, width // group, group)
+        error = decoded.reshape(rows, width // group, group) - groups
+        if search == "absmax":
+            # 16 levels across the group's absolute maximum: no element is further than a quarter of it from its code.
+            assert (error.abs() <= groups.abs().amax(-1, keepdim=True) / 4 + 1e-6).all()
+        errors[search] = float((error**2).sum())
+    assert 0 < errors["mse"] <= errors["absmax"]
+
+
+def test_q4_vocabulary_changes_only_the_table_and_the_recipe_name():
+    model, _, plain = build(Q4Options(weights="q4_g32_a16"))
+    _, _, q4 = build(Q4Options(weights="q4_g32_a16", vocab_weights="q4_g256", vocab_scale_search="mse"))
+    assert plain.name == "q4_g32_absmax_fp8_vocab_a16"
+    assert q4.name == "q4_g32_absmax_q4_g256_mse_vocab_a16"
+    assert plain.vocabulary["stored_format"] == "fp8_e4m3fn_row_bf16"
+    for name in projections(model):
+        a, b = selection(plain, name), selection(q4, name)
+        assert (a.format, a.method, a.parameters) == (b.format, b.method, b.parameters)
+    rows, width = model.parameters["text/output_head"].shape
+    assert plain.vocabulary["bytes"] - q4.vocabulary["bytes"] == rows * width // 2 + rows * 2 - rows * (width // 256) * 2
+    assert q4.payload < plain.payload
+
+
+def test_vocabulary_options_are_checked_and_default_to_fp8():
+    assert Q4Options().vocab_weights == "fp8" and Q4Options().vocab_scale_search == "absmax"
+    with pytest.raises(ValueError, match="--vocab-weights"):
+        Q4Options(vocab_weights="q4_g64")
+    with pytest.raises(ValueError, match="--vocab-scale-search must be"):
+        Q4Options(vocab_weights="q4_g256", vocab_scale_search="weighted")
+    with pytest.raises(ValueError, match="applies only with a q4"):
+        Q4Options(vocab_scale_search="mse")
+    with pytest.raises(ValueError, match="fp8_row reference"):
+        Q4Options(weights="fp8_row", vocab_weights="q4_g256")
+
+
 def test_native_groups_store_the_real_coarse_format_and_project_the_real_size():
     options = Q4Options(
         weights="q4_g32_a16", group_size=256, region_groups=("mlp_down=128", "attn_out=32"), native_groups=True
@@ -538,6 +602,39 @@ def test_fp8_is_the_default_when_the_assistant_is_present_and_nothing_changes_wi
     # The reference recipe never touches the assistant by default.
     model, reference = mtp_model()[0], build_recipe(mtp_model()[0], None, Q4Options(weights="fp8_row"), device="cpu", rows_per_chunk=512)
     assert "_mtp_" not in reference.name and selection(reference, layer).format == "bf16"
+
+
+@pytest.mark.parametrize(
+    ("weights", "head", "stored"), [("q4", "q4_g32", "q4_g32_fp16"), ("q4_g256", "q4_g256", "q4_g256_fp16")]
+)
+def test_mtp_head_and_layers_are_stored_in_the_chosen_q4_format(weights, head, stored):
+    model, built = mtp_build(mtp_weights=weights, mtp_head=head)
+    layers = [name for name in model.parameters if name.startswith("mtp/layers/0/") and model.parameters[name].projection]
+    assert {selection(built, name).format for name in layers} == {stored}
+    assert selection(built, "mtp/output_head").format == stored
+    # The target's vocabulary, the assistant's outer projection and its norms are untouched.
+    assert selection(built, "text/output_head").format == "fp8_e4m3fn_row_bf16"
+    assert selection(built, "mtp/input_projection").format == "bf16"
+    assert built.name == f"q4_g32_absmax_fp8_vocab_a8_mtp_{weights}_mtp_head_{head}"
+    assert not any(name.startswith("mtp/") for name in allow_a8(built))
+    _, fp8 = mtp_build()
+    assert built.payload < fp8.payload
+
+
+def test_mtp_head_alone_leaves_the_layers_on_the_default():
+    model, built = mtp_build(mtp_head="q4_g32")
+    assert selection(built, "mtp/output_head").format == "q4_g32_fp16"
+    assert selection(built, "mtp/layers/0/mlp/gate").format == "fp8_e4m3fn_row_bf16"
+    assert built.name.endswith("_mtp_fp8_mtp_head_q4_g32")
+
+
+def test_mtp_head_needs_the_assistant_and_a_quantized_recipe():
+    with pytest.raises(ValueError, match="--mtp-head needs the mtp component"):
+        build(Q4Options(weights="q4_g32", mtp_head="q4_g32"))
+    with pytest.raises(ValueError, match="applies only to the q4_g32"):
+        Q4Options(weights="fp8_row", mtp_head="q4_g32")
+    with pytest.raises(ValueError, match="--mtp-head must be"):
+        Q4Options(mtp_head="q4_g128")
 
 
 def test_mtp_weights_need_the_assistant_and_a_q4_recipe():

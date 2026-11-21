@@ -83,10 +83,32 @@ def test_mtp_assistant_and_no_mtp_are_mutually_exclusive_and_one_is_required(tmp
     assert code == 1 and "MTP assistant not found" in err
 
 
-@pytest.mark.parametrize("mode", ["fp8", "q4"])
-def test_mtp_weights_cannot_be_combined_with_no_mtp(tmp_path, capsys, clean_checkout, mode):
-    code, err = run(convert_args(tmp_path, "--mtp-weights", mode), capsys)
-    assert code == 1 and "needs the MTP assistant" in err
+@pytest.mark.parametrize("extra", [["--mtp-weights", "fp8"], ["--mtp-weights", "q4"], ["--mtp-head", "q4_g256"]])
+def test_mtp_storage_flags_cannot_be_combined_with_no_mtp(tmp_path, capsys, clean_checkout, extra):
+    code, err = run(convert_args(tmp_path, *extra), capsys)
+    assert code == 1 and "need the MTP assistant" in err
+    assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize(
+    "extra,message",
+    [
+        (["--vocab-scale-search", "mse"], "--vocab-scale-search applies only with a q4 --vocab-weights"),
+        (["--weights", "fp8_row", "--vocab-weights", "q4_g256"], "does not apply to the fp8_row reference"),
+    ],
+)
+def test_vocabulary_mistakes_are_refused_before_any_checkpoint_is_opened(
+    tmp_path, capsys, clean_checkout, extra, message
+):
+    code, err = run(convert_args(tmp_path, *extra), capsys)
+    assert code == 1 and message in err
+    assert not (tmp_path / "out").exists()
+
+
+def test_a_vocabulary_group_without_a_kernel_is_not_a_choice(tmp_path, capsys):
+    with pytest.raises(SystemExit):
+        cli.main(convert_args(tmp_path, "--vocab-weights", "q4_g64"))
+    assert "invalid choice" in capsys.readouterr().err
     assert not (tmp_path / "out").exists()
 
 

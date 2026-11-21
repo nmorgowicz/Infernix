@@ -25,7 +25,12 @@ Q4_REGIONS = (
 )
 Q4_WEIGHTS = ("q4_g32", "q4_g32_a16", "q5_g64", "q5_g64_a16", "fp8_row")
 SCALE_SEARCHES = ("absmax", "mse", "weighted")
-MTP_WEIGHTS = ("bf16", "fp8", "q4")
+MTP_WEIGHTS = ("bf16", "fp8", "q4", "q4_g256")
+MTP_HEADS = ("fp8", "q4_g32", "q4_g256")
+# The tied vocabulary table (embedding gather and output head are one stored object). q4_gN stores the real native
+# q4_g32/g128/g256_fp16 format; the stored table is the unscaled one, the runtime gather multiplies by sqrt(hidden).
+VOCAB_WEIGHTS = ("fp8", "q4_g256", "q4_g128", "q4_g32")
+VOCAB_SCALE_SEARCHES = ("absmax", "mse")
 # Allocation units of a mixed Q4/Q5 build: a fused projection group per layer. q,k,v and gate,up are stored as one
 # matrix, so their members share a format; the roles below name the groups (each tuple lists the member parameters).
 Q5_UNIT_ROLES = {
@@ -53,6 +58,28 @@ def sha256_file(path: Path) -> str:
         while chunk := stream.read(8 * 1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def q4_table_assignment(weights: str, scale_search: str = "absmax") -> dict:
+    """`Recipe.assign` keywords that store a matrix in the real native `q4_g<G>_fp16` format (G from `weights`, one of
+    `q4_g32`/`q4_g128`/`q4_g256`): per-group absmax, or the unweighted squared-error scale search with `mse`."""
+    group = int(weights.rpartition("_g")[2])
+    target = f"q4_g{group}_fp16"
+    if scale_search == "mse":
+        return {
+            "format": target,
+            "layout": "auto",
+            "method": "grouped_mse_search",
+            "parameters": {"group_size": group, "weighted": False},
+        }
+    if group == 32:
+        return {"format": target, "layout": "auto", "method": "grouped_absmax"}
+    return {
+        "format": target,
+        "layout": "auto",
+        "method": "grouped_absmax_emulated",
+        "parameters": {"group_size": group},
+    }
 
 
 def parse_region_groups(items: list[str]) -> list[tuple[str, int]]:
@@ -277,6 +304,9 @@ class Q4Options:
     native_groups: bool = False
     imatrix: Path | None = None
     mtp_weights: str | None = None
+    mtp_head: str = "fp8"
+    vocab_weights: str = "fp8"
+    vocab_scale_search: str = "absmax"
     gptq_source: Path | None = None
     gguf_source: Path | None = None
     q5_gptq_source: Path | None = None
@@ -307,7 +337,21 @@ class Q4Options:
         if self.mtp_weights is not None and self.mtp_weights not in MTP_WEIGHTS:
             raise ValueError(f"--mtp-weights must be one of {MTP_WEIGHTS}, got {self.mtp_weights!r}")
         if self.mtp_weights not in (None, "bf16") and not self.quantized:
-            raise ValueError("--mtp-weights fp8|q4 applies only to the q4_g32 and q4_g32_a16 weights")
+            raise ValueError("--mtp-weights fp8|q4|q4_g256 applies only to the q4_g32 and q4_g32_a16 weights")
+        if self.mtp_head not in MTP_HEADS:
+            raise ValueError(f"--mtp-head must be one of {MTP_HEADS}, got {self.mtp_head!r}")
+        if self.mtp_head != "fp8" and not self.quantized:
+            raise ValueError("--mtp-head q4_g32|q4_g256 applies only to the q4_g32 and q4_g32_a16 weights")
+        if self.vocab_weights not in VOCAB_WEIGHTS:
+            raise ValueError(f"--vocab-weights must be one of {VOCAB_WEIGHTS}, got {self.vocab_weights!r}")
+        if self.vocab_scale_search not in VOCAB_SCALE_SEARCHES:
+            raise ValueError(
+                f"--vocab-scale-search must be one of {VOCAB_SCALE_SEARCHES}, got {self.vocab_scale_search!r}"
+            )
+        if self.vocab_weights == "fp8" and self.vocab_scale_search != "absmax":
+            raise ValueError("--vocab-scale-search applies only with a q4 --vocab-weights")
+        if self.vocab_weights != "fp8" and self.weights == "fp8_row":
+            raise ValueError("--vocab-weights q4_* does not apply to the fp8_row reference, which keeps the FP8 vocabulary")
         if self.gptq_source is not None:
             if not self.quantized:
                 raise ValueError("--gptq-source applies only to q4_g32, q4_g32_a16, q5_g64 and q5_g64_a16")
@@ -374,6 +418,7 @@ class Q4Build:
     scale_search: dict | None
     q4_groups: dict | None
     payload: int
+    vocabulary: dict
 
 
 def build_recipe(model, source, options: Q4Options, *, device: str, rows_per_chunk: int) -> Q4Build:
@@ -394,6 +439,10 @@ def build_recipe(model, source, options: Q4Options, *, device: str, rows_per_chu
 
     recipe = Recipe(model)
     gemma4_31b_fp8(model, recipe, {"base": source})
+    if options.vocab_weights != "fp8":
+        # The embedding and the head stay one shared stored object (the unscaled table; the gather applies sqrt(hidden)).
+        recipe.assign("text/output_head", **q4_table_assignment(options.vocab_weights, options.vocab_scale_search))
+        recipe.share("text/token_embedding", "text/output_head")
     regions = options.regions
     layer_types = model.config["layer_types"]
     scale_search = {"method": options.scale_search}
@@ -557,17 +606,21 @@ def build_recipe(model, source, options: Q4Options, *, device: str, rows_per_chu
     if "mtp" not in model.components:
         if options.mtp_weights is not None:
             raise ValueError("--mtp-weights needs the mtp component; pass --mtp-assistant")
+        if options.mtp_head != "fp8":
+            raise ValueError("--mtp-head needs the mtp component; pass --mtp-assistant")
         mtp_weights = "bf16"
     if mtp_weights != "bf16":
         # The assistant's layer projections are BF16 in the FP8 base. They keep A16Only (the assistant has no
-        # A8 permission); the outer projections and the FP8 head are left alone.
+        # A8 permission); the outer projections are left alone and the head follows --mtp-head.
         for name, parameter in model.parameters.items():
             if not name.startswith("mtp/layers/") or not parameter.projection:
                 continue
             if mtp_weights == "fp8":
                 recipe.assign(name, format=FP8, method=fp8_row_maxabs)
             else:
-                recipe.assign(name, format="q4_g32_fp16", layout="auto", method="grouped_absmax")
+                recipe.assign(name, **q4_table_assignment("q4_g32" if mtp_weights == "q4" else mtp_weights))
+    if options.mtp_head != "fp8":
+        recipe.assign("mtp/output_head", **q4_table_assignment(options.mtp_head))
     if options.weights == "q4_g32":
         gemma4_q4_a8(model, recipe, {"base": source})
     name = {
@@ -588,10 +641,23 @@ def build_recipe(model, source, options: Q4Options, *, device: str, rows_per_chu
         name += "_q5mix"
     if options.scale_search != "absmax":
         name = name.replace("absmax", options.scale_search + "_search")
+    if options.vocab_weights != "fp8":
+        mark = options.vocab_weights + ("_mse" if options.vocab_scale_search == "mse" else "")
+        name = name.replace("fp8_vocab", mark + "_vocab")
     if mtp_weights != "bf16":
         name += "_mtp_" + mtp_weights
+    if options.mtp_head != "fp8":
+        name += "_mtp_head_" + options.mtp_head
     prepared = recipe.prepare(device=device, rows_per_chunk=rows_per_chunk)
     payload = sum(encoded_size(job.spec.layout, job.spec.format, job.spec.shape) for job in prepared.weights)
+    vocabulary_job = next(job for job in prepared.weights if "text/output_head" in job.parameters)
+    vocabulary = {
+        "stored_format": vocabulary_job.spec.format,
+        "shape": list(vocabulary_job.spec.shape),
+        "scale_search": options.vocab_scale_search if options.vocab_weights != "fp8" else "fp8_row_maxabs",
+        "bytes": encoded_size(vocabulary_job.spec.layout, vocabulary_job.spec.format, vocabulary_job.spec.shape),
+        "note": "one stored object serves the embedding gather and the output head",
+    }
     # Emulated groups keep g32 storage; a real coarse format would drop (G-32)/G of the scale bytes.
     saved = 0.0
     for job in prepared.weights:
@@ -622,6 +688,7 @@ def build_recipe(model, source, options: Q4Options, *, device: str, rows_per_chu
         scale_search=scale_search if groups or options.gguf_source is not None else None,
         q4_groups=q4_groups if groups else None,
         payload=payload,
+        vocabulary=vocabulary,
     )
 
 
