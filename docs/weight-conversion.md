@@ -701,6 +701,16 @@ baseline rerun with `--bits 4 --group-size 32`, the **same** text tree/calibrati
 separate fresh output/offload directories; import with `--weights q4_g32_a16` for A16 or the
 unchanged `--weights q4_g32` for its separate W4A8 performance arm.
 
+**A16 prefill of a native Q4 artifact is not a fast path.** An A16Only `q4_g32_fp16` / `q4_g128_fp16` / `q4_g256_fp16`
+projection (`--weights q4_g32_a16`) takes the `Wide` route from 17 tokens (`src/ops/linear/q4/q4_g32_route.h`), a SIMT kernel
+launched once per 8-token tile (`q4_g32_wide.cu`), so every 8 prompt tokens stream and decode the whole weight matrix again.
+Measured on an RTX 5090 (build `windows-2026.11.07-203-g132c9dcf`, plain-model g32 artifacts, `infernix-serve`, chunk 2048, FP8 KV):
+109-112 prompt tok/s at 1k, 2k and 4k tokens against 6,665-7,271 for the same weights stored `AllowA8` (fused/baked FP8 GEMM);
+a 65,536-token scoring window of the A16 artifact had not finished after 1,200 s (the A8 artifact took 91 s, a Q5 A16 artifact
+145 s), and none finished within 300 s at chunk 128, 512 or 1,024 or with FP8 QK. Use A16 Q4 artifacts only for short windows
+(chunk-128 KL anchors), never for long-context scoring or serving. The GGUF-block A16Only route is a different kernel (dense BF16
+plus cuBLAS) and is not affected.
+
 #### Mixed Q4 / Q5 artifacts (per fused projection group and layer)
 
 One artifact may hold native `q4_g32_fp16` and `q5_g64_fp16` projections side by side. The unit is a fused
