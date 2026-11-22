@@ -7,6 +7,7 @@ run the CLI or HTTP server.
 
 | Document | Purpose |
 |---|---|
+| [Gemma 4 selection and BF16 build guide](gemma4-selection-guide.md) | card-class decision matrix, supported presets versus research candidates, conversion prerequisites, runtime tradeoffs and evidence limits |
 | [Launcher](launcher.md) | the web interface and model-switching endpoint: downloads, model folders, model configurations, dashboard, chat, usage, updates, connecting coding tools |
 | [CLI](cli.md) | text, chat-history, image/video input, output streams, sampling, MTP, and common runtime options |
 | [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, authentication, and tool calls |
