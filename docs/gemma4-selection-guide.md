@@ -49,7 +49,7 @@ For `best-small` change the preset and both directories. For `q5-g64` likewise; 
 python -m tools.convert.gemma4_build launcher --artifact "<mixed-A.ninfer>" --serve "<serve>" --out "<camp>/serve-mixed-auto.cmd" --context auto
 ```
 
-Native Q5 detection selects `q5-quality` for this launcher, not a new weight conversion. Q4 cells retain stored A8; Q5 narrow decode stays A16. Explicit `--context` wins; explicit `--profile default` retains its historical fixed131072 unless context is overridden. An implicit mixed-A builder-auto correction is tracked separately from actual GPU `serve-check`: CPU launcher regression coverage alone is not runtime qualification, and no new GPU serve-check was performed for this guide.
+Native Q5 detection selects `q5-quality` for this launcher, not a new weight conversion. Q4 cells retain stored A8; Q5 narrow decode stays A16. Explicit `--context` wins; explicit `--profile default` retains its historical fixed131072 unless context is overridden. Since `13356265`, mixed-A builds use auto context when **both profile and context are omitted**; other profiles and explicit settings retain their contracts. The implementation's CPU builder regression suite passed227/227; actual GPU `serve-check` remains pending. CPU launcher coverage is not runtime or capacity qualification.
 
 IQ3 also needs GPU-enabled `llama-imatrix`, `llama-quantize`, their binary directory and llama.cpp source containing `convert_hf_to_gguf.py`; converter Python additionally needs gguf/transformers/sentencepiece/tokenizers, and pyarrow for default corpus export. It does **not** use GPTQ:
 
