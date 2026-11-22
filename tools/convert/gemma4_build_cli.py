@@ -80,7 +80,8 @@ prefix cache of 8192 MiB, listening on 0.0.0.0:8001. The server accepts any API 
 default) it also accepts any model name; with exact, OpenAI-style requests must use the --alias model name.
 For Q5 builds/native-Q5 artifacts, omitted --profile selects q5-quality instead: int8-g64 prefill,
 BF16 rings, auto context, chunk 2048, top-k 64, alias gemma4-q5. Explicit --profile default keeps
-the general settings above. See docs/weight-conversion.md for the lower-VRAM option ladder.
+the general settings above. Mixed-A builds also default to auto context when neither --profile nor --context
+is supplied; all other general settings remain unchanged. See docs/weight-conversion.md for the lower-VRAM option ladder.
 """
 
 
@@ -117,7 +118,7 @@ def add_serve_arguments(parser: argparse.ArgumentParser, *, prefix: str) -> None
         "prefill, auto context, chunk 2048, top-k 64 and no key-only KV: q5-quality has BF16 rings; "
         "q5-long-context has FP8 rings. memory-16gb: IQ3_XXS, key-only FP8 globals/ring, chunk 128")
     add("--context", type=context_value,
-        help=f"{prefix} --max-context: positive tokens or auto (general default 131072; Q5/memory-16gb: auto)")
+        help=f"{prefix} --max-context: positive tokens or auto (general default 131072; implicit mixed-A/Q5/memory-16gb: auto)")
     add("--alias", help=f"{prefix} --model-id, the name /v1/models reports and requests must use unless "
         "--model-match any (general default <context/1000>k; Q5: gemma4-q5; memory-16gb: gemma4-16gb)")
     add("--host", default=launcher_tools.DEFAULT_HOST, help=f"{prefix} --host (default {launcher_tools.DEFAULT_HOST}, "
@@ -320,6 +321,8 @@ def resolve_config(args: argparse.Namespace) -> tuple[BuildConfig, ServeSettings
     if work_dir == out_dir:
         raise ValueError("--work-dir must not be the output directory itself")
     kwargs = serve_kwargs(args, default_profile="q5-quality" if preset.bits == 5 else "default")
+    if preset.id == "q4q5-mixed-a" and args.profile is None and args.context is None:
+        kwargs["context"] = "auto"
     launcher_tools.check_serve_settings(launcher_tools.ServeProfile(**kwargs))
     if args.score and args.no_launcher and args.serve is None:
         raise ValueError("--score needs infernix-perplexity beside the server: pass --serve")

@@ -1795,16 +1795,16 @@ def test_other_gptq_presets_plan_no_second_pass(env):
         assert steps["gptq-check"].prune_if_short == (env.out / "work" / "text60",)
 
 
-def test_mixed_preset_keeps_the_general_profile_and_refuses_q5_profiles(env):
+def test_mixed_preset_keeps_general_compute_with_auto_context_and_refuses_other_profiles(env):
     args = cli.build_parser().parse_args(env.argv("q4q5-mixed-a"))
     cfg, serve, _ = cli.resolve_config(args)
-    assert cfg.preset.id == "q4q5-mixed-a" and serve == build.ServeSettings(server_exe=env.server)
-    assert serve.gemma4_q5_prefill == "a16" and serve.context == 131072
+    assert cfg.preset.id == "q4q5-mixed-a" and serve == build.ServeSettings(server_exe=env.server, context="auto")
+    assert serve.gemma4_q5_prefill == "a16" and serve.context == "auto"
     args = cli.build_parser().parse_args(env.argv("q4q5-mixed-a", "--gemma4-q5-prefill", "int8-g64"))
     assert cli.resolve_config(args)[1].gemma4_q5_prefill == "int8-g64"
-    for profile in ("q5-quality", "q5-long-context"):
+    for profile, preset in (("q5-quality", "q5-g64"), ("q5-long-context", "q5-g64"), ("memory-16gb", "iq3-xxs")):
         args = cli.build_parser().parse_args(env.argv("q4q5-mixed-a", "--profile", profile))
-        with pytest.raises(ValueError, match="builds --preset q5-g64 only"):
+        with pytest.raises(ValueError, match=f"builds --preset {preset} only"):
             cli.resolve_config(args)
 
 
@@ -1847,3 +1847,34 @@ def test_mixed_build_runs_both_passes_and_the_summary_states_the_evidence_and_li
     assert "long-context and incremental-decode KL are not measured" in summary and "xperimental" not in summary
     assert "GPTQ5 g64 Q5 (A16Only" in summary and "o, down" in summary and "mean KL 0.0458" in summary
     assert "default route with int8-g64 Q5 prefill" in summary
+
+
+@pytest.mark.parametrize("profile", [None, "default"])
+@pytest.mark.parametrize("context", [None, "auto", "65536", "131072"])
+@pytest.mark.parametrize("compute", [None, "int8-g64"])
+def test_mixed_build_launcher_and_receipt_preserve_context_precedence(env, monkeypatch, profile, context, compute):
+    options = [] if profile is None else ["--profile", profile]
+    options += [] if context is None else ["--context", context]
+    options += [] if compute is None else ["--gemma4-q5-prefill", compute]
+    argv = env.argv("q4q5-mixed-a", "--yes", *options)
+    cfg, settings, server = cli.resolve_config(cli.build_parser().parse_args(argv))
+    expected_context = (int(context) if context != "auto" else "auto") if context is not None else (
+        131072 if profile == "default" else "auto")
+    expected = build.ServeSettings(server_exe=env.server, context=expected_context, gemma4_q5_prefill=compute)
+    assert settings == expected
+    steps = build.build_plan(cfg)
+    runner = FakeRunner(cfg, steps)
+    monkeypatch.setattr(cli, "Builder", partial(build.Builder, runner=runner, disk_free=lambda path: 10**13))
+    monkeypatch.setattr(launcher, "artifact_info", lambda path: launcher.ArtifactInfo(True, False, 262144, q5=True))
+
+    assert cli.main(argv, probes=FakeProbes()) == 0
+    assert runner.calls == ["calibration-render", "calibration-tokens", "text-tree", "gptq", "gptq-check", "gptq-q5",
+                            "gptq-q5-check", "convert"]
+    plan = build.parse_launcher(cfg.out_dir / f"serve-{cfg.name}.cmd")
+    assert plan.context == expected_context and plan.gemma4_q5_prefill == (compute or "a16")
+    assert plan.prefill_chunk == "auto" and plan.draft_tokens == "1" and plan.gemma4_sliding_kv == "bf16"
+    assert not plan.gemma4_key_only_kv and "--top-k" not in plan.flags and "--allow-shared-memory" not in plan.flags
+    expected_argv = launcher.serve_argv(server, cfg.artifact, expected, mtp=True, vision=False)
+    assert list(plan.flags) == expected_argv[2:]
+    receipt = json.loads((cfg.out_dir / f"{cfg.name}.gemma4-build.json").read_text())
+    assert receipt["serve_command"] == build.format_command(expected_argv)

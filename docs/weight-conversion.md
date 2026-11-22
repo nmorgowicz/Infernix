@@ -769,8 +769,10 @@ deterministic, so there is no seed variation), one GPU, roleplay text from three
 and a keyword-only content screen. Measure your own build before relying on it. Evidence: llama-local-tooling
 `docs/plans/20261123-gemma4-diode-mixed-a.md` and `docs/plans/20261125-gemma4-fresh-heldout.md`.
 
-The build keeps the `default` serve profile (`--profile` omitted), and no Q5 profile is selected by this preset at build
-time. The Q5 cells' prefill compute is a launch choice on the same artifact; the measured route lets the Q4 cells
+The build keeps the `default` serve profile and its compute/ring/MTP settings, but uses context `auto` when both
+`--profile` and `--context` are omitted. No Q5 profile is selected by this preset at build time. Explicit
+`--profile default` retains the historical 131072 context; an explicit `--context` always wins, including `auto`.
+The Q5 cells' prefill compute remains a launch choice on the same artifact; the measured route lets the Q4 cells
 keep their A8 paths and runs Q5 prefill as INT8 g64:
 
 ```text
@@ -785,12 +787,17 @@ the default-route figure above.
 **Launcher for the finished artifact.** `launcher --artifact <file>` without `--profile` detects native Q5 cells in the
 artifact directory and selects `q5-quality` for this mixed file too. For it that means: Q5 cells INT8 g64 (the measured
 route; the Q4 cells keep their stored AllowA8 policy, since the override applies to Q5 trunk calls only), BF16 rings, FP8
-KV, context `auto` (fitted to the card, which matches the measured 122,432-token MTP d1 capacity rather than a fixed 131,072),
+KV, context `auto` (fitted to available resident VRAM, not a guarantee of the historical 122,432-token MTP d1 capacity),
 chunk 2048 (the measured speed protocol), top-k 64, MTP d1, and the model alias `gemma4-q5`, a name only. Nothing in that
-profile is incompatible with the mixed file. The launcher the builder writes with `--serve` uses the `default` profile
-instead (context 131072, chunk auto, `a16` unless `--gemma4-q5-prefill` is given). To get the builder's settings from the
-`launcher` subcommand, pass `--profile default [--gemma4-q5-prefill int8-g64] [--context auto]`; both launchers are valid
-for this artifact and neither changes the weights.
+profile is incompatible with the mixed file. The builder-written launcher instead keeps general settings:
+context `auto` by default, chunk auto, `a16` unless `--gemma4-q5-prefill` is given, and the existing alias resolver.
+To reproduce those settings with `launcher`, pass `--profile default --context auto`
+and the same explicit compute/alias overrides. Explicit `--profile default` without `--context` still requests 131072;
+an oversized explicit context is not silently shrunk. Both launchers retain MTP d1 and neither changes the weights.
+
+The implicit mixed-A auto-context policy is implemented and covered by CPU fake-runner build/launcher/receipt
+regressions, including explicit 131072 and shorter/auto overrides. An actual GPU `serve-check` of the newly generated
+auto launcher remains pending; neither these CPU tests nor the historical capacity measurement proves that startup.
 
 ### Create the smaller IQ3 files from HF BF16
 
