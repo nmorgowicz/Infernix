@@ -699,6 +699,16 @@ incremental-decode KL are not measured for it. It keeps the `default` profile at
 `--gemma4-q5-prefill int8-g64` for the measured Q5 prefill route. See
 [Builder preset `q4q5-mixed-a`](docs/weight-conversion.md#builder-preset-q4q5-mixed-a-supported-option-not-the-default).
 
+Three **research-only** presets reproduce the measured campaign recipes from any BF16 fine-tune, labeled as such and
+never defaults: `q4q5-mixed-b` (Q5 `gate_up` all layers + `down` 20-59, fresh roleplay KL 0.62x best-medium), and the
+16 GB IQ3 recipes `forum-iq3-16gb` (F2; FP8 assistant default, `--assistant-encoding q4-g32`/`q4-g256` options) and
+`forum-iq3-16gb-quality` (F1; assistant embedded, launcher without MTP plus an explicit override launcher). The forum
+presets require your own importance matrix from the pinned forum roleplay corpus (`--rp-raw`/`--rp-against`) and store
+the tied `q4_g32` vocabulary. See
+[Research-only presets](docs/weight-conversion.md#research-only-presets-q4q5-mixed-b-forum-iq3-16gb-forum-iq3-16gb-quality)
+and the [selection guide](docs/gemma4-selection-guide.md), which also resolves the quality/balanced/context bundle
+recommendations per card class (labels, not CLI profiles).
+
 The smaller `iq3-xs` and `iq3-xxs` presets take `--llama-cpp <binary dir> --llama-cpp-source <source dir>`, collect the BF16 model's own
 importance matrix through a Q8_0 copy and import the resulting IQ3 blocks. No GPTQ environment is needed.
 Follow [HF BF16 → IQ3 creation](docs/weight-conversion.md#create-the-smaller-iq3-files-from-hf-bf16) for both

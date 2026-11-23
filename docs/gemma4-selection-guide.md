@@ -1,6 +1,6 @@
 # Gemma 4 31B: choose a card, build and serving policy
 
-Status: 2026-11-22. This guide covers **31B dense BF16 fine-tunes**, text only, not 26B-A4B. A weight recipe, prefill compute route, KV/ring policy and MTP setting are separate decisions. `best-medium` remains the general medium default; `best-small` remains the recommended smaller Q4. No new profiles are implemented by this guide.
+Status: 2026-11-23. This guide covers **31B dense BF16 fine-tunes**, text only, not 26B-A4B. A weight recipe, prefill compute route, KV/ring policy and MTP setting are separate decisions. `best-medium` remains the general medium default; `best-small` remains the recommended smaller Q4. Bundled quality/balanced/context **recommendations are labels** resolved to preset + profile + flag combinations (`--list-presets`); they are not new CLI profiles.
 
 ## Decide by usable memory, not the box label
 
@@ -8,13 +8,22 @@ The planning envelope reserves approximately **1.9 GiB** for the desktop. Minimu
 
 | Card class | Practical starting point | Qualification and tradeoff |
 |---|---|---|
-| 16 GB, e.g. RTX 5070 Ti / 5080 | Supported `iq3-xxs` plus `memory-16gb`; inspect resolved context, optionally disable MTP | Existing public recipe **did not meet 32k with the registered 64 MiB margin** in active-ballast tests. IQ3_XS and Q4/Q5 do not solve this envelope. Standard RTX 5070 is not a 16 GB example. |
+| 16 GB, e.g. RTX 5070 Ti / 5080 | Bundled: balanced = `forum-iq3-16gb --assistant-encoding q4-g32` + `memory-16gb`; context = the same preset with `q4-g256`; quality = `forum-iq3-16gb-quality` (MTP off by default). Research-only labels, measured on the diode finetune. Public fallback: `iq3-xxs` plus `memory-16gb`; inspect resolved context, optionally disable MTP | F2 bundles passed explicit 32k+MTP under active ballast (dedicated peaks 13,815.95 / 13,791.95 MiB, g32 / g256); fresh-superiority unresolved, historical <0.85 gates still failed. The public XXS recipe **did not meet 32k with the registered 64 MiB margin**. IQ3_XS and Q4/Q5 do not solve this envelope. Standard RTX 5070 is not a 16 GB example. |
 | 24 GB, including laptop class | `best-small`, FP8 global KV/BF16 ring, chunk512; or `best-medium` with FP8 ring for 64k+MTP | Ballast study: best-small 91.4k and medium with FP8 ring 71.2k auto MTP capacity. Mixed-A needs key-only KV to reach 64k with MTP (67.6k BF16 ring). Q5 did not meet 64k even with key-only/FP8 ring. Laptop WDDM gap and overhead are assumptions, not measured. |
 | 32 GB desktop | `best-medium`, FP8 global KV/BF16 ring, chunk2048, MTP | Physically observed 131,072 startup capacity in this environment. Mixed-A reaches 131k with FP8 ring or key-only; ordinary BF16-ring auto can resolve below it. Q5 needs key-only for the registered 131k requirement. Fidelity costs must be chosen explicitly. |
 
 Only the **AM4/DDR4/PCIe4 x16 RTX 5090 Windows desktop** was measured. Smaller cards were emulated by active ballast on that GPU; neither their speed nor a laptop's speed is measured. Linux is unmeasured. The 24 GB envelope assumes 22,509 MiB usable; 16 GB assumes 14,357 MiB; 32 GB study uses 29,473 MiB. Real WDDM budgets and other applications can lower these.
 
-**Research, not public presets:** forum-calibrated F2 with Q4g32 assistant is the proposed balanced32k option; Q4g256 is the smallest option. Both passed explicit32k+MTP in ballast. Mixed-B is a measured higher-fidelity mixed candidate. None is a one-call builder preset. Do not invent preset names or assume that `--calibration-text` alone reproduces the F2 tensor/vocabulary/assistant allocation.
+**Research presets, now reproducible from any BF16 fine-tune** (still research-only labels, measured on the diode
+finetune, never defaults): `forum-iq3-16gb` is the measured F2 recipe — the balanced32k bundle uses
+`--assistant-encoding q4-g32`, the smallest/context bundle `q4-g256`; both passed explicit 32k+MTP under ballast.
+`forum-iq3-16gb-quality` is F1 (launcher without MTP, explicit `--spec mtp --draft-tokens 1 --allow-shared-memory`
+override launcher beside it). `q4q5-mixed-b` is the measured higher-fidelity mixed candidate (fresh KL 0.62x
+best-medium). All three require your **own** calibration: the forum presets build their imatrix from the pinned
+forum roleplay corpus of your own model (`--rp-raw` from `roleplay_heldout fetch` plus `--rp-against` evaluation
+texts; `--calibration-text` is refused), and mixed-B runs two GPTQ passes on your own Hessians. Supplying forum
+calibration to plain `iq3-xxs` does **not** reproduce F2: the allocation and the tied `q4_g32` vocabulary are part
+of the preset.
 
 ## What the supported recipes buy
 
@@ -26,6 +35,9 @@ Only the **AM4/DDR4/PCIe4 x16 RTX 5090 Windows desktop** was measured. Smaller c
 | `best-medium` | 18,405,559,556 | General medium baseline |
 | `q4q5-mixed-a` | 19,344,788,484 | Q5 attention output/down, Q4 elsewhere; better measured roleplay KL at extra bytes/decode cost |
 | `q5-g64` | 21,151,124,484 | Higher-fidelity weight tier; INT8-g64 prefill is the Q5 profile balance |
+| `q4q5-mixed-b` (research-only) | 20,139,576,324 | Q5 `gate_up` all layers + `down` 20-59; measured fresh roleplay KL 0.6196 [0.6061, 0.6324] of best-medium; two GPTQ passes |
+| `forum-iq3-16gb` (research-only) | 12,630,891,524 (FP8 assistant); 12,431,956,996 (q4-g32); 12,407,184,388 (q4-g256) | The measured F2 16 GB recipe: forum roleplay imatrix of your own model, pinned allocation, tied q4_g32 vocabulary |
+| `forum-iq3-16gb-quality` (research-only) | 13,173,652,484 planned (measured artifact +4,096 B) | The measured F1 16 GB recipe; launcher MTP-off, explicit override launcher beside it |
 
 Sizes belong to one fine-tune, not guaranteed output sizes. KL against the model's **own Q8** measures numerical fidelity, not human roleplay quality. Do not average short and long instruments or infer PPL from KL. Sparse/missing PPL is unmeasured.
 
@@ -60,7 +72,7 @@ python -m tools.convert.gemma4_build launcher --profile memory-16gb --artifact "
 
 For XS change preset/directories to `iq3-xs`; `memory-16gb` is specifically XXS. It plans MTP first and can fall back to off while keeping the assistant embedded. This is not a 32k guarantee.
 
-Use `--dry-run` instead of `--yes` to inspect exact stages. Q4 requires approximately75GB minimum/103GB comfortable scratch; Q5 85/115GB; mixed-A102/132GB; IQ3 at least100/120GB, excluding source and allowing separate final output space. These are planning estimates; preflight governs. IQ3 exports BF16, makes own-model Q8 for imatrix collection, quantizes pinned tensor allocations and imports blocks verbatim. GPTQ collects own-model Hessians; never borrow another fine-tune's matrix/checkpoint. Same-argument reruns resume; changed input/preset needs fresh work. Receipts, native verification, `BUILD-SUMMARY.md` and launcher are automated. `--keep-work` retains useful research intermediates but IQ3 still prunes BF16/Q8 after last use.
+Use `--dry-run` instead of `--yes` to inspect exact stages. Q4 requires approximately75GB minimum/103GB comfortable scratch; Q5 85/115GB; mixed-A102/132GB; mixed-B110/140GB; IQ3 at least100/120GB, excluding source and allowing separate final output space. These are planning estimates; preflight governs. IQ3 exports BF16, makes own-model Q8 for imatrix collection, quantizes pinned tensor allocations and imports blocks verbatim. GPTQ collects own-model Hessians; never borrow another fine-tune's matrix/checkpoint. Same-argument reruns resume; changed input/preset needs fresh work. Receipts, native verification, `BUILD-SUMMARY.md` and launcher are automated. `--keep-work` retains useful research intermediates but IQ3 still prunes BF16/Q8 after last use.
 
 ```text
 python -m tools.convert.gemma4_q4 verify --artifact "<artifact.ninfer>"

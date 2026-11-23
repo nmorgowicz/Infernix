@@ -513,8 +513,11 @@ is needed. Source weights are read-only, outputs are never overwritten, and a fa
 | `best-medium` | calibrated GPTQ, group 32 | `q4_g32_fp16` |
 | `q5-g64` (higher-quality Q5) | own-model calibrated GPTQ, 5 bits, group 64 | `q5_g64_fp16`, A16Only |
 | `q4q5-mixed-a` (supported option, not the default) | own-model calibrated GPTQ g32 plus GPTQ 5-bit g64 for the Q5 groups | `q4_g32_fp16` with `q5_g64_fp16` (A16Only) attention output and `down` in all 60 layers |
+| `q4q5-mixed-b` (research-only, measured on the diode finetune) | own-model calibrated GPTQ g32 plus GPTQ 5-bit g64 for the Q5 groups | `q4_g32_fp16` with `q5_g64_fp16` (A16Only) `gate_up` in all 60 layers and `down` in layers 20-59; about 20.14 GB |
 | `iq3-xs` | own-model importance matrix, IQ3_XS allocation | GGUF IQ3_S / IQ3_XXS / Q6_K blocks |
 | `iq3-xxs` | own-model importance matrix, IQ3_XXS allocation | GGUF IQ3_XXS / IQ2_S / IQ3_S blocks |
+| `forum-iq3-16gb` (research-only, measured on the diode finetune) | own-model roleplay-imatrix, the measured forum allocation (campaign F2), tied q4_g32 vocabulary | GGUF IQ2_S / IQ3_XXS / IQ3_S blocks; 12,630,891,524 B (FP8 assistant), 12,431,956,996 B (q4-g32), 12,407,184,388 B (q4-g256) |
+| `forum-iq3-16gb-quality` (research-only, measured on the diode finetune) | own-model roleplay-imatrix, the measured F1 allocation, tied q4_g32 vocabulary | GGUF IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS blocks; planned 13,173,652,484 B (the measured F1 artifact is 4,096 B larger) |
 | `draft` | uncalibrated absmax, group 32 | `q4_g32_fp16`; a quick conversion smoke, not a calibrated tier |
 
 See the [canonical four-tier comparison](maintainer/gemma4-benchmarks.md#four-tier-comparison) for measured
@@ -798,6 +801,63 @@ an oversized explicit context is not silently shrunk. Both launchers retain MTP 
 The implicit mixed-A auto-context policy is implemented and covered by CPU fake-runner build/launcher/receipt
 regressions, including explicit 131072 and shorter/auto overrides. An actual GPU `serve-check` of the newly generated
 auto launcher remains pending; neither these CPU tests nor the historical capacity measurement proves that startup.
+
+#### Research-only presets: `q4q5-mixed-b`, `forum-iq3-16gb`, `forum-iq3-16gb-quality`
+
+These reproduce the measured campaign recipes from any BF16 fine-tune. They are **labels, never defaults**, and
+every number below was measured on the diode finetune campaign — none of it is a measurement of your build
+(`--score` measures your own).
+
+- `q4q5-mixed-b` (about 20.14 GB, planned 20,139,580,420 B; the measured artifact is 20,139,576,324 B) is
+  best-medium with Q5 `gate_up` in every layer and `down` in layers 20-59: two GPTQ passes on your own model's
+  Hessians (`--q5-unit gate_up --q5-unit down@20-59`), the same shared text tree and calibration as mixed-A.
+  Measured: fresh held-out roleplay KL 0.6196 [0.6061, 0.6324] of best-medium (context-512 block KL, diode,
+  default route), 65k KL 0.06673 [0.06181, 0.07352] against medium's 0.08497, clean 65k medians 3109.60 PP /
+  76.14 TG tok/s (medium 3380.24 / 95.01; mixed-A 3233.83 / 83.49).
+- `forum-iq3-16gb` (campaign F2) and `forum-iq3-16gb-quality` (campaign F1) quantize with the pinned per-tensor
+  allocation of the registered X2/F arms on the deployed IQ3_XXS base: F2 = sliding-layer K IQ3_XXS, V IQ3_S,
+  `ffn_down` 20-39 IQ3_S (Q/K IQ2_S, O IQ3_S, gate/up/remaining V/down IQ3_XXS; global layers keep the native
+  tied handling); F1 = V IQ3_S, all Q/K IQ3_XXS, `ffn_down` 20-39 IQ3_S and 40-59 IQ4_XS. The tied vocabulary
+  is stored as `q4_g32` with absmax scale search (`--vocab-weights q4_g32 --vocab-scale-search absmax`).
+
+**Roleplay calibration imatrix is required for the forum presets.** They never use the public English corpus
+and never reuse a diode or publisher matrix: pass `--rp-raw DIR` (the six raw forum parquet files from
+`python -m tools.eval.roleplay_heldout fetch --out DIR`) and at least one `--rp-against PATH` (your evaluation
+or earlier calibration texts; the corpus is shingle-checked disjoint from them). The builder runs
+`python -m tools.eval.roleplay_calibration build` on your own model's tokenizer, renders the usual
+400 × 512-token chat-prefixed chunks and collects the imatrix from your model; the corpus id, SHA-256, seed and
+excerpt count are recorded in the build receipt and `BUILD-SUMMARY.md`. Forum text is not committed anywhere.
+`--calibration-text` is refused for these presets.
+
+`forum-iq3-16gb` embeds the FP8 assistant by default; `--assistant-encoding q4-g32`
+(`--mtp-weights q4 --mtp-head q4_g32`, balanced, better observed acceptance, 24,772,608 B larger than g256) or
+`--assistant-encoding q4-g256` (`--mtp-weights q4_g256 --mtp-head q4_g256`, smallest, higher tested context)
+store the draft smaller. Measured anchors: explicit 32k+MTP passed under active ballast with dedicated peaks
+13,815.95 / 13,791.95 MiB (g32 / g256); highest passing contexts 37,888 (fp8, next refusal 38,912) and 47,104
+(g256, next refusal 49,152), not exact maxima; the g32 maximum is unmeasured. Fresh forum KL ratio 0.9707
+[0.9415, 1.0018] to the deployed XXS control (unresolved — superiority not demonstrated); long-window ratio
+0.8790 [0.8557, 0.9027] resolved. The historical <0.85 fresh-superiority gates stay failed where registered.
+
+`forum-iq3-16gb-quality` embeds the FP8 assistant but generates its launcher **without MTP**; the
+`serve-<name>-mtp.cmd` launcher beside it is the explicit opt-in override using the native flags
+`--spec mtp --draft-tokens 1 --allow-shared-memory` (shared memory is system RAM over PCIe, not a resident fit).
+Its fresh forum KL ratio 0.847 missed the registered 0.85 gate on the plain control; key-only/FP8-ring/chunk-128
+serving passed 32768/36864/38912 and refused 39936 under ballast with MTP off.
+
+MTP embedding (the stored assistant and its encoding) stays separate from MTP enable (the launcher/runtime).
+
+### Bundled recommendations (labels, not CLI profiles)
+
+`--list-presets` and `--help` print the resolved quality / balanced / context bundles per card class
+(16 GB ≥ 32k, 24 GB ≥ 64k, 32 GB ≥ 131k, about 1.9 GiB desktop overhead assumed). Each label resolves to a
+concrete preset + serve profile + explicit flag combination with its measured anchors — for example the 16 GB
+balanced bundle is `--preset forum-iq3-16gb --assistant-encoding q4-g32` served with `--profile memory-16gb`,
+and the 16 GB context bundle is the same preset with `q4-g256`. Explicit operator flags always win; key-only KV
+stays explicit; the targets are planning targets, not capacity promises. `resolve_bundle` refuses an explicit
+context beyond the bundle's measured anchor (the shortfall is named, never silently spilled), and auto context
+stays auto: read the resolved limit from `/v1/models` after startup. On 24 GB the measured anchors are
+best-small 91.4k, best-medium 71.2k and mixed-A key-only 67.6k with MTP (ballast); Q5 never meets 64k there.
+On 32 GB the medium default reaches 131k physically, mixed-A with FP8 ring or key-only reaches 131k explicitly.
 
 ### Create the smaller IQ3 files from HF BF16
 
