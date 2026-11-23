@@ -72,6 +72,12 @@ constexpr Registration kSwitches[] = {
     // Gemma D512 prefill split-K diagnostic: 0 keeps wave-aware selection; 1..13
     // forces the segment count (ops/launcher/gemma4_attention_mma_d512.cu).
     {"INFERNIX_TMP_GEMMA4_ATTN_SPLIT_K", Scope::Gemma4, Kind::Value},
+    // U1 prototype (2026-11-23): rotated K/V tile read order in the D512 global prefill
+    // kernel (ops/launcher/gemma4_attention_mma_d512.cu). 0 keeps the pinned walk;
+    // 1 = per-CTA rotated tile walk inside each split-K segment (llama.cpp PR 32407 idea,
+    // our implementation); 2 = per-CTA rotated span-phase schedule across the segments
+    // (bit-identical by construction). Prototype only; removed with its A/B decision.
+    {"INFERNIX_TMP_GEMMA4_ROT_TILE", Scope::Gemma4, Kind::Value},
 };
 constexpr std::size_t kCount = std::size(kSwitches);
 
@@ -239,6 +245,7 @@ std::string describe(Scope scope) {
     std::string out;
     if ((static_cast<unsigned>(scope) & static_cast<unsigned>(Scope::Gemma4)) != 0) {
         (void)integer("INFERNIX_TMP_GEMMA4_ATTN_SPLIT_K", 0, 0, 13);
+        (void)integer("INFERNIX_TMP_GEMMA4_ROT_TILE", 0, 0, 2);
     }
     for (std::size_t i = 0; i < kCount; ++i) {
         if ((static_cast<unsigned>(kSwitches[i].scope) & static_cast<unsigned>(scope)) == 0) { continue; }

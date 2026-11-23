@@ -63,7 +63,8 @@ __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
     const std::int32_t* __restrict__ positions, __nv_bfloat16* __restrict__ out, int tokens,
     int q_heads, int kv_heads, int window, float scale, std::int32_t logical_pages,
     std::int32_t physical_pages, float* __restrict__ partial,
-    float* __restrict__ partial_stats, float value_scale, float rope_theta) {
+    float* __restrict__ partial_stats, float value_scale, float rope_theta,
+    int segment_count, int rot_mode) {
     constexpr unsigned FullMask = 0xffffffffu;
 
     extern __shared__ __align__(1024) __nv_bfloat16 gemma4_d512_smem[]; // Preserve the qualified module's alignment.
@@ -178,26 +179,30 @@ __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
     const int low0      = window == 0 ? 0 : position0 + 1 - window;
     const int low1      = window == 0 ? 0 : position1 + 1 - window;
 
-    float acc[kPvNt][4];
-#pragma unroll
-    for (int n = 0; n < kPvNt; ++n) {
-#pragma unroll
-        for (int i = 0; i < 4; ++i) { acc[n][i] = 0.0f; }
-    }
-    Gemma4KvSoftmaxRow state0, state1;
-
     const float scale_l2   = scale * kLog2E;
     const int block_begin  = first_key / kBc;
     const int block_end   = last_key < 0 ? block_begin : last_key / kBc + 1;
 
     // grid.z splits the visible 16-key block range into equal segments (flash-decoding style
     // context split-K); segment 0 owns the lowest keys. With one segment the CTA writes the
-    // final BF16 rows exactly like the single-kernel path.
-    const int segments  = static_cast<int>(gridDim.z);
-    const int span      = (max(0, block_end - block_begin) + segments - 1) / segments;
-    const int seg       = static_cast<int>(blockIdx.z);
-    const int seg_begin = block_begin + seg * span;
-    const int seg_end   = min(block_end, seg_begin + span);
+    // final BF16 rows exactly like the single-kernel path. The rotation prototype (mode 2)
+    // launches one z slot and lets each CTA visit every segment in a rotated order instead.
+    const int segments = segment_count;
+    const int span     = (max(0, block_end - block_begin) + segments - 1) / segments;
+
+    // Rotated K/V tile read-order prototype (U1, 2026-11-23). Idea credit: llama.cpp PR
+    // 32407 discussion — with stream-K, CUDA blocks sharing a K/V cache can read different
+    // tiles at the same time and lose L2 reuse; the implementation here is ours, adapted
+    // to this kernel's fixed span partition. slot is the CTA's linear launch slot.
+    // Mode 1 rotates the tile walk inside each segment (start tile = slot mod tiles,
+    // stride 1, wrapping so every tile is visited exactly once; causal masking and the
+    // online-softmax math are unchanged, only their floating-point evaluation order).
+    // Mode 2 rotates which segment a CTA visits first; every visit keeps the ascending
+    // walk, fresh softmax state, and its own segment slot, so results stay bit-identical.
+    const long long slot = static_cast<long long>(blockIdx.x) +
+                           static_cast<long long>(gridDim.x) *
+                               (static_cast<long long>(blockIdx.y) +
+                                static_cast<long long>(gridDim.y) * static_cast<long long>(blockIdx.z));
     const auto physical_of = [&](int block) {
         const int page = (block * kBc) >> kPagedKVPageShift;
         if (page >= logical_pages) { return -1; }
@@ -247,14 +252,33 @@ __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
         }
     };
 
-    int physical = seg_begin < seg_end ? physical_of(seg_begin) : -1;
-    cp_commit();
-    if (seg_begin < seg_end) { stage_key(physical, seg_begin * kBc); }
-    cp_commit();
+    // One segment visit: fresh softmax state, ascending tile walk (mode 1: rotated start,
+    // wrapping), own segment slot for the partials. Called once per CTA in modes 0/1 and
+    // once per segment in mode 2.
+    const auto run_segment = [&](int seg) {
+        const int seg_begin   = block_begin + seg * span;
+        const int seg_end     = min(block_end, seg_begin + span);
+        const int span_blocks = seg_end - seg_begin;
 
-    const auto step = [&]<bool FullTile>(int block) {
+        float acc[kPvNt][4];
+#pragma unroll
+        for (int n = 0; n < kPvNt; ++n) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) { acc[n][i] = 0.0f; }
+        }
+        Gemma4KvSoftmaxRow state0, state1;
+
+        const int phase_block = rot_mode == 1 && span_blocks > 1
+                                    ? seg_begin + static_cast<int>(slot % span_blocks)
+                                    : seg_begin;
+        int physical = phase_block < seg_end ? physical_of(phase_block) : -1;
+        cp_commit();
+        if (phase_block < seg_end) { stage_key(physical, phase_block * kBc); }
+        cp_commit();
+
+    const auto step = [&]<bool FullTile>(int block, int next_block) {
         const int k0            = block * kBc;
-        const int next_physical = block + 1 < seg_end ? physical_of(block + 1) : physical;
+        const int next_physical = next_block >= 0 ? physical_of(next_block) : physical;
         const bool mapped       = physical >= 0;
 
         cp_wait<0>();
@@ -333,9 +357,9 @@ __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
             expand(v_s, value_scale_rows, physical, k0, true);
             __syncthreads();
         }
-        if (block + 1 < seg_end) {
+        if (next_block >= 0) {
             physical = next_physical;
-            stage_key(physical, (block + 1) * kBc);
+            stage_key(physical, next_block * kBc);
             cp_commit();
         }
 
@@ -440,14 +464,22 @@ __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
                      p_frag[k][1], p_frag[k][2], p_frag[k][3], vf[cur][2], vf[cur][3]);
         }
     };
-    for (int block = seg_begin; block < seg_end; ++block) {
+    for (int j = 0; j < span_blocks; ++j) {
+        const int block      = rot_mode == 1 && span_blocks > 1
+                                   ? seg_begin + static_cast<int>((slot + j) % span_blocks)
+                                   : seg_begin + j;
+        const int next_block = j + 1 < span_blocks
+                                   ? (rot_mode == 1 && span_blocks > 1
+                                          ? seg_begin + static_cast<int>((slot + j + 1) % span_blocks)
+                                          : block + 1)
+                                   : -1;
         const int k0     = block * kBc;
         const bool whole = all_rows && physical_of(block) >= 0 && k0 + kBc - 1 <= lowest_position &&
                            (window == 0 || k0 >= last_key + 1 - window);
         if (whole) {
-            step.template operator()<true>(block);
+            step.template operator()<true>(block, next_block);
         } else {
-            step.template operator()<false>(block);
+            step.template operator()<false>(block, next_block);
         }
     }
     cp_wait<0>();
@@ -511,6 +543,22 @@ __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
                            seg) * kD + d) = make_float2(acc[n][2], acc[n][3]);
         }
     }
+    };
+
+    // Visit schedule. Mode 2: every segment of this (row, head) is visited exactly once,
+    // starting at the rotated span (slot mod segments); each visit restarts the softmax
+    // state, walks its blocks ascending, and writes its own segment slot, which the
+    // combine kernel merges in ascending slot order exactly as before, so the result is
+    // bit-identical to the unrotated schedule by construction. Modes 0/1 run only this
+    // CTA's own segment.
+    if (rot_mode == 2) {
+        const int first = static_cast<int>(slot % segments);
+        for (int visit = 0; visit < segments; ++visit) {
+            run_segment((first + visit) % segments);
+        }
+        return;
+    }
+    run_segment(static_cast<int>(blockIdx.z));
 }
 
 // grid (T * Hq); merges the context segments of one query head in segment order. Stats
@@ -604,6 +652,15 @@ int d512_segment_count(std::int32_t tokens, std::int32_t q_heads, std::int32_t p
     return static_cast<int>(std::max<std::int64_t>(segments, 1));
 }
 
+// U1 rotation prototype selector, read once per process like the pinned split-K switch:
+// 0 = pinned walk (default), 1 = per-CTA rotated tile walk inside each segment,
+// 2 = per-CTA rotated span-phase schedule (bit-identical by construction).
+int d512_rot_tile_mode() {
+    static const int mode =
+        static_cast<int>(temporary_switches::integer("INFERNIX_TMP_GEMMA4_ROT_TILE", 0, 0, 2));
+    return mode;
+}
+
 template <Gemma4KvFormat Fmt, bool Fp8Qk = false, bool KeyValues = false>
 void launch_d512(const Tensor& q, const Gemma4CacheView& cache, const Tensor& positions,
                   int window, float scale, Tensor& out, float* partial, float* partial_stats,
@@ -623,8 +680,10 @@ void launch_d512(const Tensor& q, const Gemma4CacheView& cache, const Tensor& po
     if (segments > 1 && (partial == nullptr || partial_stats == nullptr)) {
         throw std::invalid_argument("gemma4_attention: split context needs workspace");
     }
+    const int rot = d512_rot_tile_mode();
     const dim3 grid(static_cast<unsigned>((tokens + kRows - 1) / kRows),
-                    static_cast<unsigned>(q.ne[1]), static_cast<unsigned>(segments));
+                    static_cast<unsigned>(q.ne[1]),
+                    static_cast<unsigned>(rot == 2 && segments > 1 ? 1u : static_cast<unsigned>(segments)));
     gemma4_attention_d512_kernel<Fmt, Fp8Qk, KeyValues>
         <<<grid, kThreads, shared_bytes<Fp8Qk>(), stream>>>(
         static_cast<const __nv_bfloat16*>(q.data), k_pages.data,
@@ -634,7 +693,7 @@ void launch_d512(const Tensor& q, const Gemma4CacheView& cache, const Tensor& po
         static_cast<const std::int32_t*>(block_table.data),
         static_cast<const std::int32_t*>(positions.data), static_cast<__nv_bfloat16*>(out.data),
         tokens, q.ne[1], k_pages.ne[2], window, scale, block_table.ne[0], k_pages.ne[3], partial,
-        partial_stats, cache.value_scale, cache.rope_theta);
+        partial_stats, cache.value_scale, cache.rope_theta, segments, rot);
     if (segments > 1) {
         gemma4_attention_d512_combine_kernel
             <<<static_cast<unsigned>(tokens * q.ne[1]), kD512CombineThreads, 0, stream>>>(
