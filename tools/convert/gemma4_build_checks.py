@@ -19,11 +19,14 @@ import sys
 from . import gemma4_build_launcher as launcher_tools
 from .gemma4_build import (
     CALIBRATION_CHUNKS,
+    FEEDBACK_TOOLING_ENV,
     GPTQ_PYTHON_ENV,
     REPO_ROOT,
     SCORE_EXTRA_GB,
     LLAMA_CPP_ENV,
     LLAMA_CPP_SOURCE_ENV,
+    codec_library_path,
+    feedback_tooling_paths,
     llama_tool,
     BuildConfig,
     ServeSettings,
@@ -381,6 +384,52 @@ def check_llama_cpp(report: Report, cfg: BuildConfig, probes) -> None:
         report.add("ok", "llama.cpp source", str(source))
 
 
+def check_feedback_tooling(report: Report, cfg: BuildConfig, probes) -> None:
+    """The X5 preset runs the research tool from the tooling checkout in the GPTQ environment."""
+    if cfg.feedback_tooling is None:
+        report.add("fail", "research tooling", "no checkout given",
+                   f"pass --feedback-tooling <llama-local-tooling> or set {FEEDBACK_TOOLING_ENV}")
+    else:
+        tool, solver, stage0 = feedback_tooling_paths(cfg)
+        missing = next((path for path in (tool, solver, stage0) if not path.is_file()), None)
+        if missing:
+            report.add("fail", "research tooling", f"missing: {missing}",
+                       "pass the llama-local-tooling checkout that carries converter/gguf/iq_hessian_feedback.py "
+                       "and evidence/gemma4-x5-20261123/stage0-result.json")
+        else:
+            report.add("ok", "research tooling", str(cfg.feedback_tooling))
+    gpy = cfg.gptq_python
+    if gpy is None or not Path(gpy).is_file():
+        report.add("fail", "research Python", f"{gpy} not found",
+                   "the feedback pass runs in the GPTQ environment: pass --gptq-python or run setup-gptq")
+    else:
+        info = probes.python_info(str(gpy), ("torch", "transformers", "safetensors"), cuda=True)
+        if info is None or "error" in (info or {}):
+            report.add("fail", "research Python", f"{gpy} did not run ({(info or {}).get('error', 'no output')})",
+                       "create the GPTQ environment (setup-gptq) or pass --gptq-python")
+        else:
+            missing_packages = [name for name, version in info["packages"].items() if version is None]
+            if missing_packages:
+                report.add("fail", "research Python packages", f"missing {', '.join(missing_packages)} in {gpy}",
+                           f"{gpy} -m pip install {' '.join(missing_packages)}")
+            elif not info.get("cuda"):
+                report.add("fail", "research Python", "torch cannot see a CUDA device",
+                           "install a CUDA build of torch in the GPTQ environment")
+            else:
+                report.add("ok", "research Python", str(gpy))
+    codec = codec_library_path(cfg)
+    if cfg.llama_cpp is not None and not codec.is_file():
+        report.add("fail", "ggml library", f"{codec} not found",
+                   "the research solver binds ggml_quantize_chunk from the ggml library beside the llama.cpp "
+                   "binaries; pass the directory that holds llama-quantize and ggml-base")
+    elif cfg.llama_cpp is not None:
+        report.add("ok", "ggml library", str(codec))
+    _, available = probes.ram()
+    if available < 32 * GIB:
+        report.add("warn", "feedback RAM", f"{available / GIB:.0f} GiB available; the measured feedback pass kept "
+                   "about 32 GiB free", "close other programs before the feedback step")
+
+
 def check_server(report: Report, cfg: BuildConfig, serve: ServeSettings, server: Path | None, probes) -> None:
     name = launcher_tools.SERVER_NAME
     if not serve.launcher:
@@ -495,6 +544,8 @@ def preflight(
         check_gptq_env(report, cfg, probes)
     elif cfg.preset.method == "gguf":
         check_llama_cpp(report, cfg, probes)
+    if cfg.preset.feedback:
+        check_feedback_tooling(report, cfg, probes)
     check_disk(report, cfg, probes)
     check_server(report, cfg, serve, server, probes)
     if cfg.score:

@@ -150,6 +150,13 @@ class Env:
         self.rp_raw.mkdir()
         self.rp_against = tmp_path / "heldout.txt"
         self.rp_against.write_text("held-out evaluation text")
+        self.feedback_tooling = tmp_path / "tooling"
+        for relative in (build.FEEDBACK_TOOL, build.FEEDBACK_SOLVER, build.FEEDBACK_STAGE0_EVIDENCE):
+            path = self.feedback_tooling / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("research tool fixture")
+        codec = self.llama_cpp / ("ggml-base.dll" if os.name == "nt" else "libggml-base.so")
+        codec.write_bytes(b"ggml")
 
     def argv(self, preset: str, *extra: str, mtp: bool = True) -> list[str]:
         argv = ["--preset", preset, "--model", str(self.model), "--out-dir", str(self.out),
@@ -161,6 +168,8 @@ class Env:
             argv += ["--rp-raw", str(self.rp_raw), "--rp-against", str(self.rp_against)]
         else:
             argv += ["--calibration-text", str(self.calibration)]
+        if preset_object is not None and preset_object.feedback:
+            argv += ["--feedback-tooling", str(self.feedback_tooling)]
         argv += ["--assistant", str(self.assistant)] if mtp else ["--no-mtp"]
         return argv + list(extra)
 
@@ -171,6 +180,7 @@ class Env:
             gptq_python=self.gptq_python, calibration_text=self.calibration, perplexity_exe=self.perplexity,
             llama_cpp=self.llama_cpp, llama_cpp_source=self.llama_source,
             rp_raw=self.rp_raw, rp_against=(self.rp_against,),
+            feedback_tooling=self.feedback_tooling,
         )
         values.update(over)
         return build.BuildConfig(**values)
@@ -2121,3 +2131,235 @@ def test_help_and_list_presets_surface_the_bundles(env, capsys):
     out = capsys.readouterr().out
     assert "forum-iq3-16gb" in out and "bundled recommendations" in out and "q4-g256" in out
     assert "research-only" in out
+
+
+# ---------------------------------------------------------------- iq3-xxs-feedback (the registered X5 recipe)
+
+FEEDBACK_STEP_IDS = ["rp-corpus", "calibration-source", "calibration-render", "gguf-bf16", "gguf-q8", "imatrix",
+                     "feedback-config", "feedback-prepare", "feedback-register", "feedback-baseline",
+                     "feedback-capture", "feedback-pack", "convert", "receipt-check", "finalize"]
+
+
+def test_feedback_preset_plan_is_the_registered_x5_pipeline(env):
+    cfg = env.config("iq3-xxs-feedback", calibration_text=None)
+    steps = plan_by_id(cfg)
+    assert list(steps) == FEEDBACK_STEP_IDS
+    tool = str(env.feedback_tooling / build.FEEDBACK_TOOL)
+    config = w(cfg, "feedback", "config.json")
+    commands = {"feedback-prepare": "prepare", "feedback-baseline": "full-baseline",
+                "feedback-capture": "full-feedback", "feedback-pack": "full-pack"}
+    for step_id, command in commands.items():
+        assert steps[step_id].argv == [str(env.gptq_python), tool, command, "--config", config], step_id
+    assert steps["convert"].argv == convert_expected(
+        cfg, "--gguf-source", w(cfg, "feedback", "stage1", "feedback-XXS.gguf"))
+    assert steps["imatrix"].prune_always == ()  # the Q8_0 copy stays: it is the metadata template
+    assert steps["feedback-config"].prune_always == (cfg.work("model-bf16.gguf"),)
+    assert steps["feedback-baseline"].prune_always == (cfg.work("feedback", "stage1", "source-BF16.gguf"),
+                                                       cfg.work("model-q8_0.gguf"))
+    assert steps["feedback-pack"].prune_always == (cfg.work("feedback", "stage1", "raw"),)
+
+
+def test_feedback_byte_plan_matches_the_registered_x5_container():
+    preset = build.PRESETS["iq3-xxs-feedback"]
+    trunk = build.allocation_trunk_bytes(build.GGUF_ALLOCATIONS["xxs-feedback"])
+    assert trunk == build.FEEDBACK_PROJECTION_BYTES == 11_087_462_400
+    assert build.preset_file_bytes(preset) == 13_019_175_940  # the deployed XXS .ninfer bytes, FP8 vocab + assistant
+    assert (build.preset_file_bytes(preset, "q4-g32"), build.preset_file_bytes(preset, "q4-g256")) == \
+        (12_820_241_412, 12_795_468_804)
+    assert build.FEEDBACK_REGISTERED_CONTAINER_BYTES - trunk == 15_808_544  # campaign metadata overhead (observed)
+    resolved = build.resolve_allocation(build.GGUF_ALLOCATIONS["xxs-feedback"])
+    assert {role for _, role in resolved} == set(build.FEEDBACK_ROLE_TYPES)
+    counts: dict[float, int] = {}
+    for role, damping in build.FEEDBACK_ROLE_DAMPING.items():
+        counts[damping] = counts.get(damping, 0) + sum(1 for _, r in resolved if r == role)
+    assert counts == {0.01: 120, 0.03: 230, 0.1: 60}  # the frozen stage1 damping counts
+
+
+def test_feedback_roleplay_option_swaps_corpus_and_labels_unmeasured_stack(env):
+    roleplay = env.config("iq3-xxs-feedback", calibration_text=None, imatrix_corpus="roleplay")
+    steps = plan_by_id(roleplay)
+    assert list(steps)[:3] == ["rp-corpus", "calibration-render", "gguf-bf16"]
+    assert any("UNMEASURED" in line for line in build.describe_plan(roleplay, build.build_plan(roleplay)))
+    assert build.build_identity(roleplay)["imatrix_corpus"] == "roleplay"
+    public = env.config("iq3-xxs-feedback", calibration_text=None)
+    assert build.build_identity(public)["imatrix_corpus"] == "public"
+    assert not any("UNMEASURED" in line for line in build.describe_plan(public, build.build_plan(public)))
+
+
+def feedback_fixtures(env: Env, cfg: build.BuildConfig) -> None:
+    """Fabricate the upstream outputs the feedback config step reads."""
+    cfg.work("calibration").mkdir(parents=True, exist_ok=True)
+    (cfg.work("calibration", "templated.txt")).write_text("templated body")
+    build.write_json(cfg.work("calibration", "templated.json"), {"prefix_ids": [1, 2, 3], "stride_tokens": 17})
+    rp = cfg.work("calibration", "rp-corpus")
+    (rp / "data").mkdir(parents=True, exist_ok=True)
+    excerpts = [{"id": f"rpc-{index:03d}"} for index in range(40)]
+    build.write_json(rp / "provenance.json", {"excerpts": excerpts})
+    for record in excerpts:
+        (rp / "data" / f"{record['id']}.txt").write_text("thread text")
+
+
+def test_feedback_config_pins_the_frozen_policy_and_registration_inputs(env, monkeypatch):
+    cfg = env.config("iq3-xxs-feedback", calibration_text=None)
+    feedback_fixtures(env, cfg)
+    monkeypatch.setattr(build, "FEEDBACK_STAGE0_RESULT_SHA256",
+                        build.sha256_file(env.feedback_tooling / build.FEEDBACK_STAGE0_EVIDENCE))
+    builder = make_builder(env, cfg)[0]
+    build.write_feedback_config(builder)
+    config = build.read_json(cfg.work("feedback", "config.json"))
+    assert config["hessian_dtype"] == "float64" and config["seed"] == build.FEEDBACK_SEED
+    assert config["stage1_directory"] == "stage1" and config["prior_thread_records"] == []
+    assert config["quantizer"].endswith(launcher.exe_name("llama-quantize"))
+    assert config["codec_library"].endswith("ggml-base.dll") or config["codec_library"].endswith("libggml-base.so")
+    policy = build.read_json(cfg.work("feedback", "stage1-policy.json"))
+    assert policy["role_types"] == build.FEEDBACK_ROLE_TYPES
+    assert policy["role_damping"] == build.FEEDBACK_ROLE_DAMPING
+    assert policy["stage0_result_sha256"] == build.FEEDBACK_STAGE0_RESULT_SHA256
+    manifest = build.read_json(cfg.work("feedback", "dev-corpus", "manifest.json"))
+    assert len(manifest["streams"]) == 40 and manifest["streams"][0]["path"].endswith("rpc-000.txt")
+    metadata = build.read_json(cfg.work("feedback", "calibration-metadata.json"))
+    assert metadata["prefix_ids"] == [1, 2, 3] and metadata["stride_tokens"] == 17
+    cfg.work("model-q8_0.gguf").write_bytes(b"q8 template")
+    build.register_feedback_amendment(builder)
+    amendment = build.read_json(cfg.work("feedback", "implementation-amendment.json"))
+    assert amendment["driver_sha256"] == build.sha256_file(env.feedback_tooling / build.FEEDBACK_TOOL)
+    assert amendment["solver_sha256"] == build.sha256_file(env.feedback_tooling / build.FEEDBACK_SOLVER)
+    assert amendment["active_config_sha256"] == build.sha256_file(cfg.work("feedback", "config.json"))
+    assert amendment["metadata_template"] == str(cfg.work("model-q8_0.gguf"))
+    assert amendment["additional_input_sha256"] == {str(cfg.work("model-q8_0.gguf")):
+                                                    build.sha256_file(cfg.work("model-q8_0.gguf"))}
+
+
+def test_feedback_receipt_check_enforces_the_same_bytes_facts(env):
+    cfg = env.config("iq3-xxs-feedback", calibration_text=None)
+    feedback_fixtures(env, cfg)
+    stage1 = cfg.work("feedback", "stage1")
+    stage1.mkdir(parents=True)
+    (stage1 / "stock-XXS.gguf").write_bytes(b"s" * 37)
+    build.write_json(stage1 / "feedback.json", {"tensors": [{"t": index} for index in range(410)],
+                                                "encoded_bytes": build.FEEDBACK_PROJECTION_BYTES})
+    build.write_json(stage1 / "candidate.json", {"sha256": "c" * 64, "bytes": 37, "stock_sha256": "s" * 64,
+                                                 "projections": 410, "same_types_shapes_bytes": True,
+                                                 "encoded_bytes": build.FEEDBACK_PROJECTION_BYTES})
+    build.write_json(cfg.work("feedback", "stage1-policy.json"),
+                     {"role_types": build.FEEDBACK_ROLE_TYPES, "role_damping": build.FEEDBACK_ROLE_DAMPING})
+    builder = make_builder(env, cfg)[0]
+    planned = build.preset_file_bytes(cfg.preset)
+    build.check_feedback_receipt(builder, planned)  # the registered facts pass
+    feedback = build.read_json(stage1 / "feedback.json")
+    feedback["encoded_bytes"] += 1
+    build.write_json(stage1 / "feedback.json", feedback)
+    with pytest.raises(RuntimeError, match="same-bytes"):
+        build.check_feedback_receipt(builder, planned)
+    build.write_json(stage1 / "feedback.json", {"tensors": [{"t": index} for index in range(410)],
+                                                "encoded_bytes": build.FEEDBACK_PROJECTION_BYTES})
+    with pytest.raises(RuntimeError, match="preset plan"):
+        build.check_feedback_receipt(builder, planned - 1)
+    candidate = build.read_json(stage1 / "candidate.json")
+    candidate["same_types_shapes_bytes"] = False
+    build.write_json(stage1 / "candidate.json", candidate)
+    with pytest.raises(RuntimeError, match="byte-identical"):
+        build.check_feedback_receipt(builder, planned)
+
+
+class FeedbackRunner(FakeRunner):
+    """FakeRunner plus the JSON receipts the feedback steps and finalize read back."""
+
+    def __call__(self, argv, log_path, env_, cwd, status):
+        step = self.by_argv[tuple(argv)]
+        code = super().__call__(argv, log_path, env_, cwd, status)
+        cfg = self.cfg
+        if step.id == "calibration-render":
+            build.write_json(step.outputs[1], {"prefix_ids": [1, 2, 3], "stride_tokens": 17})
+        elif step.id == "rp-corpus":
+            build.write_json(step.outputs[1], {"excerpts": [{"id": f"rpc-{index:03d}"} for index in range(40)]})
+        elif step.id == "feedback-prepare":
+            build.write_json(cfg.work("feedback", "registration.json"), {
+                "config": build.read_json(cfg.work("feedback", "config.json")),
+                "input_sha256": {str(cfg.work("imatrix.gguf")): "i" * 64},
+            })
+        elif step.id == "feedback-capture":
+            build.write_json(cfg.work("feedback", "stage1", "feedback.json"),
+                             {"tensors": [{"t": index} for index in range(410)],
+                              "encoded_bytes": build.FEEDBACK_PROJECTION_BYTES})
+        elif step.id == "feedback-pack":
+            stock = cfg.work("feedback", "stage1", "stock-XXS.gguf")
+            build.write_json(cfg.work("feedback", "stage1", "candidate.json"),
+                             {"sha256": "c" * 64, "bytes": stock.stat().st_size, "stock_sha256": "s" * 64,
+                              "projections": 410, "same_types_shapes_bytes": True,
+                              "encoded_bytes": build.FEEDBACK_PROJECTION_BYTES})
+        return code
+
+
+def test_feedback_build_end_to_end_records_the_provenance(env, monkeypatch):
+    cfg = env.config("iq3-xxs-feedback", name="m-feedback",
+                     work_dir=env.out / "work-fb", python=sys.executable)
+    monkeypatch.setattr(build, "FEEDBACK_STAGE0_RESULT_SHA256",
+                        build.sha256_file(env.feedback_tooling / build.FEEDBACK_STAGE0_EVIDENCE))
+    recorded: list[int] = []
+    monkeypatch.setattr(build, "check_feedback_receipt", lambda builder, size: recorded.append(size))
+    steps = build.build_plan(cfg)
+    runner = FeedbackRunner(cfg, steps)
+    builder = build.Builder(cfg, steps, build.build_identity(cfg), serve_settings(env), server_exe=env.server,
+                            runner=runner, out=lambda message: None, disk_free=lambda path: 10**13,
+                            artifact_info=launcher.ArtifactInfo(True, False, 262144))
+    builder.run()
+    # runner.calls records argv steps only; the call steps ran as callables
+    assert runner.calls == [step for step in FEEDBACK_STEP_IDS
+                            if step not in ("calibration-source", "feedback-config", "feedback-register",
+                                            "receipt-check", "finalize")]
+    assert recorded == [14]  # the fake artifact's size; the planned-bytes guard itself is covered above
+    receipt = build.read_json(env.out / "m-feedback.gemma4-build.json")
+    assert receipt["preset"]["feedback"] is True and receipt["hessian_feedback"]["imatrix_corpus"] == "public"
+    hessian = receipt["hessian_feedback"]
+    assert hessian["role_damping"] == build.FEEDBACK_ROLE_DAMPING
+    assert hessian["tool_sha256"] == build.sha256_file(env.feedback_tooling / build.FEEDBACK_TOOL)
+    assert hessian["imatrix_sha256"] == "i" * 64
+    assert hessian["projection_bytes"] == build.FEEDBACK_PROJECTION_BYTES
+    assert hessian["registered_container_bytes"] == build.FEEDBACK_REGISTERED_CONTAINER_BYTES
+    summary = (env.out / "BUILD-SUMMARY.md").read_text()
+    assert "Hessian-feedback provenance" in summary and "research-only" in summary
+    profile = build.parse_launcher(env.out / "serve-m-feedback.cmd")
+    assert profile.draft_tokens == "1"  # MTP d1 default
+
+
+def test_feedback_defaults_auto_context_and_is_labelled(env, capsys):
+    args = cli.build_parser().parse_args(env.argv("iq3-xxs-feedback"))
+    cfg, serve, _ = cli.resolve_config(args)
+    assert serve.context == "auto"  # mixed-A-style auto context with the default profile
+    assert cfg.imatrix_corpus == "public" and cfg.feedback_tooling == env.feedback_tooling
+    assert cli.main(["--list-presets"], probes=FakeProbes()) == 0
+    out = capsys.readouterr().out
+    assert "iq3-xxs-feedback" in out and "measured on the diode finetune at XXS bytes" in out
+    assert "UNMEASURED" in cli.build_parser().format_help()  # the epilog names the roleplay option's unmeasured stack
+    args = cli.build_parser().parse_args(env.argv("iq3-xxs-feedback", "--imatrix-corpus", "roleplay"))
+    cfg, _, _ = cli.resolve_config(args)
+    assert cfg.imatrix_corpus == "roleplay"
+    assert build.PRESETS["iq3-xxs-feedback"].label in cli.preset_table()
+
+
+def test_feedback_argument_mistakes_are_refused(env, capsys):
+    assert cli.main(env.argv("best-small", "--imatrix-corpus", "roleplay"), probes=FakeProbes()) == 1
+    assert "apply to iq3-xxs-feedback" in capsys.readouterr().err
+    assert cli.main(env.argv("best-small", "--feedback-tooling", str(env.feedback_tooling)),
+                    probes=FakeProbes()) == 1
+    assert "apply to iq3-xxs-feedback" in capsys.readouterr().err
+    argv = env.argv("iq3-xxs-feedback")
+    without_tooling = argv[:argv.index("--feedback-tooling")]
+    assert cli.main(without_tooling, probes=FakeProbes()) == 1
+    assert "INFERNIX_FEEDBACK_TOOLING" in capsys.readouterr().err
+    assert cli.main(env.argv("iq3-xs", "--rp-raw", str(env.rp_raw)), probes=FakeProbes()) == 1  # untouched presets
+
+
+def test_feedback_preflight_names_missing_tooling(env):
+    cfg = env.config("iq3-xxs-feedback", calibration_text=None, feedback_tooling=None)
+    report = preflight(env, cfg)
+    tooling = finding(report, "research tooling")
+    assert tooling.level == "fail" and tooling.detail == "no checkout given"
+    cfg = env.config("iq3-xxs-feedback", calibration_text=None)
+    report = preflight(env, cfg)
+    assert finding(report, "research tooling").level == "ok"
+    assert finding(report, "research Python").level == "ok"
+    assert finding(report, "ggml library").level == "ok"
+    tight = FakeProbes(ram=(40 * 2**30, 20 * 2**30))
+    assert finding(preflight(env, cfg, tight), "feedback RAM").level == "warn"

@@ -17,6 +17,13 @@ and the research-only forum-iq3-16gb / forum-iq3-16gb-quality IQ3 recipes: the m
 (sliding K IQ3_XXS or all Q/K IQ3_XXS, V IQ3_S, staged down projections) with the tied q4_g32 vocabulary, an
 importance matrix from the pinned forum roleplay calibration corpus (`tools/eval/roleplay_calibration`) of the user's
 own model, and their measured numbers from the diode finetune campaign (research-only, never defaults).
+Also the research-only `iq3-xxs-feedback` Hessian-feedback recipe: the deployed XXS role allocation whose 410
+projections are re-solved with iterative Hessian error feedback (registered X5 recipe; the frozen rolewise damping
+policy and the FP64 covariance capture of the campaign stage 1), driven through the separate research tooling
+checkout's `converter/gguf/iq_hessian_feedback.py` (prepare, full-baseline stock parity anchor, full-feedback,
+full-pack), then imported with the ordinary IQ3 route. The campaign stage 1 collected its importance matrix from
+the generic templated public corpus; that campaign-faithful choice is this preset's default, and the forum
+roleplay corpus is an explicit option labelled unmeasured-stack.
 The two-level 6-bit scale format `q4_g32_s6_fp16` and calibrated round-to-nearest presets are not built here.
 
 Calibration text. Without `--calibration-text` the builder downloads the pinned public English corpus the measured
@@ -142,6 +149,7 @@ class Preset:
     launcher_no_mtp: bool = False  # embed the assistant but generate the launcher without MTP (+ an override launcher)
     extra_formats: tuple[str, ...] = ()  # further tensor formats the serving binary must know
     label: str = ""  # provenance label shown in the plan, table and summary (e.g. research-only, measured source)
+    feedback: bool = False  # method "gguf": re-solve the projections with the registered X5 Hessian-feedback tool
 
     @property
     def formats(self) -> tuple[str, ...]:
@@ -150,6 +158,43 @@ class Preset:
         return formats + (Q5_FORMAT,) if self.q5_units else formats
 
 
+FEEDBACK_TOOLING_ENV = "INFERNIX_FEEDBACK_TOOLING"  # llama-local-tooling checkout with the X5 research tool
+FEEDBACK_TOOL = Path("converter") / "gguf" / "iq_hessian_feedback.py"
+FEEDBACK_SOLVER = Path("lib") / "iq_hessian_feedback.py"
+FEEDBACK_STAGE0_EVIDENCE = Path("evidence") / "gemma4-x5-20261123" / "stage0-result.json"
+# The registered stage1 policy: the deployed XXS role types and the damping each role's validation-only trials
+# selected (2026-11-23). Frozen as measured; a user build never re-selects damping.
+FEEDBACK_ROLE_TYPES = {"attn_q": "IQ2_S", "attn_k": "IQ2_S", "attn_v": "IQ3_XXS", "attn_output": "IQ3_S",
+                       "ffn_gate": "IQ3_XXS", "ffn_up": "IQ3_XXS", "ffn_down": "IQ3_XXS"}
+FEEDBACK_ROLE_DAMPING = {"attn_q": 0.01, "attn_k": 0.01, "attn_v": 0.03, "attn_output": 0.03,
+                         "ffn_gate": 0.03, "ffn_up": 0.03, "ffn_down": 0.1}
+# Same-bytes facts of the registered stage1 candidate (verified in the tests): the 410 projection payloads encode
+# to exactly the deployed XXS trunk; the stock/candidate GGUF container adds the template's metadata overhead.
+FEEDBACK_PROJECTION_BYTES = 11_087_462_400
+FEEDBACK_REGISTERED_CONTAINER_BYTES = 11_103_270_944  # the diode campaign's observed container (metadata varies)
+FEEDBACK_STAGE0_RESULT_SHA256 = "34be4a02d8479f5f0d63fd5bdbfd1364a2dece75f5a263637278ebe0b99e54d9"
+FEEDBACK_SEED = 2026112305  # the campaign's registration seed: validation split, confirmation draw, torch seed
+FEEDBACK_CONFIRMATION_SEED = "x5-untouched-confirmation-20261123-05"
+FEEDBACK_CAPTURE_BATCH = 2
+FEEDBACK_DAMPINGS = (0.01, 0.03, 0.1)  # the original screen grid; stage 1 froze one damping per role from it
+FEEDBACK_IMATRIX_CORPORA = ("public", "roleplay")
+X5_EVIDENCE = (
+    "research-only (campaign X5 stage 1, measured on the diode finetune; never a default). The 410 projections "
+    "carry the deployed XXS role types (Q/K IQ2_S, V/gate/up/down IQ3_XXS, O IQ3_S) and encode to exactly the "
+    "same bytes (11,087,462,400 projection bytes; stock container 11,103,270,944 B on the campaign inputs); only "
+    "the projection payload bytes differ from a stock own-imatrix XXS build, all formats/sizes/inventory "
+    "identical, native A8 scoring, speed unchanged by construction (no timing claim). Paired thread-cluster 95 % "
+    "intervals, candidate/deployed-KL ratio: RP-dev 0.4388 [0.4248, 0.4551], fresh 0.4463 [0.4225, 0.4714], "
+    "65k-16 long 0.5263 [0.5024, 0.5502], untouched new short confirmation 0.4455 [0.4239, 0.4720] (upper < 0.85: "
+    "confirmed at the historical strength). Measured with the generic templated English imatrix; the roleplay "
+    "imatrix option of this preset is an UNMEASURED stack. The 32k+MTP memory anchors are measured on the F2 "
+    "forum allocation, NOT on this container. Not measured: your finetune, human-rated dialogue, physical 16 GB "
+    "throughput, an untouched long-context confirmation."
+)
+FEEDBACK_ROLEPLAY_NOTE = (
+    "imatrix corpus roleplay: UNMEASURED stack — the campaign stage 1 measured the generic templated English "
+    "imatrix; this option swaps only the importance matrix, everything else stays the registered recipe."
+)
 PRESETS: dict[str, Preset] = {
     "best-small": Preset(
         "best-small", "gptq", "GPTQ, group 256", "Best quality per byte: the recommended default for most people.",
@@ -232,6 +277,29 @@ PRESETS: dict[str, Preset] = {
         launcher_no_mtp=True, extra_formats=("ggml_iq2_s", "ggml_iq3_s", "ggml_iq4_xs"),
         evidence=FORUM_F1_EVIDENCE, label="research-only; measured on the diode finetune; not a default",
     ),
+    "iq3-xxs-feedback": Preset(
+        "iq3-xxs-feedback", "gguf", "IQ3_XXS base, Hessian-feedback projections, frozen X5 damping (research-only)",
+        "The registered X5 stage-1 recipe: the deployed IQ3_XXS role allocation with every one of the 410 "
+        "projections re-solved by decoder-layer-sequential Hessian error feedback (FP64 covariance capture, the "
+        "frozen per-role damping 0.01/0.03/0.1, exact IQ decode rounded BF16), packed same-bytes over the stock "
+        "own-imatrix XXS container and imported with the ordinary IQ3 route. FP8 vocabulary and FP8 assistant by "
+        "default; --assistant-encoding q4-g32 or q4-g256 stores the draft smaller. The importance matrix defaults "
+        "to the campaign-faithful generic templated English corpus; --imatrix-corpus roleplay swaps in the pinned "
+        "forum corpus of your own model (unmeasured stack). Needs the research tooling checkout "
+        "(--feedback-tooling) and a GPU lease for the feedback pass. Research-only, measured on the diode "
+        "finetune at XXS bytes, never a default.",
+        "smallest", 13.02, 0.0933, "about 4 h", 0, False, "ggml_iq3_xxs", 170, 200, 55,
+        {"calibration-source": 1, "rp-corpus": 4, "calibration-render": 1, "gguf-bf16": 15, "gguf-q8": 8,
+         "imatrix": 25, "feedback-config": 1,
+         "feedback-prepare": 10, "feedback-register": 0.5, "feedback-baseline": 60, "feedback-capture": 150,
+         "feedback-pack": 10, "convert": 6, "receipt-check": 0.5, "finalize": 0.5},
+        "IQ3_XXS", allocation="xxs-feedback", vocab_weights="fp8",
+        assistant_encodings=("fp8", "q4-g32", "q4-g256"), extra_formats=("ggml_iq2_s", "ggml_iq3_s"),
+        evidence=X5_EVIDENCE,
+        label="research-only; measured on the diode finetune at XXS bytes; confirmed at historical strength on "
+              "the untouched confirmation draw; not a default",
+        feedback=True,
+    ),
     "q4q5-mixed-b": Preset(
         "q4q5-mixed-b", "gptq", "GPTQ g32 Q4 with GPTQ5 g64 Q5 `gate_up` (all layers) and `down@20-59` (research-only)",
         "Best-medium with the fused gate/up projections of every layer and the down projections of layers 20-59 at Q5 "
@@ -245,7 +313,6 @@ PRESETS: dict[str, Preset] = {
         label="research-only; measured on the diode finetune; not a default",
     ),
 }
-# Presets that are not built by infernix, with the reason a caller gets.
 UNAVAILABLE_PRESETS = {
     "lite-medium": "it needs the q4_g32_s6_fp16 format (two-level 6-bit scales), which infernix has not ported yet; "
                    "use best-small or best-medium",
@@ -282,6 +349,8 @@ class BuildConfig:
     assistant_encoding: str = "fp8"  # presets with assistant_encodings: the assistant's stored encoding
     rp_raw: Path | None = None  # roleplay-imatrix presets: raw forum parquet directory (roleplay_heldout fetch)
     rp_against: tuple[Path, ...] = ()  # roleplay-imatrix presets: evaluation texts the corpus must be disjoint from
+    feedback_tooling: Path | None = None  # iq3-xxs-feedback: llama-local-tooling checkout with the X5 research tool
+    imatrix_corpus: str = ""  # iq3-xxs-feedback: "public" (campaign-faithful default) or "roleplay" (unmeasured)
 
     @property
     def artifact(self) -> Path:
@@ -441,6 +510,9 @@ GLOBAL_LAYERS = tuple(i for i in range(TEXT_GEOMETRY.n_layers) if TEXT_GEOMETRY.
 GGUF_TENSOR_TYPES = {
     "IQ3_XS": ("attn_output=IQ3_S", "attn_v=IQ3_S", "ffn_down=IQ3_S", r"blk\.([0-6]|5[2-9])\.ffn_(gate|up)=IQ3_S"),
     "IQ3_XXS": ("attn_q=IQ2_S", "attn_k=IQ2_S", "attn_output=IQ3_S"),
+    "xxs-feedback": (  # the registered X5 stock pins: the deployed XXS mix, feedback re-solves the payloads
+        "attn_q=IQ2_S", "attn_k=IQ2_S", "attn_output=IQ3_S",
+    ),
     "forum-iq3-16gb": (
         "attn_q=IQ2_S",
         f"blk\\.({'|'.join(str(i) for i in GLOBAL_LAYERS)})\\.attn_k=IQ2_S",
@@ -465,6 +537,9 @@ ALLOCATION_BASE_TYPES = {  # the deployed IQ3_XXS recipe's own mix
     "ffn_gate": "IQ3_XXS", "ffn_up": "IQ3_XXS", "ffn_down": "IQ3_XXS",
 }
 GGUF_ALLOCATIONS = {
+    "xxs-feedback": {  # the deployed IQ3_XXS recipe's own mix (the registered X5 stock allocation)
+        "id": "xxs-feedback", "base": "xxs", "rules": [],
+    },
     "forum-iq3-16gb": {
         "id": "forum-iq3-16gb", "base": "xxs",
         "rules": [
@@ -687,13 +762,10 @@ def llama_tool(cfg: BuildConfig, name: str) -> str:
     return str(Path(cfg.llama_cpp or ".") / (f"{name}.exe" if os.name == "nt" else name))
 
 
-def gguf_steps(cfg: BuildConfig, templated: Path, quantized: Path) -> list[Step]:
-    """BF16 GGUF, Q8_0 copy for the importance matrix, own imatrix on the rendered calibration text, quantize."""
-    preset = cfg.preset
-    minutes = preset.minutes
-    bf16, q8, imatrix = cfg.work("model-bf16.gguf"), cfg.work("model-q8_0.gguf"), cfg.work("imatrix.gguf")
-    quantize = llama_tool(cfg, "llama-quantize")
-    pins = [arg for pin in GGUF_TENSOR_TYPES[cfg.preset.allocation or cfg.preset.gguf_type] for arg in ("--tensor-type", pin)]
+def gguf_source_steps(cfg: BuildConfig, templated: Path, bf16: Path, q8: Path, imatrix: Path,
+                      *, prune_q8: bool) -> list[Step]:
+    """BF16 GGUF, Q8_0 copy for the importance matrix, own imatrix on the rendered calibration text."""
+    minutes = cfg.preset.minutes
     return [
         Step("gguf-bf16", "Write a BF16 GGUF of the model with llama.cpp's convert_hf_to_gguf.py (about 62 GB)",
              minutes["gguf-bf16"],
@@ -701,18 +773,163 @@ def gguf_steps(cfg: BuildConfig, templated: Path, quantized: Path) -> list[Step]
               "--outtype", "bf16", "--outfile", str(bf16)],
              outputs=(bf16,)),
         Step("gguf-q8", "Quantize a Q8_0 copy for the importance matrix (about 33 GB)", minutes["gguf-q8"],
-             [quantize, str(bf16), str(q8), "Q8_0"], outputs=(q8,)),
+             [llama_tool(cfg, "llama-quantize"), str(bf16), str(q8), "Q8_0"], outputs=(q8,)),
         Step("imatrix", f"Collect the importance matrix on the {CALIBRATION_CHUNKS} rendered chunks (GPU)",
              minutes["imatrix"],
              [llama_tool(cfg, "llama-imatrix"), "-m", str(q8), "-o", str(imatrix), "--output-format", "gguf",
               "--no-ppl", "--ctx-size", str(CALIBRATION_CONTEXT), "--gpu-layers", "999", "--file", str(templated),
               "--chunks", str(CALIBRATION_CHUNKS), "--parse-special"],
-             outputs=(imatrix,), prune_always=(q8,)),
-        Step("gguf-quantize", f"Quantize to {preset.gguf_type} with the importance matrix (CPU, the long step)",
-             minutes["gguf-quantize"],
-             [quantize, "--imatrix", str(imatrix), *pins, str(bf16), str(quantized), preset.gguf_type],
-             outputs=(quantized,), prune_always=(bf16,)),
+             outputs=(imatrix,), prune_always=(q8,) if prune_q8 else ()),
     ]
+
+
+def feedback_tooling_paths(cfg: BuildConfig) -> tuple[Path, Path, Path]:
+    """(tool script, solver module, registered stage0 result) of the research tooling checkout."""
+    root = cfg.feedback_tooling
+    if root is None:
+        raise ValueError(f"preset {cfg.preset.id} needs the research tooling checkout: pass --feedback-tooling "
+                         f"<llama-local-tooling> or set {FEEDBACK_TOOLING_ENV}")
+    return root / FEEDBACK_TOOL, root / FEEDBACK_SOLVER, root / FEEDBACK_STAGE0_EVIDENCE
+
+
+def codec_library_path(cfg: BuildConfig) -> Path:
+    """The ggml library the research solver binds ggml_quantize_chunk from (beside the llama.cpp binaries)."""
+    name = "ggml-base.dll" if os.name == "nt" else "libggml-base.so"
+    return Path(cfg.llama_cpp or ".") / name
+
+
+def feedback_steps(cfg: BuildConfig, templated: Path) -> list[Step]:
+    """The registered X5 chain: config/registration, stock parity baseline, feedback, same-byte pack.
+
+    The research tool (`<tooling>/converter/gguf/iq_hessian_feedback.py`, explicit JSON config) keeps doing the
+    work: full-baseline writes the lossless BF16 projection GGUF and the stock own-imatrix XXS container with
+    whole/slab parity on all 410 tensors, full-feedback re-solves every projection with FP64 Hessians collected
+    decoder-layer-sequentially under the frozen per-role damping (this is the preset's Hessian-capture stage), and
+    full-pack copies the stock container replacing only the same-type/shape/byte projection payloads.
+    """
+    preset, minutes = cfg.preset, cfg.preset.minutes
+    root = cfg.work("feedback")
+    stage1 = root / "stage1"
+    config = root / "config.json"
+    quantized = stage1 / "feedback-XXS.gguf"
+    raw = stage1 / "raw"
+    tool, solver, stage0 = feedback_tooling_paths(cfg)
+    gpy = str(cfg.gptq_python) if cfg.gptq_python else sys.executable
+    tool_argv = lambda command: [gpy, str(tool), command, "--config", str(config)]  # noqa: E731
+    return gguf_source_steps(cfg, templated, cfg.work("model-bf16.gguf"), cfg.work("model-q8_0.gguf"),
+                             cfg.work("imatrix.gguf"), prune_q8=False) + [
+        Step("feedback-config", "Write the research tool's config, the frozen stage1 policy and the registration "
+             "corpus manifest (the registered stage0 gate is copied unchanged)", minutes["feedback-config"],
+             call=write_feedback_config, outputs=(config, root / "stage1-policy.json", root / "stage0-result.json",
+                                                  root / "dev-corpus" / "manifest.json",
+                                                  root / "calibration-metadata.json"),
+             prune_always=(cfg.work("model-bf16.gguf"),),
+             note="the roleplay validation/confirmation corpus is built from --rp-raw; the damping policy is the "
+                  "campaign-frozen stage1 policy and is never re-selected"),
+        Step("feedback-prepare", "Register the full-model run (identities, tokens, untouched confirmation draw)",
+             minutes["feedback-prepare"], tool_argv("prepare"),
+             outputs=(root / "registration.json", root / "tokens.safetensors")),
+        Step("feedback-register", "Pin the execution layout: tool/solver SHAs, metadata template and config hash",
+             minutes["feedback-register"], call=register_feedback_amendment,
+             outputs=(root / "implementation-amendment.json",)),
+        Step("feedback-baseline", "Stock own-imatrix XXS quantize with whole/slab parity on all 410 tensors "
+             "(CPU, the parity anchor)", minutes["feedback-baseline"], tool_argv("full-baseline"),
+             outputs=(stage1 / "baseline.json", stage1 / "source-BF16.gguf", stage1 / "stock-XXS.gguf"),
+             prune_always=(stage1 / "source-BF16.gguf", cfg.work("model-q8_0.gguf"))),
+        Step("feedback-capture", "Hessian feedback: FP64 covariance capture and re-solve of every projection, "
+             "decoder-layer-sequential, frozen damping (GPU, the long step)", minutes["feedback-capture"],
+             tool_argv("full-feedback"), outputs=(stage1 / "feedback.json", raw),
+             env={"PYTHONUTF8": "1"}),
+        Step("feedback-pack", "Pack the feedback payloads into a byte-identical copy of the stock container",
+             minutes["feedback-pack"], tool_argv("full-pack"),
+             outputs=(quantized, stage1 / "candidate.json"), prune_always=(raw,)),
+    ]
+
+
+def gguf_steps(cfg: BuildConfig, templated: Path, quantized: Path) -> list[Step]:
+    """BF16 GGUF, Q8_0 copy for the importance matrix, own imatrix on the rendered calibration text, quantize."""
+    preset = cfg.preset
+    bf16, q8, imatrix = cfg.work("model-bf16.gguf"), cfg.work("model-q8_0.gguf"), cfg.work("imatrix.gguf")
+    quantize = llama_tool(cfg, "llama-quantize")
+    pins = [arg for pin in GGUF_TENSOR_TYPES[cfg.preset.allocation or cfg.preset.gguf_type] for arg in ("--tensor-type", pin)]
+    steps = gguf_source_steps(cfg, templated, bf16, q8, imatrix, prune_q8=True)
+    steps.append(
+        Step("gguf-quantize", f"Quantize to {preset.gguf_type} with the importance matrix (CPU, the long step)",
+             preset.minutes["gguf-quantize"],
+             [quantize, "--imatrix", str(imatrix), *pins, str(bf16), str(quantized), preset.gguf_type],
+             outputs=(quantized,), prune_always=(bf16,)))
+    return steps
+
+
+def write_feedback_config(builder: "Builder") -> None:
+    """Write the research tool's explicit JSON config and every input it registers from."""
+    cfg = builder.cfg
+    tool, solver, stage0 = feedback_tooling_paths(cfg)
+    for path in (tool, solver, stage0):
+        if not path.is_file():
+            raise RuntimeError(f"research tooling file missing: {path} (--feedback-tooling {cfg.feedback_tooling})")
+    root = cfg.work("feedback")
+    (root / "stage1").mkdir(parents=True, exist_ok=True)
+    templated = cfg.work("calibration", "templated.txt")
+    rendered = read_json(templated.with_suffix(".json"))  # the calibration-render receipt: prefix ids and stride
+    shutil.copyfile(stage0, root / "stage0-result.json")
+    if sha256_file(root / "stage0-result.json") != FEEDBACK_STAGE0_RESULT_SHA256:
+        raise RuntimeError(f"the registered stage0 gate changed: {stage0} does not match the frozen sha256")
+    write_json(root / "stage1-policy.json", {
+        "schema": "infernix.gemma4-feedback-policy/v1",
+        "role_types": dict(FEEDBACK_ROLE_TYPES), "role_damping": dict(FEEDBACK_ROLE_DAMPING),
+        "stage0_result_sha256": FEEDBACK_STAGE0_RESULT_SHA256,
+        "damping_source": "X5 stage0 validation-only selection, frozen 2026-11-23; a build never re-selects damping",
+    })
+    rp_dir = cfg.work("calibration", "rp-corpus")
+    provenance = read_json(rp_dir / "provenance.json")
+    streams = [{"id": record["id"], "path": str(rp_dir / "data" / f"{record['id']}.txt")}
+               for record in provenance["excerpts"]]
+    if len(streams) < 32:
+        raise RuntimeError(f"the roleplay corpus has {len(streams)} threads; registration needs at least 32 "
+                           "(raise the corpus quotas or add raw forum files)")
+    dev = root / "dev-corpus"
+    dev.mkdir(exist_ok=True)
+    write_json(dev / "manifest.json", {"schema": "infernix.gemma4-feedback-devcorpus/v1", "streams": streams})
+    write_json(root / "calibration-metadata.json", {
+        "source": str(templated), "prefix_ids": rendered["prefix_ids"], "stride_tokens": rendered["stride_tokens"],
+    })
+    write_json(root / "config.json", {
+        "out": str(root), "source": str(cfg.model), "infernix": str(REPO_ROOT),
+        "imatrix": str(cfg.work("imatrix.gguf")), "codec_library": str(codec_library_path(cfg)),
+        "quantizer": llama_tool(cfg, "llama-quantize"),
+        "calibration_metadata": str(root / "calibration-metadata.json"),
+        "development_corpus": str(dev), "raw": str(cfg.rp_raw),
+        "against": [str(path) for path in cfg.rp_against],
+        "seed": FEEDBACK_SEED, "confirmation_seed": FEEDBACK_CONFIRMATION_SEED,
+        "capture_batch": FEEDBACK_CAPTURE_BATCH, "dampings": list(FEEDBACK_DAMPINGS),
+        "hessian_dtype": "float64", "prior_thread_records": [],
+        "minimum_free_gib": {cfg.work_dir.anchor: 100, "C:/": 10, "D:/": 100},
+        "stage0_result": "stage0-result.json", "stage1_policy": str(root / "stage1-policy.json"),
+        "stage1_directory": "stage1",
+    })
+    builder.log(f"wrote the feedback config ({cfg.imatrix_corpus or 'public'} imatrix; frozen stage1 policy, "
+                f"FP64 Hessians, seed {FEEDBACK_SEED})")
+
+
+def register_feedback_amendment(builder: "Builder") -> None:
+    """Pin the execution layout the tool's registration check enforces: tool/solver SHAs, template, config hash."""
+    cfg = builder.cfg
+    tool, solver, _ = feedback_tooling_paths(cfg)
+    template = cfg.work("model-q8_0.gguf")
+    if not template.is_file():
+        raise RuntimeError(f"the Q8_0 metadata template is missing: {template}")
+    config = cfg.work("feedback", "config.json")
+    write_json(cfg.work("feedback", "implementation-amendment.json"), {
+        "schema": "infernix.gemma4-feedback-amendment/v1",
+        "reason": "builder preset iq3-xxs-feedback pins the execution layout of the registered X5 tool chain",
+        "driver_sha256": sha256_file(tool), "solver_sha256": sha256_file(solver),
+        "metadata_template": str(template),
+        "active_config_sha256": sha256_file(config),
+        "additional_input_sha256": {str(template): sha256_file(template)},
+    })
+    builder.log(f"pinned the feedback execution: tool {sha256_file(tool)[:12]}..., config "
+                f"{sha256_file(config)[:12]}..., template {template.name}")
 
 
 def convert_argv(cfg: BuildConfig, out: Path, *, scoring: bool, checkpoint: Path | None) -> list[str]:
@@ -740,13 +957,16 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
     templated = cfg.work("calibration", "templated.txt")
     source = cfg.calibration_text or cfg.work("calibration", "source.txt")
     tokenizer = cfg.model / "tokenizer.json"
-    checkpoint = cfg.work(f"model-{preset.gguf_type}.gguf") if preset.method == "gguf" else cfg.work("gptq")
+    checkpoint = (cfg.work("feedback", "stage1", "feedback-XXS.gguf") if preset.feedback
+                  else cfg.work(f"model-{preset.gguf_type}.gguf")) if preset.method == "gguf" else cfg.work("gptq")
     tree = cfg.work("text60")
     steps: list[Step] = []
 
     if preset.method != "plain":
-        roleplay = preset.imatrix_corpus == "roleplay"
-        if roleplay:
+        roleplay = cfg.imatrix_corpus == "roleplay" if preset.feedback else preset.imatrix_corpus == "roleplay"
+        # The feedback preset always builds the registration corpus: validation windows and the untouched
+        # confirmation draw never reuse public or diode data, whatever the imatrix corpus is.
+        if roleplay or preset.feedback:
             corpus = cfg.work("calibration", "rp-corpus")
             source = corpus / RP_SOURCE_NAME
             steps.append(Step(
@@ -759,9 +979,11 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
                    str(CALIBRATION_CONTEXT), "--prefix-tokens", "17"],
                 outputs=(source, corpus / "provenance.json"),
                 note=f"raw forum parquet files must exist in {cfg.rp_raw} (`roleplay_heldout fetch`); the corpus is "
-                     "shingle-checked disjoint from every --rp-against evaluation text",
+                     "shingle-checked disjoint from every --rp-against evaluation text"
+                     + ("; it is also the imatrix corpus" if roleplay else
+                        "; the imatrix itself comes from the corpus chosen by --imatrix-corpus (public default)"),
             ))
-        elif cfg.calibration_text is None:
+        if not roleplay and cfg.calibration_text is None:
             steps.append(Step(
                 "calibration-source", f"Download the pinned public English calibration text ({CALIBRATION_REPO})",
                 minutes["calibration-source"], call=fetch_calibration, outputs=(source,),
@@ -795,7 +1017,7 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
             steps += gptq_steps(cfg, tree, calib, cfg.work(Q5_CHECKPOINT), bits=5, group_size=Q5_GROUP_SIZE,
                                 suffix="-q5", free_tree=True)
     if preset.method == "gguf":
-        steps += gguf_steps(cfg, templated, checkpoint)
+        steps += feedback_steps(cfg, templated) if preset.feedback else gguf_steps(cfg, templated, checkpoint)
     steps.append(Step(
         "convert", f"Convert to .ninfer ({preset.id}: {preset.summary}; the converter verifies storage itself)",
         minutes["convert"], convert_argv(cfg, cfg.artifact, scoring=False, checkpoint=checkpoint),
@@ -879,6 +1101,10 @@ def describe_plan(cfg: BuildConfig, steps: list[Step]) -> list[str]:
         f"Model       {cfg.model}",
         f"MTP         {cfg.assistant if cfg.assistant else 'none (--no-mtp)'}",
         f"Vision      {'kept (--with-vision)' if cfg.with_vision else 'left out (text only)'}",
+        *((f"Imatrix     {cfg.imatrix_corpus or 'public'} corpus — "
+           + (FEEDBACK_ROLEPLAY_NOTE if cfg.imatrix_corpus == "roleplay" else
+              "the campaign-faithful default (generic templated English imatrix)"),)
+          if preset.feedback else ()),
         f"Output      {cfg.artifact}",
         f"Work dir    {cfg.work_dir}",
         f"Estimate    about {plan_minutes(steps):.0f} min in total (typical RTX 5090 + NVMe; your times vary)",
@@ -986,6 +1212,31 @@ def check_receipt(builder: "Builder") -> None:
     if not receipt["artifact"].get("file_sha256", {}).get(cfg.artifact.name):
         raise RuntimeError("converter receipt has no sha256 for the artifact")
     builder.log(f"receipt ok: {status}; {size} bytes; revision {receipt.get('revision')}")
+    if cfg.preset.feedback:
+        check_feedback_receipt(builder, size)
+
+
+def check_feedback_receipt(builder: "Builder", artifact_size: int) -> None:
+    """The registered same-bytes facts: 410 projections at exactly the deployed XXS trunk bytes, planned size."""
+    cfg = builder.cfg
+    feedback = read_json(cfg.work("feedback", "stage1", "feedback.json"))
+    candidate = read_json(cfg.work("feedback", "stage1", "candidate.json"))
+    policy = read_json(cfg.work("feedback", "stage1-policy.json"))
+    if len(feedback["tensors"]) != 410 or feedback["encoded_bytes"] != FEEDBACK_PROJECTION_BYTES:
+        raise RuntimeError(f"the feedback payload inventory is not the registered same-bytes XXS trunk "
+                           f"({len(feedback['tensors'])} tensors, {feedback['encoded_bytes']} bytes; want 410 and "
+                           f"{FEEDBACK_PROJECTION_BYTES})")
+    stock = cfg.work("feedback", "stage1", "stock-XXS.gguf")
+    if not candidate.get("same_types_shapes_bytes") or candidate["bytes"] != stock.stat().st_size:
+        raise RuntimeError("the packed candidate is not byte-identical to the stock container")
+    planned = preset_file_bytes(cfg.preset, cfg.assistant_encoding)
+    if artifact_size != planned:
+        raise RuntimeError(f"{cfg.artifact} is {artifact_size} bytes; the preset plan says {planned}")
+    if any(policy["role_types"][role] != feedback_role for role, feedback_role in FEEDBACK_ROLE_TYPES.items()):
+        raise RuntimeError("the packed role types differ from the deployed XXS allocation")
+    builder.log(f"feedback receipt ok: 410 projections, {FEEDBACK_PROJECTION_BYTES} projection bytes, candidate "
+                f"{candidate['bytes']} bytes (registered container {FEEDBACK_REGISTERED_CONTAINER_BYTES} on the "
+                "campaign inputs)")
 
 
 def render_summary(info: dict) -> str:
@@ -1033,7 +1284,24 @@ def render_summary(info: dict) -> str:
         f"- Corpus sha256: `{info['roleplay_calibration']['corpus_sha256']}`; selection seed "
         f"`{info['roleplay_calibration']['selection']['seed']}`; "
         f"{info['roleplay_calibration']['totals']['excerpts']} excerpts.",
-    ] if info.get("roleplay_calibration") else []) + [
+    ] if info.get("roleplay_calibration") else []) + ([
+        "",
+        "## Hessian-feedback provenance (research-only)",
+        "",
+        f"- Registered X5 recipe; imatrix corpus: `{info['hessian_feedback']['imatrix_corpus']}`"
+        + (" (UNMEASURED stack — the campaign measured the generic templated English imatrix)."
+           if info['hessian_feedback']['imatrix_corpus'] == "roleplay" else " (the campaign-faithful default)."),
+        f"- Importance matrix sha256: `{info['hessian_feedback']['imatrix_sha256']}`.",
+        f"- Frozen role damping: {info['hessian_feedback']['role_damping']} (validation-only selection, never "
+        "re-selected); stage0 gate sha256 `" + info['hessian_feedback']['stage0_result_sha256'][:12] + "...`.",
+        f"- Hessians: FP64 covariance capture, decoder-layer-sequential; projection bytes "
+        f"{info['hessian_feedback']['projection_bytes']:,} (same-bytes XXS trunk, 410 projections).",
+        f"- Candidate container sha256: `{info['hessian_feedback']['candidate_sha256']}` "
+        f"({info['hessian_feedback']['candidate_bytes']:,} bytes; the campaign's registered container was "
+        f"{info['hessian_feedback']['registered_container_bytes']:,} B on the campaign inputs).",
+        f"- Research tool: `{info['hessian_feedback']['tool']}` (driver sha256 "
+        f"`{info['hessian_feedback']['tool_sha256'][:12]}...`, solver `{info['hessian_feedback']['solver_sha256'][:12]}...`).",
+    ] if info.get("hessian_feedback") else []) + [
         "",
         "## Files",
         "",
@@ -1105,7 +1373,7 @@ def build_info(builder: "Builder") -> dict:
             )
         )
     roleplay = None
-    if cfg.preset.imatrix_corpus == "roleplay":
+    if (cfg.imatrix_corpus or cfg.preset.imatrix_corpus) == "roleplay":
         provenance_path = cfg.work("calibration", "rp-corpus", "provenance.json")
         if provenance_path.is_file():
             try:
@@ -1115,13 +1383,38 @@ def build_info(builder: "Builder") -> dict:
     launchers = {"main": str(launcher_path) if settings.launcher and server is not None else None}
     if cfg.preset.launcher_no_mtp and settings.launcher and server is not None:
         launchers["mtp_override"] = str(cfg.out_dir / f"serve-{cfg.name}-mtp.cmd")
+    hessian = None
+    if cfg.preset.feedback:
+        root = cfg.work("feedback")
+        candidate = read_json(root / "stage1" / "candidate.json")
+        registration = read_json(root / "registration.json")
+        policy = read_json(root / "stage1-policy.json")
+        amendment = read_json(root / "implementation-amendment.json")
+        hessian = {
+            "provenance": "registered X5 stage-1 recipe (research-only; measured on the diode finetune at XXS "
+                          "bytes; not a default)",
+            "imatrix_corpus": cfg.imatrix_corpus or "public",
+            "imatrix_sha256": registration["input_sha256"].get(str(cfg.work("imatrix.gguf"))),
+            "role_types": policy["role_types"], "role_damping": policy["role_damping"],
+            "damping_source": policy["damping_source"], "stage0_result_sha256": policy["stage0_result_sha256"],
+            "hessian_dtype": "float64", "seed": registration["config"]["seed"],
+            "confirmation_seed": registration["config"]["confirmation_seed"],
+            "tool": str(feedback_tooling_paths(cfg)[0]), "tool_sha256": amendment["driver_sha256"],
+            "solver_sha256": amendment["solver_sha256"], "config_sha256": amendment["active_config_sha256"],
+            "candidate_sha256": candidate["sha256"], "candidate_bytes": candidate["bytes"],
+            "stock_sha256": candidate["stock_sha256"], "projections": candidate["projections"],
+            "projection_bytes": candidate["encoded_bytes"],
+            "registered_container_bytes": FEEDBACK_REGISTERED_CONTAINER_BYTES,
+        }
     return {
         "name": cfg.name,
         "preset": {k: getattr(cfg.preset, k)
                    for k in ("id", "summary", "meaning", "size_class", "kl", "method", "bits", "q5_units", "evidence",
-                             "label", "allocation", "vocab_weights", "assistant_encodings", "imatrix_corpus")},
+                             "label", "allocation", "vocab_weights", "assistant_encodings", "imatrix_corpus",
+                             "feedback")},
         "assistant_encoding": cfg.assistant_encoding if cfg.preset.assistant_encodings else None,
         "roleplay_calibration": roleplay,
+        "hessian_feedback": hessian,
         "mtp": info_artifact.mtp,
         "vision": info_artifact.vision,
         "artifact": str(cfg.artifact),
@@ -1270,7 +1563,7 @@ def build_identity(cfg: BuildConfig) -> dict:
         )
     if cfg.preset.method == "plain":
         calibration = None
-    elif cfg.preset.imatrix_corpus == "roleplay":
+    elif (cfg.imatrix_corpus or cfg.preset.imatrix_corpus) == "roleplay":
         corpus_text = cfg.work("calibration", "rp-corpus", RP_SOURCE_NAME)
         calibration = {
             "corpus": "tools.eval.roleplay_calibration (the pinned forum roleplay calibration; never a public or "
@@ -1301,6 +1594,13 @@ def build_identity(cfg: BuildConfig) -> dict:
             "llama_cpp": str(cfg.llama_cpp.resolve()) if cfg.llama_cpp else None,
             "llama_cpp_source": str(cfg.llama_cpp_source.resolve()) if cfg.llama_cpp_source else None}
            if cfg.preset.method == "gguf" else {}),
+        **({"feedback_tooling": str(cfg.feedback_tooling.resolve()) if cfg.feedback_tooling else None,
+            "feedback_tool_sha256": _hash_or_none(feedback_tooling_paths(cfg)[0]) if cfg.feedback_tooling else None,
+            "feedback_solver_sha256": _hash_or_none(feedback_tooling_paths(cfg)[1]) if cfg.feedback_tooling else None,
+            "imatrix_corpus": cfg.imatrix_corpus or "public",
+            "registration_corpus": {"raw": str(cfg.rp_raw.resolve()) if cfg.rp_raw else None,
+                                    "against": sorted(str(path.resolve()) for path in cfg.rp_against)}}
+           if cfg.preset.feedback else {}),
     }
     return identity
 

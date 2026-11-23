@@ -15,6 +15,8 @@ from .gemma4_build import (
     CALIBRATION_REPO,
     CALIBRATION_REVISION,
     CARD_CLASSES,
+    FEEDBACK_IMATRIX_CORPORA,
+    FEEDBACK_TOOLING_ENV,
     GPTQ_PYTHON_ENV,
     LLAMA_CPP_ENV,
     LLAMA_CPP_SOURCE_ENV,
@@ -52,11 +54,14 @@ METHODS = {
     "iq3-xxs": "IQ3_XXS, own imatrix",
     "forum-iq3-16gb": "IQ3_XXS base + forum allocation, RP imatrix",
     "forum-iq3-16gb-quality": "IQ3_XXS base + F1 allocation, RP imatrix",
+    "iq3-xxs-feedback": "IQ3_XXS + Hessian feedback, frozen X5 damping",
 }
 NEEDS = {
     "gptq": "GPU with 12 GiB free, 64 GiB RAM, about 75 GB disk, the GPTQ environment (setup-gptq)",
     "plain": "nothing extra",
-    "gguf": "llama.cpp binaries and source (--llama-cpp, --llama-cpp-source); own-model imatrix",
+    "gguf": "llama.cpp binaries and source (--llama-cpp, --llama-cpp-source); own-model imatrix; "
+            "iq3-xxs-feedback additionally needs the GPTQ Python environment (the research tool's interpreter), "
+            "the research tooling checkout (--feedback-tooling) and about 170 GB disk",
 }
 EPILOG = f"""\
 presets (text only, sizes include MTP; quality hints are historical, NOT a matched ranking):
@@ -83,6 +88,12 @@ the public and diode matrices are never reused). forum-iq3-16gb defaults to the 
 q4-g32 (balanced, better observed acceptance) or q4-g256 (smallest, higher tested context) stores the draft smaller.
 forum-iq3-16gb-quality embeds the FP8 assistant but generates its launcher without MTP; the serve-<name>-mtp.cmd
 launcher beside it is the explicit opt-in override (native --spec mtp --draft-tokens 1 --allow-shared-memory).
+iq3-xxs-feedback (campaign X5 stage 1) re-solves all 410 XXS-role projections with Hessian error feedback at the
+same encoded bytes: KL ratios 0.44-0.53 of the deployed XXS (confirmed at the historical strength on an untouched
+confirmation draw). Its imatrix defaults to the campaign-faithful generic templated English corpus;
+--imatrix-corpus roleplay swaps in the pinned forum corpus of your own model (an UNMEASURED stack). It needs
+--feedback-tooling <llama-local-tooling> (the research tool checkout), --rp-raw/--rp-against (the registration
+corpus), and a GPU lease for the feedback pass; the damping policy is frozen and never re-selected.
 
 Bundled recommendations (quality / balanced / context per card class; labels resolved to concrete combinations,
 not new CLI profiles; explicit flags always win; key-only KV stays explicit; MTP embedding and MTP enable are
@@ -260,6 +271,12 @@ def build_parser() -> argparse.ArgumentParser:
         "on this corpus")
     add("--rp-against", type=Path, action="append", default=[], help="forum presets: evaluation text (file or "
         "directory of *.txt) the calibration corpus must be shingle-disjoint from; repeatable, at least one")
+    add("--imatrix-corpus", choices=FEEDBACK_IMATRIX_CORPORA, default=None,
+        help="iq3-xxs-feedback only: the importance-matrix corpus: public (default, the generic templated English "
+        "corpus the campaign measured — the campaign-faithful stack) or roleplay (the pinned forum calibration "
+        "corpus of your own model; UNMEASURED stack)")
+    add("--feedback-tooling", type=Path, help=f"iq3-xxs-feedback only: llama-local-tooling checkout with "
+        f"converter/gguf/iq_hessian_feedback.py (default: ${FEEDBACK_TOOLING_ENV})")
     add("--gptq-python", type=Path, help=f"python.exe of the GPTQ environment (default: ${GPTQ_PYTHON_ENV}, else "
         "<checkout>/.venv-gptq); never the converter's interpreter")
     add("--llama-cpp", type=Path, help=f"IQ3 presets: directory containing llama-quantize and llama-imatrix "
@@ -359,7 +376,18 @@ def resolve_config(args: argparse.Namespace) -> tuple[BuildConfig, ServeSettings
     if args.preset not in PRESETS:
         raise ValueError(f"unknown preset {args.preset!r}; choose one of {', '.join(PRESETS)}")
     preset = PRESETS[args.preset]
-    if preset.assistant_encodings:
+    if preset.feedback:
+        if not args.rp_raw or not args.rp_against:
+            raise ValueError(f"preset {preset.id} registers its run against the pinned forum roleplay corpus: "
+                "pass --rp-raw (raw files from `roleplay_heldout fetch`) and --rp-against (your evaluation "
+                "texts); the registration corpus, validation windows and untouched confirmation draw never reuse "
+                "public or diode data")
+        if args.imatrix_corpus == "roleplay" and args.calibration_text is not None:
+            raise ValueError(f"preset {preset.id} with --imatrix-corpus roleplay quantizes with the forum "
+                "calibration corpus; --calibration-text would replace it and is refused")
+        if args.assistant_encoding is None:
+            args.assistant_encoding = "fp8"
+    elif preset.assistant_encodings:
         if not args.rp_raw or not args.rp_against:
             raise ValueError(f"preset {preset.id} quantizes with an importance matrix from your own model on the "
                 "pinned forum roleplay calibration corpus: pass --rp-raw (raw files from `roleplay_heldout fetch`) "
@@ -371,6 +399,12 @@ def resolve_config(args: argparse.Namespace) -> tuple[BuildConfig, ServeSettings
             args.assistant_encoding = "fp8"
     elif args.assistant_encoding is not None:
         raise ValueError("--assistant-encoding applies to forum-iq3-16gb only")
+    if not preset.feedback and (args.imatrix_corpus is not None or args.feedback_tooling is not None):
+        raise ValueError("--imatrix-corpus and --feedback-tooling apply to iq3-xxs-feedback only")
+    feedback_tooling = args.feedback_tooling or os.environ.get(FEEDBACK_TOOLING_ENV)
+    if preset.feedback and not feedback_tooling:
+        raise ValueError(f"preset {args.preset} drives the registered X5 research tool in a llama-local-tooling "
+                         f"checkout: pass --feedback-tooling <checkout> or set {FEEDBACK_TOOLING_ENV}")
     for flag in ("model", "out_dir"):
         if getattr(args, flag) is None:
             raise ValueError(f"--{flag.replace('_', '-')} is required")
@@ -383,7 +417,7 @@ def resolve_config(args: argparse.Namespace) -> tuple[BuildConfig, ServeSettings
     if work_dir == out_dir:
         raise ValueError("--work-dir must not be the output directory itself")
     kwargs = serve_kwargs(args, default_profile="q5-quality" if preset.bits == 5 else "default")
-    if preset.id in ("q4q5-mixed-a", "q4q5-mixed-b") and args.profile is None and args.context is None:
+    if preset.id in ("q4q5-mixed-a", "q4q5-mixed-b", "iq3-xxs-feedback") and args.profile is None and args.context is None:
         kwargs["context"] = "auto"
     launcher_tools.check_serve_settings(launcher_tools.ServeProfile(**kwargs))
     if args.score and args.no_launcher and args.serve is None:
@@ -392,7 +426,8 @@ def resolve_config(args: argparse.Namespace) -> tuple[BuildConfig, ServeSettings
         None if args.no_launcher and not args.score
         else launcher_tools.find_server_exe(REPO_ROOT, preset.formats)
     )
-    gptq_python = (args.gptq_python or default_gptq_python()).absolute() if preset.method == "gptq" else None
+    gptq_python = (args.gptq_python or default_gptq_python()).absolute() \
+        if (preset.method == "gptq" or preset.feedback) else None
     llama_cpp = args.llama_cpp or os.environ.get(LLAMA_CPP_ENV)
     llama_source = args.llama_cpp_source or os.environ.get(LLAMA_CPP_SOURCE_ENV)
     cfg = BuildConfig(
@@ -407,6 +442,8 @@ def resolve_config(args: argparse.Namespace) -> tuple[BuildConfig, ServeSettings
         assistant_encoding=args.assistant_encoding or "fp8",
         rp_raw=args.rp_raw.resolve() if args.rp_raw else None,
         rp_against=tuple(path.resolve() for path in args.rp_against),
+        feedback_tooling=Path(feedback_tooling).resolve() if feedback_tooling else None,
+        imatrix_corpus=args.imatrix_corpus or ("public" if preset.feedback else ""),
     )
     serve = ServeSettings(**kwargs, server_exe=server, cuda_bin=args.cuda_bin, launcher=not args.no_launcher)
     return cfg, serve, server
