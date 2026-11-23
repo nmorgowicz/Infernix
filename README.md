@@ -709,6 +709,14 @@ the tied `q4_g32` vocabulary. See
 and the [selection guide](docs/gemma4-selection-guide.md), which also resolves the quality/balanced/context bundle
 recommendations per card class (labels, not CLI profiles).
 
+A fourth research-only preset, `iq3-xxs-feedback` (campaign X5 stage 1), re-solves all 410 XXS-role projections
+with Hessian error feedback at exactly the deployed XXS bytes (measured KL ratios 0.44-0.53 of deployed XXS,
+confirmed at the historical strength on an untouched confirmation draw). It drives the research tool in a
+llama-local-tooling checkout (`--feedback-tooling`), defaults the imatrix to the campaign-measured generic
+templated corpus (`--imatrix-corpus roleplay` opts into the unmeasured forum stack), and needs the GPTQ Python
+environment plus a GPU lease for the feedback pass. See
+[iq3-xxs-feedback](docs/weight-conversion.md#research-only-preset-iq3-xxs-feedback-campaign-x5-stage-1).
+
 The smaller `iq3-xs` and `iq3-xxs` presets take `--llama-cpp <binary dir> --llama-cpp-source <source dir>`, collect the BF16 model's own
 importance matrix through a Q8_0 copy and import the resulting IQ3 blocks. No GPTQ environment is needed.
 Follow [HF BF16 → IQ3 creation](docs/weight-conversion.md#create-the-smaller-iq3-files-from-hf-bf16) for both

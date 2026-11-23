@@ -518,6 +518,7 @@ is needed. Source weights are read-only, outputs are never overwritten, and a fa
 | `iq3-xxs` | own-model importance matrix, IQ3_XXS allocation | GGUF IQ3_XXS / IQ2_S / IQ3_S blocks |
 | `forum-iq3-16gb` (research-only, measured on the diode finetune) | own-model roleplay-imatrix, the measured forum allocation (campaign F2), tied q4_g32 vocabulary | GGUF IQ2_S / IQ3_XXS / IQ3_S blocks; 12,630,891,524 B (FP8 assistant), 12,431,956,996 B (q4-g32), 12,407,184,388 B (q4-g256) |
 | `forum-iq3-16gb-quality` (research-only, measured on the diode finetune) | own-model roleplay-imatrix, the measured F1 allocation, tied q4_g32 vocabulary | GGUF IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS blocks; planned 13,173,652,484 B (the measured F1 artifact is 4,096 B larger) |
+| `iq3-xxs-feedback` (research-only, measured on the diode finetune at XXS bytes) | own-model importance matrix (generic templated default; roleplay option), the deployed XXS allocation with all 410 projections re-solved by Hessian error feedback (frozen X5 damping), FP8 vocabulary | GGUF IQ2_S / IQ3_XXS / IQ3_S blocks; planned 13,019,175,940 B (FP8 assistant), 12,820,241,412 B (q4-g32), 12,795,468,804 B (q4-g256) |
 | `draft` | uncalibrated absmax, group 32 | `q4_g32_fp16`; a quick conversion smoke, not a calibrated tier |
 
 See the [canonical four-tier comparison](maintainer/gemma4-benchmarks.md#four-tier-comparison) for measured
@@ -845,6 +846,48 @@ Its fresh forum KL ratio 0.847 missed the registered 0.85 gate on the plain cont
 serving passed 32768/36864/38912 and refused 39936 under ballast with MTP off.
 
 MTP embedding (the stored assistant and its encoding) stays separate from MTP enable (the launcher/runtime).
+
+#### Research-only preset: `iq3-xxs-feedback` (campaign X5 stage 1)
+
+`--preset iq3-xxs-feedback` reproduces the registered X5 Hessian-feedback recipe from any BF16 fine-tune: the
+deployed IQ3_XXS role allocation with **all 410 projections re-solved by decoder-layer-sequential Hessian error
+feedback** (FP64 covariance capture, exact IQ decode rounded BF16), packed same-bytes over the stock own-imatrix
+XXS container and imported with the ordinary IQ3 route (native A8 scoring; speed unchanged by construction — no
+timing claim). Planned artifact 13,019,175,940 B (the same bytes as the deployed XXS `.ninfer`; the campaign's
+stock container was 11,103,270,944 B on the campaign inputs). Measured on the diode finetune, candidate/deployed-KL
+ratios RP-dev 0.4388 [0.4248, 0.4551], fresh 0.4463 [0.4225, 0.4714], 65k-16 long 0.5263 [0.5024, 0.5502],
+untouched short confirmation 0.4455 [0.4239, 0.4720] — confirmed at the historical <0.85 strength. Labels:
+research-only, never a default.
+
+Extra needs beyond the IQ3 route: the research tooling checkout, `--feedback-tooling <llama-local-tooling>`
+(or `INFERNIX_FEEDBACK_TOOLING`), which carries `converter/gguf/iq_hessian_feedback.py`; the GPTQ Python
+environment (the tool's interpreter, `--gptq-python`); `ggml-base` beside the llama.cpp binaries; a GPU lease for
+the feedback pass (the campaign stage 1 used 2.3 h of GPU loop time); and about 170 GB of work-disk (BF16 GGUF,
+Q8_0 metadata template, lossless BF16 projection GGUF, stock container, raw payload checkpoints). The preset also
+requires `--rp-raw`/`--rp-against` in every mode: the registration corpus, validation windows and the untouched
+confirmation draw are always built from the pinned forum corpus of your own model and never reuse public or
+diode data.
+
+**Imatrix choice is explicit.** The campaign stage 1 measured the **generic templated English** imatrix; that
+campaign-faithful stack is the default. `--imatrix-corpus roleplay` swaps the importance matrix to the pinned
+forum calibration corpus of your own model — an **UNMEASURED stack** (everything else stays the registered
+recipe). The build plan, `BUILD-SUMMARY.md` and the receipt label the choice.
+
+The damping policy is **frozen** from the campaign's validation-only stage-0 selection (attn 0.01x120,
+0.03x230, down 0.1x60 tensor counts) and is never re-selected; the registered stage-0 gate is copied into the
+work dir unchanged and pinned by SHA-256. Pipeline stages: `rp-corpus` (+ `calibration-source` for the public
+imatrix) → `calibration-render` → `gguf-bf16` → `gguf-q8` (kept as the metadata template) → `imatrix` →
+`feedback-config` → `feedback-prepare` (registration; writes the untouched confirmation draw) →
+`feedback-register` (pins tool/solver SHAs, config hash, metadata template) → `feedback-baseline` (stock
+quantize with whole/slab parity on all 410 tensors) → `feedback-capture` (the FP64 Hessian-feedback pass) →
+`feedback-pack` (same-byte pack, re-reads every payload) → `convert` → `receipt-check` → `finalize`. The
+receipt check enforces the registered same-bytes facts: 410 projections at exactly 11,087,462,400 projection
+bytes and the planned artifact size. The receipt and `BUILD-SUMMARY.md` record the imatrix, stage-0 gate,
+damping, tool/solver/config and candidate SHAs.
+
+Launcher defaults follow the mixed-A style: default serve profile, MTP with one draft token, **auto context**.
+Memory expectations: the file is 13.02 GB; the measured 32k+MTP anchors were taken on the F2 forum allocation,
+**not** on this container — treat any 16 GB capacity claim for this exact container as unmeasured.
 
 ### Bundled recommendations (labels, not CLI profiles)
 
