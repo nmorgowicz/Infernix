@@ -146,12 +146,21 @@ class Env:
         self.llama_source = tmp_path / "llama-src"
         self.llama_source.mkdir()
         (self.llama_source / "convert_hf_to_gguf.py").write_text("# converter")
+        self.rp_raw = tmp_path / "rp-raw"
+        self.rp_raw.mkdir()
+        self.rp_against = tmp_path / "heldout.txt"
+        self.rp_against.write_text("held-out evaluation text")
 
     def argv(self, preset: str, *extra: str, mtp: bool = True) -> list[str]:
         argv = ["--preset", preset, "--model", str(self.model), "--out-dir", str(self.out),
                 "--serve", str(self.server), "--gptq-python", str(self.gptq_python),
-                "--calibration-text", str(self.calibration), "--llama-cpp", str(self.llama_cpp),
-                "--llama-cpp-source", str(self.llama_source)]
+                "--llama-cpp", str(self.llama_cpp), "--llama-cpp-source", str(self.llama_source)]
+        preset_object = build.PRESETS.get(preset)
+        if preset_object is not None and preset_object.assistant_encodings:
+            # --calibration-text is refused for these; the imatrix comes from the roleplay corpus.
+            argv += ["--rp-raw", str(self.rp_raw), "--rp-against", str(self.rp_against)]
+        else:
+            argv += ["--calibration-text", str(self.calibration)]
         argv += ["--assistant", str(self.assistant)] if mtp else ["--no-mtp"]
         return argv + list(extra)
 
@@ -161,6 +170,7 @@ class Env:
             out_dir=self.out, work_dir=self.out / "work", name="m-" + preset, python=PY,
             gptq_python=self.gptq_python, calibration_text=self.calibration, perplexity_exe=self.perplexity,
             llama_cpp=self.llama_cpp, llama_cpp_source=self.llama_source,
+            rp_raw=self.rp_raw, rp_against=(self.rp_against,),
         )
         values.update(over)
         return build.BuildConfig(**values)
@@ -1878,3 +1888,236 @@ def test_mixed_build_launcher_and_receipt_preserve_context_precedence(env, monke
     assert list(plan.flags) == expected_argv[2:]
     receipt = json.loads((cfg.out_dir / f"{cfg.name}.gemma4-build.json").read_text())
     assert receipt["serve_command"] == build.format_command(expected_argv)
+
+
+# ---------------------------------------------------------------- research recipes (forum F2/F1, mixed-B)
+
+
+def test_research_byte_plans_reproduce_the_campaign_artifacts():
+    """The compose plan arithmetic must match the exact measured diode artifacts before anyone runs a GPU."""
+    f2 = build.PRESETS["forum-iq3-16gb"]
+    assert build.preset_file_bytes(f2, "fp8") == 12_630_891_524
+    assert build.preset_file_bytes(f2, "q4-g32") == 12_431_956_996
+    assert build.preset_file_bytes(f2, "q4-g256") == 12_407_184_388
+    # F1/mixed-B: the retained campaign artifacts are 4,096 B larger (storage alignment the plan does not model).
+    assert abs(build.preset_file_bytes(build.PRESETS["forum-iq3-16gb-quality"]) - 13_173_656_580) == 4_096
+    assert abs(build.preset_file_bytes(build.PRESETS["q4q5-mixed-b"]) - 20_139_576_324) == 4_096
+    # The same arithmetic reproduces the retained single-recipe artifacts to within its rounding.
+    for preset, exact in ((build.PRESETS["best-medium"], 18_405_559_556), (build.PRESETS["q4q5-mixed-a"], 19_344_788_484),
+                          (build.PRESETS["q5-g64"], 21_151_124_484)):
+        assert abs(build.preset_file_bytes(preset) - exact) < 100_000, preset.id
+    assert round(build.PRESETS["q4q5-mixed-b"].file_gb, 2) == 20.14
+    assert f2.assistant_encodings == ("fp8", "q4-g32", "q4-g256")
+
+
+def test_allocation_resolution_and_pins_cover_the_registered_maps():
+    f2 = build.resolve_allocation(build.GGUF_ALLOCATIONS["forum-iq3-16gb"])
+    assert f2[(7, "attn_k")] == "IQ3_XXS" and f2[(5, "attn_k")] == "IQ2_S"  # sliding K, global K fused with Q
+    assert f2[(3, "attn_v")] == "IQ3_S" and f2[(25, "ffn_down")] == "IQ3_S" and f2[(45, "ffn_down")] == "IQ3_XXS"
+    assert f2[(0, "attn_q")] == "IQ2_S" and f2[(0, "attn_output")] == "IQ3_S"
+    f1 = build.resolve_allocation(build.GGUF_ALLOCATIONS["forum-iq3-16gb-quality"])
+    assert f1[(0, "attn_q")] == "IQ3_XXS" and f1[(0, "attn_k")] == "IQ3_XXS" and f1[(3, "attn_v")] == "IQ3_S"
+    assert f1[(25, "ffn_down")] == "IQ3_S" and f1[(45, "ffn_down")] == "IQ4_XS"
+    # The pins match exactly the tensors the allocation pins: every pinned tensor agrees with the resolved map,
+    # and every tensor that deviates from the deployed XXS base mix is covered by a pin (the rest stay the
+    # quantizer's own IQ3_XXS mix).
+    import re
+    for allocation in ("forum-iq3-16gb", "forum-iq3-16gb-quality"):
+        pins = [pin.split("=", 1) for pin in build.GGUF_TENSOR_TYPES[allocation]]
+        resolved = build.resolve_allocation(build.GGUF_ALLOCATIONS[allocation])
+        covered = set()
+        for pattern, typ in pins:
+            for (layer, role), want in resolved.items():
+                name = f"blk.{layer}.{role}.weight"
+                if re.search(pattern, name):
+                    assert want == typ, (name, pattern, typ, want)
+                    covered.add((layer, role))
+        base = build.ALLOCATION_BASE_TYPES
+        expected = {(i, r) for (i, r), t in resolved.items() if t != base.get(r) or r in ("attn_q", "attn_k", "attn_output")}
+        assert covered == expected, (allocation, sorted(expected - covered), sorted(covered - expected))
+
+
+def test_forum_plan_collects_the_roleplay_imatrix_with_provenance(env):
+    cfg = env.config("forum-iq3-16gb", assistant_encoding="q4-g256")
+    steps = plan_by_id(cfg)
+    assert list(steps) == ["rp-corpus", "calibration-render", "gguf-bf16", "gguf-q8", "imatrix", "gguf-quantize",
+                           "convert", "receipt-check", "finalize"]
+    corpus = w(cfg, "calibration", "rp-corpus")
+    assert steps["rp-corpus"].argv == [
+        PY, "-m", "tools.eval.roleplay_calibration", "build", "--raw", str(env.rp_raw), "--out", corpus,
+        "--against", str(env.rp_against), "--tokenizer", str(env.model / "tokenizer.json"), "--chunks", "400",
+        "--ctx-size", "512", "--prefix-tokens", "17"]
+    assert steps["calibration-render"].argv[steps["calibration-render"].argv.index("--source") + 1] == \
+        str(cfg.work("calibration", "rp-corpus", build.RP_SOURCE_NAME))
+    tool = str(env.llama_cpp / launcher.exe_name("llama-quantize"))
+    assert steps["gguf-quantize"].argv[3:-3][1::2] == list(build.GGUF_TENSOR_TYPES["forum-iq3-16gb"])
+    convert = steps["convert"].argv
+    assert convert[convert.index("--vocab-weights") + 1] == "q4_g32"
+    assert convert[convert.index("--vocab-scale-search") + 1] == "absmax"
+    assert convert[convert.index("--mtp-weights") + 1] == "q4_g256"
+    assert convert[convert.index("--mtp-head") + 1] == "q4_g256"
+    identity = build.build_identity(cfg)
+    assert identity["calibration"]["corpus"].startswith("tools.eval.roleplay_calibration")
+    assert identity["calibration"]["raw"] == str(env.rp_raw.resolve())
+    assert identity["calibration"]["against"] == [str(env.rp_against.resolve())]
+    assert identity["assistant_encoding"] == "q4-g256" and identity["vocab_weights"] == "q4_g32"
+    assert identity["gguf_recipe"]["allocation"] == "forum-iq3-16gb"
+    assert steps["rp-corpus"].outputs == (cfg.work("calibration", "rp-corpus", build.RP_SOURCE_NAME),
+                                          cfg.work("calibration", "rp-corpus", "provenance.json"))
+
+
+def argv_index(argv: list[str], flag: str) -> int:
+    return argv.index(flag)
+
+
+def test_forum_quality_plan_and_encoding_defaults(env):
+    cfg = env.config("forum-iq3-16gb-quality")
+    steps = plan_by_id(cfg)
+    pins = steps["gguf-quantize"].argv[3:-3][1::2]
+    assert "attn_q=IQ3_XXS" in pins and "attn_k=IQ3_XXS" in pins and "attn_v=IQ3_S" in pins
+    assert r"blk\.(4[0-9]|5[0-9])\.ffn_down=IQ4_XS" in pins
+    convert = steps["convert"].argv
+    assert "--mtp-weights" not in convert  # the FP8 assistant is the converter default (no extra flags)
+    cfg_fp8 = env.config("forum-iq3-16gb")
+    assert "--mtp-weights" not in plan_by_id(cfg_fp8)["convert"].argv
+
+
+def test_forum_builds_require_the_own_roleplay_corpus_and_refuse_public_text(env, capsys):
+    argv = [item for item in env.argv("forum-iq3-16gb") if item not in ("--rp-raw", str(env.rp_raw))]
+    assert cli.main(argv + ["--dry-run"], probes=FakeProbes()) == 1
+    assert "--rp-raw" in capsys.readouterr().err
+    assert cli.main(env.argv("forum-iq3-16gb", "--calibration-text", str(env.calibration), "--dry-run"),
+                    probes=FakeProbes()) == 1
+    assert "--calibration-text" in capsys.readouterr().err
+    assert cli.main(env.argv("best-small", "--assistant-encoding", "q4-g32", "--dry-run"), probes=FakeProbes()) == 1
+    assert "--assistant-encoding" in capsys.readouterr().err
+
+
+def test_research_labels_and_evidence_are_surface(env):
+    for preset in ("forum-iq3-16gb", "forum-iq3-16gb-quality", "q4q5-mixed-b"):
+        assert "research-only" in build.PRESETS[preset].label and "not a default" in build.PRESETS[preset].label
+        assert "diode" in build.PRESETS[preset].evidence
+    assert build.PRESETS["best-medium"].label == ""
+
+
+def test_forum_quality_launcher_defaults_to_mtp_off_with_explicit_override(env):
+    cfg = env.config("forum-iq3-16gb-quality")
+    builder, runner, _ = make_builder(env, cfg)
+    provenance = cfg.work("calibration", "rp-corpus", "provenance.json")
+    base_runner = builder.runner
+
+    def seeded(argv, log_path, run_env, cwd, status):
+        code = base_runner(argv, log_path, run_env, cwd, status)
+        if code == 0 and "ran rp-corpus" in log_path.read_text():
+            provenance.write_text(json.dumps({
+                "corpus_id": "ninfer-rp-forum-calibration-v1", "corpus_sha256": "c" * 64,
+                "selection": {"seed": "20261130"}, "totals": {"excerpts": 384}}))
+        return code
+
+    builder.runner = seeded
+    builder.run()
+    builder.cleanup()
+    names = sorted(path.name for path in env.out.iterdir())
+    assert f"serve-{cfg.name}-mtp.cmd" in names
+    main = build.parse_launcher(env.out / f"serve-{cfg.name}.cmd")
+    assert "--spec" not in main.flags and "--allow-shared-memory" not in main.flags
+    override = build.parse_launcher(env.out / f"serve-{cfg.name}-mtp.cmd")
+    flags = list(override.flags)
+    assert flags[flags.index("--spec") + 1] == "mtp"
+    assert flags[flags.index("--draft-tokens") + 1] == "1"
+    assert "--allow-shared-memory" in flags
+    summary = (env.out / "BUILD-SUMMARY.md").read_text()
+    assert "MTP override launcher" in summary and "--allow-shared-memory" in summary
+    assert "ninfer-rp-forum-calibration-v1" in summary and "Roleplay calibration provenance" in summary
+    assert "research-only" in summary
+    receipt = json.loads((env.out / f"{cfg.name}.gemma4-build.json").read_text())
+    assert receipt["roleplay_calibration"]["corpus_sha256"] == "c" * 64
+    assert receipt["launchers"]["mtp_override"].endswith("mtp.cmd")
+
+
+def test_forum_balanced_build_keeps_the_assistant_enabled(env):
+    cfg = env.config("forum-iq3-16gb", assistant_encoding="q4-g32")
+    builder, _, _ = make_builder(env, cfg)
+    builder.run()
+    builder.cleanup()
+    plan = build.parse_launcher(env.out / f"serve-{cfg.name}.cmd")
+    flags = list(plan.flags)
+    assert flags[flags.index("--spec") + 1] == "mtp" and "--allow-shared-memory" not in flags
+    assert not any(path.name.endswith("-mtp.cmd") for path in env.out.iterdir())
+    assert "research-only" in (env.out / "BUILD-SUMMARY.md").read_text()
+
+
+def test_mixed_b_runs_two_gptq_passes_and_marks_research(env):
+    cfg = env.config("q4q5-mixed-b")
+    steps = plan_by_id(cfg)
+    assert [step_id for step_id in steps if step_id.startswith("gptq")] == ["gptq", "gptq-check", "gptq-q5", "gptq-q5-check"]
+    convert = steps["convert"].argv
+    assert convert[convert.index("--q5-unit") + 1] == "gate_up"
+    assert convert[convert.index("--q5-unit", convert.index("--q5-unit") + 1) + 1] == "down@20-59"
+    assert "--vocab-weights" not in convert
+    identity = build.build_identity(cfg)
+    assert "assistant_encoding" not in identity and identity["preset"] == "q4q5-mixed-b"
+
+
+# ---------------------------------------------------------------- bundled recommendations and context refusals
+
+
+def test_bundles_resolve_to_concrete_combinations_with_measured_anchors():
+    balanced = build.resolve_bundle("16gb", "balanced")
+    assert balanced["preset"] == "forum-iq3-16gb" and balanced["profile"] == "memory-16gb"
+    assert balanced["assistant_encoding"] == "q4-g32" and balanced["resolved_context"] == 32768
+    assert build.resolve_bundle("16gb", "context")["assistant_encoding"] == "q4-g256"
+    quality = build.resolve_bundle("16gb", "quality")
+    assert quality["preset"] == "forum-iq3-16gb-quality" and quality["max_context"] == 38912
+    assert build.resolve_bundle("24gb", "context")["preset"] == "best-small"
+    assert build.resolve_bundle("32gb", "balanced")["preset"] == "best-medium"
+    assert build.resolve_bundle("32gb", "quality")["preset"] == "q4q5-mixed-a"
+    assert build.resolve_bundle("24gb", "balanced", 49152)["resolved_context"] == 49152
+    assert build.resolve_bundle("16gb", "context", "auto")["resolved_context"] == "auto"  # startup fits, read /v1/models
+
+
+def test_bundles_refuse_impossible_explicit_contexts_with_the_shortfall():
+    for card, bundle, requested in (("16gb", "balanced", 49152), ("16gb", "context", 65536),
+                                    ("16gb", "quality", 65536), ("24gb", "quality", 131072),
+                                    ("32gb", "context", 262144)):
+        with pytest.raises(ValueError) as error:
+            build.resolve_bundle(card, bundle, requested)
+        assert str(requested) in str(error.value) and "measured anchor" in str(error.value)
+    with pytest.raises(ValueError):
+        build.resolve_bundle("8gb", "balanced")
+    with pytest.raises(ValueError):
+        build.resolve_bundle("16gb", "cheapest")
+
+
+def test_bundle_profiles_construct_and_the_requested_context_is_surfaced(tmp_path):
+    """Every bundle resolves to a valid launcher profile; explicit refusals live in the bundle and launcher paths."""
+    for card in build.CARD_CLASSES:
+        for name in build.BUNDLE_NAMES:
+            combo = build.resolve_bundle(card, name)
+            profile = launcher.ServeProfile(
+                profile=combo["profile"], context=combo["resolved_context"],
+                kv_dtype="fp8", logits_dtype="bf16", prefill_chunk="128" if combo["profile"] == "memory-16gb" else None,
+            )
+            launcher.check_serve_settings(profile)
+            flat = [flag for group in launcher.serve_groups(profile, mtp=True, vision=False) for flag in group]
+            assert "--kv-dtype" in flat
+            if combo["preset"].startswith("forum"):
+                assert "--gemma4-key-only-kv" in flat  # key-only stays explicit
+    # Existing explicit-context refusals (kept, covered here): below the memory-profile minimum and beyond the
+    # artifact position limit.
+    with pytest.raises(ValueError):
+        launcher.ServeProfile(profile="memory-16gb", context=4096)
+    server, artifact = tmp_path / "s.exe", tmp_path / "a.ninfer"
+    for path in (server, artifact):
+        path.write_bytes(b"x")
+    info = launcher.ArtifactInfo(mtp=True, vision=False, max_context=262144)
+    with pytest.raises(ValueError, match="position limit"):
+        launcher.write_launcher(tmp_path / "x.cmd", artifact, server, launcher.ServeProfile(context=300000),
+                                info=info)
+
+
+def test_help_and_list_presets_surface_the_bundles(env, capsys):
+    cli.main(["--list-presets"], probes=FakeProbes())
+    out = capsys.readouterr().out
+    assert "forum-iq3-16gb" in out and "bundled recommendations" in out and "q4-g256" in out
+    assert "research-only" in out

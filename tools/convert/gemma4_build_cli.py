@@ -11,12 +11,15 @@ import sys
 
 from . import gemma4_build_launcher as launcher_tools
 from .gemma4_build import (
+    BUNDLE_NAMES,
     CALIBRATION_REPO,
     CALIBRATION_REVISION,
+    CARD_CLASSES,
     GPTQ_PYTHON_ENV,
     LLAMA_CPP_ENV,
     LLAMA_CPP_SOURCE_ENV,
     PRESETS,
+    PROFILE_BUNDLES,
     REPO_ROOT,
     SERVE_CHECK_ACTIONS,
     SERVE_CHECK_TIMEOUT,
@@ -31,6 +34,8 @@ from .gemma4_build import (
     default_name,
     describe_plan,
     fingerprint_of,
+    preset_file_bytes,
+    resolve_bundle,
     safe_name,
     serve_check,
 )
@@ -41,9 +46,12 @@ METHODS = {
     "best-medium": "GPTQ g32",
     "q5-g64": "GPTQ5 g64, A16Only",
     "q4q5-mixed-a": "GPTQ g32 + Q5 o,down",
+    "q4q5-mixed-b": "GPTQ g32 + Q5 gate_up,down@20-59",
     "draft": "absmax g32, no calibration",
     "iq3-xs": "IQ3_XS, own imatrix",
     "iq3-xxs": "IQ3_XXS, own imatrix",
+    "forum-iq3-16gb": "IQ3_XXS base + forum allocation, RP imatrix",
+    "forum-iq3-16gb-quality": "IQ3_XXS base + F1 allocation, RP imatrix",
 }
 NEEDS = {
     "gptq": "GPU with 12 GiB free, 64 GiB RAM, about 75 GB disk, the GPTQ environment (setup-gptq)",
@@ -65,6 +73,23 @@ KL against each model's own Q8_0, diode build, default route) its KL is 0.74x th
 lower in 36 of 36 threads). Not measured: long-context or incremental-decode KL, more than one GPTQ pass, other GPUs.
 iq3-xs and iq3-xxs trade quality for smaller files and collect their own importance matrix; draft is a quick
 test build only. The calibrated-RTN presets and the two-level 6-bit scale format (q4_g32_s6_fp16) are not built here.
+
+Research-only presets (labels, never defaults; every number is measured on the diode finetune campaign, not on
+your build): q4q5-mixed-b (Q5 gate_up all layers + down@20-59, two GPTQ passes, fresh KL 0.62x best-medium) and
+forum-iq3-16gb / forum-iq3-16gb-quality (the measured 16 GB IQ3 recipes: pinned per-tensor allocation, tied
+q4_g32 vocabulary, and an importance matrix that MUST come from the pinned forum roleplay calibration corpus of
+YOUR OWN model — pass --rp-raw (raw files from `roleplay_heldout fetch`) and --rp-against (your evaluation texts);
+the public and diode matrices are never reused). forum-iq3-16gb defaults to the FP8 assistant; --assistant-encoding
+q4-g32 (balanced, better observed acceptance) or q4-g256 (smallest, higher tested context) stores the draft smaller.
+forum-iq3-16gb-quality embeds the FP8 assistant but generates its launcher without MTP; the serve-<name>-mtp.cmd
+launcher beside it is the explicit opt-in override (native --spec mtp --draft-tokens 1 --allow-shared-memory).
+
+Bundled recommendations (quality / balanced / context per card class; labels resolved to concrete combinations,
+not new CLI profiles; explicit flags always win; key-only KV stays explicit; MTP embedding and MTP enable are
+separate; targets assume about 1.9 GiB desktop overhead and are planning targets, not capacity promises):
+
+{{bundles}}
+
 other commands:
   python -m tools.convert.gemma4_build setup-gptq --venv DIR     create the pinned GPTQ environment
   python -m tools.convert.gemma4_build launcher --artifact F --out FILE.cmd   write a launcher for an existing file
@@ -91,8 +116,25 @@ def preset_table() -> str:
         rows.append(
             f"  {preset.id:<12} {METHODS[preset.id]:<28} {preset.size_class:<7} {f'{preset.file_gb:g} GB':<9} "
             f"{preset.kl:<7.4f} {preset.wait:<13} {NEEDS[preset.method]}"
-            + ("; supported option, not the default; roleplay KL 0.74x best-medium (held-out, diode)" if preset.evidence else "")
+            + ("; supported option, not the default; roleplay KL 0.74x best-medium (held-out, diode)"
+               if preset.id == "q4q5-mixed-a" else "")
+            + (f"; {preset.label}" if preset.label else "")
         )
+    return "\n".join(rows)
+
+
+def bundle_table() -> str:
+    """The card-class recommendation labels resolved to concrete combinations (labels, not CLI profiles)."""
+    rows = [f"  {'card':<6} {'bundle':<9} {'preset':<24} {'serve profile':<14} {'ctx':<8} flags / measured"]
+    for card in CARD_CLASSES:
+        for name in BUNDLE_NAMES:
+            combo = PROFILE_BUNDLES[card][name]
+            rows.append(
+                f"  {card:<6} {name:<9} {combo['preset']:<24} --profile {combo['profile']:<6} "
+                f"{combo['context']:<8} {' '.join(combo['flags']) or '(no extra flags)'}"
+            )
+            rows.append(f"  {'':<6} {'':<9} measured: {combo['measured']}"
+                        + (f" [{combo['note']}]" if combo.get("note") else ""))
     return "\n".join(rows)
 
 
@@ -194,7 +236,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Build a Gemma 4 31B .ninfer for infernix-serve from a BF16 checkpoint in one command "
         "(Q4, Q5 or IQ3 weights; FP8 KV cache and attention QK in the launcher): checks, plan, "
         "calibration, quantization, conversion, receipts, launcher.",
-        epilog=EPILOG.format(table=preset_table()),
+        epilog=EPILOG.format(table=preset_table(), bundles=bundle_table()),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     add = parser.add_argument
@@ -210,6 +252,14 @@ def build_parser() -> argparse.ArgumentParser:
     add("--with-vision", action="store_true", help="keep the vision tower (default: text only, as measured)")
     add("--calibration-text", type=Path, help="your own public UTF-8 calibration text, disjoint from anything you "
         "evaluate on (default: download the pinned public English corpus)")
+    add("--assistant-encoding", choices=("fp8", "q4-g32", "q4-g256"), default=None,
+        help="forum-iq3-16gb only: the MTP assistant's stored encoding: fp8 (default), q4-g32 (balanced, better "
+        "observed acceptance, 24,772,608 B larger than g256) or q4-g256 (smallest, higher tested context)")
+    add("--rp-raw", type=Path, help="forum presets: directory with the six raw forum parquet files "
+        "(python -m tools.eval.roleplay_heldout fetch --out DIR); required, the imatrix comes from your own model "
+        "on this corpus")
+    add("--rp-against", type=Path, action="append", default=[], help="forum presets: evaluation text (file or "
+        "directory of *.txt) the calibration corpus must be shingle-disjoint from; repeatable, at least one")
     add("--gptq-python", type=Path, help=f"python.exe of the GPTQ environment (default: ${GPTQ_PYTHON_ENV}, else "
         "<checkout>/.venv-gptq); never the converter's interpreter")
     add("--llama-cpp", type=Path, help=f"IQ3 presets: directory containing llama-quantize and llama-imatrix "
@@ -308,20 +358,32 @@ def resolve_config(args: argparse.Namespace) -> tuple[BuildConfig, ServeSettings
         raise ValueError(f"preset {args.preset!r} is not available in infernix: {UNAVAILABLE_PRESETS[args.preset]}")
     if args.preset not in PRESETS:
         raise ValueError(f"unknown preset {args.preset!r}; choose one of {', '.join(PRESETS)}")
+    preset = PRESETS[args.preset]
+    if preset.assistant_encodings:
+        if not args.rp_raw or not args.rp_against:
+            raise ValueError(f"preset {preset.id} quantizes with an importance matrix from your own model on the "
+                "pinned forum roleplay calibration corpus: pass --rp-raw (raw files from `roleplay_heldout fetch`) "
+                "and --rp-against (your evaluation texts); public and diode matrices are never reused")
+        if args.calibration_text is not None:
+            raise ValueError(f"preset {preset.id} uses the roleplay calibration corpus; --calibration-text would "
+                "replace it and is refused")
+        if args.assistant_encoding is None:
+            args.assistant_encoding = "fp8"
+    elif args.assistant_encoding is not None:
+        raise ValueError("--assistant-encoding applies to forum-iq3-16gb only")
     for flag in ("model", "out_dir"):
         if getattr(args, flag) is None:
             raise ValueError(f"--{flag.replace('_', '-')} is required")
     if args.no_mtp == (args.assistant is not None):
         raise ValueError("Pass --assistant <dir> (hf download google/gemma-4-31B-it-assistant --local-dir <DIR>) "
                          "or explicitly --no-mtp")
-    preset = PRESETS[args.preset]
     model, out_dir = args.model.resolve(), args.out_dir.resolve()
     name = safe_name(args.name) if args.name else default_name(model, preset.id)
     work_dir = (args.work_dir or out_dir / f"work-{name}").resolve()
     if work_dir == out_dir:
         raise ValueError("--work-dir must not be the output directory itself")
     kwargs = serve_kwargs(args, default_profile="q5-quality" if preset.bits == 5 else "default")
-    if preset.id == "q4q5-mixed-a" and args.profile is None and args.context is None:
+    if preset.id in ("q4q5-mixed-a", "q4q5-mixed-b") and args.profile is None and args.context is None:
         kwargs["context"] = "auto"
     launcher_tools.check_serve_settings(launcher_tools.ServeProfile(**kwargs))
     if args.score and args.no_launcher and args.serve is None:
@@ -342,6 +404,9 @@ def resolve_config(args: argparse.Namespace) -> tuple[BuildConfig, ServeSettings
         if args.score and server else None, keep_work=args.keep_work,
         llama_cpp=Path(llama_cpp).resolve() if llama_cpp else None,
         llama_cpp_source=Path(llama_source).resolve() if llama_source else None,
+        assistant_encoding=args.assistant_encoding or "fp8",
+        rp_raw=args.rp_raw.resolve() if args.rp_raw else None,
+        rp_against=tuple(path.resolve() for path in args.rp_against),
     )
     serve = ServeSettings(**kwargs, server_exe=server, cuda_bin=args.cuda_bin, launcher=not args.no_launcher)
     return cfg, serve, server
@@ -497,6 +562,9 @@ def main(argv: list[str] | None = None, probes: Probes | None = None) -> int:
         args = build_parser().parse_args(argv)
         if args.list_presets:
             print(preset_table())
+            print()
+            print("bundled recommendations (labels, not CLI profiles):")
+            print(bundle_table())
             return 0
         return run_build(args, probes)
     except (ValueError, OSError, BuildError, RuntimeError, subprocess.SubprocessError) as error:

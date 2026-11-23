@@ -9,9 +9,14 @@ are only read.
 
 Presets: best-small (GPTQ group 256, `q4_g256_fp16`), best-medium (GPTQ group 32, `q4_g32_fp16`),
 q5-g64 (GPTQ5 group 64, A16Only), q4q5-mixed-a (best-medium with Q5 `o` and `down` in every layer, a supported option),
-draft (uncalibrated absmax, group 32), and iq3-xs / iq3-xxs
+q4q5-mixed-b (best-medium with Q5 `gate_up` in every layer and `down` in layers 20-59, a research-only option),
+draft (uncalibrated absmax, group 32), iq3-xs / iq3-xxs
 (llama.cpp IQ3_XS / IQ3_XXS blocks quantized with the model's own
-importance matrix and imported verbatim; they need a llama.cpp build and its source tree for `convert_hf_to_gguf.py`).
+importance matrix and imported verbatim; they need a llama.cpp build and its source tree for `convert_hf_to_gguf.py`),
+and the research-only forum-iq3-16gb / forum-iq3-16gb-quality IQ3 recipes: the measured X2/F allocations
+(sliding K IQ3_XXS or all Q/K IQ3_XXS, V IQ3_S, staged down projections) with the tied q4_g32 vocabulary, an
+importance matrix from the pinned forum roleplay calibration corpus (`tools/eval/roleplay_calibration`) of the user's
+own model, and their measured numbers from the diode finetune campaign (research-only, never defaults).
 The two-level 6-bit scale format `q4_g32_s6_fp16` and calibrated round-to-nearest presets are not built here.
 
 Calibration text. Without `--calibration-text` the builder downloads the pinned public English corpus the measured
@@ -23,7 +28,7 @@ export (it affects the 18,228 non-ASCII characters of the 20 MB). The result is 
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dataclasses_replace
 import hashlib
 import json
 import os
@@ -63,6 +68,7 @@ Q5_FORMAT = "q5_g64_fp16"  # tensor format of the Q5 cells of a `q5_units` prese
 Q5_GROUP_SIZE = 64
 Q5_CHECKPOINT = "gptq-q5"  # work-dir name of the 5-bit GPTQ checkpoint a `q5_units` preset reads
 SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
+RP_SOURCE_NAME = "calibration-source.txt"  # the corpus text file `roleplay_calibration build` writes
 MIXED_A_EVIDENCE = (
     "on fresh held-out roleplay text (36 forum threads, 72 windows, disjoint from the development windows and every "
     "calibration text; block-prefill KL at context 512 against each model's own Q8_0) the diode build on its default "
@@ -73,6 +79,36 @@ MIXED_A_EVIDENCE = (
     "only (long-context and incremental-decode KL are not measured for this allocation; the Q5 INT8-g64 prefill route has "
     "a measured long-context cost, see llama-local-tooling docs/plans/20261124-gemma4-long-context-roleplay.md), a single GPTQ pass per width, one GPU, roleplay text "
     "from three forums that the finetune may have seen, a keyword-only content screen. Measure your own build before relying on it."
+)
+FORUM_F2_EVIDENCE = (
+    "research-only (campaign F2, measured on the diode finetune; never a default). Exact artifact bytes: FP8 assistant "
+    "12,630,891,524; q4_g32 assistant 12,431,956,996; q4_g256 assistant 12,407,184,388. On the combined 65k/16 "
+    "instrument (forum fresh windows, own-diode Q8) its fresh KL ratio to the deployed XXS control is 0.9707 "
+    "[0.9415, 1.0018]: unresolved, superiority not demonstrated; the long-window ratio 0.8790 [0.8557, 0.9027] is "
+    "resolved. The historical <0.85 fresh-superiority gates stay failed where registered; the utility offered is "
+    "approximately-current-quality 32k+MTP on 16 GB (explicit 32k+MTP passed under active ballast: dedicated peaks "
+    "13,815.95 / 13,791.95 MiB for the g32 / g256 assistants; highest passing contexts 37,888 (fp8, next refusal "
+    "38,912) and 47,104 (g256, next refusal 49,152), not exact maxima). Deployed with key-only FP8 global KV, FP8 "
+    "ring, chunk 128, --draft-tokens 1. Not measured: your finetune (never reuse the diode matrices), untouched "
+    "confirmation, human-rated dialogue, physical 16 GB throughput."
+)
+FORUM_F1_EVIDENCE = (
+    "research-only (campaign F1, measured on the diode finetune; never a default). The FP8 assistant is embedded in "
+    "the artifact but the generated launcher starts without MTP; the serve-<name>-mtp.cmd launcher beside it is the "
+    "explicit opt-in override (native --spec mtp --draft-tokens 1 --allow-shared-memory: shared memory is system RAM "
+    "over PCIe, not a resident fit). On the fresh forum instrument its KL ratio 0.847 missed the registered 0.85 "
+    "gate on the plain control. Key-only/FP8-ring/chunk-128 serving reached the low-40k contexts under ballast "
+    "(32768/36864/38912 passed, 39936 refused, MTP off). Not measured: your finetune, untouched confirmation, "
+    "physical 16 GB throughput."
+)
+MIXED_B_EVIDENCE = (
+    "research-only (campaign mixed-B, measured on the diode finetune; never a default). Exact artifact bytes "
+    "20,139,576,324 (about 20.14 GB). On fresh held-out roleplay text its KL ratio to best-medium is 0.6196 "
+    "[0.6061, 0.6324] (diode, default route; context-512 block KL), lower than mixed-A's 0.740; at the 65k "
+    "instrument its KL is 0.06673 [0.06181, 0.07352] against best-medium's 0.08497. Clean 65k timing medians "
+    "3109.60 PP / 76.14 TG tok/s (best-medium: 3380.24 / 95.01; mixed-A: 3233.83 / 83.49). Costs: +1.73 GB, two "
+    "GPTQ passes, decode about -20 %. Not measured: long-context incremental-decode KL, more than one GPTQ pass "
+    "per width, other GPUs."
 )
 
 
@@ -99,11 +135,19 @@ class Preset:
     bits: int = 4
     q5_units: tuple[str, ...] = ()  # `--q5-unit` selectors: fused groups read from a second, 5-bit GPTQ checkpoint
     evidence: str = ""  # a supported non-default option: the measured evidence and its limits, shown in the plan and summary
+    allocation: str = ""  # method "gguf": key into GGUF_ALLOCATIONS / GGUF_TENSOR_TYPES (the pinned per-tensor map)
+    imatrix_corpus: str = "public"  # "roleplay": the pinned forum roleplay calibration corpus (required, never public)
+    vocab_weights: str = "fp8"  # tied-vocabulary storage the converter is asked for (forum presets: q4_g32, absmax)
+    assistant_encodings: tuple[str, ...] = ()  # nonempty: the preset's `--assistant-encoding` choices (fp8 default)
+    launcher_no_mtp: bool = False  # embed the assistant but generate the launcher without MTP (+ an override launcher)
+    extra_formats: tuple[str, ...] = ()  # further tensor formats the serving binary must know
+    label: str = ""  # provenance label shown in the plan, table and summary (e.g. research-only, measured source)
 
     @property
     def formats(self) -> tuple[str, ...]:
         """Tensor formats the serving binary must know."""
-        return (self.format_name, Q5_FORMAT) if self.q5_units else (self.format_name,)
+        formats = (self.format_name,) + self.extra_formats
+        return formats + (Q5_FORMAT,) if self.q5_units else formats
 
 
 PRESETS: dict[str, Preset] = {
@@ -160,6 +204,46 @@ PRESETS: dict[str, Preset] = {
          "gguf-quantize": 45, "convert": 6, "receipt-check": 0.5, "finalize": 0.5},
         "IQ3_XXS",
     ),
+    "forum-iq3-16gb": Preset(
+        "forum-iq3-16gb", "gguf", "IQ3_XXS base, measured forum allocation, roleplay imatrix (research-only)",
+        "The measured 16 GB research recipe (campaign F2): deployed IQ3_XXS base with sliding-layer K at IQ3_XXS, "
+        "V at IQ3_S and ffn_down of layers 20-39 at IQ3_S, tied q4_g32 (absmax) vocabulary, and an importance matrix "
+        "from the pinned forum roleplay calibration corpus of your own model (required; never a public or diode "
+        "matrix). FP8 assistant by default; --assistant-encoding q4-g32 or q4-g256 stores the draft smaller. "
+        "Research-only, measured on the diode finetune, never a default.",
+        "smallest", 12.63, 0.2273, "about 2 h", 0, False, "ggml_iq3_xxs", 100, 120, 13,
+        {"rp-corpus": 4, "calibration-render": 1, "gguf-bf16": 15, "gguf-q8": 8, "imatrix": 25,
+         "gguf-quantize": 45, "convert": 6, "receipt-check": 0.5, "finalize": 0.5},
+        "IQ3_XXS", allocation="forum-iq3-16gb", imatrix_corpus="roleplay", vocab_weights="q4_g32",
+        assistant_encodings=("fp8", "q4-g32", "q4-g256"), extra_formats=("ggml_iq2_s", "ggml_iq3_s"),
+        evidence=FORUM_F2_EVIDENCE, label="research-only; measured on the diode finetune; not a default",
+    ),
+    "forum-iq3-16gb-quality": Preset(
+        "forum-iq3-16gb-quality", "gguf", "IQ3_XXS base, Q/K IQ3_XXS, V IQ3_S, staged down (research-only)",
+        "The measured 16 GB quality research recipe (campaign F1): the same roleplay-imatrix forum family with V at "
+        "IQ3_S, Q/K at IQ3_XXS in every layer, ffn_down of layers 20-39 at IQ3_S and of layers 40-59 at IQ4_XS, tied "
+        "q4_g32 vocabulary, FP8 assistant embedded but the launcher generated without MTP (the documented override "
+        "launcher beside it re-enables it with --spec mtp --draft-tokens 1 --allow-shared-memory). "
+        "Research-only, measured on the diode finetune, never a default.",
+        "smallest", 13.17, 0.2273, "about 2 h", 0, False, "ggml_iq3_xxs", 100, 120, 14,
+        {"rp-corpus": 4, "calibration-render": 1, "gguf-bf16": 15, "gguf-q8": 8, "imatrix": 25,
+         "gguf-quantize": 45, "convert": 6, "receipt-check": 0.5, "finalize": 0.5},
+        "IQ3_XXS", allocation="forum-iq3-16gb-quality", imatrix_corpus="roleplay", vocab_weights="q4_g32",
+        launcher_no_mtp=True, extra_formats=("ggml_iq2_s", "ggml_iq3_s", "ggml_iq4_xs"),
+        evidence=FORUM_F1_EVIDENCE, label="research-only; measured on the diode finetune; not a default",
+    ),
+    "q4q5-mixed-b": Preset(
+        "q4q5-mixed-b", "gptq", "GPTQ g32 Q4 with GPTQ5 g64 Q5 `gate_up` (all layers) and `down@20-59` (research-only)",
+        "Best-medium with the fused gate/up projections of every layer and the down projections of layers 20-59 at Q5 "
+        "(about 1.73 GB larger); both GPTQ checkpoints use your own model's Hessians from the same calibration. "
+        "A measured research option, never a default: on fresh held-out roleplay text its KL is 0.62x that of "
+        "best-medium (diode, default route; context-512 block KL).",
+        "medium+", 20.14, 0.0524, "about 70 min", 32, False, "q4_g32_fp16", 110, 140, 45,
+        {"calibration-source": 1, "calibration-render": 1, "calibration-tokens": 1, "text-tree": 2, "gptq": 18,
+         "gptq-q5": 25, "gptq-check": 1, "convert": 6, "receipt-check": 0.5, "finalize": 0.5},
+        q5_units=("gate_up", "down@20-59"), evidence=MIXED_B_EVIDENCE,
+        label="research-only; measured on the diode finetune; not a default",
+    ),
 }
 # Presets that are not built by infernix, with the reason a caller gets.
 UNAVAILABLE_PRESETS = {
@@ -195,6 +279,9 @@ class BuildConfig:
     keep_work: bool = False
     llama_cpp: Path | None = None  # method "gguf": directory with llama-quantize and llama-imatrix
     llama_cpp_source: Path | None = None  # method "gguf": llama.cpp source tree (convert_hf_to_gguf.py)
+    assistant_encoding: str = "fp8"  # presets with assistant_encodings: the assistant's stored encoding
+    rp_raw: Path | None = None  # roleplay-imatrix presets: raw forum parquet directory (roleplay_heldout fetch)
+    rp_against: tuple[Path, ...] = ()  # roleplay-imatrix presets: evaluation texts the corpus must be disjoint from
 
     @property
     def artifact(self) -> Path:
@@ -310,12 +397,290 @@ def gptq_steps(cfg: BuildConfig, tree: Path, calib: Path, checkpoint: Path, *, b
     ]
 
 
+# ---------------------------------------------------------------- allocation plan (exact byte arithmetic)
+
+# Text-trunk shape of Gemma 4 31B (converter geometry): layer i is GLOBAL (full attention, K stored with Q, no V)
+# when i % period == period - 1.
+GGUF_ROLES = ("attn_q", "attn_k", "attn_v", "attn_output", "ffn_gate", "ffn_up", "ffn_down")
+GGUF_BLOCK_BYTES = {"IQ2_S": 82, "IQ3_XXS": 98, "IQ3_S": 110, "IQ4_XS": 136}  # bytes per 256 weights, QK columns 256
+
+
+@dataclass(frozen=True)
+class TextGeometry:
+    n_layers: int
+    hidden: int
+    inter: int
+    sliding: dict
+    glob: dict
+    period: int = 6
+
+    def is_global(self, layer: int) -> bool:
+        return layer % self.period == self.period - 1
+
+    def shape(self, layer: int, role: str) -> tuple[int, int] | None:
+        """(rows, cols) of the layer's tensor for `role`, or None when the layer has no such tensor."""
+        rows = self.glob if self.is_global(layer) else self.sliding
+        if role in ("attn_q", "attn_k"):
+            return rows[role], self.hidden
+        if role == "attn_v":
+            return None if self.is_global(layer) else (rows[role], self.hidden)
+        if role == "attn_output":
+            return self.hidden, rows["attn_q"]
+        if role in ("ffn_gate", "ffn_up"):
+            return self.inter, self.hidden
+        return self.hidden, self.inter
+
+
+TEXT_GEOMETRY = TextGeometry(60, 5376, 21504, {"attn_q": 8192, "attn_k": 4096, "attn_v": 4096}, {"attn_q": 16384, "attn_k": 2048})
+SLIDING_LAYERS = tuple(i for i in range(TEXT_GEOMETRY.n_layers) if not TEXT_GEOMETRY.is_global(i))
+GLOBAL_LAYERS = tuple(i for i in range(TEXT_GEOMETRY.n_layers) if TEXT_GEOMETRY.is_global(i))
+
 # llama-quantize --tensor-type pins (regex searched in the tensor name) of the measured IQ3 recipes: the per-tensor
-# types a published imatrix IQ3_XS / IQ3_XXS of Gemma 4 31B uses where they differ from llama.cpp's own mix.
+# types a published imatrix IQ3_XS / IQ3_XXS of Gemma 4 31B uses where they differ from llama.cpp's own mix, plus the
+# pinned per-tensor maps of the measured forum research allocations (the pins never overlap one another).
 GGUF_TENSOR_TYPES = {
     "IQ3_XS": ("attn_output=IQ3_S", "attn_v=IQ3_S", "ffn_down=IQ3_S", r"blk\.([0-6]|5[2-9])\.ffn_(gate|up)=IQ3_S"),
     "IQ3_XXS": ("attn_q=IQ2_S", "attn_k=IQ2_S", "attn_output=IQ3_S"),
+    "forum-iq3-16gb": (
+        "attn_q=IQ2_S",
+        f"blk\\.({'|'.join(str(i) for i in GLOBAL_LAYERS)})\\.attn_k=IQ2_S",
+        "attn_output=IQ3_S",
+        f"blk\\.({'|'.join(str(i) for i in SLIDING_LAYERS)})\\.attn_k=IQ3_XXS",
+        "attn_v=IQ3_S",
+        r"blk\.(2[0-9]|3[0-9])\.ffn_down=IQ3_S",
+    ),
+    "forum-iq3-16gb-quality": (
+        "attn_output=IQ3_S",
+        "attn_q=IQ3_XXS",
+        "attn_k=IQ3_XXS",
+        "attn_v=IQ3_S",
+        r"blk\.(2[0-9]|3[0-9])\.ffn_down=IQ3_S",
+        r"blk\.(4[0-9]|5[0-9])\.ffn_down=IQ4_XS",
+    ),
 }
+
+# The measured X2/F allocation specs (campaign registration): base recipe plus per-role/layer overrides.
+ALLOCATION_BASE_TYPES = {  # the deployed IQ3_XXS recipe's own mix
+    "attn_q": "IQ2_S", "attn_k": "IQ2_S", "attn_v": "IQ3_XXS", "attn_output": "IQ3_S",
+    "ffn_gate": "IQ3_XXS", "ffn_up": "IQ3_XXS", "ffn_down": "IQ3_XXS",
+}
+GGUF_ALLOCATIONS = {
+    "forum-iq3-16gb": {
+        "id": "forum-iq3-16gb", "base": "xxs",
+        "rules": [
+            {"roles": ["attn_k"], "layers": "sliding", "type": "IQ3_XXS"},
+            {"roles": ["attn_v"], "layers": "all", "type": "IQ3_S"},
+            {"roles": ["ffn_down"], "layers": "20-39", "type": "IQ3_S"},
+        ],
+    },
+    "forum-iq3-16gb-quality": {
+        "id": "forum-iq3-16gb-quality", "base": "xxs",
+        "rules": [
+            {"roles": ["attn_v"], "layers": "all", "type": "IQ3_S"},
+            {"roles": ["attn_q", "attn_k"], "layers": "all", "type": "IQ3_XXS"},
+            {"roles": ["ffn_down"], "layers": "20-39", "type": "IQ3_S"},
+            {"roles": ["ffn_down"], "layers": "40-59", "type": "IQ4_XS"},
+        ],
+    },
+}
+
+
+def _parse_allocation_layers(selection: str) -> list[int]:
+    allv = list(range(TEXT_GEOMETRY.n_layers))
+    if selection == "all":
+        return allv
+    if selection == "sliding":
+        return [i for i in allv if not TEXT_GEOMETRY.is_global(i)]
+    if selection == "global":
+        return [i for i in allv if TEXT_GEOMETRY.is_global(i)]
+    out = []
+    for part in selection.split(","):
+        lo, _, hi = part.strip().partition("-")
+        try:
+            out += list(range(int(lo), int(hi or lo) + 1))
+        except ValueError as error:
+            raise ValueError(f"allocation layer selector {selection!r}: use all, sliding, global or 20-39 ranges") from error
+    if any(not 0 <= i < TEXT_GEOMETRY.n_layers for i in out):
+        raise ValueError(f"allocation layer selector {selection!r} names layers outside 0-{TEXT_GEOMETRY.n_layers - 1}")
+    return out
+
+
+def resolve_allocation(spec: dict) -> dict[tuple[int, str], str]:
+    """Allocation spec -> {(layer, role): type}, validated (global layers have no V; fused objects share a type)."""
+    alloc = {
+        (i, r): ALLOCATION_BASE_TYPES[r]
+        for i in range(TEXT_GEOMETRY.n_layers) for r in GGUF_ROLES if TEXT_GEOMETRY.shape(i, r)
+    }
+    for rule in spec.get("rules", []):
+        typ, roles, layers = rule["type"], rule["roles"], _parse_allocation_layers(rule.get("layers", "all"))
+        if typ not in GGUF_BLOCK_BYTES:
+            raise ValueError(f"allocation {spec['id']}: type {typ!r} is not one of {tuple(GGUF_BLOCK_BYTES)}")
+        for i in layers:
+            for role in roles:
+                if TEXT_GEOMETRY.shape(i, role) is None:
+                    if rule.get("layers", "all") not in ("all", "sliding", "global"):
+                        raise ValueError(f"allocation {spec['id']}: layer {i} has no {role} tensor")
+                    continue
+                alloc[(i, role)] = typ
+    for i in range(TEXT_GEOMETRY.n_layers):
+        if alloc[(i, "ffn_gate")] != alloc[(i, "ffn_up")]:
+            raise ValueError(f"allocation {spec['id']}: layer {i} gate/up are one fused object and must share a type")
+        if TEXT_GEOMETRY.is_global(i) and alloc[(i, "attn_q")] != alloc[(i, "attn_k")]:
+            raise ValueError(f"allocation {spec['id']}: global layer {i} Q/K are one fused object and must share a type")
+    return alloc
+
+
+def _tensor_bytes(shape: tuple[int, int], typ: str) -> int:
+    rows, cols = shape
+    return rows * (cols // 256) * GGUF_BLOCK_BYTES[typ]
+
+
+def allocation_trunk_bytes(spec: dict) -> int:
+    """Exact trunk bytes of an allocation (the compose plan arithmetic, verified against the campaign artifacts)."""
+    alloc = resolve_allocation(spec)
+    return sum(_tensor_bytes(TEXT_GEOMETRY.shape(i, r), t) for (i, r), t in alloc.items())
+
+
+TRUNK_PARAMS = sum(
+    shape[0] * shape[1]
+    for i in range(TEXT_GEOMETRY.n_layers) for role in GGUF_ROLES
+    if (shape := TEXT_GEOMETRY.shape(i, role))
+)
+Q4_G32_BYTES_PER_256, Q5_G64_BYTES_PER_256 = 144, 168  # native groupwise storage, exact binary16 scales
+VOCAB_BYTES = {"fp8": 1_409_810_432, "q4_g32": 792_723_456}  # the tied 262,144 x 5,376 table
+ASSISTANT_BYTES = {"fp8": 486_806_032, "q4_g32": 287_871_504, "q4_g256": 263_098_896}  # whole assistant payload
+ASSISTANT_ENCODING_ALIASES = {"fp8": "fp8", "q4-g32": "q4_g32", "q4-g256": "q4_g256"}
+ASSISTANT_ENCODING_FLAGS = {
+    "fp8": (),
+    "q4-g32": ("--mtp-weights", "q4", "--mtp-head", "q4_g32"),
+    "q4-g256": ("--mtp-weights", "q4_g256", "--mtp-head", "q4_g256"),
+}
+FIXED_PAYLOAD_BYTES = 2_663_152 + 32_192_698 + 225_280 + 15_946  # norms, tokenizer, header
+
+_Q5_UNIT_SHAPES = {"o": ("attn_output",), "gate_up": ("ffn_gate", "ffn_up"), "down": ("ffn_down",)}
+
+
+def _q5_unit_params(unit: str) -> int:
+    """Weight count of one `--q5-unit` selector such as `gate_up` or `down@20-59` (what moves from Q4 to Q5)."""
+    role, _, selection = unit.partition("@")
+    if role not in _Q5_UNIT_SHAPES:
+        raise ValueError(f"q5 unit {unit!r}: use o, gate_up or down[@LAYERS]")
+    layers = _parse_allocation_layers(selection) if selection else list(range(TEXT_GEOMETRY.n_layers))
+    total = 0
+    for i in layers:
+        for name in _Q5_UNIT_SHAPES[role]:
+            shape = TEXT_GEOMETRY.shape(i, name)
+            if shape:
+                total += shape[0] * shape[1]
+    return total
+
+
+def preset_file_bytes(preset: Preset, assistant_encoding: str = "fp8") -> int:
+    """Exact planned artifact bytes (text + MTP) of a preset with an analytic plan; None-safe plans only."""
+    if preset.method == "gguf" and preset.allocation:
+        assistant = ASSISTANT_BYTES[ASSISTANT_ENCODING_ALIASES[assistant_encoding]] if assistant_encoding else 0
+        return allocation_trunk_bytes(GGUF_ALLOCATIONS[preset.allocation]) + VOCAB_BYTES[preset.vocab_weights] \
+            + FIXED_PAYLOAD_BYTES + assistant
+    if preset.method == "gptq" and preset.q5_units:
+        moved = sum(_q5_unit_params(unit) for unit in preset.q5_units)
+        return TRUNK_PARAMS * Q4_G32_BYTES_PER_256 // 256 + moved * (Q5_G64_BYTES_PER_256 - Q4_G32_BYTES_PER_256) // 256 \
+            + VOCAB_BYTES["fp8"] + ASSISTANT_BYTES["fp8"] + FIXED_PAYLOAD_BYTES
+    if preset.method == "gptq" and preset.bits == 5:
+        return TRUNK_PARAMS * Q5_G64_BYTES_PER_256 // 256 + VOCAB_BYTES["fp8"] + ASSISTANT_BYTES["fp8"] + FIXED_PAYLOAD_BYTES
+    if preset.method == "gptq":
+        return TRUNK_PARAMS * Q4_G32_BYTES_PER_256 // 256 + VOCAB_BYTES["fp8"] + ASSISTANT_BYTES["fp8"] + FIXED_PAYLOAD_BYTES
+    raise ValueError(f"preset {preset.id} has no analytic byte plan (the quantizer's own mix decides the bytes)")
+
+
+# ---------------------------------------------------------------- bundled recommendations
+# Design labels (quality / balanced / context per card class), NOT new CLI profiles: each bundle resolves to a
+# concrete preset + serve profile + explicit flag combination with its measured numbers. Explicit operator flags
+# always win. Key-only KV stays explicit (the memory-16gb profile owns it); MTP embedding (assistant encoding) is
+# separate from MTP enable (the launcher/runtime). Numbers are measured campaign anchors, not capacity promises.
+PROFILE_BUNDLES = {
+    "16gb": {
+        "quality": {
+            "preset": "forum-iq3-16gb-quality", "profile": "memory-16gb", "assistant_encoding": None,
+            "flags": ["--text-only"], "context": 32768, "max_context": 38912,
+            "measured": "F1: fresh forum KL 0.847 vs plain control (0.85 gate missed); key-only/FP8-ring/chunk-128 "
+                        "passed 32768/36864/38912, refused 39936 (MTP off) under ballast; launcher starts without "
+                        "MTP, override launcher enables it",
+            "note": "research-only; measured on the diode finetune",
+        },
+        "balanced": {
+            "preset": "forum-iq3-16gb", "profile": "memory-16gb", "assistant_encoding": "q4-g32",
+            "flags": ["--assistant-encoding", "q4-g32", "--text-only"], "context": 32768, "max_context": 32768,
+            "measured": "F2 + Q4g32 assistant: explicit 32k+MTP passed under ballast (dedicated peak 13,815.95 MiB); "
+                        "fresh forum KL ratio 0.9707 [0.9415, 1.0018] unresolved vs deployed XXS; g32 maximum "
+                        "context unmeasured",
+            "note": "research-only; measured on the diode finetune",
+        },
+        "context": {
+            "preset": "forum-iq3-16gb", "profile": "memory-16gb", "assistant_encoding": "q4-g256",
+            "flags": ["--assistant-encoding", "q4-g256", "--text-only"], "context": 32768, "max_context": 47104,
+            "measured": "F2 + Q4g256 assistant: explicit 32k+MTP passed under ballast (dedicated peak 13,791.95 "
+                        "MiB); highest passing context 47,104, next refusal 49,152 (not an exact maximum); "
+                        "acceptance trade versus g32 (-3.24 pp)",
+            "note": "research-only; measured on the diode finetune",
+        },
+    },
+    "24gb": {
+        "context": {
+            "preset": "best-small", "profile": "default", "assistant_encoding": None, "flags": [],
+            "context": 65536, "max_context": 65536,
+            "measured": "ballast: best-small FP8 KV/BF16 ring 91.4k with MTP; the 65k target fits with margin",
+        },
+        "balanced": {
+            "preset": "best-medium", "profile": "default", "assistant_encoding": None, "flags": [],
+            "context": 65536, "max_context": 65536,
+            "measured": "ballast: best-medium FP8 ring 71.2k with MTP",
+        },
+        "quality": {
+            "preset": "q4q5-mixed-a", "profile": "default", "assistant_encoding": None,
+            "flags": ["--gemma4-key-only-kv"], "context": 65536, "max_context": 65536,
+            "measured": "ballast: mixed-A key-only/BF16 ring 67.6k; an explicit capacity trade, never a default",
+        },
+    },
+    "32gb": {
+        "context": {
+            "preset": "best-medium", "profile": "default", "assistant_encoding": None, "flags": [],
+            "context": 131072, "max_context": 131072,
+            "measured": "physical 5090: best-medium FP8 KV/BF16 ring 131k with MTP",
+        },
+        "balanced": {
+            "preset": "best-medium", "profile": "default", "assistant_encoding": None, "flags": [],
+            "context": 131072, "max_context": 131072,
+            "measured": "the unchanged medium default at the full 131k target",
+        },
+        "quality": {
+            "preset": "q4q5-mixed-a", "profile": "default", "assistant_encoding": None,
+            "flags": ["--gemma4-key-only-kv"], "context": 131072, "max_context": 131072,
+            "measured": "mixed-A reaches 131k with FP8 ring or key-only (an explicit ordinary-KV sacrifice); "
+                        "q5-g64 needs key-only to meet 131k with study margin; both fidelity options, not defaults",
+        },
+    },
+}
+CARD_CLASSES = ("16gb", "24gb", "32gb")
+BUNDLE_NAMES = ("quality", "balanced", "context")
+
+
+def resolve_bundle(card: str, bundle: str, requested_context: int | str | None = None) -> dict:
+    """Resolve a recommendation label to its concrete combination; refuses impossible explicit contexts."""
+    combos = PROFILE_BUNDLES.get(card)
+    if combos is None:
+        raise ValueError(f"card class {card!r}: use one of {CARD_CLASSES} (16/24/32 GB, 1.9 GiB overhead assumed)")
+    combo = combos.get(bundle)
+    if combo is None:
+        raise ValueError(f"bundle {bundle!r}: use one of {BUNDLE_NAMES}")
+    requested = combo["context"] if requested_context is None else requested_context
+    if requested != "auto" and requested > combo["max_context"]:
+        raise ValueError(
+            f"{card} {bundle} bundle: --context {requested} exceeds the measured anchor {combo['max_context']} "
+            f"({combo['measured']}). The server would refuse or silently spill; choose a smaller explicit context "
+            "or 'auto' and read the resolved limit from /v1/models."
+        )
+    return {**combo, "card": card, "bundle": bundle,
+            "requested_context": requested_context, "resolved_context": requested}
 
 
 def llama_tool(cfg: BuildConfig, name: str) -> str:
@@ -328,7 +693,7 @@ def gguf_steps(cfg: BuildConfig, templated: Path, quantized: Path) -> list[Step]
     minutes = preset.minutes
     bf16, q8, imatrix = cfg.work("model-bf16.gguf"), cfg.work("model-q8_0.gguf"), cfg.work("imatrix.gguf")
     quantize = llama_tool(cfg, "llama-quantize")
-    pins = [arg for pin in GGUF_TENSOR_TYPES[preset.gguf_type] for arg in ("--tensor-type", pin)]
+    pins = [arg for pin in GGUF_TENSOR_TYPES[cfg.preset.allocation or cfg.preset.gguf_type] for arg in ("--tensor-type", pin)]
     return [
         Step("gguf-bf16", "Write a BF16 GGUF of the model with llama.cpp's convert_hf_to_gguf.py (about 62 GB)",
              minutes["gguf-bf16"],
@@ -358,8 +723,12 @@ def convert_argv(cfg: BuildConfig, out: Path, *, scoring: bool, checkpoint: Path
         argv.append("--text-only")
     if not scoring and cfg.assistant is not None:
         argv += ["--mtp-assistant", str(cfg.assistant)]
+        if cfg.preset.assistant_encodings:
+            argv += list(ASSISTANT_ENCODING_FLAGS[cfg.assistant_encoding])
     else:
         argv.append("--no-mtp")
+    if cfg.preset.vocab_weights != "fp8":
+        argv += ["--vocab-weights", cfg.preset.vocab_weights, "--vocab-scale-search", "absmax"]
     argv += ["--name", cfg.name, "--out", str(out)]
     return argv
 
@@ -376,7 +745,23 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
     steps: list[Step] = []
 
     if preset.method != "plain":
-        if cfg.calibration_text is None:
+        roleplay = preset.imatrix_corpus == "roleplay"
+        if roleplay:
+            corpus = cfg.work("calibration", "rp-corpus")
+            source = corpus / RP_SOURCE_NAME
+            steps.append(Step(
+                "rp-corpus", "Build the pinned roleplay calibration corpus from the raw forum files (required: "
+                "never a public or diode matrix)", minutes["rp-corpus"],
+                [cfg.python, "-m", "tools.eval.roleplay_calibration", "build", "--raw", str(cfg.rp_raw), "--out",
+                 str(corpus)]
+                + [flag for path in cfg.rp_against for flag in ("--against", str(path))]
+                + ["--tokenizer", str(tokenizer), "--chunks", str(CALIBRATION_CHUNKS), "--ctx-size",
+                   str(CALIBRATION_CONTEXT), "--prefix-tokens", "17"],
+                outputs=(source, corpus / "provenance.json"),
+                note=f"raw forum parquet files must exist in {cfg.rp_raw} (`roleplay_heldout fetch`); the corpus is "
+                     "shingle-checked disjoint from every --rp-against evaluation text",
+            ))
+        elif cfg.calibration_text is None:
             steps.append(Step(
                 "calibration-source", f"Download the pinned public English calibration text ({CALIBRATION_REPO})",
                 minutes["calibration-source"], call=fetch_calibration, outputs=(source,),
@@ -426,11 +811,14 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
 
 
 def finalize_outputs(cfg: BuildConfig) -> tuple[Path, ...]:
-    return (
+    outputs = (
         cfg.out_dir / "BUILD-SUMMARY.md",
         cfg.out_dir / f"{cfg.name}.gemma4-build.json",
         cfg.out_dir / f"serve-{cfg.name}.cmd",
     )
+    if cfg.preset.launcher_no_mtp:
+        outputs += (cfg.out_dir / f"serve-{cfg.name}-mtp.cmd",)
+    return outputs
 
 
 def score_steps(cfg: BuildConfig, checkpoint: Path) -> list[Step]:
@@ -485,8 +873,9 @@ def describe_plan(cfg: BuildConfig, steps: list[Step]) -> list[str]:
     lines = [
         f"Preset      {preset.id}: {preset.summary} ({preset.size_class}; {gb(preset.file_gb)} with MTP; "
         f"KL {preset.kl:.4f}, lower is better)"
-        + ("; supported option, not the default: roleplay KL 0.74x best-medium on fresh held-out text" if preset.evidence else ""),
+        + ("; supported option, not the default: roleplay KL 0.74x best-medium on fresh held-out text" if preset.id == "q4q5-mixed-a" else ""),
         f"            {preset.meaning}",
+        *((f"            {preset.label}",) if preset.label else ()),
         f"Model       {cfg.model}",
         f"MTP         {cfg.assistant if cfg.assistant else 'none (--no-mtp)'}",
         f"Vision      {'kept (--with-vision)' if cfg.with_vision else 'left out (text only)'}",
@@ -616,10 +1005,16 @@ def render_summary(info: dict) -> str:
         ("- Weights: IQ3 GGUF blocks, AllowA8 for prefill and decode; "
          if p["method"] == "gguf" else "- Weights: native GPTQ5 group 64, A16Only; "
          if p["bits"] == 5 else "- Weights: GPTQ g32 Q4 (W4A8, FP8 activations while reading the prompt) with "
-         f"GPTQ5 g64 Q5 (A16Only, choose the Q5 prefill route at launch) for {', '.join(p['q5_units'])} in every layer; "
+         f"GPTQ5 g64 Q5 (A16Only, choose the Q5 prefill route at launch) for {', '.join(p['q5_units'])}"
+         + (" in the named layers; " if any("@" in u for u in p["q5_units"]) else " in every layer; ")
          if p.get("q5_units") else "- Weights: W4A8 (4-bit weights, FP8 activations while reading the prompt); ")
         + f"{'with the MTP draft assistant (speculative decoding)' if info['mtp'] else 'no MTP assistant'}; "
         f"{'with the vision tower' if info['vision'] else 'text only'}.",
+        (f"- Assistant encoding: {info['assistant_encoding']} (the converter's --mtp-weights/--mtp-head recipe); "
+         "FP8 is the default." if info.get("assistant_encoding") else ""),
+        (f"- Tied vocabulary: {p['vocab_weights']} with absmax scale search (the converter's --vocab-weights "
+         "--vocab-scale-search recipe)." if p.get("vocab_weights", "fp8") != "fp8" else ""),
+        (f"- {p['label']}" if p.get("label") else ""),
         f"- Historical hint (English, text only, RTX 5090): mean KL {p['kl']:.4f} from "
         + ("the plain model's own Q8_0 reference, A16 compute" if p["bits"] == 5 else
            "the plain model's own Q8_0 reference, default route with int8-g64 Q5 prefill" if p.get("q5_units") else
@@ -627,7 +1022,18 @@ def render_summary(info: dict) -> str:
         + ". This is not a quality measurement of your build.",
     ] + ([
         f"- Supported option, not the default (best-medium stays the general default): {p['evidence']}",
-    ] if p.get("evidence") else []) + [
+    ] if p.get("evidence") and not p.get("label") else []) + ([
+        f"- {p['evidence']}",
+    ] if p.get("evidence") and p.get("label") else []) + ([
+        "",
+        "## Roleplay calibration provenance",
+        "",
+        f"- Corpus: `{info['roleplay_calibration']['corpus_id']}` built by `tools/eval.roleplay_calibration` from "
+        "your own model's raw forum files (the diode matrices are never reused).",
+        f"- Corpus sha256: `{info['roleplay_calibration']['corpus_sha256']}`; selection seed "
+        f"`{info['roleplay_calibration']['selection']['seed']}`; "
+        f"{info['roleplay_calibration']['totals']['excerpts']} excerpts.",
+    ] if info.get("roleplay_calibration") else []) + [
         "",
         "## Files",
         "",
@@ -636,6 +1042,9 @@ def render_summary(info: dict) -> str:
         f"- sha256: `{info['sha256']}`",
         f"- Converter receipt: `{info['artifact']}.build.json`",
         f"- Launcher: `{info['launcher']}`" if info["launcher"] else "- Launcher: not generated (--no-launcher)",
+        (f"- MTP override launcher: `{info['launchers']['mtp_override']}` (starts with `--spec mtp --draft-tokens 1 "
+         "--allow-shared-memory`; the main launcher starts without MTP)" if info["launchers"].get("mtp_override")
+         else ""),
         "",
         "## Serve it",
         "",
@@ -691,19 +1100,35 @@ def build_info(builder: "Builder") -> dict:
     if settings.launcher and server is not None:
         serve = format_command(
             launcher_tools.serve_argv(
-                server, cfg.artifact, settings, mtp=info_artifact.mtp, vision=info_artifact.vision
+                server, cfg.artifact, settings, mtp=info_artifact.mtp and not cfg.preset.launcher_no_mtp,
+                vision=info_artifact.vision,
             )
         )
+    roleplay = None
+    if cfg.preset.imatrix_corpus == "roleplay":
+        provenance_path = cfg.work("calibration", "rp-corpus", "provenance.json")
+        if provenance_path.is_file():
+            try:
+                roleplay = read_json(provenance_path)
+            except ValueError:
+                roleplay = None
+    launchers = {"main": str(launcher_path) if settings.launcher and server is not None else None}
+    if cfg.preset.launcher_no_mtp and settings.launcher and server is not None:
+        launchers["mtp_override"] = str(cfg.out_dir / f"serve-{cfg.name}-mtp.cmd")
     return {
         "name": cfg.name,
-        "preset": {k: getattr(cfg.preset, k) for k in ("id", "summary", "meaning", "size_class", "kl", "method", "bits",
-                                                        "q5_units", "evidence")},
+        "preset": {k: getattr(cfg.preset, k)
+                   for k in ("id", "summary", "meaning", "size_class", "kl", "method", "bits", "q5_units", "evidence",
+                             "label", "allocation", "vocab_weights", "assistant_encodings", "imatrix_corpus")},
+        "assistant_encoding": cfg.assistant_encoding if cfg.preset.assistant_encodings else None,
+        "roleplay_calibration": roleplay,
         "mtp": info_artifact.mtp,
         "vision": info_artifact.vision,
         "artifact": str(cfg.artifact),
         "file_bytes": receipt["artifact"]["file_bytes"],
         "sha256": receipt["artifact"]["file_sha256"][cfg.artifact.name],
-        "launcher": str(launcher_path) if settings.launcher and server is not None else None,
+        "launcher": launchers["main"],
+        "launchers": launchers,
         "serve_command": serve,
         "serve": {"kv": settings.kv_dtype, "qk": settings.gemma4_qk},
         "alias": settings.model_id,
@@ -721,10 +1146,20 @@ def finalize(builder: "Builder") -> None:
     cfg, settings = builder.cfg, builder.serve
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
     if settings.launcher and builder.server_exe is not None:
-        launcher_tools.write_launcher(
+        info = launcher_tools.write_launcher(
             cfg.out_dir / f"serve-{cfg.name}.cmd", cfg.artifact, builder.server_exe, settings,
             cuda_bin=settings.cuda_bin, info=builder.read_artifact_info(), overwrite=True,
+            no_mtp=cfg.preset.launcher_no_mtp,
         )
+        if cfg.preset.launcher_no_mtp and info.mtp:
+            # The explicit opt-in override: the same settings with the assistant enabled and the shortfall allowed
+            # in shared GPU memory (native --spec mtp --draft-tokens 1 --allow-shared-memory).
+            launcher_tools.write_launcher(
+                cfg.out_dir / f"serve-{cfg.name}-mtp.cmd", cfg.artifact, builder.server_exe,
+                dataclasses_replace(settings, allow_shared_memory=True),
+                cuda_bin=settings.cuda_bin, info=info, overwrite=True,
+            )
+            builder.log("wrote the MTP-off launcher and the explicit serve-<name>-mtp.cmd override launcher")
     write_summary(builder)
 
 
@@ -835,11 +1270,20 @@ def build_identity(cfg: BuildConfig) -> dict:
         )
     if cfg.preset.method == "plain":
         calibration = None
+    elif cfg.preset.imatrix_corpus == "roleplay":
+        corpus_text = cfg.work("calibration", "rp-corpus", RP_SOURCE_NAME)
+        calibration = {
+            "corpus": "tools.eval.roleplay_calibration (the pinned forum roleplay calibration; never a public or "
+                      "diode matrix)",
+            "raw": str(cfg.rp_raw.resolve()) if cfg.rp_raw else None,
+            "against": sorted(str(path.resolve()) for path in cfg.rp_against),
+            "text_sha256": _hash_or_none(corpus_text),
+        }
     elif cfg.calibration_text is not None:
         calibration = {"file": str(cfg.calibration_text.resolve()), "sha256": _hash_or_none(cfg.calibration_text)}
     else:
         calibration = {"source": f"{CALIBRATION_REPO}@{CALIBRATION_REVISION}", "text_sha256": CALIBRATION_TEXT_SHA256}
-    return {
+    identity = {
         "preset": cfg.preset.id,
         "model": str(model.resolve()),
         "model_files": files,
@@ -849,11 +1293,16 @@ def build_identity(cfg: BuildConfig) -> dict:
         "name": cfg.name,
         "out_dir": str(cfg.out_dir.resolve()),
         "calibration": calibration,
-        **({"gguf_recipe": {"type": cfg.preset.gguf_type, "tensor_types": GGUF_TENSOR_TYPES[cfg.preset.gguf_type]},
+        **({"assistant_encoding": cfg.assistant_encoding} if cfg.preset.assistant_encodings else {}),
+        **({"vocab_weights": cfg.preset.vocab_weights} if cfg.preset.vocab_weights != "fp8" else {}),
+        **({"gguf_recipe": {"type": cfg.preset.gguf_type,
+                            "allocation": cfg.preset.allocation or None,
+                            "tensor_types": GGUF_TENSOR_TYPES[cfg.preset.allocation or cfg.preset.gguf_type]},
             "llama_cpp": str(cfg.llama_cpp.resolve()) if cfg.llama_cpp else None,
             "llama_cpp_source": str(cfg.llama_cpp_source.resolve()) if cfg.llama_cpp_source else None}
            if cfg.preset.method == "gguf" else {}),
     }
+    return identity
 
 
 def load_state(work: Path, fingerprint: str, identity: dict) -> dict | None:
