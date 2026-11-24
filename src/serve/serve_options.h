@@ -80,12 +80,16 @@ struct ServeOptions {
     bool allow_shared_memory = false; // Gemma4 only: start with the shortfall in shared GPU memory
     SharedMemoryPlacement shared_memory_placement = SharedMemoryPlacement::RuntimeResident;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(8192);
+    // --kv-capacity given (without it the parser sets the default above: auto with the prefix cache or
+    // --max-context auto, else max_context), for refuse_unsupported_options.
+    bool kv_capacity_explicit          = false;
     std::optional<std::size_t> vram_headroom_bytes; // empty: the model's automatic headroom
     bool vram_past_budget = false;
     std::uint32_t expert_tail_skip = 0; // EngineOptions::expert_tail_skip
     bool expert_a4_activations     = false; // EngineOptions::expert_a4_activations
     bool expert_a16_activations    = false; // EngineOptions::expert_a16_activations (--a16-activations)
     bool a8_activations            = false; // EngineOptions::a8_activations
+    bool q8_weights                = false; // EngineOptions::q8_weights
     bool embedding_host            = false; // EngineOptions::embedding_host
     std::uint32_t max_concurrency      = 1;
     // At most kMaximumPendingRequests: the HTTP pool starts a worker for each admitted or pending request.
@@ -135,6 +139,7 @@ struct ServeOptions {
     std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
     std::uint64_t ram_free_bytes           = kDefaultRamFreeBytes;
     bool ram_resize                        = true; // --ram-resize auto|off (infernix::EngineOptions::ram_resize)
+    bool ram_resize_explicit               = false; // --ram-resize given (refuse_unsupported_options)
     std::optional<std::uint64_t> expert_ram_bytes; // --expert-ram-mib; empty: the RAM ledger's share
     std::optional<ExpertRamLayout> expert_ram_layout; // --expert-ram-layout (empty: the model's default)
     bool expert_csf = false;                          // --expert-csf
@@ -232,6 +237,11 @@ struct ServeOptions {
 // without the dashes (product/config/config_file.h); options on the command line override the
 // file, and the file overrides the defaults.
 ServeOptions parse_serve_options(int argc, char** argv);
+// The server's own options that the model `architecture` (LoadSummary::architecture, EnginePlan::architecture) has
+// nothing to apply them to, and those the Engine's options cannot tell from their defaults (--expert-state FILE,
+// --ram-resize, --kv-capacity): throws std::invalid_argument naming the first one given. A start calls it once the
+// Engine has loaded (the family is known then) and --plan from its plan, so neither runs without what it asked for.
+void refuse_unsupported_options(const ServeOptions& options, std::string_view architecture);
 // "off", "stop" or "conclude".
 const char* reasoning_loop_name(infernix::ReasoningLoopAction action) noexcept;
 std::string resolve_public_model_id(const ServeOptions& options,

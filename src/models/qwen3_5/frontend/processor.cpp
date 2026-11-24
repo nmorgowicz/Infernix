@@ -1,6 +1,7 @@
 #include "models/qwen3_5/frontend/processor.h"
 
 #include "media/decode/decode.h"
+#include "media/decode/resize.h"
 #include "models/qwen3_5/frontend/digest.h"
 #include "models/qwen3_5/frontend/media_cache.h"
 
@@ -122,107 +123,9 @@ Size smart_resize_video(int frames, int height, int width, std::uint64_t min_pix
     return {h, w};
 }
 
-double cubic(double x) {
-    // Torchvision's antialiased bicubic path uses the Keys/Pillow coefficient.
-    constexpr double a = -0.5;
-    x                  = std::abs(x);
-    if (x < 1.0) { return ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0; }
-    if (x < 2.0) { return (((a * x - 5.0 * a) * x + 8.0 * a) * x - 4.0 * a); }
-    return 0.0;
-}
-
-struct Coefficients {
-    std::vector<int> starts;
-    std::vector<int> offsets;
-    std::vector<float> weights;
-};
-
-Coefficients coefficients(int input, int output) {
-    Coefficients out;
-    out.starts.resize(static_cast<std::size_t>(output));
-    out.offsets.resize(static_cast<std::size_t>(output + 1));
-    const double scale    = static_cast<double>(input) / output;
-    const double invscale = scale >= 1.0 ? 1.0 / scale : 1.0;
-    const double support  = 2.0 * (scale >= 1.0 ? scale : 1.0);
-    for (int dst = 0; dst < output; ++dst) {
-        const double center = scale * (dst + 0.5);
-        const int begin     = std::max(static_cast<int>(center - support + 0.5), 0);
-        const int size      = std::min(static_cast<int>(center + support + 0.5), input) - begin;
-        out.starts[static_cast<std::size_t>(dst)]  = begin;
-        out.offsets[static_cast<std::size_t>(dst)] = static_cast<int>(out.weights.size());
-        double sum                                 = 0.0;
-        for (int j = 0; j < size; ++j) {
-            const double weight = cubic((j + begin - center + 0.5) * invscale);
-            out.weights.push_back(static_cast<float>(weight));
-            sum += weight;
-        }
-        if (sum == 0.0) { throw std::runtime_error("bicubic resize produced zero weights"); }
-        const int first = out.offsets[static_cast<std::size_t>(dst)];
-        for (std::size_t i = static_cast<std::size_t>(first); i < out.weights.size(); ++i) {
-            out.weights[i] = static_cast<float>(out.weights[i] / sum);
-        }
-    }
-    out.offsets[static_cast<std::size_t>(output)] = static_cast<int>(out.weights.size());
-    return out;
-}
-
 void resize_bicubic(media::decode::Image& input, Size size, const PreparationControl& control) {
     if (input.width == size.w && input.height == size.h) { return; }
-    const Coefficients horizontal = coefficients(input.width, size.w);
-    const Coefficients vertical   = coefficients(input.height, size.h);
-    std::vector<std::uint8_t> temp(static_cast<std::size_t>(input.height) * size.w * 3);
-    for (int y = 0; y < input.height; ++y) {
-        if (y % 16 == 0) { check_preparation_control(control); }
-        for (int x = 0; x < size.w; ++x) {
-            const int first        = horizontal.offsets[static_cast<std::size_t>(x)];
-            const int last         = horizontal.offsets[static_cast<std::size_t>(x + 1)];
-            const int source_begin = horizontal.starts[static_cast<std::size_t>(x)];
-            std::array<float, 3> value{};
-            const std::uint8_t* source =
-                input.rgb.data() + (static_cast<std::size_t>(y) * input.width + source_begin) * 3;
-            for (int i = first; i < last; ++i, source += 3) {
-                const float weight = horizontal.weights[static_cast<std::size_t>(i)];
-                value[0] += weight * source[0];
-                value[1] += weight * source[1];
-                value[2] += weight * source[2];
-            }
-            std::uint8_t* destination =
-                temp.data() + (static_cast<std::size_t>(y) * size.w + x) * 3;
-            for (int c = 0; c < 3; ++c) {
-                destination[c] =
-                    static_cast<std::uint8_t>(std::clamp(round_even(value[c]), 0, 255));
-            }
-        }
-    }
-
-    media::decode::Image out;
-    out.width  = size.w;
-    out.height = size.h;
-    out.rgb.resize(static_cast<std::size_t>(size.h) * size.w * 3);
-    for (int y = 0; y < size.h; ++y) {
-        if (y % 16 == 0) { check_preparation_control(control); }
-        const int first        = vertical.offsets[static_cast<std::size_t>(y)];
-        const int last         = vertical.offsets[static_cast<std::size_t>(y + 1)];
-        const int source_begin = vertical.starts[static_cast<std::size_t>(y)];
-        for (int x = 0; x < size.w; ++x) {
-            std::array<float, 3> value{};
-            const std::uint8_t* source =
-                temp.data() + (static_cast<std::size_t>(source_begin) * size.w + x) * 3;
-            for (int i = first; i < last; ++i, source += static_cast<std::size_t>(size.w) * 3) {
-                const float weight = vertical.weights[static_cast<std::size_t>(i)];
-                value[0] += weight * source[0];
-                value[1] += weight * source[1];
-                value[2] += weight * source[2];
-            }
-            std::uint8_t* destination =
-                out.rgb.data() + (static_cast<std::size_t>(y) * size.w + x) * 3;
-            for (int c = 0; c < 3; ++c) {
-                destination[c] =
-                    static_cast<std::uint8_t>(std::clamp(round_even(value[c]), 0, 255));
-            }
-        }
-    }
-    input = std::move(out);
+    input = media::decode::resize_bicubic(input, size.w, size.h, [&] { check_preparation_control(control); });
 }
 
 std::uint16_t to_bf16(float value) noexcept {
@@ -747,7 +650,7 @@ void assign_positions(ProcessedInput& output,
     output.rope_delta = maximum + 1 - static_cast<std::int32_t>(length);
 }
 
-int media_token_id(const Tokenizer& tokenizer, std::string_view text) {
+int media_token_id(const text::Tokenizer& tokenizer, std::string_view text) {
     const std::vector<int> ids = tokenizer.encode(text);
     if (ids.size() != 1) {
         throw std::invalid_argument("Vision placeholder must encode to one tokenizer token: " +
@@ -784,7 +687,7 @@ std::span<const std::int32_t> ProcessedInput::position_axis(int axis) const {
         static_cast<std::size_t>(axis) * input_ids.size(), input_ids.size());
 }
 
-EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered,
+EncodedChat encode_rendered_chat(const text::Tokenizer& tokenizer, const RenderedChat& rendered,
                                  std::size_t maximum_tokens) {
     if (!rendered.media_placeholders.empty()) {
         throw std::logic_error("rendered chat contains unexpanded media placeholders");
@@ -813,8 +716,8 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
     }
     byte_boundaries.insert(byte_boundaries.end(), rendered.generation_splits.begin(), rendered.generation_splits.end());
 
-    BoundaryEncodedText tokenized = tokenizer.encode_with_boundaries(
-        rendered.text, byte_boundaries, EncodeOptions{.max_tokens = maximum_tokens},
+    text::BoundaryEncodedText tokenized = tokenizer.encode_with_boundaries(
+        rendered.text, byte_boundaries, text::EncodeOptions{.max_tokens = maximum_tokens},
         rendered.literal_spans, rendered.generation_splits);
     encoded.input_ids = std::move(tokenized.input_ids);
     if (encoded.input_ids.size() == maximum_tokens) { return encoded; }
@@ -826,8 +729,8 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
         return static_cast<std::uint32_t>(frontier);
     };
     if (rendered.rewrite_checkpoint) {
-        const TokenBoundaryResult& boundary = tokenized.boundaries.at(boundary_index++);
-        const TokenBoundaryResult& recovery = tokenized.boundaries.at(boundary_index++);
+        const text::TokenBoundaryResult& boundary = tokenized.boundaries.at(boundary_index++);
+        const text::TokenBoundaryResult& recovery = tokenized.boundaries.at(boundary_index++);
         if (boundary.exact_frontier && *boundary.exact_frontier > 0) {
             const auto frontier = to_frontier(*boundary.exact_frontier, "rewrite checkpoint");
             encoded.rewrite_checkpoint = RewriteCheckpointSpec{
@@ -842,7 +745,7 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
     encoded.rewrite_execution_frontiers.reserve(rendered.rewrite_execution_boundaries.size());
     for (std::size_t remaining = rendered.rewrite_execution_boundaries.size(); remaining != 0;
          --remaining) {
-        const TokenBoundaryResult& result = tokenized.boundaries.at(boundary_index++);
+        const text::TokenBoundaryResult& result = tokenized.boundaries.at(boundary_index++);
         const std::optional<std::uint32_t> frontier =
             result.exact_frontier ? std::optional<std::uint32_t>(to_frontier(
                                         *result.exact_frontier, "rewrite execution boundary"))
@@ -856,7 +759,7 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
     encoded.message_boundaries.resize(rendered.message_boundaries.size());
     for (std::size_t index = 0; index < rendered.message_boundaries.size(); ++index) {
         if (rendered.message_boundaries[index]) {
-            const TokenBoundaryResult& boundary = tokenized.boundaries.at(boundary_index++);
+            const text::TokenBoundaryResult& boundary = tokenized.boundaries.at(boundary_index++);
             if (boundary.exact_frontier) {
                 encoded.message_boundaries[index] =
                     to_frontier(*boundary.exact_frontier, "message boundary");
@@ -866,7 +769,7 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
     encoded.cache_boundaries.resize(rendered.cache_boundaries.size());
     for (std::size_t index = 0; index < rendered.cache_boundaries.size(); ++index) {
         if (rendered.cache_boundaries[index]) {
-            const TokenBoundaryResult& boundary = tokenized.boundaries.at(boundary_index++);
+            const text::TokenBoundaryResult& boundary = tokenized.boundaries.at(boundary_index++);
             if (boundary.exact_frontier)
                 encoded.cache_boundaries[index] =
                     to_frontier(*boundary.exact_frontier, "cache boundary");
@@ -874,8 +777,8 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
     }
     encoded.media_token_runs.reserve(rendered.media_token_runs.size());
     for (const MediaTokenRunByteSpec& run : rendered.media_token_runs) {
-        const TokenBoundaryResult& begin = tokenized.boundaries.at(boundary_index++);
-        const TokenBoundaryResult& end   = tokenized.boundaries.at(boundary_index++);
+        const text::TokenBoundaryResult& begin = tokenized.boundaries.at(boundary_index++);
+        const text::TokenBoundaryResult& end   = tokenized.boundaries.at(boundary_index++);
         if (!begin.exact_frontier || !end.exact_frontier ||
             *begin.exact_frontier >= *end.exact_frontier) {
             throw std::logic_error("media token run is not an exact nonempty token span");
@@ -899,7 +802,7 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
     // The tokenizer splits at each of them, so each is an exact frontier.
     encoded.reply_frontiers.reserve(rendered.generation_splits.size());
     for (std::size_t remaining = rendered.generation_splits.size(); remaining != 0; --remaining) {
-        const TokenBoundaryResult& result = tokenized.boundaries.at(boundary_index++);
+        const text::TokenBoundaryResult& result = tokenized.boundaries.at(boundary_index++);
         if (result.exact_frontier) {
             encoded.reply_frontiers.push_back(to_frontier(*result.exact_frontier, "reply frontier"));
         }
@@ -910,7 +813,7 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
     return encoded;
 }
 
-Processor::Processor(const Tokenizer& tokenizer, const CompiledChatTemplate& chat_template,
+Processor::Processor(const text::Tokenizer& tokenizer, const CompiledChatTemplate& chat_template,
                      ProcessorOptions options, std::shared_ptr<MediaPreprocessCache> media_cache)
     : tokenizer_(tokenizer), chat_template_(chat_template), options_(std::move(options)),
       media_cache_(std::move(media_cache)) {
@@ -987,7 +890,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
         const std::size_t preliminary_tokens =
             tokenizer_
                 .encode_with_boundaries(rendered.text, {},
-                                        EncodeOptions{.max_tokens = encode_limit},
+                                        text::EncodeOptions{.max_tokens = encode_limit},
                                         rendered.literal_spans, rendered.generation_splits)
                 .input_ids.size();
         preliminary_tokenize_seconds =
@@ -998,7 +901,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
                 tokenizer_
                     .encode_with_boundaries(
                         rendered.text, {},
-                        EncodeOptions{.max_tokens = context_recount_limit(maximum_prompt_tokens)},
+                        text::EncodeOptions{.max_tokens = context_recount_limit(maximum_prompt_tokens)},
                         rendered.literal_spans, rendered.generation_splits)
                     .input_ids.size();
             throw ProcessorError(context_length_details(counted, maximum_prompt_tokens));

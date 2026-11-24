@@ -151,7 +151,7 @@ void validate_gemma4_options(const EngineOptions& options) {
     default: throw std::invalid_argument("invalid Gemma4 Q5 prefill mode");
     }
     if (!options.lora_path.empty() || !options.ablate_sidecar_path.empty()) {
-        throw std::invalid_argument("Gemma4 does not support Qwen runtime --lora or --ablate sidecars");
+        throw std::invalid_argument("Gemma4 does not support runtime --lora or --ablate sidecars");
     }
     if (!options.fast_paths || options.lossless || options.reference) {
         throw std::invalid_argument("Gemma4 does not support --reproducible, --lossless or --reference");
@@ -203,14 +203,14 @@ void validate_gemma4_options(const EngineOptions& options) {
     if (options.enable_vision || options.vision_offload == VisionOffload::On) {
         throw std::invalid_argument("Gemma4 vision and audio input are not supported by the text route");
     }
-    if (options.rope_yarn_factor != 1.0F || options.embedding_host || options.a8_activations ||
+    if (options.rope_yarn_factor != 1.0F || options.embedding_host || options.a8_activations || options.q8_weights ||
         options.expert_a4_activations || options.expert_a16_activations || options.expert_csf ||
         !options.fast_path_candidates.empty() ||
         std::any_of(options.fast_path_exclusions.begin(), options.fast_path_exclusions.end(),
                     [](FastPath path) { return path != FastPath::FreeCacheResume; })) {
-        throw std::invalid_argument("Gemma4 runs its artifact-declared projection policies; Qwen activation, fast-path "
-                                    "(other than --no-fast-path free-cache-resume), embedding-host and YaRN overrides "
-                                    "are unsupported");
+        throw std::invalid_argument("Gemma4 runs its artifact-declared projection policies; activation, Q8-weight, "
+                                    "fast-path (other than --no-fast-path free-cache-resume), embedding-host and "
+                                    "YaRN overrides are unsupported");
     }
     if (options.logits_dtype != LogitsDtype::BF16) {
         throw std::invalid_argument("Gemma4 preserves its native BF16 head; select --logits-dtype bf16 (unrounded FP32 logits are unsupported)");

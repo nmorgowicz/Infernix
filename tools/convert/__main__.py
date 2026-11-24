@@ -15,8 +15,8 @@ from tools.artifact.reader import Artifact
 from .graft import Graft
 from .official_recipes import RECIPES
 from .pipeline import DEFAULT_MAX_BUFFERED_BYTES, convert
-from .proposal import DEFAULT_RANKING, add_official_proposal
-from . import qwen4_exp
+from .proposal import DEFAULT_RANKING, add_official_proposal, add_token_rank
+from . import inkling2_loop, qwen4_exp
 from .screen import add_screen_heads
 from .gemma4 import build_model as build_gemma4
 from .qwen3_5 import build_model
@@ -159,6 +159,11 @@ def main(argv=None):
     parser.add_argument("--proposal-rows", type=int, default=131072)
     parser.add_argument("--ranking", type=Path, default=DEFAULT_RANKING)
     parser.add_argument(
+        "--token-rank",
+        type=Path,
+        help="Inkling 2: store this rank order of the vocabulary (tools/freq_corpus/build_rank.py) for --lm-head-draft",
+    )
+    parser.add_argument(
         "--screen-heads",
         action="store_true",
         help="Qwen4Exp: add 2-bit screens (q2_g64_fp16) of the LM head and, with --proposal, of the "
@@ -221,7 +226,14 @@ def main(argv=None):
     graft_paths = _pairs(args.graft, "graft")
     with ExitStack() as stack:
         base = stack.enter_context(SafetensorsSource(args.model))
+        if inkling2_loop.is_inkling2_loop(base.config):
+            # Inkling2Loop converts from its own checkpoint only: no GGUF, graft, n-gram or companion options.
+            if graft_paths or args.gguf or args.mmproj or args.screen_heads or args.ngram_out or args.ngram_reuse:
+                raise ValueError("Inkling2Loop takes no --graft, --gguf, --mmproj, --screen-heads or n-gram options")
+            if "dspark" in components and "dspark" not in paths:
+                paths["dspark"] = Path(base.root) / "mtp.safetensors"
         sources = SourceInputs(base, paths, stack)
+        inkling = inkling2_loop.is_inkling2_loop(base.config)
         qwen4 = qwen4_exp.is_qwen4_exp(base.config)
         companion = "text" not in components
         if graft_paths and (qwen4 or companion or args.gguf):
@@ -261,7 +273,14 @@ def main(argv=None):
 
             mmproj = stack.enter_context(GGUFSource(args.mmproj))
         ngram_out = None
-        if companion:
+        if inkling:
+            model = inkling2_loop.build_model(
+                base,
+                components=components,
+                drafter=sources["dspark"] if "dspark" in components else None,
+                resource_overrides=overrides,
+            )
+        elif companion:
             model = qwen4_exp.build_dflash2_companion(base, sources["dflash2"])
         elif qwen4:
             # The checkpoint's own table format; a BF16 volume (tools/flash_next/ngram_bf16.py) binds the
@@ -335,6 +354,10 @@ def main(argv=None):
         _function(args.recipe)(model, recipe, sources)
         if args.proposal:
             add_official_proposal(recipe, ranking=args.ranking, rows=args.proposal_rows)
+        if args.token_rank:
+            if args.recipe != "inkling2_mini":
+                raise ValueError("--token-rank serves Inkling 2's drafter (recipe inkling2_mini)")
+            add_token_rank(recipe, args.token_rank)
         if args.screen_heads:
             # After every other parameter: the copies are the artifact's last objects.
             if not qwen4 or gguf_store is not None:
@@ -365,6 +388,8 @@ def main(argv=None):
             provenance["override"] = args.override
         if args.proposal:
             provenance["ranking"] = str(args.ranking)
+        if args.token_rank:
+            provenance["token_rank"] = args.token_rank.name
         if args.screen_heads:
             provenance["screen_heads"] = {"format": "q2_g64_fp16", "method": "grouped_mse_norm"}
         if grafts:

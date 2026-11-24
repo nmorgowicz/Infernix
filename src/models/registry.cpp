@@ -18,6 +18,9 @@ Architecture resolve_architecture(std::string_view architecture, std::string_vie
     if (architecture == "Gemma4ForCausalLM" && model_type == "gemma4_text") {
         return Architecture::Gemma4;
     }
+    if (architecture == "Inkling2LoopForCausalLM" && model_type == "inkling2_loop_text") {
+        return Architecture::Inkling2Loop;
+    }
     throw std::invalid_argument("unsupported architecture/config pair " +
                                 std::string(architecture) + "/" + std::string(model_type));
 }
@@ -32,6 +35,8 @@ std::string_view architecture_name(Architecture architecture) noexcept {
         return "Qwen4ExpForCausalLM";
     case Architecture::Gemma4:
         return "Gemma4ForCausalLM";
+    case Architecture::Inkling2Loop:
+        return "Inkling2LoopForCausalLM";
     }
     return {};
 }

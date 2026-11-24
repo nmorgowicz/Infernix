@@ -27,6 +27,7 @@ add_library(infernix_engine STATIC
   engine/model_instance.cpp
   engine/qwen4_exp_instance.cpp
   engine/gemma4_instance.cpp
+  engine/inkling2_instance.cpp
   contract/sampling.cpp
   engine/engine.cpp
 )

@@ -90,6 +90,7 @@ struct Options {
     bool expert_a4_activations          = false;
     bool expert_a16_activations         = false;
     bool a8_activations                 = false; // EngineOptions::a8_activations
+    bool q8_weights                     = false; // EngineOptions::q8_weights
     bool fast_paths                     = true;
     std::vector<infernix::FastPath> fast_path_candidates;
     std::vector<infernix::FastPath> fast_path_exclusions;
@@ -119,13 +120,14 @@ std::string usage_text() {
            "        rounds each once, as Transformers returns them, for comparisons)\n"
            "       [--use-original-int8-prefill-kernel (int8 only; default fast kernel)]\n"
            "       [--use-original-nvfp4-prefill-kernel (nvfp4 only; default fast kernel)]\n"
-           "       [--lora PATH] (Qwen3.5 dense: a LoRA adapter applied at runtime, a Hugging Face PEFT\n"
+           "       [--lora PATH] (Qwen3.5 dense, Inkling 2: a LoRA adapter applied at runtime, a Hugging Face PEFT\n"
            "        adapter directory or its adapter_model.safetensors with adapter_config.json beside it)\n"
            "       [--ablate FILE] (an ablation sidecar applied at runtime, every model: its\n"
            "        sidecar.json with the direction file beside it)\n"
-           "       [--lossless] (Qwen3.5/3.6/3.8 and Qwen3.8-Flash-Next: the quality reference's\n"
-           "        route, every operation of the model correctly rounded; no fast path, one\n"
-           "        pass per window: give --prefill-chunk the context; logits as --logits-dtype)\n"
+           "       [--lossless] (Qwen3.5/3.6/3.8, Qwen3.8-Flash-Next and Inkling 2: the quality\n"
+           "        reference's route, every operation of the model correctly rounded; no fast path,\n"
+           "        one pass per window: give --prefill-chunk the context (Inkling 2 always scores a\n"
+           "        window in one pass); logits as --logits-dtype)\n"
            "       [--reference] (the design reference: --lossless with the configuration's declared\n"
            "        steps applied exactly, the activation quantization its artifact permits and\n"
            "        the --kv-dtype's codec; implies --lossless)\n"
@@ -135,6 +137,8 @@ std::string usage_text() {
            "       [--a16-activations] (16-bit activations where the checkpoint specifies fewer\n"
            "        bits: Flash-Next's W4A4 NVFP4 experts, NVIDIA's NVFP4 27B's NVFP4 and FP8 layers)\n"
            "       [--a8-activations] (8-bit activations where infernix-serve's option takes them;\n"
+           "        not on the reproducible or lossless route)\n"
+           "       [--q8-weights] (8-bit weights where infernix-serve's option takes them: Inkling 2;\n"
            "        not on the reproducible or lossless route)\n"
            "       [--reproducible] (score the reproducible route; by default the qualified fast\n"
            "        paths run, as in infernix-serve)\n"
@@ -226,6 +230,8 @@ Options parse_options(int argc, char** argv) {
             out.expert_a16_activations = true;
         } else if (option == "--a8-activations") {
             out.a8_activations = true;
+        } else if (option == "--q8-weights") {
+            out.q8_weights = true;
         } else if (option == "--ngram-volume") {
             out.ngram_volume = std::filesystem::path(value("--ngram-volume"));
         } else if (option == "--lora") {
@@ -758,6 +764,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.expert_a4_activations         = options.expert_a4_activations;
     engine_options.expert_a16_activations        = options.expert_a16_activations;
     engine_options.a8_activations                = options.a8_activations;
+    engine_options.q8_weights                    = options.q8_weights;
     // The lossless route runs no fast path.
     engine_options.fast_paths           = options.fast_paths && !options.lossless;
     engine_options.fast_path_candidates = options.fast_path_candidates;
@@ -1077,6 +1084,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"lora_adapter", load.lora_adapter.empty() ? nlohmann::json(nullptr) : nlohmann::json(load.lora_adapter)},
           {"ablate_sidecar",
            load.ablate_sidecar.empty() ? nlohmann::json(nullptr) : nlohmann::json(load.ablate_sidecar)},
+          {"q8_weights", options.q8_weights},
           {"fast_paths", load.fast_paths},
           {"fast_path_configuration", load.fast_path_configuration},
           {"stride_tokens", options.stride},

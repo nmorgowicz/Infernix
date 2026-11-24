@@ -55,7 +55,7 @@ def validate_sampling(value: dict, path: Path, *, architecture: str) -> None:
             raise ValueError(f"{path}: {mode}.repetition_penalty must be 1 (the sampler has none)")
 
 # Must stay byte-identical to kQwenSplitPattern in
-# src/models/qwen3_5/frontend/tokenizer.cpp: the runtime tokenizer validates
+# src/text/tokenizer.cpp: the runtime tokenizer validates
 # tokenizer.json's Split pattern for exact equality and rejects any artifact whose
 # pattern differs.
 STD_QWEN_SPLIT_PATTERN = (
@@ -227,7 +227,11 @@ def load_resources(
     architecture: str,
     vision_config: Mapping[str, int] | None = None,
     overrides: Mapping[str, str | Path] | None = None,
+    qwen_normalizers: bool = True,
 ) -> tuple[dict[str, dict[str, str]], dict[str, bytes], int, tuple[int, ...]]:
+    """Select resources and their public token domain. Qwen normalization is opt-out for other families;
+    Gemma always preserves its own split/BOS semantics and only drops the inert embedded template.
+    Inkling2Loop opts out and keeps its tokenizer resources byte for byte."""
     overrides = {} if overrides is None else dict(overrides)
     roles = {"text": TEXT_RESOURCES + tuple(r for r in OPTIONAL_TEXT_RESOURCES if r in overrides)}
     if vision_config is not None:
@@ -273,21 +277,32 @@ def load_resources(
             payloads[object_id] = data
     tokenizer_json = parsed["tokenizer.json"]
     tokenizer_config = parsed["tokenizer_config.json"]
-    if architecture != "Gemma4ForCausalLM" and _normalize_qwen_split(tokenizer_json):
+    if architecture == "Gemma4ForCausalLM":
+        if _drop_embedded_chat_template(tokenizer_config):
+            payloads["resource/text/tokenizer_config.json"] = _dump_json(tokenizer_config)
+            print("dropped tokenizer_config.json inert embedded chat template", flush=True)
+    elif qwen_normalizers:
+        _apply_qwen_normalizers(tokenizer_json, tokenizer_config, payloads)
+    count, special = token_domain(tokenizer_json, tokenizer_config, vocab_size)
+    return references, payloads, count, special
+
+
+def _apply_qwen_normalizers(tokenizer_json: dict, tokenizer_config: dict, payloads: dict[str, bytes]) -> None:
+    if _normalize_qwen_split(tokenizer_json):
         payloads["resource/text/tokenizer.json"] = _dump_json(tokenizer_json)
         print(
             "normalized tokenizer.json split pattern to the standard Qwen pattern",
             flush=True,
         )
     config_changed = False
-    if architecture != "Gemma4ForCausalLM" and _normalize_added_decoder(tokenizer_json, tokenizer_config):
+    if _normalize_added_decoder(tokenizer_json, tokenizer_config):
         print(
             "built tokenizer_config.json added_tokens_decoder "
             f"({len(tokenizer_config['added_tokens_decoder'])} tokens)",
             flush=True,
         )
         config_changed = True
-    if architecture != "Gemma4ForCausalLM" and _normalize_prefix_semantics(tokenizer_config):
+    if _normalize_prefix_semantics(tokenizer_config):
         print(
             "normalized tokenizer_config.json prefix semantics "
             "(add_bos_token/add_prefix_space=false, pad_token=<|endoftext|>)",
@@ -303,5 +318,3 @@ def load_resources(
         config_changed = True
     if config_changed:
         payloads["resource/text/tokenizer_config.json"] = _dump_json(tokenizer_config)
-    count, special = token_domain(tokenizer_json, tokenizer_config, vocab_size)
-    return references, payloads, count, special

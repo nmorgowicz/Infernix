@@ -424,6 +424,7 @@ infernix::EngineOptions make_engine_options(const ServeOptions& options, Startup
     engine_options.expert_a4_activations    = options.expert_a4_activations;
     engine_options.expert_a16_activations   = options.expert_a16_activations;
     engine_options.a8_activations           = options.a8_activations;
+    engine_options.q8_weights               = options.q8_weights;
     engine_options.embedding_host           = options.embedding_host;
     engine_options.max_concurrency          = options.max_concurrency;
     engine_options.max_pending_requests     = options.max_pending_requests;
@@ -606,19 +607,13 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         engine_->apply_tool_choice(prompt, request_options.tool_choice);
         check_preparation_control(prepared.lifetime->deadline, is_cancelled,
                                   queue_retry_after_seconds());
-        prepared.enable_thinking = prompt.summary().starts_in_reasoning;
-        if (!prepared.enable_thinking) {
-            request_options.execution.thinking.budget.reset();
-            prepared.thinking_budget.reset();
-        } else if (semantics.enable_thinking != false) {
-            // The answer room follows the limit the request actually has: a prompt that leaves
-            // less context than max_tokens would otherwise think to the end of the context.
-            request_options.execution.thinking.budget = settle_thinking_budget(
-                options_, request.thinking_budget,
-                effective_output_limit(request_options.execution.requested_output_tokens,
-                                       engine_->options().max_context, prompt.summary().prompt_tokens));
-            prepared.thinking_budget = request_options.execution.thinking.budget;
-        }
+        const SettledThinking thinking =
+            settle_thinking(request, options_, semantics, prompt.summary(), request_options.execution.thinking,
+                            request_options.execution.requested_output_tokens, engine_->options().max_context);
+        prepared.enable_thinking            = thinking.enabled;
+        request_options.execution.thinking  = thinking.controls;
+        prepared.thinking_budget            = thinking.controls.budget;
+        prepared.reasoning_effort           = thinking.effort;
         prepared.prompt_tokens           = static_cast<int>(prompt.summary().prompt_tokens);
         // The request log's output-overlap figure (candidates CF-07): the prompt's 4-grams before the
         // Engine takes the prompt; and its ids for the prefix-miss record (CF-08).

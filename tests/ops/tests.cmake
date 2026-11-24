@@ -187,6 +187,14 @@ infernix_add_family_op_test(infernix_lossless_ops_test FAMILY lossless NO_TEST
 add_test(NAME infernix_lossless_ops_test
   COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_LIST_DIR}/lossless_ops_oracle.py
           $<TARGET_FILE:infernix_ops_lossless_test> lossless_ops ${CMAKE_CURRENT_BINARY_DIR}/oracle-cache)
+# Inkling 2's operations (norms, mixes, message gates, clips, convolutions, eager attention probabilities, the router,
+# the experts' quantizers, SwiGLU and combine, the softcap) against an exact oracle following lossless-route.md §2b.
+infernix_add_family_op_test(infernix_lossless_inkling2_test FAMILY lossless NO_TEST
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lossless_inkling2.cu"
+  LIBRARIES infernix_ops)
+add_test(NAME infernix_lossless_inkling2_test
+  COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_LIST_DIR}/lossless_inkling2_oracle.py
+          $<TARGET_FILE:infernix_ops_lossless_test> lossless_inkling2 ${CMAKE_CURRENT_BINARY_DIR}/oracle-cache)
 # The design reference's KV storage: the production append's planes and window rows, byte for byte.
 infernix_add_family_op_test(infernix_lossless_kv_encode_test FAMILY lossless
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lossless_kv_encode.cu"
@@ -599,6 +607,64 @@ infernix_add_family_op_test(infernix_lora_gdn_test FAMILY lora
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lora_gdn.cpp"
   LIBRARIES infernix_ops)
 set_tests_properties(infernix_lora_gdn_test PROPERTIES TIMEOUT 3600 RESOURCE_LOCK gpu_memory)
+# Inkling 2's canonical functions (expm1, tanh, sigmoid, softcaps, four-over-six NVFP4 activations): GPU bits equal the
+# CPU header's, exhaustively over BF16; within 2 ulp of FP64; four-over-six against the torch reference's fixture.
+infernix_add_family_op_test(infernix_inkling2_canon_test FAMILY inkling2
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_inkling2_canon.cu"
+  LIBRARIES infernix::json
+  ARGS "${PROJECT_SOURCE_DIR}/tests/fixtures/inkling2/four_over_six.json")
+
+# Inkling 2's routed experts at [128, 2304, 1152] in both arithmetics: NVFP4 equals the exact pinned arithmetic bit for
+# bit, both within 2^-6 of an FP64 chain, column invariance (T = 1 against T = 32), and no state across calls.
+# A16 and A8 (--a8-activations: NVFP4 x int8) bit for bit their orders, the A8 prompt route the narrow route's bits.
+infernix_add_family_op_test(infernix_w4a4_sparse_moe_test FAMILY inkling2
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_w4a4_sparse_moe.cu"
+  LIBRARIES infernix_ops)
+
+# Inkling 2's visit chain (embed, mixers, message gates, short convs, the experts' rows, softcap): bit for bit the
+# pinned arithmetic's host emulation, FP64 stage by stage, exact activation rows, and single-column calls equal to a
+# 22-column call (rings included).
+infernix_add_family_op_test(infernix_inkling2_visit_test FAMILY inkling2
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_inkling2_visit.cu"
+  LIBRARIES infernix_ops)
+
+# Inkling 2's LoRA term (--lora) against an FP64 oracle at the model's output shapes, ranks 16-128, narrow and wide tiles:
+# B = 0 leaves y's bits, a column's bits are its own.
+infernix_add_family_op_test(infernix_inkling2_lora_test FAMILY inkling2
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_inkling2_lora.cu"
+  LIBRARIES infernix_ops)
+
+# Inkling 2's cut instances of the visit chain (--ablate) against an FP64 oracle over the plain instance's conv output:
+# the attn lane in mlp_entry, the mlp lane in the tail; a tiny alpha keeps every plain bit, the rings hold the uncut input.
+infernix_add_family_op_test(infernix_inkling2_visit_cut_test FAMILY inkling2
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_inkling2_visit_cut.cu"
+  LIBRARIES infernix_ops)
+
+# Inkling 2's fused projections bit for bit ops::linear's BF16 route on one visit's real shapes, widths 1-40.
+# Q8 storage within FP64 bounds; 8-bit inputs (x8) bit for bit their order, every width and tile shape.
+infernix_add_family_op_test(infernix_inkling2_projections_test FAMILY inkling2
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_inkling2_projections.cu"
+  LIBRARIES infernix_ops)
+
+# Inkling 2's decode and verify attention, sliding and full: the prologue bit for bit its host emulation and within
+# FP64 stage criteria, the output within an FP64 criterion over the represented K/V, single-column calls equal to a
+# 22-column call (outputs, K/V, rings), a repeated call equal.
+infernix_add_family_op_test(infernix_inkling2_attention_test FAMILY inkling2
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_inkling2_attention.cu"
+  LIBRARIES infernix_ops)
+
+# Inkling 2's DSpark drafter Ops against FP64 oracles of the reference arithmetic (its BF16 rounding points as
+# semantic boundaries): the context mix and norm, the head norm with RoPE into a cache ring and a dense buffer, the
+# block attention (sliding with the window cut, full), the residual norm, SwiGLU, and the Markov head's drafts.
+infernix_add_family_op_test(infernix_inkling2_dspark_test FAMILY inkling2
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_inkling2_dspark.cu"
+  LIBRARIES infernix_ops)
+
+# Inkling 2's vision-tower elementwise Ops (the fused QKV bias with the axial rotary on interleaved pairs, the
+# layer-scaled residual) against FP64 oracles; single-row calls equal to many-row calls, repeated calls equal.
+infernix_add_family_op_test(infernix_inkling2_vision_test FAMILY inkling2
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_inkling2_vision.cu"
+  LIBRARIES infernix_ops)
 
 # The family executables of every op test above (infernix_ops_<family>_test).
 infernix_finish_op_families()

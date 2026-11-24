@@ -119,7 +119,14 @@ no-term call plus the FP64 term at every route and policy, a zero `B`'s bits, `A
 the snapshot and record forms bit for bit against the projection with the term and the convolution over it. On the
 host, `infernix_artifact_peft_lora_test` covers the safetensors reader and PEFT configuration handling (patterns,
 rsLoRA, every refusal) and `infernix_qwen3_5_lora_binding_test` the module binding (the Gated DeltaNet modules
-included), ranks to 128 and its refusals (a rank above 128 by its wording).
+included), ranks to 128 and its refusals (a rank above 128 by its wording). On Inkling 2,
+`infernix_inkling2_lora_test` checks the term Op (`lora_term_add`) against an FP64 oracle at the model's output shapes
+(K2's, W_o, the gates' down and their FP32 forget and message rows, a partial 16-row group for the sink) at ranks 16, 64
+and 128: a zero `B` keeps `y`'s bits, rows outside a target stay, and a column equals the column computed alone;
+`infernix_inkling2_lora_binding_test` the PEFT module binding and its refusals (host only);
+`infernix_lossless_lora_test` also the FP32 output form against its exact oracle; and
+`infernix_inkling2_adapters_real_test` (a real artifact, generated adapter and sidecar) that a zero adapter keeps the
+logits' bits on the default, reproducible and lossless routes.
 
 `--ablate` ([Ablation sidecars](../docs/ablate.md)): `infernix_direction_cut_test` checks the cut injects (the plain
 lane form and the fused MoE combine) at Flash-Next's shapes and the single-stream cut after a lane's write
@@ -127,6 +134,10 @@ lane form and the fused MoE combine) at Flash-Next's shapes and the single-strea
 mathematics, with residual elements in the thousands), a column's bits whatever the call's width or the column's
 position, graph replay, that an inactive cut is the plain kernel bit for bit (a negligible one too, for the cut after
 the write) and that the fused combine equals `moe_combine` followed by the cut inject. On the host, `infernix_artifact_ablate_sidecar_test` covers the sidecar reader and every refusal.
+`infernix_inkling2_visit_cut_test` checks Inkling 2's cut instances (the attn lane in `mlp_entry`, the mlp lane in the
+tail of `visit_entry` / `final_mix`) against an FP64 oracle over the plain instance's conv output: a negligible alpha keeps
+the plain bits, the rings hold the uncut input; `infernix_inkling2_adapters_real_test` the same through the Engine, the
+24 hidden-state rows at any prefill chunk and the refusal with `--lossless`.
 `infernix_qwen4_exp_ablate_real_test` (Flash-Next, the reproducible route) checks that a negligible cut keeps the
 plain run's bits on every cut path, that cuts of the last layer's lanes and of layer 0's move the first-token
 readouts, that a strong cut's decode agrees with its own prefill, and that a cut prompt reads the same bits at two
@@ -514,13 +525,88 @@ shape guard (a table serves only its exact geometry), the conversion to the warm
 missing, foreign or damaged file falls back to it and `--expert-state off` starts empty.
 `tests/test_expert_cache_calibrated_order.py` covers its generator (`tools/expert_cache_replay/calibrated_order.py`).
 
-`infernix_qwen3_5_tokenizer_golden_real_test` compares the tokenizer's ids with Hugging Face
-`tokenizers` on about 2,600 adversarial strings (whitespace families, combining marks, ZWJ emoji,
-numbers, paths, code, special-token spellings; `tests/fixtures/qwen3_5/tokenizer_golden.json`). It needs
+`infernix_qwen3_5_tokenizer_golden_real_test` compares the tokenizer's ids (`src/text/tokenizer.cpp`, Qwen
+pipeline) with Hugging Face `tokenizers` on about 2,600 adversarial strings (the shared corpus
+`tests/text/tokenizer_corpus.py`: whitespace families, combining marks, ZWJ emoji, numbers, paths, code,
+special-token spellings; plus contractions under Unicode case folding; `tests/fixtures/qwen3_5/tokenizer_golden.json`). It needs
 the tokenizer files the golden was made from, not an artifact: `py -3.11 -I
 tests/models/qwen3_5/generate_tokenizer_golden.py <artifact> <golden.json> <dir>` writes them from any
 Qwen3.5-family artifact (and regenerates the golden), and `INFERNIX_TEST_TOKENIZER_DIR=<dir>` runs the
 test (skipped without it, and for a tokenizer.json of another size).
+`infernix_inkling2_tokenizer_golden_real_test` does the same for Inkling 2's pipeline (no normalizer, the
+o200k-style split with case classes, `ignore_merges`): `py -3.11 -I tests/models/inkling2/generate_tokenizer_golden.py
+<checkpoint or artifact> <golden.json> <dir>` writes the fixture (`tests/fixtures/inkling2/tokenizer_golden.json`:
+the shared corpus plus letter-case runs, folded contractions, digit and slash runs) and the resource directory,
+`INFERNIX_TEST_INKLING_TOKENIZER_DIR=<dir>` runs it, and every case must also decode back to its text. With
+`--sweep` the generator writes every codepoint in blocks of 64 in eight joinings (139,008 strings, about 200 MB, not
+committed), which `INFERNIX_TEST_INKLING_TOKENIZER_GOLDEN=<file>` runs in place of the fixture.
+`infernix_inkling2_load_plan_real_test` (CPU only) runs the loader's plan on `INFERNIX_INKLING2_ARTIFACT` (an
+`inkling2_mini` conversion): the config, every binding's name, shape, format and Use, and the tokenizer over exactly
+the model's vocabulary. `infernix_inkling2_canon_test` (GPU) checks the canonical functions Inkling's experts and
+router add (`expm1_c`, `tanh_c`, `sigmoid_c`, `softcap_c`, four-over-six NVFP4 activations): GPU bits equal the CPU
+header's exhaustively over BF16, each within 2 ulp of FP64, and four-over-six against the torch reference's fixture
+(`tests/models/inkling2/generate_four_over_six_fixture.py`). `tests/convert/test_inkling2.py` converts a synthetic
+checkpoint and checks every word, and `tools/convert/verify_inkling2.py` re-checks a real artifact against its
+checkpoint with its own reader. The Inkling 2 Op tests (GPU, family `inkling2`): `infernix_w4a4_sparse_moe_test` (the
+routed experts, also as a captured graph), `infernix_inkling2_visit_test` (embed, the mixers, message gates, short
+convs and the experts' rows: bit for bit their host emulation of the pinned orders, FP64 stage criteria, and
+single-column calls equal to a 22-column call, rings included) and `infernix_inkling2_attention_test` (sliding and full:
+the prologue bit for bit its emulation, the output against FP64 over the represented K/V, decode = verify; the full
+pool again in every `--kv-dtype` form with its codes and side records bit for bit against a host encoder, bf16p equal
+to the bf16 storage of its words and a row with no packed form flagging its lane alone; the rotated vq2 / k4v2 pools
+against a host emulation of their Hadamard rotation and exhaustive pattern search, their rotated queries bit for bit and
+within FP64 of the rotation, attention against FP64 in the rotated domain). `infernix_w4a4_sparse_moe_test` also
+requires the one-column launch (`moe_single`) to give the separate kernels' routing and outputs byte for byte, eagerly
+and in graphs interleaving both paths.
+`infernix_inkling2_chat_template_test` (CPU only) renders `tools/chat_templates/inkling2.jinja` (the checkpoint's,
+byte for byte) through the Jinja engine against transformers' `apply_chat_template`
+(`tests/fixtures/inkling2/chat_template_golden.json`, from `generate_chat_template_golden.py`).
+Three CPU tests run on the real tokenizer (`INFERNIX_TEST_INKLING_TOKENIZER_DIR`, as the tokenizer test):
+`infernix_inkling2_prompt_real_test` tokenizes those renders with the Jinja engine's literal spans and requires
+Hugging Face's ids (the golden's `ids`) for every conversation whose client text spells no marker, and for one whose
+client strings all spell markers exactly the added tokens of its twin; `infernix_inkling2_output_session_real_test`
+feeds the generated turns of `tests/fixtures/inkling2/output_session_golden.json` (`generate_output_golden.py`: the
+checkpoint's `response_template` through transformers' `ResponseParser`, markers by token identity) to the output
+session one token a round, in rounds of 2 to 16 with a discarded preview each, and whole, and checks its stop
+strings, thinking budget, reasoning ban and raw output; `infernix_inkling2_frontend_real_test` converts the golden
+conversations to Engine requests (their ids again), echoes each generated turn back as history (reporting where a
+non-canonical turn departs) and checks the refusals of this slice and the context limit.
+`infernix_inkling2_forward_real_test` (GPU) runs the forward on `INFERNIX_INKLING2_ARTIFACT` against a CPU reference's
+per-visit dump (`INFERNIX_INKLING2_REFERENCE`, a path prefix of `.bin`/`.json`): teacher-forced stages within 2^-5 of
+their row maximum, the greedy continuation's argmax, decode = verify bit for bit; its header says what it reports
+rather than judges and why. `INFERNIX_INKLING2_PACK` loads with the bf16_p12 packing (its bits must not change:
+`INFERNIX_INKLING2_LOGITS_GUARD` compares them); `INFERNIX_INKLING2_Q8` loads with `--q8-weights`' conversion (other
+bits, so the reference criteria do not apply: for its timing, its invariance checks and a census of its FP16 group
+scales). `infernix_inkling2_projections_test` (GPU) requires the fused
+projections launch to equal `linear()` bit for bit on one visit's real shapes (and W_o's) at widths 1-300 (past 16
+columns the wide kernel), BF16 and FP32 out, plain and packed (bf16_p12 segments, escapes included); with Q8 storage
+(`--q8-weights`) every output within the FP32 fold's bound of an FP64 sum of the stored codes and scales, and every
+column equal to the same column projected alone.
+`infernix_qwen4_exp_forward_real_test --pack-bf16` loads Flash-Next packed as the Engine does.
+`infernix_inkling2_engine_real_test` (GPU, the same variables) runs Inkling 2 through the public Engine against an eager
+one-request Engine prefilling 16 columns a call: the golden prompt's greedy continuation, CUDA graphs, four sampled
+requests at C = 2, 4 and 8, prefill chunks of 7, and a CausalScoring Engine's logits equal to the forward test's
+(`INFERNIX_INKLING2_LOGITS_GUARD`) byte for byte; on a 2,300-token prompt at context 4,096, wide prefill (chunks of 100,
+128, 1,000 and 4,096, one beside a decoding request) gives the greedy continuation and the scoring logits of chunks of
+16 byte for byte; under `--q8-weights` (refused with `--reproducible`) an eager one-request Engine is again the
+reference for graphs, C = 4, chunks of 7 and the long prompt in one call; it reports a chat turn, a thinking-budget
+turn and how far `--q8-weights`' tokens agree with the BF16 weights' without judging them. Each `--kv-dtype` format of
+the full pools runs as such a variant too (accepted with `--reproducible`), with DSpark equal to its plain tokens and a
+10,000-token prompt's continuation the same in chunks of 4,096 and 1,000; bf16p must give bf16's tokens throughout.
+A forced MoE stall (the down pass's error word, through a test seam) must fail its request with the stall's error, and
+the next request must equal an undisturbed run (`INFERNIX_INKLING2_STALL_ONLY=1` runs that case alone).
+`infernix_inkling2_options_test` (CPU only) passes every launch option Inkling 2 refuses through infernix-serve's parser,
+`normalize_inkling2_options` and `serve::refuse_unsupported_options` (each must be refused by its flag), and the
+configurations its callers start with (the server's and the launcher's defaults, tools/ablate's engines,
+infernix_bench's, the real tests' and infernix-perplexity's options), which must start; a scoring start must report
+the generation options it leaves unused.
+`infernix_inkling2_lossless_real_test` (GPU, `INFERNIX_INKLING2_ARTIFACT`) checks the `--lossless` route's cache form
+(generation) against its window form (scoring), the exact oracle: a 1,226-token sequence's logits byte for byte over
+calls of mixed widths (one wider than a sliding visit's ring, single-column decode calls, calls across the ring's wrap
+and the 1,024-key window, a restored state) through a permuted block table; then Engine generation: greedy tokens are
+the lossless scoring Engine's top tokens, prompt readouts (resumed from the prefix cache too) its log-probabilities bit
+for bit, and sampled requests give the same tokens alone, two at once, at another chunk, resumed, read back from the
+SSD tier and restored from a prefix cache file.
 `infernix_qwen3_5_echoed_empty_reasoning_test` (CPU only, the same directory) checks that a reply sent back
 as history renders as the prompt's ids then the ids the model generated, so its endpoint serves the next
 turn: through the real Frontend and the maintained Qwen3.8 and Qwen3.6 templates, an empty reasoning's

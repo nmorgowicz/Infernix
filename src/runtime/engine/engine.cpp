@@ -17,6 +17,7 @@
 #include "runtime/engine/diagnostics.h"
 #include "runtime/engine/context_cache/hybrid_resource_manager.h"
 #include "runtime/engine/model_instance.h"
+#include "runtime/engine/inkling2_instance.h"
 #include "runtime/engine/qwen4_exp_instance.h"
 #include "runtime/engine/gemma4_instance.h"
 #include "runtime/expert_offload/host_slot_pool.h"
@@ -94,6 +95,16 @@ EngineOptions normalize_options(EngineOptions engine_options, models::Architectu
     std::optional<models::qwen3_5::BundledDrafters> drafters;
     std::vector<std::filesystem::path> dflash2_companions;
     std::exception_ptr unreadable;
+    bool inkling2 = false, inkling2_drafter = false;
+    try {
+        const artifact::Reader reader(engine_options.artifact_path);
+        inkling2         = runtime::artifact_is_inkling2(reader);
+        inkling2_drafter = inkling2 && runtime::artifact_has_inkling2_drafter(reader);
+    } catch (const std::exception&) {}
+    if (inkling2) { // its own options (runtime/engine/inkling2_instance.h); none of the Qwen families' defaults apply
+        architecture = models::Architecture::Inkling2Loop;
+        return runtime::normalize_inkling2_options(std::move(engine_options), inkling2_drafter);
+    }
     try {
         const artifact::Reader reader(engine_options.artifact_path);
         if (models::gemma4::is_gemma4(reader)) {
@@ -235,19 +246,19 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
 
 class PreparedPrompt::Impl {
 public:
-    Impl(PromptSummary prompt_summary, PromptPreparationStats preparation, SamplingMode mode,
-         models::qwen3_5::PreparedPrompt prepared)
-        : summary(std::move(prompt_summary)), prepare(std::move(preparation)), sampling_mode(mode),
-          value(std::move(prepared)) {}
-    Impl(PromptSummary prompt_summary, PromptPreparationStats preparation, SamplingMode mode,
-         models::gemma4::PreparedPrompt prepared)
+    // Qwen3.5's frontend also serves Qwen3.8-Flash-Next; Gemma4 and Inkling 2 have their own prompts.
+    using Value = std::variant<models::qwen3_5::PreparedPrompt, models::gemma4::PreparedPrompt,
+                               models::inkling2::PreparedPrompt>;
+
+    template <class Prepared>
+    Impl(PromptSummary prompt_summary, PromptPreparationStats preparation, SamplingMode mode, Prepared prepared)
         : summary(std::move(prompt_summary)), prepare(std::move(preparation)), sampling_mode(mode),
           value(std::move(prepared)) {}
 
     PromptSummary summary;
     PromptPreparationStats prepare;
     SamplingMode sampling_mode = SamplingMode::Thinking;
-    std::variant<models::qwen3_5::PreparedPrompt, models::gemma4::PreparedPrompt> value;
+    Value value;
 };
 
 PreparedPrompt::PreparedPrompt() noexcept                            = default;
@@ -268,9 +279,8 @@ const PromptPreparationStats& PreparedPrompt::preparation_stats() const noexcept
 }
 
 std::span<const TokenId> PreparedPrompt::token_ids() const noexcept {
-    return impl_ != nullptr
-        ? std::visit([](const auto& value) { return value.token_ids(); }, impl_->value)
-        : std::span<const TokenId>{};
+    if (impl_ == nullptr) { return {}; }
+    return std::visit([](const auto& value) { return value.token_ids(); }, impl_->value);
 }
 
 PreparedPrompt::operator bool() const noexcept { return impl_ != nullptr; }
@@ -363,18 +373,26 @@ public:
     using Qwen4ExpScoringCore = runtime::CausalScoreCore<runtime::Qwen4ExpInstance>;
     using Gemma4Core = runtime::EngineCore<runtime::Gemma4Instance>;
     using Gemma4ScoringCore = runtime::CausalScoreCore<runtime::Gemma4Instance>;
+    using Inkling2Core = runtime::EngineCore<runtime::Inkling2Instance>;
+    using Inkling2ScoringCore = runtime::CausalScoreCore<runtime::Inkling2Instance>;
     using Core = std::variant<std::monostate, std::unique_ptr<GenerationCore>, std::unique_ptr<ScoringCore>,
                               std::unique_ptr<Qwen4ExpCore>, std::unique_ptr<Qwen4ExpScoringCore>,
-                              std::unique_ptr<Gemma4Core>, std::unique_ptr<Gemma4ScoringCore>>;
+                              std::unique_ptr<Gemma4Core>, std::unique_ptr<Gemma4ScoringCore>,
+                              std::unique_ptr<Inkling2Core>, std::unique_ptr<Inkling2ScoringCore>>;
     template <class CoreState>
     static constexpr bool kScoring = std::is_same_v<CoreState, std::unique_ptr<ScoringCore>> ||
                                      std::is_same_v<CoreState, std::unique_ptr<Qwen4ExpScoringCore>> ||
-                                     std::is_same_v<CoreState, std::unique_ptr<Gemma4ScoringCore>>;
+                                     std::is_same_v<CoreState, std::unique_ptr<Gemma4ScoringCore>> ||
+                                     std::is_same_v<CoreState, std::unique_ptr<Inkling2ScoringCore>>;
+
     template <class CoreState>
-    using NativePrompt = std::conditional_t<
-        std::is_same_v<CoreState, std::unique_ptr<Gemma4Core>> ||
-        std::is_same_v<CoreState, std::unique_ptr<Gemma4ScoringCore>>,
-        models::gemma4::PreparedPrompt, models::qwen3_5::PreparedPrompt>;
+    static auto take_prompt(PreparedPrompt::Impl::Value& value) {
+        using Prompt = typename CoreState::element_type::PreparedPrompt;
+        if (!std::holds_alternative<Prompt>(value)) {
+            throw std::invalid_argument("PreparedPrompt was prepared by another model family's Engine");
+        }
+        return std::move(std::get<Prompt>(value));
+    }
 
     explicit Impl(EngineOptions engine_options,
                   std::shared_ptr<runtime::expert_offload::HostSlotPool> slot_pool = nullptr)
@@ -401,6 +419,23 @@ public:
                 core = std::make_unique<Gemma4ScoringCore>(*gemma, device);
             } else {
                 core = std::make_unique<Gemma4Core>(*gemma, device, options);
+            }
+            finalize_phase.complete();
+            return;
+        }
+        if (architecture == models::Architecture::Inkling2Loop) {
+            auto constructed = runtime::construct_inkling2(options, device);
+            options = std::move(constructed.options);
+            inkling = std::move(constructed.instance);
+            load = std::move(constructed.load);
+            model_metadata = std::move(constructed.model_metadata);
+            load.cuda_sync_mode = device.sync_mode();
+            sampling_defaults = inkling->frontend.sampling_defaults();
+            StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
+            if (options.purpose == EnginePurpose::CausalScoring) {
+                core = std::make_unique<Inkling2ScoringCore>(*inkling, device);
+            } else {
+                core = std::make_unique<Inkling2Core>(*inkling, device, options);
             }
             finalize_phase.complete();
             return;
@@ -481,14 +516,17 @@ public:
 
     [[nodiscard]] bool persists_prefix_cache() const noexcept {
         return (std::holds_alternative<std::unique_ptr<GenerationCore>>(core) ||
-                std::holds_alternative<std::unique_ptr<Qwen4ExpCore>>(core)) &&
+                std::holds_alternative<std::unique_ptr<Qwen4ExpCore>>(core) ||
+                std::holds_alternative<std::unique_ptr<Inkling2Core>>(core)) &&
                options.context_cache.enabled &&
                !options.context_cache.hybrid.persistent_file.empty();
     }
 
     void report_prefix_cache_save() const noexcept {
         try {
-            if (qwen4) {
+            if (inkling) {
+                report_prefix_cache_save(inkling->program->prefix_shutdown_save());
+            } else if (qwen4) {
                 report_prefix_cache_save(qwen4->program->prefix_shutdown_save());
             } else {
                 report_prefix_cache_save(active->program->hybrid_shutdown_save());
@@ -524,11 +562,13 @@ public:
     template <class Function>
     decltype(auto) with_frontend(Function&& function) const {
         if (gemma) { return std::forward<Function>(function)(gemma->frontend); }
+        if (inkling) { return std::forward<Function>(function)(inkling->frontend); }
         return std::forward<Function>(function)(qwen4 ? qwen4->frontend : active->frontend);
     }
 
     [[nodiscard]] std::uint32_t capacity() const {
         if (gemma) { return gemma->capacity; }
+        if (inkling) { return inkling->capacity; }
         return qwen4 ? qwen4->capacity : active->capacity;
     }
 
@@ -538,6 +578,7 @@ public:
     std::unique_ptr<runtime::ModelInstance> active;
     std::unique_ptr<runtime::Qwen4ExpInstance> qwen4;
     std::unique_ptr<runtime::Gemma4Instance> gemma;
+    std::unique_ptr<runtime::Inkling2Instance> inkling;
     LoadSummary load;
     ModelMetadata model_metadata;
     ModelSamplingDefaults sampling_defaults;
@@ -641,6 +682,8 @@ EnginePlan Engine::plan(EngineOptions engine_options) {
     EnginePlan plan;
     if (architecture == models::Architecture::Gemma4) {
         (void)runtime::construct_gemma4(options, device, &plan);
+    } else if (architecture == models::Architecture::Inkling2Loop) {
+        (void)runtime::construct_inkling2(options, device, &plan);
     } else if (architecture == models::Architecture::Qwen4Exp) {
         (void)runtime::construct_qwen4_exp(options, device, &plan);
     } else {
@@ -664,7 +707,7 @@ PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& cont
         if (info.prompt_tokens > impl_->capacity()) {
             throw std::logic_error("target Frontend admitted a prompt beyond Engine capacity");
         }
-        const auto preparation = prepared.preparation_stats();
+        const PromptPreparationStats preparation = prepared.preparation_stats();
         return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
             info, preparation, sampling_mode, std::move(prepared)));
     });
@@ -685,7 +728,7 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
         if (info.prompt_tokens > impl_->capacity()) {
             throw std::logic_error("target Frontend admitted prompt tokens beyond capacity");
         }
-        const auto preparation = prepared.preparation_stats();
+        const PromptPreparationStats preparation = prepared.preparation_stats();
         return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
             info, preparation, SamplingMode::Thinking, std::move(prepared)));
     });
@@ -763,7 +806,22 @@ ScoreResult Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t firs
     if (options.prompt_hidden_states && impl_->architecture == models::Architecture::Gemma4) {
         throw std::invalid_argument("score_tokens prompt_hidden_states is not implemented for Gemma4");
     }
-    const bool hidden_states           = options.prompt_hidden_states;
+    const bool hidden_states = options.prompt_hidden_states;
+    const bool argmax_only = options.argmax_only;
+    bool argmax_by_top_k = false;
+    if (argmax_only) {
+        if (options.top_k != 0 || options.candidates_per_position != 0 || !options.logits_positions.empty() ||
+            hidden_states) {
+            throw std::invalid_argument("score_tokens argmax_only excludes top_k, candidates, logits_positions and "
+                                        "prompt_hidden_states");
+        }
+        // Inkling 2 has a dedicated kernel; the other families rank top_k = 1 on the device.
+        if (!std::holds_alternative<std::unique_ptr<Impl::Inkling2ScoringCore>>(impl_->core)) {
+            options.argmax_only = false;
+            options.top_k = 1;
+            argmax_by_top_k = true;
+        }
+    }
     const std::size_t logit_rows       = options.logits_positions.size();
     const std::size_t top_values       = positions * options.top_k;
     const std::size_t candidate_values = options.candidates.size();
@@ -772,21 +830,24 @@ ScoreResult Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t firs
         [&](auto& core) -> ScoreResult {
             using CoreState = std::remove_cvref_t<decltype(core)>;
             if constexpr (Impl::kScoring<CoreState>) {
-                auto* native = std::get_if<Impl::NativePrompt<CoreState>>(&prompt.impl_->value);
-                if (!native) { throw std::invalid_argument("PreparedPrompt belongs to another model family"); }
-                return core->score(std::move(*native), first_target, std::move(options));
+                return core->score(Impl::take_prompt<CoreState>(prompt.impl_->value), first_target,
+                                   std::move(options));
             } else {
                 throw std::logic_error("Engine scoring core is unavailable");
             }
         },
         impl_->core);
-    if (result.logprobs.size() != positions || result.top_ids.size() != top_values ||
-        result.top_logprobs.size() != top_values ||
+    if (result.logprobs.size() != (argmax_only && !argmax_by_top_k ? 0 : positions) ||
+        result.top_ids.size() != (argmax_only ? positions : top_values) || result.top_logprobs.size() != top_values ||
         result.candidate_logprobs.size() != candidate_values ||
         (logit_rows == 0 ? !result.logits.empty() : result.logits.empty() || result.logits.size() % logit_rows != 0) ||
         result.hidden_states.empty() == hidden_states ||
         (hidden_states && (result.hidden_state_layers == 0 || result.hidden_states.size() % result.hidden_state_layers != 0))) {
         throw std::logic_error("target Program returned an invalid causal score count");
+    }
+    if (argmax_by_top_k) {
+        result.logprobs.clear();
+        result.top_logprobs.clear();
     }
     return result;
 }
@@ -799,7 +860,8 @@ std::uint32_t Engine::count_tokens(PromptInput input, const PreparationControl& 
         apply_tool_choice(prompt, tool_choice);
         return prompt.summary().prompt_tokens;
     }
-    return impl_->with_frontend([&](const auto& frontend) { return frontend.count_tokens(std::move(input), control); });
+    return impl_->with_frontend(
+        [&](const auto& frontend) { return frontend.count_tokens(std::move(input), control); });
 }
 
 ModelSamplingDefaults Engine::sampling_defaults() const {
@@ -898,10 +960,8 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             } else if constexpr (Impl::kScoring<CoreState>) {
                 throw std::logic_error("Engine generation core is unavailable");
             } else {
-                auto* native = std::get_if<Impl::NativePrompt<CoreState>>(&prompt.impl_->value);
-                if (!native) { throw std::invalid_argument("PreparedPrompt belongs to another model family"); }
                 auto submission =
-                    core->submit(std::move(*native), prompt_summary, prepare_seconds,
+                    core->submit(Impl::take_prompt<CoreState>(prompt.impl_->value), prompt_summary, prepare_seconds,
                                  std::move(resolved_options), consumer_mode, std::move(observation),
                                  pending_deadline);
                 return GenerationHandle(std::make_unique<GenerationHandle::Impl>(

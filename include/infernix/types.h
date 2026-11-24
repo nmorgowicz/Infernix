@@ -454,6 +454,7 @@ enum class SpeculativeBackend : std::uint8_t {
     Mtp,
     DFlash,
     DFlash2,
+    DSpark, // Inkling 2's DFlash-style block drafter with its Markov head (the artifact's dspark component)
 };
 
 // Automatic tree verification considers, besides the chain, trees of these many columns
@@ -774,7 +775,8 @@ struct EngineOptions {
     std::filesystem::path artifact_path;
     // A LoRA adapter applied at runtime (--lora): a Hugging Face PEFT adapter's directory, or its
     // adapter_model.safetensors with adapter_config.json beside it. Every projection it targets computes
-    // W x + s B (A x) exactly (include/infernix/ops/lora.h); the artifact is unchanged. Qwen3.5 dense models only.
+    // W x + s B (A x) exactly (include/infernix/ops/lora.h); the artifact is unchanged. Qwen3.5 dense models and
+    // Inkling 2.
     std::filesystem::path lora_path;
     std::filesystem::path chat_template_path;
     // Qwen3.8-Flash-Next's per-layer n-gram embedding volume. Empty uses `<artifact>.ngram`.
@@ -907,8 +909,10 @@ struct EngineOptions {
     // 16-bit activations where the checkpoint specifies fewer bits (--a16-activations): Qwen3.8-Flash-Next routed
     // experts that are W4A4 by their checkpoint (NVIDIA's NVFP4 recipes A and B, Dense8, NVFP4-QAD) run the
     // arithmetic of the weight-only banks (design §16.2.1); on a Qwen3.5-family artifact every text projection
-    // binds A16Only (NVIDIA's NVFP4 27B layers instead of 4-bit, its FP8 layers instead of 8-bit activations).
-    // Changes the output; the engine warns at launch that the default follows NVIDIA's specification and is
+    // binds A16Only (NVIDIA's NVFP4 27B layers instead of 4-bit, its FP8 layers instead of 8-bit activations); on an
+    // Inkling 2 artifact the routed experts' NVFP4 and MXFP8 layers take 16-bit activations (w4a4_sparse_moe.h's
+    // ExpertActivation::A16), deterministic and request-invariant, which the reproducible route accepts.
+    // Changes the output; the engine warns at launch that the default follows the checkpoint's specification and is
     // recommended. Artifacts that already run 16-bit activations accept it unchanged; --expert-a4-activations,
     // --a8-activations and the lossless route refuse it.
     bool expert_a16_activations        = false;
@@ -927,6 +931,13 @@ struct EngineOptions {
     // projections already take the activations their artifact permits, the 35B-A3B and the official FP8 import),
     // the reproducible route and the lossless route refuse it.
     bool a8_activations                = false;
+    // 8-bit weights (--q8-weights; approximate, opt-in, never a default): BF16 projections converted at load to Q8
+    // (int8 codes, an FP16 scale per 32 values; include/infernix/ops/q8_g32.h) where that measured faster, and their
+    // BF16 copies freed. Inkling 2: each attention's fused input projections (query, relative, gate, key, value, sink
+    // and the dynamic-conv taps) and the head (in place of its lossless bf16_p12 packing); the activations stay 16-bit.
+    // Every route stays column- and request-invariant. Other artifacts, the reproducible route and the lossless route
+    // refuse it.
+    bool q8_weights                    = false;
     // Qwen3.5-family artifacts (--embedding-host): keep the token embedding in pinned host memory and
     // gather its rows zero-copy, as artifacts with offloaded experts already do, so its VRAM (1.18 GiB on
     // the 27B) goes to the KV and prefix caches. Same bits; a prefill chunk reads its rows over the link.
@@ -1615,6 +1626,11 @@ struct VisionImageBudget {
 
 struct PromptSummary {
     bool starts_in_reasoning    = false;
+    // The model may open reasoning in its output although the prompt does not start in it, whatever the request's
+    // thinking options (Inkling 2: its thinking blocks open mid-turn, and its lowest effort still thinks), so the
+    // turn's thinking controls (ThinkingControlOptions) apply to every request. False for the Qwen families, whose
+    // prompts start in reasoning exactly when they think.
+    bool opens_reasoning        = false;
     std::uint32_t prompt_tokens = 0;
     bool has_media              = false;
     // One entry per media item, in prompt order.
@@ -2149,6 +2165,10 @@ struct ScoreOptions {
     // distribution is scored position 0): ScoreResult::hidden_states (tools/ablate's capture). Not on the lossless
     // route.
     bool prompt_hidden_states = false;
+    // Only the most probable token of every scored position (equal logits: the lowest id), found on the device, in
+    // ScoreResult::top_ids (one a position, logprobs and top_logprobs empty): a token-frequency measurement over
+    // millions of positions (tools/freq_corpus). Excludes top_k, candidates and logits_positions.
+    bool argmax_only = false;
 };
 
 inline constexpr std::uint32_t kMaximumScoreLogitPositions = 256;
@@ -2168,7 +2188,8 @@ struct ScoreResult {
     // ScoreOptions::prompt_hidden_states: [layers][hidden_size], layer-major, the BF16 values widened exactly. Row L
     // is the hidden state layer L hands on at the last prompt token: on Qwen3.5 the residual after layer L; on
     // Qwen3.8-Flash-Next (four hyper-connection streams) layer L + 1's mixer input, and for the last layer its MoE
-    // input. Empty otherwise.
+    // input; on Inkling 2 the residual after physical layer L on its last visit (a core layer's on the third pass).
+    // Empty otherwise.
     std::vector<float> hidden_states;
     std::uint32_t hidden_state_layers = 0; // hidden_states' rows (0 when empty)
 };

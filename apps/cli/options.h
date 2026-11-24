@@ -47,12 +47,14 @@ struct Options {
     bool allow_shared_memory = false; // Gemma4 only: start with the shortfall in shared GPU memory
     SharedMemoryPlacement shared_memory_placement = SharedMemoryPlacement::RuntimeResident;
     KvCapacityPolicy kv_capacity = KvCapacityPolicy::explicit_capacity(2048);
+    bool kv_capacity_explicit    = false; // --kv-capacity given (else the parser's default above)
     std::optional<std::size_t> vram_headroom_bytes; // empty: the model's automatic headroom
     bool vram_past_budget = false;
     std::uint32_t expert_tail_skip = 0; // EngineOptions::expert_tail_skip
     bool expert_a4_activations     = false; // EngineOptions::expert_a4_activations
     bool expert_a16_activations    = false; // EngineOptions::expert_a16_activations (--a16-activations)
     bool a8_activations            = false; // EngineOptions::a8_activations
+    bool q8_weights                = false; // EngineOptions::q8_weights
     bool embedding_host            = false; // EngineOptions::embedding_host
     std::uint32_t prefill_chunk  = 0; // 0: the model's default (EngineOptions)
     bool prefill_chunk_auto = false; // Gemma4 only; 0 remains the model's default

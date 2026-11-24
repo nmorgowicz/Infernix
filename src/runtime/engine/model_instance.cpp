@@ -79,13 +79,14 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
         if (architecture != models::Architecture::Qwen3_5) {
             throw std::invalid_argument("LoRA adapter " + options.lora_path.string() +
                                         " is refused: Qwen3.8-Flash-Next is a mixture-of-experts model, and Infernix "
-                                        "applies LoRA adapters to the dense Qwen3.5-family models (the 27B) only");
+                                        "applies LoRA adapters to the dense Qwen3.5-family models (the 27B) and "
+                                        "Inkling 2 only");
         }
         if (offloaded_experts) {
             throw std::invalid_argument("LoRA adapter " + options.lora_path.string() +
                                         " is refused: this artifact is a mixture-of-experts model (its experts are "
                                         "offloaded), and Infernix applies LoRA adapters to the dense Qwen3.5-family "
-                                        "models (the 27B) only");
+                                        "models (the 27B) and Inkling 2 only");
         }
     }
     // The lossless route computes the model's own forward correctly rounded; a cut is not part of it. Refused here,
@@ -309,16 +310,6 @@ std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::st
 }
 
 namespace {
-
-// The free device memory a start sizes its KV against: cudaMemGetInfo's, bounded under WDDM by the OS
-// budget less this process's usage, as the expert frames are (size_expert_frames). The two differ (an RTX
-// 5090: 24.10 GiB free against 21.88 the budget left, Basalt #28), and a KV sized past the budget is
-// demoted to system memory, which the Program's spill guard refuses at startup (candidates VR-04).
-std::size_t free_device_bytes(const VramSnapshot& s) {
-    if (!s.has_budget) { return s.device_free; }
-    const std::uint64_t left = s.local_budget > s.local_usage ? s.local_budget - s.local_usage : 0U;
-    return static_cast<std::size_t>(std::min<std::uint64_t>(s.device_free, left));
-}
 
 // What a start resolves its KV capacity in (kv_available_bytes): an automatic capacity leaves `headroom` of
 // free device memory and, of the OS budget, the expert frames' margin (size_expert_frames) with the retry's
@@ -601,6 +592,7 @@ void resolve_auto_speculative_backend(EngineOptions& options, models::Architectu
     case SpeculativeBackend::Mtp: break;
     case SpeculativeBackend::DFlash: chosen = "dflash"; break;
     case SpeculativeBackend::DFlash2: chosen = "dflash2"; break;
+    case SpeculativeBackend::DSpark: chosen = "dspark"; break;
     case SpeculativeBackend::None:
         // Nothing to draft with: plain decode, and every drafter setting goes with the drafter (copy
         // proposals stay where the model verifies them alone).
@@ -756,6 +748,8 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     if (options.a8_activations && !options.fast_paths) {
         throw std::invalid_argument("--a8-activations is approximate; the reproducible route (--reproducible) refuses it");
     }
+    // Inkling 2's options are normalized apart (inkling2_instance.cpp): every artifact reaching here refuses it.
+    if (options.q8_weights) { throw std::invalid_argument("--q8-weights applies to Inkling 2 artifacts only"); }
     // An automatic draft length chooses up to the model's most drafts unless given a ceiling: MTP on
     // Qwen3.8-Flash-Next verifies 8 columns column-invariantly, the Qwen3.5 planner captures 5, Gemma 4's
     // assistant drafts 6 (the ninfer.spo measurement; its launchers default to 1). The

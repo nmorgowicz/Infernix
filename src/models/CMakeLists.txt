@@ -1,10 +1,10 @@
 # Immutable loading and mutable execution have separate compile owners.
 # --ablate (docs/ablate.md): the sidecar's binding is Model data for every architecture, its device cuts Parameters.
-add_library(infernix_model_loading STATIC registry.cpp ablate/binding.cpp)
+add_library(infernix_model_loading STATIC registry.cpp ablate/binding.cpp bf16_packing.cpp q8_weights.cpp)
 infernix_internal_includes(infernix_model_loading)
 target_link_libraries(infernix_model_loading PUBLIC infernix_artifact infernix_text infernix_ops)
 
-add_library(infernix_model_runtime STATIC ablate/parameters.cpp)
+add_library(infernix_model_runtime STATIC ablate/parameters.cpp output_text.cpp)
 infernix_internal_includes(infernix_model_runtime)
 target_link_libraries(infernix_model_runtime
   PUBLIC infernix_model_loading infernix_ops infernix_runtime_support
@@ -15,6 +15,7 @@ target_include_directories(infernix_model_runtime SYSTEM PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/xgrammar/3rdparty/picojson)
 
 include(${PROJECT_SOURCE_DIR}/src/runtime/expert_offload/sources.cmake)
+include(inkling2/sources.cmake)
 include(qwen3_5/loading_sources.cmake)
 include(qwen3_5/frontend_sources.cmake)
 include(qwen3_5/execution_sources.cmake)

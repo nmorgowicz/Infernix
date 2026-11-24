@@ -1,6 +1,7 @@
 #include "models/qwen3_5/frontend/output_session.h"
+#include "models/output_text.h"
 #include "models/qwen3_5/frontend/chat_template.h"
-#include "models/qwen3_5/frontend/tokenizer.h"
+#include "text/tokenizer.h"
 #include "models/qwen3_5/frontend/tool_call_parser.h"
 #include "runtime/contract/execution.h"
 #include "text/unicode.h"
@@ -19,7 +20,9 @@
 namespace infernix::models::qwen3_5 {
 namespace {
 namespace fi                                = frontend;
-constexpr std::string_view kUtf8Replacement = "\xef\xbf\xbd";
+using models::consume_generated_utf8;
+using models::kUtf8Replacement;
+using models::stop_hold_size;
 constexpr std::string_view kCloseSeparator  = fi::kReasoningCloseSeparator;
 
 std::size_t channel_index(OutputChannel channel) noexcept {
@@ -33,88 +36,6 @@ void append_delta(PublishedOutput& output, OutputChannel channel, std::string te
     } else {
         output.push_back(OutputDelta{.channel = channel, .text = std::move(text)});
     }
-}
-
-std::string consume_generated_utf8(std::string& pending) {
-    std::string decoded;
-    decoded.reserve(pending.size());
-    std::size_t offset = 0;
-    while (offset < pending.size()) {
-        const auto lead    = static_cast<unsigned char>(pending[offset]);
-        std::size_t length = 0;
-        if (lead <= 0x7fU) {
-            decoded.push_back(pending[offset]);
-            ++offset;
-            continue;
-        } else if (lead >= 0xc2U && lead <= 0xdfU) {
-            length = 2;
-        } else if (lead >= 0xe0U && lead <= 0xefU) {
-            length = 3;
-        } else if (lead >= 0xf0U && lead <= 0xf4U) {
-            length = 4;
-        } else {
-            decoded.append(kUtf8Replacement);
-            ++offset;
-            continue;
-        }
-
-        bool malformed = false;
-        for (std::size_t index = 1; index < length; ++index) {
-            if (offset + index >= pending.size()) {
-                pending.erase(0, offset);
-                return decoded;
-            }
-            const auto byte      = static_cast<unsigned char>(pending[offset + index]);
-            unsigned int minimum = 0x80U;
-            unsigned int maximum = 0xbfU;
-            if (index == 1) {
-                if (lead == 0xe0U) {
-                    minimum = 0xa0U;
-                } else if (lead == 0xedU) {
-                    maximum = 0x9fU;
-                } else if (lead == 0xf0U) {
-                    minimum = 0x90U;
-                } else if (lead == 0xf4U) {
-                    maximum = 0x8fU;
-                }
-            }
-            if (byte < minimum || byte > maximum) {
-                // Replace one maximal subpart. The first byte that cannot continue this sequence
-                // is deliberately left for the next iteration, so valid following text is kept.
-                decoded.append(kUtf8Replacement);
-                offset += index;
-                malformed = true;
-                break;
-            }
-        }
-        if (malformed) { continue; }
-
-        decoded.append(pending, offset, length);
-        offset += length;
-    }
-    pending.clear();
-    return decoded;
-}
-
-// The longest proper prefix of `marker` that `text` ends with, in O(n) for n = min(|text|, |marker|):
-// Knuth-Morris-Pratt over text's last n bytes. (Comparing every size from the largest down was
-// quadratic once a long held prefix broke, and a stop string's length is the client's; QA-14.)
-std::size_t longest_suffix_prefix(std::string_view text, std::string_view marker) {
-    const std::size_t n = std::min(text.size(), marker.size());
-    if (n == 0) { return 0; }
-    thread_local std::vector<std::size_t> border;
-    border.assign(n, 0);
-    for (std::size_t i = 1, k = 0; i < n; ++i) {
-        while (k != 0 && marker[i] != marker[k]) { k = border[k - 1]; }
-        if (marker[i] == marker[k]) { ++k; }
-        border[i] = k;
-    }
-    std::size_t state = 0;
-    for (const char c : text.substr(text.size() - n)) {
-        while (state != 0 && (state == marker.size() || c != marker[state])) { state = border[state - 1]; }
-        if (c == marker[state]) { ++state; }
-    }
-    return state == marker.size() ? border[state - 1] : state;
 }
 
 // The token after which a prompt that re-renders this turn leaves the generated sequence: the end
@@ -197,15 +118,6 @@ bool stop_match_precedes(std::uint32_t committed_tokens, std::uint64_t byte_cut,
     }
     if (byte_cut != current.byte_cut) { return byte_cut < current.byte_cut; }
     return declaration_order < current.declaration_order;
-}
-
-std::size_t stop_hold_size(std::string_view text, OutputChannel channel, const StopPolicy& policy) {
-    std::size_t hold = 0;
-    for (const StopString& stop : policy.strings) {
-        if (stop.channel != channel) { continue; }
-        hold = std::max(hold, longest_suffix_prefix(text, stop.text));
-    }
-    return hold;
 }
 
 void feed_channel(DecoderState& state, OutputChannel channel, std::string_view text,
@@ -400,7 +312,7 @@ DecoderState terminal_state(DecoderState state) {
 
 class OutputSession::Impl {
 public:
-    Impl(std::shared_ptr<const fi::Tokenizer> tokenizer_, fi::OutputMarkerTokens markers_,
+    Impl(std::shared_ptr<const text::Tokenizer> tokenizer_, fi::OutputMarkerTokens markers_,
          StopPolicy policy_, OutputOptions output, bool starts_in_reasoning,
          ThinkingControlOptions thinking,
          std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens_,
@@ -466,7 +378,7 @@ public:
         for (auto& tokens : preview_tool_call_tokens) { tokens.clear(); }
     }
 
-    std::shared_ptr<const fi::Tokenizer> tokenizer;
+    std::shared_ptr<const text::Tokenizer> tokenizer;
     fi::OutputMarkerTokens markers;
     StopPolicy policy;
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens;
@@ -551,7 +463,7 @@ OutputSession::OutputSession(OutputSession&&) noexcept            = default;
 OutputSession& OutputSession::operator=(OutputSession&&) noexcept = default;
 
 OutputSession::OutputSession(
-    std::shared_ptr<const frontend::Tokenizer> tokenizer, frontend::OutputMarkerTokens markers,
+    std::shared_ptr<const text::Tokenizer> tokenizer, frontend::OutputMarkerTokens markers,
     StopPolicy policy, OutputOptions output, bool starts_in_reasoning,
     ThinkingControlOptions thinking,
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens,
@@ -663,7 +575,7 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
     for (std::size_t index = 0; index < tokens.size(); ++index) {
         const std::uint32_t count          = static_cast<std::uint32_t>(index + 1);
         const TokenId token                = tokens[index];
-        const fi::DecodedTokenView decoded = impl_->tokenizer->decoded_token(token);
+        const text::DecodedTokenView decoded = impl_->tokenizer->decoded_token(token);
         const bool reasoning_close         = token == impl_->markers.reasoning_close;
 
         if (impl_->preview_prefix_execution.feed(reasoning_close, decoded.bytes)) {
@@ -766,7 +678,7 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
     impl_->clear_preview_tool_calls();
     for (std::size_t index = 0; index < tokens.size(); ++index) {
         const TokenId token                = tokens[index];
-        const fi::DecodedTokenView decoded = impl_->tokenizer->decoded_token(token);
+        const text::DecodedTokenView decoded = impl_->tokenizer->decoded_token(token);
         const bool reasoning_close         = token == impl_->markers.reasoning_close;
         if (impl_->preview_prefix_execution.feed(reasoning_close, decoded.bytes)) {
             impl_->preview_execution_split_after = static_cast<std::uint32_t>(index + 1U);
