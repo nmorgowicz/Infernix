@@ -43,7 +43,8 @@ KV, no fast path, FP32 logits ([definition](maintainer/lossless-route.md)). Save
 `--save-top-tokens`, it is the reference that `--kl-reference` measures other runs against, and
 `report.json` records it as `lossless`. [Model-level numerical quality](maintainer/model-quality.md)
 has the method and the recorded results. Qwen3.8-Flash-Next reads its n-gram volume from `<model>.ngram` unless
-`--ngram-volume FILE` names it, as in `infernix` (`--expert-stripe FILE` as there too). Its windows
+`--ngram-volume FILE` names it, as in `infernix` (and with offloaded experts, Flash-Next's or the 122B's,
+`--expert-stripe FILE` as there too). Its windows
 prefill through the generation path, the SSD expert tier included, keeping each position's final
 residual; the LM head then runs over them in tiles of 64 positions with FP32 logits. The available Main
 KV representations are `bf16`, `int8`, `fp8`, `nvfp4`, `k8v4`, `vq2`, and `k4v2`; unlike `infernix` and
@@ -154,7 +155,14 @@ same route as generation; `--ngram-volume FILE` names their n-gram volume when i
 `<artifact>.ngram`.
 `--expert-a4-activations` scores nvidia/Qwen3.8-Flash-Next-FP4-Local with 4-bit expert activations
 ([guide](qwen3_8-flash-next.md#nvidia-fp4-local-checkpoint)); `report.json` records it as
-`expert_a4_activations`. The
+`expert_a4_activations`. `--a16-activations` scores the artifacts whose routed experts NVIDIA specifies as W4A4
+(NVFP4, NVFP4 Dense8 and NVFP4-QAD) with 16-bit expert activations and NVIDIA's NVFP4 Qwen3.8-27B artifacts with
+16-bit activations at every text projection, and `--a8-activations` scores infernix-serve's
+8-bit route, which the reproducible and lossless routes refuse; `report.json` records them as
+`expert_a16_activations` and `a8_activations`. `--lora PATH` scores the model with a LoRA adapter applied
+([LoRA adapters](lora.md)); `report.json` names it in `execution.lora_adapter` (`null` without one). `--ablate FILE`
+scores the model with an ablation sidecar applied ([Ablation sidecars](ablate.md)); `report.json` names it in
+`execution.ablate_sidecar` (`null` without one). The
 [numerical acceptance policy](maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths)
 uses its own corpus and tool (`infernix-certify`).
 

@@ -56,6 +56,9 @@ struct PrefillContext {
     std::uint32_t mtp_proposal_extent                          = 0;
     std::int32_t dflash_kv_table_row                           = 0;
     qwen3_5::DFlashPrefillIngress* dflash_prefill_host_ingress = nullptr;
+    // Positional initializers end at dflash_prefill_host_ingress. Every member below is set by name: a member
+    // inserted here once shifted a trailing positional rope_delta into dflash_context_floor (text passes of image
+    // requests then ran at delta 0), which compiled silently.
     // YE-01 (text prefill with a DFlash2 drafter whose layers are all local): the first prompt position
     // the drafter's context needs from this pass; the pass's columns below it (positions text_kv_base
     // onwards) are not projected, since every later read of the ring is overwritten past them. -1: all.
@@ -76,6 +79,13 @@ struct PrefillContext {
     // YC-01 (TextContext::set_prefill_last_rows_only): a generation prompt, which reads each window's final hidden
     // at its last column only. Causal scoring and the other prompt-shaped passes leave it off.
     bool last_rows_only = false;
+    // QK-02 (TextContext::set_prefill_pair_tap): an exact tap this text pass takes without a split, and the
+    // physical state image slot it fills (ProgramImpl::hybrid_reserve_pair); -1: none.
+    std::int64_t pair_tap_frontier = -1;
+    std::int32_t pair_tap_slot     = -1;
+    // Causal scoring with ScoreOptions::prompt_hidden_states: the text pass records each layer's output at the sink's
+    // position (prefill_text_chunk); null otherwise.
+    HiddenStateSink* hidden_states = nullptr;
 };
 
 struct OrdinaryBatchContext {

@@ -10,7 +10,7 @@
 
 namespace infernix::models::gemma4 {
 
-// P4 has no speculative archive. Engine bookkeeping may query this truthful absence adapter;
+// Gemma4 has no speculative archive. Engine bookkeeping may query this truthful absence adapter;
 // any attempt to publish or bind an archive request is rejected, never reported as successful.
 class NgramArchive {
 public:
@@ -21,9 +21,10 @@ public:
     class Request {};
     explicit NgramArchive(Limits) noexcept {}
     bool publish(std::unique_ptr<Request>, std::span<const TokenId>, std::uint32_t) {
-        throw std::invalid_argument("gemma4 P4 does not support ngram archives");
+        throw std::invalid_argument("Gemma4 does not support ngram archives");
     }
     [[nodiscard]] NgramArchiveStats stats(std::string_view) const noexcept { return {}; }
+    [[nodiscard]] std::uint64_t bytes() const noexcept { return 0; }
 };
 
 } // namespace infernix::models::gemma4

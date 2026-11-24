@@ -303,7 +303,16 @@ maximizing log q + g(seed, base + i + 1, token), and a tree node's children are 
 that order, so a draft is the target's draw whenever the target's draw is also the drafter's own Gumbel winner
 among its 16 candidates. A Gumbel-max pick is an exact draw from q, so the drafts' distribution and q are those of
 the proposal-uniform draw; only which draw is taken changes, and the output is plain sampling's text either way
-(the route's contract). With `--draft-tree-nodes` a DFlash2 round
+(the route's contract). MTP's argmax drafts do the same at a round's leading steps (candidates QK-04,
+`ops::speculative_couple_drafts`): every step on a dense model and the first on a mixture of experts
+(ExecutionSchedule::coupled_mtp_steps). The gain sits at the leading positions while each coupled step costs about
+20 us: against no coupling the NVFP4 27B gained 4.45 / 7.76 / 8.9 % with one, two or all five steps coupled and the
+35B-A3B 1.08 / 0.33 / -0.13 % with one, two or all three; the 122B follows the 35B until it is timed. Such a draft is re-drawn from the head's logits as the support sample() builds under the row's temperature,
+top-k, top-p and min-p (no penalties or masks) with the Gumbel key of its verify column, the head's probability of
+the drawn row then feeding MTP's confidence policy; greedy rows and the prompt's first MTP drafts keep the argmax.
+DFlash's argmax chain drafts are not coupled: on the only configuration that runs them (35B-A3B `--spec dflash`)
+coupling cost 0.12 % of sampled decode and moved acceptance by 0.3 %. With
+`--draft-tree-nodes` a DFlash2 round
 instead verifies a tree of proposals built from the same lattice, whose main chain is this path
 ([tree verification](tree-verification.md)). Different draft formats, shortlist heads or
 block widths can change acceptance and throughput; their logits need not match one another.

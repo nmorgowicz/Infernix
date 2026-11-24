@@ -1,5 +1,6 @@
 #include "serve/http_server.h"
 
+#include "serve/http_stream_driver.h"
 #include "serve/http_transport.h"
 #include "serve/openai_common.h"
 #include "serve/openai_responses.h"
@@ -86,71 +87,72 @@ void run_openai_response(GenerationBackend& service, const OpenAIResponsesCreate
                          const std::function<bool()>& is_cancelled,
                          const ContinuationPreparer& prepare_next, const RoundWriter& on_round,
                          const HostedSearchId& hosted_search_id) {
-    const bool hosted = request.prompt.tool_search && request.prompt.tool_search->server;
-    const std::string search_name(kToolSearchFunctionName);
-    for (;;) {
-        GenerationOutcome outcome = service.run(prepared, sink, is_cancelled);
-        const std::size_t count   = outcome.tool_calls.size();
-        std::vector<std::string> call_ids(count);
-        std::vector<std::optional<OpenAIToolSearchExecution>> searches(count);
-        std::vector<ToolCall> calls(count);
-        std::vector<ChatTurn> result_turns;
-        bool client_calls = false;
-        for (std::size_t index = 0; index < count; ++index) {
-            const infernix::GeneratedToolCall& call = outcome.tool_calls[index];
-            calls[index] = ToolCall{.name = call.name, .arguments_json = call.arguments_json};
-            if (!hosted || call.name != search_name ||
-                outcome.finish_reason == infernix::FinishReason::Cancelled) {
-                client_calls = true;
-                continue;
-            }
-            call_ids[index]  = hosted_search_id(index);
-            calls[index].id  = call_ids[index];
-            searches[index]  = execute_openai_tool_search(request, calls[index]);
-            result_turns.push_back(searches[index]->turn);
-            ++state.hosted_calls;
-        }
-        const bool turn_ended = outcome.finish_reason == infernix::FinishReason::StopToken ||
-                                outcome.finish_reason == infernix::FinishReason::None;
-        bool continues = !result_turns.empty() && !client_calls && turn_ended &&
-                         state.rounds.size() + 1U < kMaximumServerToolRounds &&
-                         (!request.max_tool_calls ||
-                          state.hosted_calls < static_cast<std::size_t>(*request.max_tool_calls));
-        std::optional<infernix::FinishReason> finish;
-        ServerToolRound round{.outcome = std::move(outcome),
-                              .calls   = std::move(calls),
-                              .results = std::move(result_turns)};
-        std::optional<PreparedRequest> next;
-        if (continues) {
-            GenerationRequest extended = state.continuation;
-            append_server_round(extended, round, std::span(&search_name, 1));
-            if (extended.max_tokens <= 0) {
-                continues = false;
-                finish    = infernix::FinishReason::OutputLimit;
-            } else {
-                try {
-                    next.emplace(prepare_next(extended));
-                    state.continuation = std::move(extended);
-                } catch (const ApiException& error) {
-                    if (error.error().code != "context_length_exceeded") { throw; }
-                    continues = false;
-                    finish    = infernix::FinishReason::ContextCapacity;
+    // The protocol's part of run_server_tool_rounds: a hosted tool_search runs (counted against max_tool_calls),
+    // any other call is the client's, and each generation keeps its searches' Item ids and results.
+    struct Protocol {
+        const OpenAIResponsesCreateRequest& request;
+        ResponseRounds& state;
+        const RoundWriter& on_round;
+        const HostedSearchId& hosted_search_id;
+        const bool hosted;
+        const std::string& search_name;
+        std::vector<std::string> call_ids;                               // the current generation's, by call
+        std::vector<std::optional<OpenAIToolSearchExecution>> searches; // likewise
+
+        ServerRoundCalls calls(const GenerationOutcome& outcome) {
+            const std::size_t count = outcome.tool_calls.size();
+            call_ids.assign(count, std::string());
+            searches.assign(count, std::nullopt);
+            ServerRoundCalls out;
+            out.calls.resize(count);
+            for (std::size_t index = 0; index < count; ++index) {
+                const infernix::GeneratedToolCall& call = outcome.tool_calls[index];
+                out.calls[index] = ToolCall{.name = call.name, .arguments_json = call.arguments_json};
+                if (!hosted || call.name != search_name ||
+                    outcome.finish_reason == infernix::FinishReason::Cancelled) {
+                    out.client_calls = true;
+                    continue;
                 }
+                call_ids[index]     = hosted_search_id(index);
+                out.calls[index].id = call_ids[index];
+                searches[index]     = execute_openai_tool_search(request, out.calls[index]);
+                out.results.push_back(searches[index]->turn);
+                ++state.hosted_calls;
             }
+            return out;
         }
-        if (!continues) {
+
+        [[nodiscard]] bool limit_reached() const noexcept {
+            return request.max_tool_calls && state.hosted_calls >= static_cast<std::size_t>(*request.max_tool_calls);
+        }
+
+        void keep() {
+            state.round_call_ids.push_back(std::move(call_ids));
+            state.round_searches.push_back(std::move(searches));
+            if (on_round) { on_round(state.round(state.rounds.size() - 1U)); }
+        }
+
+        void end(ServerToolRound&& round, ServerRoundsEnd end) {
             state.final_outcome  = std::move(round.outcome);
             state.final_call_ids = std::move(call_ids);
             state.final_searches = std::move(searches);
-            state.finish         = finish;
-            return;
+            switch (end) {
+            case ServerRoundsEnd::Finished:
+            case ServerRoundsEnd::RoundLimit: state.finish = std::nullopt; break;
+            case ServerRoundsEnd::OutputLimit: state.finish = infernix::FinishReason::OutputLimit; break;
+            case ServerRoundsEnd::ContextWindow: state.finish = infernix::FinishReason::ContextCapacity; break;
+            }
         }
-        state.rounds.push_back(std::move(round));
-        state.round_call_ids.push_back(std::move(call_ids));
-        state.round_searches.push_back(std::move(searches));
-        if (on_round) { on_round(state.round(state.rounds.size() - 1U)); }
-        prepared = std::move(*next);
-    }
+    };
+    const std::string search_name(kToolSearchFunctionName);
+    Protocol protocol{.request          = request,
+                      .state            = state,
+                      .on_round         = on_round,
+                      .hosted_search_id = hosted_search_id,
+                      .hosted           = request.prompt.tool_search && request.prompt.tool_search->server,
+                      .search_name      = search_name};
+    run_server_tool_rounds(service, prepared, sink, is_cancelled, prepare_next, state.continuation, state.rounds,
+                           std::span(&search_name, 1), protocol);
 }
 
 struct StreamingResponse {
@@ -165,14 +167,6 @@ struct StreamingResponse {
 ApiError responses_error(ApiError error) {
     if (error.param == "messages") { error.param = "input"; }
     if (error.param == "reasoning_effort") { error.param = "reasoning.effort"; }
-    return error;
-}
-
-ApiError internal_error(const std::exception& exception) {
-    ApiError error;
-    error.status  = 500;
-    error.type    = "server_error";
-    error.message = exception.what();
     return error;
 }
 
@@ -375,6 +369,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     OpenAIResponsesResolvedPrompt resolved;
     const std::string id = new_openai_response_id();
     try {
+        require_generation();
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
         const auto body           = parse_json_body(req);
@@ -382,6 +377,10 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         request.prompt.model = resolve_openai_model(request.prompt.model, public_model_id_, options_.any_model_name);
         resolved = resolve_openai_responses_prompt(request.prompt, openai_responses_store_);
         resolved.generation.ngram_session = resolve_ngram_session(req, body, options_);
+        if (request.store) {
+            openai_responses_store_.check_input_capacity(resolved.parent, request.prompt.input_turns,
+                                                         request.prompt.input_items);
+        }
     } catch (const ApiException& exception) {
         write_openai_error(res, responses_error(exception.error()));
         return;
@@ -389,7 +388,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         operational_log_.http_failure(
             "openai_responses",
             make_internal_request_failure(RequestFailurePhase::Http, exception.what()));
-        write_openai_error(res, internal_error(exception));
+        write_openai_error(res, internal_server_error(exception, "server_error"));
         return;
     }
 
@@ -426,7 +425,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         write_openai_error(res, error);
         return;
     } catch (const std::exception& exception) {
-        const ApiError error = internal_error(exception);
+        const ApiError error = internal_server_error(exception, "server_error");
         record_request_rejected(make_request_rejection_log_context(
             req_id, "openai_responses", resolved.generation, metadata, error));
         write_openai_error(res, error);
@@ -474,7 +473,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         } catch (const std::exception& exception) {
             lifecycle->failure(
                 make_internal_request_failure(RequestFailurePhase::Generation, exception.what()));
-            write_openai_error(res, internal_error(exception));
+            write_openai_error(res, internal_server_error(exception, "server_error"));
             return;
         }
         const GenerationOutcome outcome = rounds.totals();
@@ -495,7 +494,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         } catch (const std::exception& exception) {
             lifecycle->response_failure(make_internal_request_failure(
                 RequestFailurePhase::ResponseRender, exception.what()));
-            write_openai_error(res, internal_error(exception));
+            write_openai_error(res, internal_server_error(exception, "server_error"));
             return;
         }
 
@@ -503,7 +502,9 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         storage.input_turns      = std::move(request.prompt.input_turns);
         storage.input_items      = std::move(request.prompt.input_items);
         storage.previous_context = std::move(resolved.parent);
-        storage.enabled          = request.store;
+        // A cancelled response (status "cancelled": the client left, or the server is stopping) is answered but not
+        // kept: it would take store room and a later previous_response_id could chain onto a cut answer.
+        storage.enabled = request.store && outcome.finish_reason != infernix::FinishReason::Cancelled;
         try {
             commit_stored_response(openai_responses_store_, std::move(storage), id, response->body,
                                    std::move(response->output_history), prepared.preserve_thinking);
@@ -516,7 +517,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         } catch (const std::exception& exception) {
             lifecycle->response_failure(make_internal_request_failure(
                 RequestFailurePhase::ResponseStore, exception.what()));
-            write_openai_error(res, internal_error(exception));
+            write_openai_error(res, internal_server_error(exception, "server_error"));
             return;
         }
 
@@ -526,7 +527,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         } catch (const std::exception& exception) {
             lifecycle->response_failure(make_internal_request_failure(
                 RequestFailurePhase::ResponseRender, exception.what()));
-            write_openai_error(res, internal_error(exception));
+            write_openai_error(res, internal_server_error(exception, "server_error"));
         }
         return;
     }
@@ -547,7 +548,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     } catch (const std::exception& exception) {
         lifecycle->failure(
             make_internal_request_failure(RequestFailurePhase::Generation, exception.what()));
-        write_openai_error(res, internal_error(exception));
+        write_openai_error(res, internal_server_error(exception, "server_error"));
         return;
     }
 
@@ -576,34 +577,17 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 SseTransport transport(sink, stream->cancelled);
                 transport.set_heartbeat([&] { return stream->encoder->keep_alive(); });
                 const auto send_failed = [&](const ApiError& error) {
-                    try {
+                    return end_stream_with_error(sink, *lifecycle, [&] {
                         render_and_write(transport, [&] { return stream->encoder->failed(error); });
-                        sink.done();
-                        return true;
-                    } catch (const ClientDisconnected&) {
-                        lifecycle->response_failure(
-                            make_client_disconnected_failure(RequestFailurePhase::Transport));
-                        return false;
-                    } catch (const ResponseRenderFailure& exception) {
-                        lifecycle->response_failure(make_internal_request_failure(
-                            RequestFailurePhase::ResponseRender, exception.what()));
-                        return false;
-                    }
+                    });
                 };
-                try {
-                    render_and_write(transport, [&] { return stream->encoder->start(); });
-                } catch (const ClientDisconnected&) {
-                    lifecycle->failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                    return false;
-                } catch (const ResponseRenderFailure& exception) {
-                    const ApiError error = internal_error(exception);
-                    lifecycle->failure(make_internal_request_failure(
-                        RequestFailurePhase::ResponseRender, exception.what()));
-                    return send_failed(error);
-                }
+                const auto server_error = [](const std::exception& exception) {
+                    return internal_server_error(exception, "server_error");
+                };
 
                 try {
+                    // The Response's created and in_progress events, before the generation.
+                    render_and_write(transport, [&] { return stream->encoder->start(); });
                     StreamSink output;
                     output.on_reasoning = [&](const std::string& text) {
                         render_and_write(transport,
@@ -628,34 +612,12 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                                              [&] { return stream->encoder->round(round); });
                         },
                         [&](std::size_t index) { return stream->encoder->hosted_search_id(index); });
-                } catch (const ClientDisconnected&) {
-                    lifecycle->failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                    return false;
-                } catch (const ResponseRenderFailure& exception) {
-                    const ApiError error = internal_error(exception);
-                    lifecycle->failure(make_internal_request_failure(
-                        RequestFailurePhase::ResponseRender, exception.what()));
-                    return send_failed(error);
-                } catch (const ApiException& exception) {
-                    const ApiError error = responses_error(exception.error());
-                    lifecycle->failure(make_generation_request_failure(error));
-                    return send_failed(error);
-                } catch (const std::exception& exception) {
-                    const ApiError error = internal_error(exception);
-                    lifecycle->failure(make_internal_request_failure(
-                        RequestFailurePhase::Generation, exception.what()));
-                    return send_failed(error);
+                } catch (...) {
+                    return end_failed_stream_generation(*lifecycle, responses_error, server_error, send_failed);
                 }
 
                 const GenerationOutcome outcome = stream->rounds.totals();
-                lifecycle->done(outcome);
-                if (stream->rounds.final_outcome.finish_reason == infernix::FinishReason::Cancelled ||
-                    stream->cancelled.load(std::memory_order_acquire)) {
-                    lifecycle->response_failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                    return false;
-                }
+                if (!record_stream_generation(*lifecycle, outcome, stream->cancelled)) { return false; }
                 std::optional<OpenAIResponsesStreamFinish> finished;
                 try {
                     const std::vector<OpenAIResponsesRound> all = stream->rounds.all();
@@ -666,10 +628,9 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                         make_request_failure(RequestFailurePhase::ResponseRender, error));
                     return send_failed(error);
                 } catch (const std::exception& exception) {
-                    const ApiError error = internal_error(exception);
                     lifecycle->response_failure(make_internal_request_failure(
                         RequestFailurePhase::ResponseRender, exception.what()));
-                    return send_failed(error);
+                    return send_failed(server_error(exception));
                 }
 
                 try {
@@ -683,10 +644,9 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                         make_request_failure(RequestFailurePhase::ResponseStore, error));
                     return send_failed(error);
                 } catch (const std::exception& exception) {
-                    const ApiError error = internal_error(exception);
                     lifecycle->response_failure(make_internal_request_failure(
                         RequestFailurePhase::ResponseStore, exception.what()));
-                    return send_failed(error);
+                    return send_failed(server_error(exception));
                 }
 
                 std::string terminal;
@@ -698,33 +658,18 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                         terminal.insert(0, comment);
                     }
                 } catch (const std::exception& exception) {
-                    const ApiError error = internal_error(exception);
                     lifecycle->response_failure(make_internal_request_failure(
                         RequestFailurePhase::ResponseRender, exception.what()));
-                    return send_failed(error);
+                    return send_failed(server_error(exception));
                 }
-                try {
-                    transport.write(finished->events_before_terminal);
-                    transport.write(terminal);
-                    sink.done();
-                    return true;
-                } catch (const ClientDisconnected&) {
-                    lifecycle->response_failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                    return false;
-                }
+                return write_stream_terminal(transport, sink, *lifecycle, finished->events_before_terminal,
+                                             terminal);
             },
-            [stream, lifecycle](bool successful) {
-                stream->cancelled.store(true, std::memory_order_release);
-                if (!successful || !stream->started.load(std::memory_order_acquire)) {
-                    lifecycle->failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                }
-            });
+            stream_release(stream, lifecycle));
     } catch (const std::exception& exception) {
         lifecycle->failure(
             make_internal_request_failure(RequestFailurePhase::ResponseRender, exception.what()));
-        write_openai_error(res, internal_error(exception));
+        write_openai_error(res, internal_server_error(exception, "server_error"));
     }
 }
 
@@ -746,7 +691,7 @@ void HttpServer::handle_response_input_tokens(const httplib::Request& req, httpl
         operational_log_.http_failure(
             "openai_responses_input_tokens",
             make_internal_request_failure(RequestFailurePhase::Http, exception.what()));
-        write_openai_error(res, internal_error(exception));
+        write_openai_error(res, internal_server_error(exception, "server_error"));
     }
 }
 

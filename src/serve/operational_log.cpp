@@ -269,7 +269,16 @@ OperationalRecord render_request_done(const RequestLogContext& context,
         out << "; " << product::format_pretty_count(outcome.cached_block_tokens)
             << " in cached blocks, no state to resume";
     }
-    out << ") | TTFT " << product::format_pretty_duration(outcome.timings.first_token_seconds)
+    out << ')';
+    // A large re-prefill's cause (prefix_miss.h): the client changed the history, or the cache lost it.
+    if (outcome.prefix_miss) {
+        const PrefixMiss& miss = *outcome.prefix_miss;
+        out << " | miss " << prefix_miss_kind_name(miss.kind)
+            << (miss.kind == PrefixMiss::Kind::Diverged ? " at " : ", shared ")
+            << product::format_pretty_count(miss.common_prefix_tokens) << ", "
+            << product::format_pretty_count(miss.lost_reuse_tokens) << " tok recomputed";
+    }
+    out << " | TTFT " << product::format_pretty_duration(outcome.timings.first_token_seconds)
         << " | total " << product::format_pretty_duration(outcome.timings.total_seconds);
     if (outcome.engine_timing.queue_wait_seconds >= 0.01) {
         out << " | queue "
@@ -404,10 +413,19 @@ std::optional<OperationalRecord> render_tool_call_fallback(const RequestLogConte
     std::string snippet;
     if (const std::size_t marker = outcome.text.find("<tool_call>");
         marker != std::string::npos) {
-        snippet = outcome.text.substr(marker, kMarkupSnippetBytes);
-        if (outcome.text.size() - marker > kMarkupSnippetBytes) { snippet += "..."; }
+        // The model's bytes go to the operator's terminal and the log file: every control byte (an escape
+        // sequence would move the cursor or retitle the window) becomes a space, and the cut ends on a UTF-8
+        // character boundary.
+        std::size_t length = std::min(kMarkupSnippetBytes, outcome.text.size() - marker);
+        while (length > 0 && marker + length < outcome.text.size() &&
+               (static_cast<unsigned char>(outcome.text[marker + length]) & 0xC0U) == 0x80U) {
+            --length;
+        }
+        snippet = outcome.text.substr(marker, length);
+        if (outcome.text.size() - marker > length) { snippet += "..."; }
         for (char& byte : snippet) {
-            if (byte == '\n' || byte == '\r' || byte == '\t') { byte = ' '; }
+            const auto value = static_cast<unsigned char>(byte);
+            if (value < 0x20U || value == 0x7FU) { byte = ' '; }
         }
     }
 
@@ -484,6 +502,25 @@ OperationalRecord render_throughput(const ThroughputReport& report) {
     }
     if (report.current.terminal_pending_requests != 0) {
         out << " | terminal-pending " << report.current.terminal_pending_requests;
+    }
+    // Recovery over the interval: pauses, resumes from a snapshot at the paused frontier and by
+    // Replay, and the history tokens Replay recomputed (their share of the computed prefill).
+    const std::uint64_t pauses = monotonic_delta(report.previous.preemptions, report.current.preemptions);
+    const std::uint64_t direct =
+        monotonic_delta(report.previous.snapshot_restores, report.current.snapshot_restores);
+    const std::uint64_t replays = monotonic_delta(report.previous.replay_restores, report.current.replay_restores);
+    const std::uint64_t replayed =
+        monotonic_delta(report.previous.replayed_tokens, report.current.replayed_tokens);
+    if (pauses != 0 || direct != 0 || replays != 0 || replayed != 0) {
+        out << " | pauses " << pauses << ", resumes " << direct << " from snapshot, " << replays << " by replay";
+        if (replayed != 0) {
+            out << " (" << product::format_pretty_count(replayed) << " tok replayed";
+            if (const std::uint64_t computed = report.computed_prefill_tokens + replayed; computed != 0) {
+                out << ", " << product::format_pretty_percent(static_cast<double>(replayed) / static_cast<double>(computed))
+                    << " of prefill";
+            }
+            out << ')';
+        }
     }
     if (report.decode_rounds != 0) {
         out << " | batch " << std::fixed << std::setprecision(2)
@@ -682,6 +719,11 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                       product::format_pretty_bytes(media.live_capacity_bytes));
     }
 
+    if (memory.draft_screen_bytes != 0 || memory.adapter_bytes != 0) {
+        logger_->debug("memory ledger | beside the weights: draft screen {} | adapters {}",
+                       product::format_pretty_bytes(memory.draft_screen_bytes),
+                       product::format_pretty_bytes(memory.adapter_bytes));
+    }
     logger_->debug("memory ledger | after weights {} | after startup {} | headroom {} | slack {} | "
                    "CUDA graphs {} allowed, {} used",
                    product::format_pretty_bytes(memory.available_after_weights_bytes),
@@ -690,9 +732,10 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                    product::format_pretty_bytes(memory.planned_slack_bytes),
                    product::format_pretty_bytes(memory.cuda_graph_allowance_bytes),
                    product::format_pretty_bytes(memory.cuda_graph_measured_bytes));
-    if (memory.cuda_graph_measured_bytes > memory.cuda_graph_allowance_bytes) {
+    if (memory.cuda_graph_measured_bytes > memory.cuda_graph_allowance_bytes && !memory.cuda_graph_excess_absorbed) {
         // The KV pool was sized against the allowance, so the excess came out of the slack left
-        // beside it; with no headroom the next allocation can fail.
+        // beside it; with no headroom the next allocation can fail. (An elastic expert-frame pool gives the
+        // excess back from its frames by design: no warning, the debug ledger above shows both figures.)
         logger_->warn("CUDA graphs used {} but the KV sizing allowed {}; leave more room with "
                       "--vram-headroom-mib or a smaller --kv-capacity",
                       product::format_pretty_bytes(memory.cuda_graph_measured_bytes),

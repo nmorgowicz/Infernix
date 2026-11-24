@@ -599,6 +599,16 @@ void prepare_process(const EngineOptions& options) {
                                         io->before);
         }
     }
+    // Under WSL2 every RAM reading is the virtual machine's: --ram-free-mib, an automatic --host-context-mib and
+    // --ram-resize cannot see the Windows host's memory, and the host cannot take back what the engine page-locks.
+    if (host_is_wsl()) {
+        runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
+                                    "running under WSL2: --ram-free-mib (%llu MiB) and --ram-resize are measured inside "
+                                    "the Linux VM, not on the Windows host, which cannot reclaim the RAM the engine "
+                                    "page-locks; bound the VM with `memory=` in .wslconfig, or set --host-context-mib "
+                                    "to leave Windows the RAM it needs",
+                                    static_cast<unsigned long long>(options.ram_free_bytes >> 20));
+    }
 }
 
 } // namespace
@@ -747,6 +757,13 @@ ScoreResult Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t firs
         throw std::invalid_argument("score_tokens logits_positions must be strictly ascending scored positions, at "
                                     "most kMaximumScoreLogitPositions");
     }
+    if (options.prompt_hidden_states && impl_->options.lossless) {
+        throw std::invalid_argument("score_tokens prompt_hidden_states is not offered on the lossless route");
+    }
+    if (options.prompt_hidden_states && impl_->architecture == models::Architecture::Gemma4) {
+        throw std::invalid_argument("score_tokens prompt_hidden_states is not implemented for Gemma4");
+    }
+    const bool hidden_states           = options.prompt_hidden_states;
     const std::size_t logit_rows       = options.logits_positions.size();
     const std::size_t top_values       = positions * options.top_k;
     const std::size_t candidate_values = options.candidates.size();
@@ -766,7 +783,9 @@ ScoreResult Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t firs
     if (result.logprobs.size() != positions || result.top_ids.size() != top_values ||
         result.top_logprobs.size() != top_values ||
         result.candidate_logprobs.size() != candidate_values ||
-        (logit_rows == 0 ? !result.logits.empty() : result.logits.empty() || result.logits.size() % logit_rows != 0)) {
+        (logit_rows == 0 ? !result.logits.empty() : result.logits.empty() || result.logits.size() % logit_rows != 0) ||
+        result.hidden_states.empty() == hidden_states ||
+        (hidden_states && (result.hidden_state_layers == 0 || result.hidden_states.size() % result.hidden_state_layers != 0))) {
         throw std::logic_error("target Program returned an invalid causal score count");
     }
     return result;
@@ -838,6 +857,9 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
     }
     const double prepare_seconds = prompt.impl_->prepare.seconds;
     if (resolved_options.execution.requested_output_tokens == 0) {
+        // Answered here without the core, but only by an Engine that would accept the request: after stop() or a
+        // failure a zero-token request is refused as Unavailable like any other.
+        if (!is_available()) { throw RequestError(RequestErrorKind::Unavailable, "inference engine is unavailable"); }
         struct ImmediateSubmission {
             GenerationResult result;
             OutputConsumerMode consumer_mode = OutputConsumerMode::Aggregate;
@@ -969,6 +991,11 @@ ChatTemplateRoleSupport Engine::chat_template_role_support() const {
     return impl_->with_frontend([](const auto& frontend) { return frontend.chat_template_role_support(); });
 }
 
+VisionImageBudget Engine::vision_image_budget() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return impl_->with_frontend([](const auto& frontend) { return frontend.vision_image_budget(); });
+}
+
 RuntimeStats Engine::runtime_stats() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return std::visit(
@@ -978,6 +1005,22 @@ RuntimeStats Engine::runtime_stats() const {
                 throw std::logic_error("Engine core is unavailable");
             } else {
                 return core->runtime_stats();
+            }
+        },
+        impl_->core);
+}
+
+RequestMonitor Engine::request_monitor() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [](const auto& core) -> RequestMonitor {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate>) {
+                throw std::logic_error("Engine core is unavailable");
+            } else if constexpr (requires { core->request_monitor(); }) {
+                return core->request_monitor();
+            } else {
+                return {}; // a scoring Engine holds no generation requests
             }
         },
         impl_->core);

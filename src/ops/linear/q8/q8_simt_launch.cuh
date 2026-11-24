@@ -3,6 +3,7 @@
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
 #include "ops/linear/q8/q8_a16_simt.cuh"
+#include "ops/linear/common/simt_dispatch.cuh"
 #include "ops/linear/q8/q8_operands.h"
 
 namespace infernix::ops::detail {
@@ -10,6 +11,9 @@ template <class Schedule, bool Full, bool FullK, bool TriggerPdl, bool JoinPdl, 
           class Output, class Epilogue>
 void launch_q8_a16_simt_slice(const Q8LinearOperands& operands, Output output, Epilogue epilogue,
                               int token_begin, int tokens, cudaStream_t stream) {
+    // A programmatic launch of a staged SIMT kernel that does not join reads x (the producer's output) with no
+    // wait: it only waits at the end (JoinPdl). Its callers read x early by design only with JoinPdl.
+    static_assert(!Dependent || JoinPdl, "a Dependent staged SIMT launch must join (JoinPdl)");
     const dim3 grid(div_up(operands.rows, Schedule::kBlockRows),
                     div_up(tokens, Schedule::kBlockTokens));
     const dim3 block(Schedule::kThreads);
@@ -41,18 +45,10 @@ void launch_q8_a16_simt(const Q8LinearOperands& operands, Output output, Epilogu
     for_each_token_slice(operands.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
         const bool full = !Schedule::kPredicated && operands.rows % Schedule::kBlockRows == 0 &&
                           count % Schedule::kBlockTokens == 0;
-        if (full && full_k)
-            launch_q8_a16_simt_slice<Schedule, true, true, TriggerPdl, JoinPdl, Dependent>(
+        dispatch_simt_tiles(full, full_k, [&]<bool Full, bool FullK>() {
+            launch_q8_a16_simt_slice<Schedule, Full, FullK, TriggerPdl, JoinPdl, Dependent>(
                 operands, output, epilogue, offset, count, stream);
-        else if (full)
-            launch_q8_a16_simt_slice<Schedule, true, false, TriggerPdl, JoinPdl, Dependent>(
-                operands, output, epilogue, offset, count, stream);
-        else if (full_k)
-            launch_q8_a16_simt_slice<Schedule, false, true, TriggerPdl, JoinPdl, Dependent>(
-                operands, output, epilogue, offset, count, stream);
-        else
-            launch_q8_a16_simt_slice<Schedule, false, false, TriggerPdl, JoinPdl, Dependent>(
-                operands, output, epilogue, offset, count, stream);
+        });
     });
 }
 

@@ -74,6 +74,20 @@ std::uint32_t SequenceCapacityCurve::resolved_tokens(std::uint32_t main_page_gro
     return static_cast<std::uint32_t>(tokens);
 }
 
+std::size_t kv_available_bytes(bool automatic, std::size_t device_free, std::optional<std::uint64_t> budget_left,
+                               std::size_t automatic_headroom_bytes, std::size_t budget_margin_bytes) noexcept {
+    if (!budget_left) { return device_free; }
+    std::uint64_t bound = *budget_left;
+    if (automatic) {
+        bound = bound > budget_margin_bytes ? bound - budget_margin_bytes : 0U;
+        // Saturating: a bound past size_t leaves free device memory the limit.
+        bound = automatic_headroom_bytes > std::numeric_limits<std::uint64_t>::max() - bound
+                    ? std::numeric_limits<std::uint64_t>::max()
+                    : bound + automatic_headroom_bytes;
+    }
+    return static_cast<std::size_t>(std::min<std::uint64_t>(device_free, bound));
+}
+
 KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
                                          const SequenceCapacityCurve& curve,
                                          std::size_t available_runtime_bytes,
@@ -164,6 +178,22 @@ resolve_kv_capacity_beside(const KvCapacityPolicy& policy, const SequenceCapacit
             : ordinary.main_page_groups;
     if (grown.main_page_groups < required) { return std::nullopt; }
     return grown;
+}
+
+MemorySummary with_kv_capacity(MemorySummary summary, const KvCapacityResolution& resolution) {
+    summary.kv_capacity_mode                  = resolution.mode;
+    summary.kv_capacity_page_groups           = resolution.main_page_groups;
+    summary.kv_capacity_max_page_groups       = resolution.maximum_main_page_groups;
+    summary.minimum_runtime_reservation_bytes = resolution.minimum_runtime_reservation_bytes;
+    summary.kv_capacity_increment_bytes       = resolution.bytes_per_additional_main_page_group;
+    summary.runtime_reservation_bytes         = resolution.runtime_reservation_bytes;
+    summary.available_after_weights_bytes     = resolution.available_after_weights_bytes;
+    summary.available_after_startup_bytes     = resolution.available_after_startup_bytes;
+    summary.shared_memory_weights_bytes        = resolution.shared_memory_weights_bytes;
+    summary.shared_memory_runtime_bytes        = resolution.shared_memory_runtime_bytes;
+    summary.vram_headroom_bytes               = resolution.automatic_headroom_bytes;
+    summary.planned_slack_bytes               = resolution.planned_slack_bytes;
+    return summary;
 }
 
 } // namespace infernix::runtime

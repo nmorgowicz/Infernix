@@ -7,6 +7,9 @@ infernix_add_test(infernix_qwen4_exp_expert_cache_test
 infernix_add_test(infernix_qwen4_exp_host_expert_tier_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_host_expert_tier.cpp"
   LIBRARIES infernix_model_runtime)
+# --fetch: the tier also as the responder of a fetch channel (mapped words, so a CUDA context).
+add_test(NAME infernix_qwen4_exp_host_expert_tier_fetch_test COMMAND infernix_qwen4_exp_host_expert_tier_test --fetch)
+set_tests_properties(infernix_qwen4_exp_host_expert_tier_fetch_test PROPERTIES LABELS "gpu")
 
 # The SSD tier's RAM-level controller (design §19.3.7 RT2), host only.
 infernix_add_test(infernix_qwen4_exp_host_tier_test
@@ -92,6 +95,31 @@ infernix_add_test(infernix_qwen4_exp_vision_lend_real_test
 set_tests_properties(infernix_qwen4_exp_vision_lend_real_test
   PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
+# A new chat asking about the same image resumes past it (a structural tap at the media's end) and encodes no
+# image (QC-01). Needs a Qwen4Exp artifact with the vision tower.
+infernix_add_test(infernix_qwen4_exp_media_reask_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_media_reask_real.cpp"
+  LIBRARIES infernix_engine infernix_model_runtime)
+set_tests_properties(infernix_qwen4_exp_media_reask_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 1800)
+
+# A request that finishes while another request's binding spans Engine cycles (a test hook holds it open, as a
+# Vision encode lent its window runs): its result arrives before the binding ends, with its usage fields, both
+# requests keep their solo ids, and its next turn resumes from the endpoint it published (QN-04).
+infernix_add_test(infernix_qwen4_exp_finish_beside_binding_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_finish_beside_binding_real.cpp"
+  LIBRARIES infernix_engine infernix_model_runtime)
+set_tests_properties(infernix_qwen4_exp_finish_beside_binding_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 1800)
+
+# A request waiting for the KV cache to grow is bound at a long prompt's walk-span boundary, when the prompt's
+# lent frames can go back, not after the whole prompt (GitHub #24); both requests keep their solo ids.
+infernix_add_test(infernix_qwen4_exp_queued_growth_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_queued_growth_real.cpp"
+  LIBRARIES infernix_engine infernix_model_runtime)
+set_tests_properties(infernix_qwen4_exp_queued_growth_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 1800)
+
 # Non-finite logits after a request published prefix-cache entries (a test hook): its entries are
 # withdrawn, a retry resumes from nothing and equals a cache-off run, and a saved cache file cannot
 # bring them back (hybrid-prefix-cache-spec §7.8, candidates SQ-01).
@@ -134,6 +162,11 @@ infernix_add_test(infernix_qwen4_exp_call_plan_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_call_plan.cpp"
   LIBRARIES infernix_model_runtime)
 
+# What a pause leaves in the prefix cache, as pause_replay_tokens prices it (host only).
+infernix_add_test(infernix_qwen4_exp_prefix_pause_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_prefix_pause.cpp"
+  LIBRARIES infernix_model_runtime)
+
 # RoPE staging of a lane: prompt M-RoPE, later tokens, block starts, MTP sub-chunks (host only).
 infernix_add_test(infernix_qwen4_exp_rope_positions_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_rope_positions.cpp"
@@ -142,7 +175,7 @@ infernix_add_test(infernix_qwen4_exp_rope_positions_test
 # The startup RAM ledger (host only).
 infernix_add_test(infernix_qwen4_exp_memory_plan_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_memory_plan.cpp"
-  LIBRARIES infernix_model_loading)
+  LIBRARIES infernix_engine infernix_model_loading)
 
 # Prefix-cache state images and page records on synthetic Device pools (no model; skips without a GPU).
 infernix_add_test(infernix_qwen4_exp_prefix_state_test
@@ -176,7 +209,15 @@ infernix_add_test(infernix_qwen4_exp_prefill_width_real_test
   LIBRARIES infernix_engine)
 set_tests_properties(infernix_qwen4_exp_prefill_width_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
-# TEMPORARY with INFERNIX_TMP_STARTUP_CAPTURE (candidates §23 NU-04): the graph set captured at startup against
+# --ablate (docs/ablate.md) on the reproducible route: a negligible cut keeps the plain run's bits on every cut path, a
+# cut of the last layer's lanes or layer 0's moves the first-token readouts, a strong cut's decode agrees with its
+# prefill, and a cut prompt reads the same bits at two prefill chunks of one grid.
+infernix_add_test(infernix_qwen4_exp_ablate_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ablate_real.cpp"
+  LIBRARIES infernix_engine)
+set_tests_properties(infernix_qwen4_exp_ablate_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+
+# Startup capture (candidates §23 NU-04; tests turn it off through testing::set_startup_capture): the graph set captured at startup against
 # capture at first use, plain, MTP and DFlash2 (INFERNIX_QWEN4_DFLASH2): reproducible-route ids equal, and no graph
 # captured after startup on either route.
 infernix_add_test(infernix_qwen4_exp_startup_capture_real_test
@@ -184,6 +225,14 @@ infernix_add_test(infernix_qwen4_exp_startup_capture_real_test
   LIBRARIES infernix_engine infernix_model_runtime
   ARGS plain mtp dflash2)
 set_tests_properties(infernix_qwen4_exp_startup_capture_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+
+# The decode and verification expert calls' fork route at every width up to eight columns, MTP and DFlash2
+# (INFERNIX_QWEN4_DFLASH2): no call offered it may lose it to the staging slots (NVFP4-QAD's shared job, design §6.1.3).
+infernix_add_test(infernix_qwen4_exp_fork_route_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fork_route_real.cpp"
+  LIBRARIES infernix_engine infernix_ops
+  ARGS mtp dflash2)
+set_tests_properties(infernix_qwen4_exp_fork_route_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
 # A long prompt's layer walk while another lane decodes, with SSD-only experts (issue #5): both
 # requests complete with their solo ids and no call reports a silent host.
@@ -197,6 +246,23 @@ infernix_add_test(infernix_qwen4_exp_preemption_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_preemption_real.cpp"
   LIBRARIES infernix_engine)
 set_tests_properties(infernix_qwen4_exp_preemption_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+
+# The wide prefill workspace against its plan (design §19.3.7): every wide scope's peak stays within its arena and the
+# forward's own allocation plan, on the expert banks, the SSD tier, MTP, DFlash2, two lanes, causal scoring,
+# --a8-activations, the packed BF16 KV cache, a chat prompt's pair call, the reproducible route, every KV storage, a
+# 48K prompt's 32,768-column MoE group (long) and a walk whose chunks a structural tap cuts below the prefill chunk
+# (cut); the _a4_ entry runs the expert-A4 routes (FP4-Local's W4A16 banks only; they skip on every other artifact).
+# An entry's scenarios run one after another in one process on one EngineHost, so only its first start page-locks the
+# SSD tier's slots and reads their records; each scenario prints its own verdict and the rest run after a failure.
+infernix_add_test(infernix_qwen4_exp_wide_plan_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_wide_plan_real.cpp"
+  LIBRARIES infernix_engine
+  ARGS banks tier mtp dflash2 two-lanes scoring a8 bf16p chat reproducible kv-bf16 kv-fp8 kv-nvfp4 kv-k8v4 kv-vq2
+       kv-k4v2 long cut)
+add_test(NAME infernix_qwen4_exp_wide_plan_a4_real_test
+  COMMAND infernix_qwen4_exp_wide_plan_real_test a4 a4-residual a4-residual-3)
+set_tests_properties(infernix_qwen4_exp_wide_plan_real_test infernix_qwen4_exp_wide_plan_a4_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
 # MTP drafts (one-hot and sampled-mtp-drafts) and a DFlash2 companion drafter (--draft-model) against
 # one plain-decoding reference: the sampler's output distribution, greedy tokens, concurrency and the

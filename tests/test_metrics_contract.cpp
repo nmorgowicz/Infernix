@@ -306,6 +306,68 @@ int main() {
         failures += check(live.rows(t0).empty(), "every request ended");
     }
 
+    // GET /monitor: the Engine's view of each request it holds, joined with the server's request by
+    // Engine id (an Engine idle-time prefill, or a request not admitted yet, has no server id).
+    {
+        using Clock = LiveRequests::Clock;
+        const Clock::time_point t0 = Clock::now();
+        LiveRequests live;
+        live.begin(21, "agent-a", "anthropic_messages", 70000, t0);
+        live.begin(22, "", "openai_chat_completions", 900, t0);
+        live.progress(21, {.engine_request_id = 104, .prompt_tokens = 70000, .reused_prompt_tokens = 65536});
+        infernix::RequestMonitor monitor;
+        monitor.progress_owner_request_id = 104;
+        monitor.no_progress_seconds       = 0.5;
+        monitor.queued_not_listed         = 3;
+        monitor.requests.push_back({.engine_request_id      = 104,
+                                    .phase                  = infernix::RequestMonitorPhase::Replay,
+                                    .lane                   = 1U,
+                                    .progress_owner         = true,
+                                    .recovery_pending       = true,
+                                    .recovery_route         = infernix::GenerationRecoveryRoute::Replay,
+                                    .prompt_tokens          = 70000,
+                                    .reused_prompt_tokens   = 65536,
+                                    .computed_prompt_tokens = 4464,
+                                    .output_tokens          = 812,
+                                    .preemptions            = 2,
+                                    .snapshot_restores      = 1,
+                                    .replay_restores        = 1,
+                                    .replayed_tokens        = 2048,
+                                    .age_seconds            = 30.0,
+                                    .paused_seconds         = 4.0,
+                                    .since_progress_seconds = 0.25});
+        monitor.requests.push_back({.engine_request_id = 105, .phase = infernix::RequestMonitorPhase::Paused,
+                                    .background = true, .prompt_tokens = 4000});
+        monitor.requests.push_back({.engine_request_id = 106, .phase = infernix::RequestMonitorPhase::Queued});
+        const Json body = Json::parse(render_monitor_json(monitor, live.rows(t0), 1234.5));
+        failures += check(body["schema"] == "infernix.monitor/1" && body["time"] == 1234.5 &&
+                              body["progress_owner"] == 104 && body["no_progress_s"] == 0.5 &&
+                              body["queued_not_listed"] == 3 && body["requests"].size() == 3,
+                          "monitor header fields");
+        const Json& owner = body["requests"][0];
+        failures += check(owner["engine_id"] == 104 && owner["id"] == 21 && owner["label"] == "agent-a" &&
+                              owner["protocol"] == "anthropic_messages" && owner["phase"] == "replay" &&
+                              owner["lane"] == 1 && owner["progress_owner"] == true &&
+                              owner["recovery_pending"] == true && owner["recovery_route"] == "replay" &&
+                              owner["prompt_tokens"] == 70000 && owner["reused_tokens"] == 65536 &&
+                              owner["computed_prompt_tokens"] == 4464 && owner["output_tokens"] == 812 &&
+                              owner["preemptions"] == 2 && owner["snapshot_restores"] == 1 &&
+                              owner["replay_restores"] == 1 && owner["replayed_tokens"] == 2048 &&
+                              owner["age_s"] == 30.0 && owner["paused_s"] == 4.0 && owner["since_progress_s"] == 0.25,
+                          "a monitored request joined with its server request");
+        const Json& background = body["requests"][1];
+        failures += check(background["id"].is_null() && background["label"].is_null() &&
+                              background["protocol"].is_null() && background["phase"] == "paused" &&
+                              background["background"] == true && background["lane"].is_null() &&
+                              background["since_progress_s"].is_null() && background["recovery_route"] == "none",
+                          "an Engine-only request has no server identity");
+        failures += check(body["requests"][2]["phase"] == "queued" && body["requests"][2]["id"].is_null(),
+                          "a queued request's Engine id joins no server request before admission");
+        infernix::RequestMonitor idle;
+        failures += check(Json::parse(render_monitor_json(idle, {}, 1.0))["progress_owner"].is_null(),
+                          "no service turn renders null");
+    }
+
     // memory: what the server holds on the device, in RAM and on the SSD, by part, with the totals the launcher's
     // dashboard shows them against.
     {
@@ -318,16 +380,19 @@ int main() {
         MetricsJsonSnapshot held = snapshot;
         auto& m                  = held.stats.memory;
         m.device.weights         = 6000;
+        m.device.adapter         = 300;
         m.device.experts         = 24000;
         m.device.expert_frames   = 87;
         m.device.kv              = 1700;
         m.device.kv_used         = 400;
+        m.device.mtp_kv          = 90;
         m.device.cuda_graphs     = 140;
         m.host.experts           = 69000;
         m.host.expert_records    = 2400;
         m.host.prefix            = 9900;
         m.host.prefix_used       = 20000; // more than the part: clamped to it
         m.host.ngram             = 1000;
+        m.host.ngram_archive     = 500;
         m.ssd.prefix             = 50000;
         m.ssd.prefix_used        = 12000;
         m.ssd.experts            = 3000;
@@ -342,16 +407,21 @@ int main() {
                           "memory.device totals");
         std::vector<std::string> keys;
         for (const Json& part : device["parts"]) { keys.push_back(part["key"].get<std::string>()); }
-        failures += check(keys == std::vector<std::string>{"weights", "experts", "kv_cache", "cuda_graphs"},
+        failures += check(keys == std::vector<std::string>{"weights", "adapter", "experts", "kv_cache", "mtp_kv",
+                                                            "cuda_graphs"},
                           "memory.device lists the parts that hold memory, in order");
-        failures += check(device["parts"][1]["count"] == 87 && device["parts"][2]["used_bytes"] == 400 &&
+        failures += check(device["parts"][1]["bytes"] == 300, "memory.device names a LoRA adapter's factors");
+        failures += check(device["parts"][4]["bytes"] == 90 && !device["parts"][4].contains("used_bytes"),
+                          "memory.device names the MTP drafter's KV pool beside the KV cache");
+        failures += check(device["parts"][2]["count"] == 87 && device["parts"][3]["used_bytes"] == 400 &&
                               !device["parts"][0].contains("used_bytes") && !device["parts"][0].contains("count"),
                           "memory.device experts' frames and the KV cache's used pages");
         const Json& host = full["host"];
         failures += check(host["total_bytes"] == 102000 && host["available_bytes"] == 7000 && host["process_bytes"] == 85000 &&
-                              host["parts"].size() == 3 && host["parts"][0]["key"] == "experts" &&
+                              host["parts"].size() == 4 && host["parts"][0]["key"] == "experts" &&
                               host["parts"][0]["count"] == 2400 && host["parts"][1]["key"] == "prefix_cache" &&
-                              host["parts"][1]["used_bytes"] == 9900 && host["parts"][2]["key"] == "ngram",
+                              host["parts"][1]["used_bytes"] == 9900 && host["parts"][2]["key"] == "ngram" &&
+                              host["parts"][3]["key"] == "ngram_archive" && host["parts"][3]["bytes"] == 500,
                           "memory.host totals and parts (used clamped to the part)");
         const Json& ssd = full["ssd"];
         failures += check(ssd["parts"].size() == 2 && ssd["parts"][0]["key"] == "prefix_cache" &&

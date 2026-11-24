@@ -39,7 +39,11 @@ bool has_flag(const Args& args, std::string_view flag) {
 }
 
 std::optional<std::string> flag_value(const Args& args, std::string_view flag) {
-    const std::size_t index = find_flag(args, flag);
+    // The last occurrence: infernix-serve (and the CLI) take a repeated option's last value.
+    std::size_t index = std::string::npos;
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        if (matches(args[i], flag)) { index = i; }
+    }
     if (index == std::string::npos) { return std::nullopt; }
     const std::string& token = args[index];
     if (token.size() > flag.size()) { return token.substr(flag.size() + 1); }
@@ -107,10 +111,13 @@ std::vector<std::string> strip_managed_flags(Args& args, const TakesValue& takes
     return removed;
 }
 
+bool context_auto(const Args& args) { return flag_value(args, "--max-context") == "auto"; }
+
 std::uint64_t context_length(const Args& args) {
     constexpr std::uint64_t kServeDefault = 8192;
     const std::optional<std::string> value = flag_value(args, "--max-context");
     if (!value) { return kServeDefault; }
+    if (*value == "auto") { return 0; }
     std::uint64_t parsed = 0;
     const auto [end, error] = std::from_chars(value->data(), value->data() + value->size(), parsed);
     if (error != std::errc{} || end != value->data() + value->size() || parsed == 0) {
@@ -124,6 +131,16 @@ std::string windows_quote(std::string_view arg) {
         return std::string(arg);
     }
     return windows_quoted(arg);
+}
+
+std::string windows_command_line(std::string_view program, const std::vector<std::string>& args) {
+    std::string command = windows_quote(program);
+    for (const std::string& arg : args) { command += " " + windows_quote(arg); }
+    return command;
+}
+
+std::string cmd_batch_command_line(std::string_view cmd, std::string_view script) {
+    return windows_quote(cmd) + " /d /s /c \"\"" + std::string(script) + "\"\"";
 }
 
 std::string batch_command_line(const std::vector<std::string>& argv) {

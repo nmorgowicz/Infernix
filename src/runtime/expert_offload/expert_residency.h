@@ -43,6 +43,7 @@
 #include "core/vmm_arena.h"
 #include "core/vram_budget.h"
 #include "ops/offloaded_sparse_moe/csf_record.h"
+#include "runtime/expert_offload/memory_plan.h"
 #include "runtime/expert_offload/expert_cache.h"
 #include "runtime/expert_offload/memory_plan.h"
 #include "runtime/expert_offload/route_predictor.h"
@@ -55,6 +56,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace infernix::runtime::expert_offload {
@@ -146,6 +148,8 @@ public:
         std::uint32_t frames  = 0;     // frames backed afterwards, over every pool
         std::uint64_t spilled = 0;     // bytes of a chunk the driver placed in system memory (given back)
         bool refused          = false; // the device had no memory for the next chunk
+        bool short_of_room    = false; // a grow stopped: free memory no longer left the next chunk (growth_room)
+        std::string spill_readings;    // with `spilled`: the readings that found it (SpillGuard::readings)
     };
     // Backs `frames` frames over the pools (every layer frames / layers; clamped to frame_limit());
     // unchanged while frames are lent. Call only between rounds, with nothing in flight on the
@@ -153,8 +157,11 @@ public:
     // lowest-score experts, moves the survivors above its new top below it on `compute` and
     // releases the top chunks; a grow maps chunks one at a time, stops at the first the driver
     // refuses or places in system memory (`vram` tells), and fills the new frames from the queue.
-    // Without VMM only the first call allocates.
-    Resize resize(std::uint32_t frames, cudaStream_t compute, VramBudgetSource& vram);
+    // With `limit`, a grow reads free memory before each chunk (one allocation without VMM) and maps it only
+    // while growth_room covers it, so free memory that went since sizing stops it short of `frames`
+    // (short_of_room) instead of mapping past the budget. Without VMM only the first call allocates.
+    Resize resize(std::uint32_t frames, cudaStream_t compute, VramBudgetSource& vram,
+                  std::optional<GrowthLimit> limit = std::nullopt);
     // Frame lending (design §19.3.2, "Frame lending"): a contiguous run of one pool's frames serves
     // another use of device memory (the prefill stream's ring and areas, the Vision window) and
     // comes back. Lent frames hold no expert and are never resized; decode graphs reach frames
@@ -192,6 +199,54 @@ public:
     // Returns a lease. The caller has ordered `compute` after every access to it; promotions into
     // its frames start after `compute` reaches this point.
     void give_back(FrameLease& lease, cudaStream_t compute);
+    // A lease taken in a scope that can still fail before its owner holds it: given back when the hold dies still
+    // holding it (a lease left lent stops every later resize), handed over by release(). The give-back issues
+    // loads; a failure there while another failure unwinds is dropped (the first one goes on to recovery).
+    class LeaseHold {
+    public:
+        LeaseHold() noexcept = default;
+        LeaseHold(ExpertResidency& residency, FrameLease lease, cudaStream_t compute) noexcept
+            : residency_(lease.valid() ? &residency : nullptr), lease_(lease), compute_(compute) {}
+        LeaseHold(LeaseHold&& other) noexcept
+            : residency_(std::exchange(other.residency_, nullptr)), lease_(std::exchange(other.lease_, {})),
+              compute_(other.compute_) {}
+        LeaseHold& operator=(LeaseHold&& other) noexcept {
+            if (this != &other) {
+                reset();
+                residency_ = std::exchange(other.residency_, nullptr);
+                lease_     = std::exchange(other.lease_, {});
+                compute_   = other.compute_;
+            }
+            return *this;
+        }
+        LeaseHold(const LeaseHold&)            = delete;
+        LeaseHold& operator=(const LeaseHold&) = delete;
+        ~LeaseHold() { reset(); }
+
+        [[nodiscard]] const FrameLease& get() const noexcept { return lease_; }
+        [[nodiscard]] FrameLease release() noexcept {
+            residency_ = nullptr;
+            return std::exchange(lease_, {});
+        }
+        // Gives the lease back now, failures included (a path that is not unwinding another failure).
+        void give_back() {
+            if (ExpertResidency* residency = std::exchange(residency_, nullptr)) { residency->give_back(lease_, compute_); }
+            lease_ = {};
+        }
+        void reset() noexcept {
+            if (ExpertResidency* residency = std::exchange(residency_, nullptr)) {
+                try {
+                    residency->give_back(lease_, compute_);
+                } catch (...) {}
+            }
+            lease_ = {};
+        }
+
+    private:
+        ExpertResidency* residency_ = nullptr;
+        FrameLease lease_;
+        cudaStream_t compute_ = nullptr;
+    };
 
     // SSD tier mode: records come from `tier` (owned by the caller, outliving this), not the banks.
     // Before the first round and before warm_start. `exclusive`: the exclusive RAM layout's tier (RAM holds what
@@ -213,6 +268,13 @@ public:
     [[nodiscard]] std::uint64_t frame_pitch(std::uint32_t layer) const noexcept;
     // The average frame's bytes (average_frame_bytes of the layers' strides).
     [[nodiscard]] std::uint64_t frame_bytes() const noexcept { return frame_bytes_; }
+    // The host memory this object has page-locked: the tables', route log's, landing tables' and (with a tier) record
+    // table's host copies, every pinned allocation it makes. For a caller that guards its device allocations by the
+    // process's shared system memory use (SpillGuard::end), which page-locked memory raises too.
+    [[nodiscard]] std::uint64_t pinned_bytes() const noexcept {
+        return table_host_.size() + route_host_.size() + landing_host_.size() + landed_host_.size() +
+               records_host_.size();
+    }
     [[nodiscard]] const std::int32_t* table(std::uint32_t layer) const noexcept;
     // The host copy of every layer's table (I32 [layers][experts]), equal to the device tables
     // once before_round has uploaded them.
@@ -306,7 +368,8 @@ private:
     // Frames per pool for `frames` average frames.
     [[nodiscard]] std::vector<std::uint32_t> split_frames(std::uint32_t frames) const;
     // Resizes one pool to `frames`; returns false when a grow was refused or spilled (out.*).
-    void resize_pool(Pool& pool, std::uint32_t frames, cudaStream_t compute, VramBudgetSource& vram, Resize& out);
+    void resize_pool(Pool& pool, std::uint32_t frames, cudaStream_t compute, VramBudgetSource& vram,
+                     const std::optional<GrowthLimit>& limit, Resize& out);
     // The pool a lease comes from: the most lendable bytes.
     [[nodiscard]] std::size_t lend_pool() const noexcept;
     [[nodiscard]] std::uint32_t pool_lendable(const Pool& pool) const noexcept;

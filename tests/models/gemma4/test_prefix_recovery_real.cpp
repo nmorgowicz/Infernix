@@ -336,6 +336,83 @@ void engine_recovery(const char* artifact) {
     }
 }
 
+// The shared Engine completes a released request before recovering a device error from finish/abort.
+// Enable free-cache-resume so the decoded full blocks really enqueue release-time Host writes.
+void release_recovery(const char* artifact) {
+    std::printf("== release-time device failures\n");
+    auto options = engine_options(artifact, kChunk, host_bytes_from_env(), 2304);
+    options.fast_path_exclusions.clear();
+    infernix::Engine engine = start_engine(std::move(options));
+    const Tokens queued = tokens(1000, 991);
+    const Served queued_reference = generate(engine, queued, kOut, false);
+    constexpr std::uint32_t outputs = 128;
+    for (const std::uint64_t count : {1ULL, 2ULL, 4ULL}) {
+        const Tokens prompt = tokens(1536, static_cast<std::uint32_t>(997 + count));
+        const Served reference = generate(engine, prompt, outputs, false);
+        const auto before = settled(engine, "before a finish fault");
+        const auto injected = infernix::testing::memory_exhausted_injections();
+        testing::request_finish_fault(count);
+        auto finishing = engine.submit(engine.prepare_tokens(prompt), greedy(outputs, true));
+        auto waiting = engine.submit(engine.prepare_tokens(queued), greedy(kOut, false));
+        const auto first = finishing.wait();
+        const auto second = waiting.wait();
+        testing::request_finish_fault(0);
+        expect(infernix::testing::memory_exhausted_injections() > injected,
+               "the finish fault fired at check " + std::to_string(count));
+        expect(first.generated_token_ids == reference.tokens,
+               "a release failure preserves the completed reply");
+        expect(second.generated_token_ids == queued_reference.tokens,
+               "the request queued behind a failed finish returns its reference");
+        const auto after = stats_when(engine, [&](const infernix::RuntimeStats& stats) {
+            return stats.device_memory_recoveries > before.device_memory_recoveries;
+        });
+        expect(after.device_memory_recoveries == before.device_memory_recoveries + 1 && engine.is_available(),
+               "a failed finish reports one device recovery and leaves the Engine available");
+        settled(engine, "after a finish fault");
+    }
+    class ReleaseCancelSink final : public infernix::OutputSink {
+    public:
+        std::atomic<bool> cancel{false};
+        void start(infernix::GenerationStart) override {}
+        void progress(infernix::PromptProgress) override {}
+        void timing(infernix::GenerationTimingObservation timing) override {
+            if (timing.generated_tokens >= 80) {
+                testing::hold_units(true); // cancellation must use abort, not race the next commit
+                cancel = true;
+            }
+        }
+        void publish(infernix::OutputDelta) override {}
+        void tool_call(infernix::ToolCallDelta) override {}
+    };
+    for (const std::uint64_t count : {1ULL, 2ULL, 4ULL}) {
+        const Tokens prompt = tokens(1536, static_cast<std::uint32_t>(1031 + count));
+        const auto before = settled(engine, "before an abort fault");
+        const auto injected = infernix::testing::memory_exhausted_injections();
+        testing::request_abort_fault(count);
+        ReleaseCancelSink sink;
+        const infernix::GenerationObservationOptions observation{.live_timings = true};
+        auto cancelled = engine.submit(engine.prepare_tokens(prompt), greedy(256, true),
+                                        infernix::OutputConsumerMode::Streaming, observation);
+        auto waiting = engine.submit(engine.prepare_tokens(queued), greedy(kOut, false));
+        const auto first = cancelled.wait(&sink, infernix::CancellationView([&sink] { return sink.cancel.load(); }));
+        testing::hold_units(false);
+        testing::request_abort_fault(0);
+        const auto second = waiting.wait();
+        expect(infernix::testing::memory_exhausted_injections() > injected,
+               "the abort fault fired at check " + std::to_string(count));
+        expect(first.finish_reason == infernix::FinishReason::Cancelled,
+               "a release failure preserves cancellation");
+        expect(second.generated_token_ids == queued_reference.tokens,
+               "the request queued behind a failed abort returns its reference");
+        const auto after = stats_when(engine, [&](const infernix::RuntimeStats& stats) {
+            return stats.device_memory_recoveries > before.device_memory_recoveries;
+        });
+        expect(after.device_memory_recoveries == before.device_memory_recoveries + 1 && engine.is_available(),
+               "a failed abort reports one device recovery and leaves the Engine available");
+        settled(engine, "after an abort fault");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -348,8 +425,11 @@ int main() {
     try {
         program_recovery(artifact);
         engine_recovery(artifact);
+        release_recovery(artifact);
     } catch (const std::exception& error) {
         infernix::testing::arm_memory_exhausted_here(0);
+        testing::request_finish_fault(0);
+        testing::request_abort_fault(0);
         testing::set_nonfinite_fault(0);
         testing::hold_units(false);
         testing::set_no_progress_bounds(0, 0);

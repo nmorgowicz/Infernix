@@ -10,6 +10,12 @@
 namespace infernix::ops::detail {
 namespace {
 
+// The widest A16 call on the fused small-T kernel; wider calls materialize the projection (its sliced-K tiles)
+// and convolve it. Cold [16384,5120] snapshot calls (RTX 5090, 2026-11-19): fused 39.6, 42.0, 51.8, 92.8 us at 4, 5,
+// 8 and 16 columns against materialized 39.5, 39.5, 41.6, 53.9; NVIDIA's NVFP4-QAD 27B, whose 38 NVFP4 GDN layers
+// verify DFlash2 rounds of up to 16 columns this way, decoded 7.5-9.6 % faster with the cut at 4 than at 16.
+constexpr std::int32_t kSmallTFusedA16MaxTokens = 4;
+
 struct Nvfp4GdnProjectedWorkspace {
     Tensor projected;
     DeviceSpan projection;
@@ -40,11 +46,13 @@ Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t t
     // convolution (the batched composition, at every B), so a row's result does not depend on
     // the other rows.
     if (batch_size > 1 || column_invariant(policy)) { return {Nvfp4GdnConvScheduleId::Materialized}; }
+    // A8Only: the projection's 8-bit tiles at every width, then the convolution (no fused 8-bit form).
+    if (a8_only(policy)) { return {Nvfp4GdnConvScheduleId::Materialized}; }
     // The residual profiles are registered for the NVFP4 MLP and FP8 projections only.
     if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
         allows_residual(policy)) {
         if (tokens == 1) { return {Nvfp4GdnConvScheduleId::DecodeFusedA16}; }
-        if (tokens <= 16) { return {Nvfp4GdnConvScheduleId::SmallTFusedA16}; }
+        if (tokens <= kSmallTFusedA16MaxTokens) { return {Nvfp4GdnConvScheduleId::SmallTFusedA16}; }
         if (tokens <= 64) { return {Nvfp4GdnConvScheduleId::Materialized}; }
         throw std::invalid_argument("nvfp4 gdn conv A16 is registered only through T=64");
     }
@@ -55,13 +63,14 @@ Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t t
 
 std::size_t nvfp4_gdn_snapshot_workspace_capacity_bytes(LinearPolicy policy,
                                                         std::int32_t min_tokens,
-                                                        std::int32_t max_tokens) {
+                                                        std::int32_t max_tokens, bool lora) {
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("nvfp4 gdn snapshot workspace: invalid token interval");
     }
     (void)nvfp4_gdn_conv_resolve_plan(policy, min_tokens, 1);
     const Nvfp4GdnConvPlan maximum_plan = nvfp4_gdn_conv_resolve_plan(policy, max_tokens, 1);
-    if (maximum_plan.schedule != Nvfp4GdnConvScheduleId::Materialized) { return 0; }
+    // A term materializes at every width, the widest call taking the most.
+    if (!lora && maximum_plan.schedule != Nvfp4GdnConvScheduleId::Materialized) { return 0; }
 
     WorkspaceLayoutBuilder layout;
     (void)allocate_workspace(layout, max_tokens, policy);
@@ -73,8 +82,12 @@ void nvfp4_gdn_snapshot_dispatch(const Tensor& x, const Weight& weight, const Te
                                  const Tensor& initial_slot, const Tensor& snapshot_base_slot,
                                  Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                                  LinearPolicy policy, WorkspaceArena& workspace,
-                                 cudaStream_t stream) {
-    switch (nvfp4_gdn_conv_resolve_plan(policy, x.ne[1], 1).schedule) {
+                                 cudaStream_t stream, const LoraAddend* lora) {
+    Nvfp4GdnConvScheduleId schedule = nvfp4_gdn_conv_resolve_plan(policy, x.ne[1], 1).schedule;
+    // A term has no fused form: the projection with the term, materialized, then the convolution (the plan is
+    // resolved first, so its domain is the no-term call's).
+    if (lora != nullptr) { schedule = Nvfp4GdnConvScheduleId::Materialized; }
+    switch (schedule) {
     case Nvfp4GdnConvScheduleId::DecodeFusedA16:
         nvfp4_gdn_snapshot_decode_launch(x, weight, conv_weight, conv_states, valid_columns,
                                          initial_slot, snapshot_base_slot, query, key, value, z,
@@ -94,7 +107,7 @@ void nvfp4_gdn_snapshot_dispatch(const Tensor& x, const Weight& weight, const Te
     std::optional<WorkspaceArena> projection_workspace;
     if (scratch.projection.bytes != 0) { projection_workspace.emplace(scratch.projection); }
     nvfp4_gdn_input_dispatch(x, weight, scratch.projected, z, policy,
-                             projection_workspace ? &*projection_workspace : nullptr, stream);
+                             projection_workspace ? &*projection_workspace : nullptr, stream, lora);
     nvfp4_gdn_snapshot_post_launch(scratch.projected, conv_weight, conv_states, valid_columns,
                                    initial_slot, snapshot_base_slot, query, key, value, stream);
 }

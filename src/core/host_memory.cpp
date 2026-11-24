@@ -138,6 +138,28 @@ HostMemorySnapshot host_memory_snapshot() {
     return out;
 }
 
+bool kernel_release_is_wsl(std::string_view release) noexcept {
+    // WSL2 kernels are named "<version>-microsoft-standard-WSL2" (WSL1: "<version>-Microsoft").
+    const auto contains = [&](std::string_view word) {
+        return std::search(release.begin(), release.end(), word.begin(), word.end(), [](char a, char b) {
+                   return (a >= 'A' && a <= 'Z' ? static_cast<char>(a - 'A' + 'a') : a) == b;
+               }) != release.end();
+    };
+    return contains("microsoft") || contains("wsl");
+}
+
+bool host_is_wsl() noexcept {
+#ifdef _WIN32
+    return false;
+#else
+    try {
+        std::ifstream file("/proc/sys/kernel/osrelease");
+        std::string release;
+        return std::getline(file, release) && kernel_release_is_wsl(release);
+    } catch (...) { return false; }
+#endif
+}
+
 #ifdef _WIN32
 namespace {
 
@@ -148,11 +170,35 @@ SIZE_T current_working_set() noexcept {
     return ::GetProcessMemoryInfo(::GetCurrentProcess(), &counters, sizeof(counters)) ? counters.WorkingSetSize : 0;
 }
 
+// SetProcessWorkingSetSizeEx documents that raising the minimum needs SE_INC_WORKING_SET_NAME. Standard accounts
+// hold that right with the privilege disabled in the token; a raise succeeds so on Windows 11 here, but the
+// documented contract is the enabled privilege (issue #68), so it is enabled once, before the first raise. A token
+// without the right is left as it is: the raise then reports its own error.
+void enable_increase_working_set_privilege() noexcept {
+    static const bool enabled = [] {
+        HANDLE token = nullptr;
+        if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) { return false; }
+        TOKEN_PRIVILEGES privileges{};
+        privileges.PrivilegeCount = 1;
+        // SE_INC_WORKING_SET_NAME is TEXT()-wrapped, so the wide name is spelled out for the W call.
+        bool ok = ::LookupPrivilegeValueW(nullptr, L"SeIncreaseWorkingSetPrivilege", &privileges.Privileges[0].Luid);
+        if (ok) {
+            privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            // AdjustTokenPrivileges succeeds without enabling an unheld privilege; GetLastError tells.
+            ok = ::AdjustTokenPrivileges(token, FALSE, &privileges, 0, nullptr, nullptr) && ::GetLastError() == ERROR_SUCCESS;
+        }
+        ::CloseHandle(token);
+        return ok;
+    }();
+    (void)enabled;
+}
+
 } // namespace
 #endif
 
 std::string reserve_process_working_set(std::uint64_t bytes) {
 #ifdef _WIN32
+    enable_increase_working_set_privilege();
     SIZE_T minimum = 0, maximum = 0;
     DWORD flags    = 0;
     if (!::GetProcessWorkingSetSizeEx(::GetCurrentProcess(), &minimum, &maximum, &flags)) {
@@ -288,14 +334,17 @@ namespace {
 constexpr SIZE_T kWorkingSetSlack = SIZE_T{64} << 20;
 
 // Raises the hard minimum working set by `bytes` and locks [at, at + bytes); empty, or the OS's reason. `raised` grows
-// by what the minimum grew.
-std::string lock_resident(std::byte* at, std::size_t bytes, std::size_t& raised) {
+// by what the minimum grew. `covered` is what the minimum still holds for pages decommitted without lowering it
+// (ResidentHostBuffer::decommit): that much of `bytes` needs no raise, and leaves `covered` once the minimum is set.
+std::string lock_resident(std::byte* at, std::size_t bytes, std::size_t& raised, std::size_t& covered) {
+    enable_increase_working_set_privilege();
     SIZE_T minimum = 0, maximum = 0;
     DWORD flags    = 0;
     if (!::GetProcessWorkingSetSizeEx(::GetCurrentProcess(), &minimum, &maximum, &flags)) {
         return "Windows error " + std::to_string(::GetLastError()) + " reading the working set";
     }
-    const SIZE_T grow   = bytes + (raised == 0 ? kWorkingSetSlack : 0);
+    const std::size_t reused = std::min(bytes, covered);
+    const SIZE_T grow        = (bytes - reused) + (raised == 0 ? kWorkingSetSlack : 0);
     const SIZE_T wanted = minimum + grow;
     // Above the working set now as well, so raising the minimum trims nothing (reserve_process_working_set).
     const SIZE_T new_maximum = std::max({maximum, wanted + kWorkingSetSlack, current_working_set() + kWorkingSetSlack});
@@ -304,6 +353,7 @@ std::string lock_resident(std::byte* at, std::size_t bytes, std::size_t& raised)
         return "Windows error " + std::to_string(::GetLastError()) + " raising the working set";
     }
     raised += grow;
+    covered -= reused;
     constexpr std::size_t kPiece = std::size_t{1} << 30;
     for (std::size_t done = 0; done < bytes; done += kPiece) {
         if (!::VirtualLock(at + done, std::min(kPiece, bytes - done))) {
@@ -362,7 +412,7 @@ ResidentHostBuffer::ResidentHostBuffer(std::size_t bytes) : size_(bytes) {
                                  std::to_string(::GetLastError()));
     }
     data_         = static_cast<std::byte*>(p);
-    lock_failure_ = lock_resident(data_, bytes, raised_);
+    lock_failure_ = lock_resident(data_, bytes, raised_, not_lowered_);
 #else
     void* p = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) { throw std::runtime_error("mmap of " + std::to_string(bytes) + " bytes failed"); }
@@ -392,13 +442,19 @@ void ResidentHostBuffer::decommit(std::size_t offset, std::size_t bytes) noexcep
 #ifdef _WIN32
     (void)::VirtualUnlock(at, bytes); // fails on pages the OS never locked, which decommit alike
     (void)::VirtualFree(at, bytes, MEM_DECOMMIT);
-    // The minimum shrinks by the pages it covered (never below the slack it was raised with).
+    // The minimum shrinks by the pages it covered (never below the slack it was raised with). What it could not
+    // be lowered by (the OS refused, or the slack's floor) stays in it and in raised_: recorded, so the range's
+    // recommit raises by that much less and raised_ stays what the minimum really grew by.
+    if (raised_ == 0) { return; } // never raised (the lock was refused at construction): nothing covers the pages
     const std::size_t lowered = std::min(bytes, raised_ > kWorkingSetSlack ? raised_ - kWorkingSetSlack : 0);
     SIZE_T minimum = 0, maximum = 0;
     DWORD flags    = 0;
     if (lowered != 0 && ::GetProcessWorkingSetSizeEx(::GetCurrentProcess(), &minimum, &maximum, &flags) &&
         minimum > lowered && ::SetProcessWorkingSetSizeEx(::GetCurrentProcess(), minimum - lowered, maximum, flags)) {
         raised_ -= lowered;
+        not_lowered_ += bytes - lowered;
+    } else {
+        not_lowered_ += bytes;
     }
 #else
     (void)::munlock(at, bytes);
@@ -413,7 +469,9 @@ bool ResidentHostBuffer::recommit(std::size_t offset, std::size_t bytes) {
     if (::VirtualAlloc(at, bytes, MEM_COMMIT, PAGE_READWRITE) == nullptr) { return false; }
     // Locked again only when the constructor raised the working set (otherwise the block stays pageable).
     if (raised_ != 0) {
-        if (std::string failure = lock_resident(at, bytes, raised_); !failure.empty()) { lock_failure_ = std::move(failure); }
+        if (std::string failure = lock_resident(at, bytes, raised_, not_lowered_); !failure.empty()) {
+            lock_failure_ = std::move(failure);
+        }
     }
 #else
     if (std::string failure = lock_resident(at, bytes); !failure.empty()) { lock_failure_ = std::move(failure); }

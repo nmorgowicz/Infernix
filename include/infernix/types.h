@@ -331,9 +331,15 @@ enum class FastPath : std::uint8_t {
     // 2608.20961), instead of walking the tree column by column. FP32 in another order: outputs
     // within rounding of the walk, not bit-identical; records unchanged.
     GdnTreeClosedForm,
+    // Qwen3.5 with speculation: positive-temperature requests draw by Gumbel-max (ops::SamplingConfig::gumbel_max)
+    // as the reproducible route does, so speculation verifies each sampled draft by equality with the target's own
+    // draw, and the drafters draw their drafts under the same keys (candidates ZH-01: candidate selectors, coupled
+    // MTP argmax drafts). The output distribution stays the sampler's; a seeded sampled request's text
+    // changes, greedy requests are unchanged. Without it sampled drafts are verified by rejection sampling.
+    GumbelSampling,
 };
 
-inline constexpr std::array<FastPath, 38> kFastPaths{
+inline constexpr std::array<FastPath, 39> kFastPaths{
     FastPath::PromptPv8,           FastPath::DecodeSplit64,
     FastPath::Q8SlicedK,           FastPath::GdnConvFused,
     FastPath::QsaPrepareFused,     FastPath::Fp8A8Pair,
@@ -354,7 +360,7 @@ inline constexpr std::array<FastPath, 38> kFastPaths{
     FastPath::Bf16PromptSplit,     FastPath::RouterMma,
     FastPath::ScreenedLmHead,      FastPath::Fp16GdnState,
     FastPath::BlockVerification,   FastPath::UniverTrees,
-    FastPath::GdnTreeClosedForm};
+    FastPath::GdnTreeClosedForm,   FastPath::GumbelSampling};
 
 [[nodiscard]] constexpr const char* fast_path_name(FastPath path) noexcept {
     switch (path) {
@@ -396,6 +402,7 @@ inline constexpr std::array<FastPath, 38> kFastPaths{
     case FastPath::BlockVerification: return "block-verification";
     case FastPath::UniverTrees: return "univer-trees";
     case FastPath::GdnTreeClosedForm: return "gdn-tree-closed-form";
+    case FastPath::GumbelSampling: return "gumbel-sampling";
     }
     return "unknown";
 }
@@ -765,18 +772,27 @@ inline constexpr const char* kExpertRamLayoutDefaults = "exclusive for Qwen3.8-F
 
 struct EngineOptions {
     std::filesystem::path artifact_path;
+    // A LoRA adapter applied at runtime (--lora): a Hugging Face PEFT adapter's directory, or its
+    // adapter_model.safetensors with adapter_config.json beside it. Every projection it targets computes
+    // W x + s B (A x) exactly (include/infernix/ops/lora.h); the artifact is unchanged. Qwen3.5 dense models only.
+    std::filesystem::path lora_path;
     std::filesystem::path chat_template_path;
     // Qwen3.8-Flash-Next's per-layer n-gram embedding volume. Empty uses `<artifact>.ngram`.
     std::filesystem::path ngram_volume_path;
+    // Ablation sidecar, every model (docs/ablate.md): a sidecar.json naming a direction file and
+    // per-layer alpha tables. Empty (no --ablate): nothing loads, nothing hooks, behavior
+    // byte-identical to the standard engine.
+    std::filesystem::path ablate_sidecar_path;
     NgramResidency ngram_residency = NgramResidency::Auto;
-    // Qwen3.8-Flash-Next's saved expert-cache state: read at startup to fill the VRAM expert cache
-    // before the first request (warm start), written at stop and every 10 minutes between requests.
-    // Without a usable file (none given, a first start, another artifact's) the cache is seeded from the
-    // built-in calibrated expert order instead, and only a given file is saved.
+    // Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B): the saved expert-cache state, read at
+    // startup to fill the VRAM expert cache before the first request (warm start), written at stop and
+    // every 10 minutes between requests. Without a usable file (none given, a first start, another
+    // artifact's) the cache is seeded from the model's built-in calibrated expert order instead (half the
+    // frames on the 122B), and only a given file is saved.
     std::filesystem::path expert_state_path;
     // --expert-state off: no file and no seed, so the expert cache starts empty (cold benchmarks).
     bool expert_state_off = false;
-    // Qwen3.8-Flash-Next's expert stripe (tools/flash_next/expert_stripe.py): the tail of every routed
+    // Offloaded experts' stripe (tools/flash_next/expert_stripe.py): the tail of every routed
     // expert record on a second drive, read beside each record's head in the artifact when the SSD
     // expert tier serves the experts. Empty: whole records from the artifact.
     std::filesystem::path expert_stripe_path;
@@ -793,10 +809,10 @@ struct EngineOptions {
     EnginePurpose purpose              = EnginePurpose::Generation;
     int device                         = 0;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
-    // Gemma4 only (--max-context auto): max_context is the upper ceiling (at most 131072/native).
-    // Requires automatic KV capacity. Startup resolves from resident free VRAM, page aligned,
-    // or refuses below 9216 tokens.
-    // Engine::options() reports that resolved max_context; numeric contexts never shrink.
+    // --max-context auto: resident Qwen3.5 sizes to its KV cache, bounded by native positions.
+    // Gemma4 treats max_context as an upper ceiling (at most 131072/native), requires automatic
+    // KV capacity, fits resident free VRAM page-aligned and refuses below 9216 tokens.
+    // Engine::options() reports the resolved context; explicit numeric contexts never shrink.
     bool max_context_auto = false;
     // Gemma4 only, opt-in: global FP8 K planes alone; reconstruct V from K. Sliding KV follows gemma4_sliding_kv.
     bool gemma4_key_only_kv = false;
@@ -888,12 +904,13 @@ struct EngineOptions {
     // default 16-bit activations. Other artifacts refuse it, as does the lossless route without the
     // design reference.
     bool expert_a4_activations         = false;
-    // Qwen3.8-Flash-Next artifacts whose routed experts are W4A4 by their checkpoint (NVIDIA's NVFP4 recipes A and
-    // B, Dense8): run them with 16-bit activations (--a16-activations), the arithmetic of the weight-only banks
-    // (design §16.2.1), instead of the 4-bit activations at NVIDIA's calibrated scales. Changes the output; the
-    // engine warns at launch that the default follows NVIDIA's specification and is recommended. Artifacts whose
-    // experts already run 16-bit activations accept it unchanged; --expert-a4-activations, --a8-activations
-    // and the lossless route refuse it.
+    // 16-bit activations where the checkpoint specifies fewer bits (--a16-activations): Qwen3.8-Flash-Next routed
+    // experts that are W4A4 by their checkpoint (NVIDIA's NVFP4 recipes A and B, Dense8, NVFP4-QAD) run the
+    // arithmetic of the weight-only banks (design §16.2.1); on a Qwen3.5-family artifact every text projection
+    // binds A16Only (NVIDIA's NVFP4 27B layers instead of 4-bit, its FP8 layers instead of 8-bit activations).
+    // Changes the output; the engine warns at launch that the default follows NVIDIA's specification and is
+    // recommended. Artifacts that already run 16-bit activations accept it unchanged; --expert-a4-activations,
+    // --a8-activations and the lossless route refuse it.
     bool expert_a16_activations        = false;
     // The 8-bit activation routes (--a8-activations; approximate, opt-in, never a default), each where it
     // measured faster than the route it replaces (or is being measured; docs/maintainer/qwen3_8-flash-next-design.md
@@ -1417,6 +1434,11 @@ struct PromptOptions {
     // constraints cover them after tool_jsons, in this order, while the template's tool section
     // omits them; a message that loads one carries its definition in its own content.
     std::vector<std::string> deferred_tool_jsons;
+    // Names of listed declarations (tool_jsons) the output contract leaves out: tools the conversation withdrew or
+    // redefined after the tool section listed them (Anthropic tool_removal / tool_addition in a mid-conversation
+    // system message). The tool section still lists them as the conversation first saw them; a redefinition's newer
+    // declaration is in deferred_tool_jsons under the same name.
+    std::vector<std::string> withdrawn_tool_names;
     // The client knows tools the request does not declare (it defers tools behind its own search, as
     // Claude Code does with its MCP tools): a well-formed call to an undeclared name stays a call for
     // the client to judge instead of turning into text. The prompt does not change.
@@ -1578,6 +1600,17 @@ struct MediaGeometry {
     std::int32_t height = 0;
 
     [[nodiscard]] friend bool operator==(MediaGeometry, MediaGeometry) noexcept = default;
+};
+
+// How Vision sizes an image, for a caller that renders images itself (PDF pages): an image whose sides are
+// multiples of token_edge and whose area lies within [min_pixels, max_pixels] enters unresized, as
+// (width / token_edge) * (height / token_edge) vision tokens. One prompt's images and videos hold at most
+// prompt_tokens together. All zero without vision.
+struct VisionImageBudget {
+    std::uint64_t prompt_tokens = 0;
+    std::uint32_t token_edge    = 0;
+    std::uint64_t min_pixels    = 0;
+    std::uint64_t max_pixels    = 0;
 };
 
 struct PromptSummary {
@@ -1746,6 +1779,8 @@ using GenerationFirstTokenObserver = std::function<void(const GenerationFirstTok
 // prefix, as PromptProgress does; generated_tokens counts accepted tokens, as
 // GenerationTimingObservation does.
 struct GenerationProgressObservation {
+    // The Engine's request id (GenerationResult::engine_request_id, RequestMonitorEntry's).
+    std::uint64_t engine_request_id       = 0;
     std::uint32_t prompt_tokens           = 0;
     std::uint32_t reused_prompt_tokens    = 0;
     std::uint32_t processed_prompt_tokens = 0;
@@ -1868,6 +1903,9 @@ struct GenerationWorkTiming {
 // paused time and the remaining resident interval partition this Engine wall time.
 struct GenerationFirstOutputTiming {
     double elapsed_seconds         = 0.0;
+    // From the binding's start, at the end of an Engine cycle, to its completion at the next cycle's start: it
+    // includes the round the other lanes run in between (about 0.1 s at 100K-token contexts beside it), not only
+    // the binding's own work.
     double initial_binding_seconds = 0.0;
     GenerationEngineTiming engine;
     GenerationWorkTiming prefill;
@@ -1976,8 +2014,8 @@ enum class AdmissionFallbackReason : std::uint8_t {
 
 struct GenerationAdmissionStats {
     std::uint32_t preferred_reused_tokens = 0;
-    // Subset of initial queue wait, not additional TTFT. Includes waiting for a lane
-    // after a useful source has been selected.
+    // Subset of initial queue wait, not additional TTFT: the time from the request's first source quote to its
+    // binding. A request is quoted only once a lane is free for it, so waiting for a lane is not in it.
     double source_wait_seconds              = 0.0;
     AdmissionFallbackReason fallback_reason = AdmissionFallbackReason::None;
 };
@@ -2107,6 +2145,10 @@ struct ScoreOptions {
     // teacher-forced suffix token alone, retaining that window's KV state. Position 0
     // is still the final prefill distribution; positions 1+ exercise incremental decode.
     bool incremental = false;
+    // Every layer's hidden state at the last prompt token (the position before first_target, whose next-token
+    // distribution is scored position 0): ScoreResult::hidden_states (tools/ablate's capture). Not on the lossless
+    // route.
+    bool prompt_hidden_states = false;
 };
 
 inline constexpr std::uint32_t kMaximumScoreLogitPositions = 256;
@@ -2123,6 +2165,12 @@ struct ScoreResult {
     // One vocabulary-sized row per ScoreOptions::logits_positions entry, in that order: the FP32 logits
     // as scoring computed them.
     std::vector<float> logits;
+    // ScoreOptions::prompt_hidden_states: [layers][hidden_size], layer-major, the BF16 values widened exactly. Row L
+    // is the hidden state layer L hands on at the last prompt token: on Qwen3.5 the residual after layer L; on
+    // Qwen3.8-Flash-Next (four hyper-connection streams) layer L + 1's mixer input, and for the last layer its MoE
+    // input. Empty otherwise.
+    std::vector<float> hidden_states;
+    std::uint32_t hidden_state_layers = 0; // hidden_states' rows (0 when empty)
 };
 
 // Offloaded routed experts (Qwen3.5-122B-A10B): the VRAM expert cache's frames now and at startup,
@@ -2164,10 +2212,13 @@ struct MemoryUsage {
     struct Device {
         std::uint64_t weights       = 0; // the model's device weights, the drafter's excepted
         std::uint64_t drafter       = 0; // a separate drafter's weights, and the drafters' columns, rings and pools
+        std::uint64_t adapter       = 0; // a LoRA adapter's factors (--lora; its per-call U is in `workspace`) and an
+                                         // ablation sidecar's direction (--ablate)
         std::uint64_t experts       = 0; // the VRAM expert cache's frames that hold experts
         std::uint32_t expert_frames = 0;
         std::uint64_t kv            = 0; // the KV cache's backed pages and tables, less `prefix`'s pages
         std::uint64_t kv_used       = 0; // of them, pages holding requests' tokens
+        std::uint64_t mtp_kv        = 0; // the MTP drafter's own KV page pool (Qwen3.5 with --spec mtp), not in `kv`
         std::uint64_t state         = 0; // recurrent (GDN) state, per-request rows and records, call inputs and outputs
         std::uint64_t prefix        = 0; // the prefix cache's device snapshots and the KV pages only it holds
         std::uint64_t workspace     = 0; // activation workspace, with frames the expert cache lends to prefill and vision
@@ -2180,7 +2231,8 @@ struct MemoryUsage {
         std::uint64_t prefix         = 0; // the prefix cache's Host tier
         std::uint64_t prefix_used    = 0; // of it, slabs holding entries
         std::uint64_t weights        = 0; // weights kept in RAM (pinned mirrors and escapes, the embedding, a vision tower)
-        std::uint64_t ngram          = 0; // the n-gram table in RAM, or its row cache
+        std::uint64_t ngram          = 0; // Qwen3.8-Flash-Next's n-gram table in RAM, or its row cache
+        std::uint64_t ngram_archive  = 0; // the n-gram drafter's conversation archive (--ngram-archive-mib)
         std::uint64_t staging        = 0; // pinned staging buffers
     } host;
     struct Ssd {
@@ -2214,6 +2266,9 @@ struct MemorySummary {
     // Present only for Gemma4's mixed global/sliding cache.
     std::optional<Gemma4KvMemorySummary> gemma4_kv;
     ArenaMemorySummary weights;
+    // Beside the weights' arena: the DFlash2 drafter's proposal-head screen, and a LoRA adapter's factors (--lora).
+    std::size_t draft_screen_bytes = 0;
+    std::size_t adapter_bytes      = 0;
     ArenaMemorySummary sequence;
     ArenaMemorySummary workspace;
     std::optional<VisionWorkspaceMemorySummary> vision_workspace;
@@ -2230,11 +2285,17 @@ struct MemorySummary {
     std::size_t planned_slack_bytes               = 0;
     std::size_t workspace_logical_peak_bytes      = 0;
     std::size_t cuda_graph_allowance_bytes        = 0;
-    // Device memory CUDA Graph preparation actually took at startup (free memory before minus
-    // after instantiating, uploading and launching every executable), in the driver's allocation
-    // granularity: 0 without CUDA Graphs, and also when the graphs fit in memory the driver already
-    // held (StartupPhase::CudaGraphPrepare reports the preparation itself).
+    // Device memory CUDA Graph preparation actually took at startup (instantiating, uploading and
+    // launching every executable), in the driver's allocation granularity: Qwen3.5 reads this
+    // process's own device memory where the OS reports it (Windows, WSL2) and free memory before
+    // minus after elsewhere; Qwen3.8-Flash-Next reads free memory. 0 without CUDA Graphs, and also
+    // when the graphs fit in memory the driver already held (StartupPhase::CudaGraphPrepare reports
+    // the preparation itself).
     std::size_t cuda_graph_measured_bytes         = 0;
+    // The graphs past cuda_graph_allowance_bytes take device memory back from an elastic expert-frame pool (Qwen3.8-
+    // Flash-Next: a fixed 128 MiB reserve, the frames shrinking by chunks for the rest, by design), so a measured
+    // figure above the allowance is not a shortfall.
+    bool cuda_graph_excess_absorbed               = false;
     std::size_t kv_payload_bytes                  = 0;
     // With offloaded experts (beside runtime_reservation_bytes, which excludes them).
     std::optional<ExpertCacheMemorySummary> expert_cache;
@@ -2268,10 +2329,15 @@ struct EnginePlanVram {
     // Offloaded experts: the VRAM expert cache's frames and bytes.
     std::optional<std::uint64_t> expert_cache_bytes;
     std::optional<std::uint32_t> expert_frames;
+    // Beside the weights' arena: the DFlash2 drafter's proposal-head screen (Qwen3.5 family), and the adapters, a
+    // LoRA adapter's factors (--lora, Qwen3.5 dense) and an ablation sidecar's direction (--ablate, every model); their
+    // per-call workspace is in workspace_bytes. Empty when the start has none.
+    std::optional<std::uint64_t> draft_screen_bytes;
+    std::optional<std::uint64_t> adapter_bytes;
     // Left free for the display and other programs (--vram-headroom-mib or the automatic headroom).
     std::uint64_t headroom_bytes = 0;
-    // Everything planned on the device (weights, the Program's reservation, expert frames), and what
-    // the free memory leaves beside it and the headroom (0 when it does not fit).
+    // Everything planned on the device (weights, the draft screen, the adapter, the Program's reservation, expert
+    // frames), and what the free memory leaves beside it and the headroom (0 when it does not fit).
     std::uint64_t planned_bytes = 0;
     std::uint64_t left_bytes    = 0;
 };
@@ -2468,6 +2534,7 @@ struct RuntimeStats {
     // refused Host slabs (they stay Device-only), Device snapshot slots taken from an owner, slot
     // requests refused, and the slots free now.
     std::uint64_t hybrid_taps_skipped_no_slot      = 0;
+    std::uint64_t hybrid_taps_retried              = 0; // flexible taps taken a boundary later after a skip for room
     std::uint64_t hybrid_endpoints_skipped         = 0;
     std::uint64_t hybrid_host_image_write_refusals = 0;
     std::uint64_t hybrid_host_block_write_refusals = 0;
@@ -2478,11 +2545,12 @@ struct RuntimeStats {
     std::uint64_t hybrid_host_block_writes       = 0;
     std::uint64_t hybrid_host_image_restores     = 0;
     std::uint64_t hybrid_host_block_restores     = 0;
-    // Of those, blocks copied for a waiting FIFO head before its admission.
+    // Of those, blocks copied for a queued request (the FIFO head or the one behind it) before its admission.
     std::uint64_t hybrid_prefetched_blocks       = 0;
     std::uint64_t hybrid_host_write_bytes        = 0;
     std::uint64_t hybrid_host_restore_bytes      = 0;
-    // The copy calls behind those bytes (Qwen3.5's Host tier; zero for other caches).
+    // The copy calls behind those bytes, a restore's each a batch of copies (Qwen3.5's Host tier; zero for other
+    // caches).
     std::uint64_t hybrid_host_write_copies       = 0;
     std::uint64_t hybrid_host_restore_copies     = 0;
     std::uint64_t hybrid_evicted_blocks          = 0;
@@ -2553,6 +2621,58 @@ struct RuntimeStats {
     std::uint64_t next_turn_prefill_tokens            = 0;
 };
 
+// Where a request the Engine holds stands (Engine::request_monitor).
+enum class RequestMonitorPhase : std::uint8_t {
+    Queued,    // waiting for admission
+    Binding,   // its binding restores cached state into a lane
+    Prefill,   // computing its prompt
+    Replay,    // a resume recomputing its history toward the paused frontier
+    Pausing,   // releasing its lane under resource pressure
+    Paused,    // holds no lane; resumed in its service turn
+    Decode,    // generating
+    Control,   // committing forced control tokens
+    Finishing, // the model finished; its output is being delivered
+};
+
+// One request the Engine holds, as its last runtime-stats publication saw it.
+struct RequestMonitorEntry {
+    std::uint64_t engine_request_id = 0;
+    RequestMonitorPhase phase          = RequestMonitorPhase::Queued;
+    std::optional<std::uint32_t> lane;
+    // The Engine's own idle-time prefill of a finished turn (no client).
+    bool background = false;
+    // It owns the current service turn (resource pressure), and a resumed request still protects
+    // its recovery capacity.
+    bool progress_owner   = false;
+    bool recovery_pending = false;
+    // Replay: the request's latest resume recomputes history (else it restored its state or was never paused).
+    GenerationRecoveryRoute recovery_route = GenerationRecoveryRoute::None;
+    std::uint32_t prompt_tokens            = 0;
+    // Admitted requests: the prompt prefix its binding reused, and the prompt tokens computed since.
+    std::uint32_t reused_prompt_tokens   = 0;
+    std::uint32_t computed_prompt_tokens = 0;
+    std::uint64_t output_tokens          = 0;
+    std::uint64_t preemptions            = 0;
+    std::uint64_t snapshot_restores      = 0;
+    std::uint64_t replay_restores        = 0;
+    std::uint64_t replayed_tokens        = 0;
+    double age_seconds                   = 0.0; // since submission
+    double paused_seconds                = 0.0; // in total, the current pause included
+    // Since its last committed progress (prompt prefilled, history replayed, output committed);
+    // none before any.
+    std::optional<double> since_progress_seconds;
+};
+
+// The requests the Engine holds: residents in lane order, the one binding, the paused ones, then
+// the queue in FIFO order (at most `kListedQueued`; `queued_not_listed` counts the rest).
+struct RequestMonitor {
+    static constexpr std::size_t kListedQueued = 32;
+    std::vector<RequestMonitorEntry> requests;
+    std::uint64_t progress_owner_request_id = 0; // 0: no service turn
+    double no_progress_seconds              = 0.0;
+    std::uint32_t queued_not_listed         = 0;
+};
+
 enum class ContextCostPresetSource : std::uint8_t {
     GenericDefault,
     CompiledDefault,
@@ -2599,6 +2719,12 @@ struct ModelMetadata {
 struct LoadSummary {
     std::string architecture;
     std::string model_name;
+    // EngineOptions::lora_path: the adapter applied, as "<directory>: <modules, rank, scale, factor type, base>";
+    // empty without one.
+    std::string lora_adapter;
+    // EngineOptions::ablate_sidecar_path: the sidecar applied, as "<sidecar.json>: <format, direction, lanes cut,
+    // provenance>" (the startup log's line); empty without one.
+    std::string ablate_sidecar;
     std::string cuda_sync_mode;
     std::vector<std::string> weight_formats;
     std::string prefill_signature;

@@ -28,8 +28,12 @@
 #    include <immintrin.h>
 #endif
 #if defined(__linux__)
+#    include <linux/futex.h>
 #    include <pthread.h>
 #    include <sched.h>
+#    include <sys/syscall.h>
+#    include <time.h>
+#    include <unistd.h>
 #endif
 
 #include <cerrno>
@@ -107,6 +111,9 @@ CpuMissService::CpuMissService(std::vector<Layer> layers, Options options)
         std::memset(p, 0, bytes);
         return p;
     };
+    // A step that throws gives back what the earlier ones took (the destructor does not run for a constructor that
+    // throws).
+    try {
     request_ = static_cast<MissRequest*>(mapped(sizeof(MissRequest)));
     // A service that takes prefill calls sizes for every job a call may hand it: a gated call's cap
     // (MoeCpuChannel::wide_jobs, set per call) may rise to kMaxCpuJobs.
@@ -123,45 +130,83 @@ CpuMissService::CpuMissService(std::vector<Layer> layers, Options options)
     idle_timer_ = ::CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
 #endif
     thread_ = std::thread([this] { serve(); });
+    } catch (...) {
+        release();
+        throw;
+    }
 }
 
 CpuMissService::~CpuMissService() {
     stop_.store(true, std::memory_order_release);
     wake();
     if (thread_.joinable()) { thread_.join(); }
+    release();
+}
+
+void CpuMissService::release() noexcept {
 #if defined(_WIN32)
     if (wake_event_ != nullptr) { ::CloseHandle(wake_event_); }
     if (idle_timer_ != nullptr) { ::CloseHandle(idle_timer_); }
+    wake_event_ = idle_timer_ = nullptr;
 #endif
-    cudaFree(sequence_);
+    cudaFree(sequence_); // null-safe, as cudaFreeHost
     cudaFreeHost(done_);
     cudaFreeHost(y_);
     cudaFreeHost(x_);
     cudaFreeHost(request_);
+    sequence_ = nullptr;
+    done_     = nullptr;
+    y_        = nullptr;
+    x_        = nullptr;
+    request_  = nullptr;
 }
 
 void CpuMissService::wake() const noexcept {
-    wakes_.fetch_add(1, std::memory_order_acq_rel);
+    // A spinning thread sees the count at its next clock check; only a waiting one is signalled, so a decoding
+    // round (which calls this before each enqueue) pays no system call. Sequentially consistent with idle_wait's
+    // store of sleeping_ and load of wakes_: either the waiter sees this count and does not wait, or this sees
+    // sleeping_ and signals it.
+    wakes_.fetch_add(1, std::memory_order_seq_cst);
+    if (!sleeping_.load(std::memory_order_seq_cst)) { return; }
 #if defined(_WIN32)
     if (wake_event_ != nullptr) { ::SetEvent(wake_event_); }
+#elif defined(__linux__)
+    (void)::syscall(SYS_futex, reinterpret_cast<std::uint32_t*>(&wakes_), FUTEX_WAKE_PRIVATE, 1, nullptr, nullptr, 0);
 #endif
 }
 
-void CpuMissService::idle_wait() noexcept {
+void CpuMissService::idle_wait(std::uint32_t microseconds) noexcept {
+    sleeping_.store(true, std::memory_order_seq_cst);
+    if (wakes_.load(std::memory_order_seq_cst) == 0) {
 #if defined(_WIN32)
-    // A wait's timeout and sleep_for both round up to the 15.6 ms timer tick; the high-resolution
-    // timer measured 0.51 ms for a 50 us request (2026-10-09, Windows 11, i9-13900K).
-    if (wake_event_ != nullptr && idle_timer_ != nullptr) {
-        LARGE_INTEGER due{};
-        due.QuadPart = -500; // 50 us, relative, in 100 ns units
-        if (::SetWaitableTimerEx(idle_timer_, &due, 0, nullptr, nullptr, nullptr, 0)) {
-            const HANDLE handles[2] = {wake_event_, idle_timer_};
-            ::WaitForMultipleObjects(2, handles, FALSE, INFINITE);
-            return;
+        // A plain wait's timeout and sleep_for round up to the 15.6 ms timer tick; the high-resolution timer
+        // measured 0.51 ms for a 50 us request (2026-10-09, Windows 11, i9-13900K). wake() ends the wait through
+        // the event. A signal that lands after a timer wake leaves the auto-reset event set, which ends the next
+        // wait at once: harmless, that pass then sees the wake's count.
+        bool waited = false;
+        if (wake_event_ != nullptr && idle_timer_ != nullptr) {
+            LARGE_INTEGER due{};
+            due.QuadPart = -10LL * static_cast<long long>(microseconds); // relative, in 100 ns units
+            if (::SetWaitableTimerEx(idle_timer_, &due, 0, nullptr, nullptr, nullptr, 0)) {
+                const HANDLE handles[2] = {wake_event_, idle_timer_};
+                ::WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+                waited = true;
+            }
         }
-    }
+        if (!waited) { std::this_thread::sleep_for(std::chrono::microseconds(microseconds)); }
+#elif defined(__linux__)
+        // Sleeps while the wake count is still 0 (the kernel compares it atomically), until wake()'s FUTEX_WAKE or
+        // the timeout.
+        timespec timeout{};
+        timeout.tv_sec  = static_cast<time_t>(microseconds / 1'000'000U);
+        timeout.tv_nsec = static_cast<long>(microseconds % 1'000'000U) * 1000L;
+        (void)::syscall(SYS_futex, reinterpret_cast<std::uint32_t*>(&wakes_), FUTEX_WAIT_PRIVATE, 0U, &timeout,
+                        nullptr, 0);
+#else
+        std::this_thread::sleep_for(std::chrono::microseconds(microseconds));
 #endif
-    std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+    sleeping_.store(false, std::memory_order_relaxed);
 }
 
 MoeCpuChannel CpuMissService::channel(int layer) const {
@@ -248,21 +293,37 @@ void CpuMissService::serve() {
         std::uint32_t seen      = 0;
         auto last               = std::chrono::steady_clock::now();
         std::uint32_t polls     = 0;
+        // Idle (PR #69, dwalthour): spin while requests come; kIdleQuiet after the last request or wake(), wait in
+        // timed waits that wake() ends, back to back with no spin between them (each pass still re-reads the
+        // request word and advances the heartbeat). The clock is read every kIdleCheckPolls spins: the old 4,096
+        // spins between checks, and one wait per 4,096 spins once idle, kept a quiet server spinning most of the
+        // time (measured on the PR's 24-core Linux desktop: 37-41 % of a core idle, 0.3-0.7 % with the PR). After
+        // kIdleDeep of quiet the waits lengthen to kIdleDeepWaitUs. The GPU publishes a request by writing the
+        // mapped word, which no wait can see, so a request that arrives with no wake() first is answered up to one
+        // wait late; every round that can request calls wake() before it is enqueued. The device's heartbeat
+        // timeout (kHeartbeatTimeoutNs, 10 s) is far above either wait.
+        constexpr std::uint32_t kIdleCheckPolls = 64;
+        constexpr auto kIdleQuiet               = std::chrono::milliseconds(20);
+        constexpr auto kIdleDeep                = std::chrono::milliseconds(1000);
+        bool idle                               = false;
         while (!stop_.load(std::memory_order_acquire)) {
             const std::uint32_t sequence = *volatile_sequence;
             *volatile_beat = ++beat;
             if (sequence == seen) {
-                relax();
-                // Spin while decoding; after 20 ms without a request or a wake(), idle in short
-                // waits that wake() ends at once.
-                if (++polls % 4096 == 0) {
-                    if (wakes_.exchange(0, std::memory_order_acq_rel) != 0) {
-                        last = std::chrono::steady_clock::now();
-                    } else if (std::chrono::steady_clock::now() - last > std::chrono::milliseconds(20)) {
-                        idle_wait();
-                        if (wakes_.exchange(0, std::memory_order_acq_rel) != 0) { last = std::chrono::steady_clock::now(); }
-                    }
+                if (!idle) {
+                    relax();
+                    if (++polls % kIdleCheckPolls != 0) { continue; }
                 }
+                const auto now = std::chrono::steady_clock::now();
+                if (wakes_.exchange(0, std::memory_order_acq_rel) != 0) {
+                    last = now;
+                    idle = false;
+                    continue;
+                }
+                const auto quiet = now - last;
+                if (quiet <= kIdleQuiet) { continue; }
+                idle = true;
+                idle_wait(quiet > kIdleDeep ? kIdleDeepWaitUs : kIdleWaitUs);
                 continue;
             }
             std::atomic_thread_fence(std::memory_order_acquire);
@@ -359,6 +420,7 @@ void CpuMissService::serve() {
             serving_layer = -1;
             last          = std::chrono::steady_clock::now();
             polls         = 0;
+            idle          = false;
         }
     } catch (const std::exception& error) {
         // A failed service never answers: the device wait ends after its timeout instead of hanging,

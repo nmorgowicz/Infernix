@@ -16,6 +16,7 @@
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/execution/workspace.h"
 #include "core/device.h"
+#include "core/vmm_arena.h"
 #include "infernix/ops/argmax.h"
 #include "core/temporary_switches.h"
 #include "infernix/ops/gated_delta_net.h"
@@ -41,6 +42,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace infernix::models::qwen3_5::detail {
@@ -249,10 +251,49 @@ std::uint64_t maximum_main_page_groups(std::uint32_t concurrency, std::uint32_t 
 // drafting (72 MiB at 2) and MTP verifying a 15-wide n-gram window (182 MiB for 136 executables at
 // 4). The 2026-09-26 calibration measured 2.2-4.1 MiB on the graphs of then, and the 4 MiB and
 // 64 MiB it kept left 66-426 MiB of these configurations free above the headroom, KV capacity
-// automatic sizing never used. The allowance keeps 2 MiB per executable (a third above the largest
-// measured) plus 16 MiB; serve warns at startup when the graphs took more.
-constexpr std::size_t kGraphExecutableAllowance = 2ULL * kMiB;
-constexpr std::size_t kGraphDriverAllowance     = 16ULL * kMiB;
+// automatic sizing never used. The allowance keeps 2 MiB per executable plus 16 MiB; serve warns at
+// startup when the graphs took more. DFlash2 tree verification (2026-11-18, the same 27B at max concurrency
+// 1-4, every KV format, which changes nothing): the table 16,12,12,10 took 18, 38 and 80 MiB against 36, 56 and
+// 96 allowed, automatic widths 28, 58 and 124 against 46, 76 and 136, the largest share 1.8 MiB an executable
+// past the 16 MiB, so the margin there is 12 MiB. Column-invariant decode (the
+// reproducible route, without batched-decode) launches each column's kernels apart, so its executables carry
+// more nodes: 2026-11-16, the same 27B with DFlash2 and n-gram drafting at max concurrency 4 took 76 MiB for 28
+// executables on --reproducible (2.1 MiB each past the 16 MiB, past the 72 MiB allowed: serve warned), against
+// 212 MiB for 112 on the default route (1.75 MiB each). It keeps 3 MiB per executable.
+constexpr std::size_t kGraphExecutableAllowance                = 2ULL * kMiB;
+constexpr std::size_t kGraphExecutableAllowanceColumnInvariant = 3ULL * kMiB;
+constexpr std::size_t kGraphDriverAllowance                    = 16ULL * kMiB;
+// --lora: each adapted site (lora_sites) adds its shrink and its projection's adapter nodes to every executable.
+// Measured 2026-11-21 (RTX 5090, driver 621.01, CUDA 13.4, Qwen3.8-27B NVFP4-QAD, INT8 KV, a rank-32 adapter on all
+// seven projections: 160 sites; the zero adapter, which runs every kernel an adapter does), the graphs' growth over
+// the same start without it: default route 2, 4 and 4 MiB at max concurrency 1, 2 and 4 (26-41 executables, at most
+// 0.15 MiB each), reproducible 2, 10 and 16 MiB (5-20 executables, at most 1.0 MiB each), lossless 8 MiB (one
+// executable at max concurrency 1). The allowance keeps about twice that a site.
+constexpr std::size_t kGraphLoraSiteAllowance                 = 2ULL * 1024;
+constexpr std::size_t kGraphLoraSiteAllowanceColumnInvariant  = 12ULL * 1024;
+constexpr std::size_t kGraphLoraSiteAllowanceLossless         = 96ULL * 1024;
+
+// --lora: the text layers' adapted sites (an adapted input's shrink and its projection's term), each of which every
+// captured forward runs.
+std::uint64_t lora_sites(const execution::Parameters& parameters) {
+    std::uint64_t sites = 0;
+    for (const auto& block : parameters.text.layers) {
+        if (const auto* attention = std::get_if<execution::AttentionParameters>(&block.mixer)) {
+            sites += (attention->lora_input || attention->lossless_lora_input ? 1U : 0U) +
+                     (attention->lora_output || attention->lossless_lora_output ? 1U : 0U);
+        } else if (const auto* gdn = std::get_if<execution::GdnParameters>(&block.mixer)) {
+            // An adapted control is a site of its own (the norm, the shrink and its control kernel).
+            sites += (gdn->lora_input || gdn->lossless_lora_input ? 1U : 0U) +
+                     (gdn->lora_control.present() ? 1U : 0U) +
+                     (gdn->lora_output || gdn->lossless_lora_output ? 1U : 0U);
+        }
+        if (const auto* dense = std::get_if<execution::DenseParameters>(&block.ffn)) {
+            sites += (dense->lora_gate_up || dense->lossless_lora_gate_up ? 1U : 0U) +
+                     (dense->lora_down || dense->lossless_lora_down ? 1U : 0U);
+        }
+    }
+    return sites;
+}
 
 // Number of executables one family instantiates for one batch size: one per topology class.
 std::uint32_t graph_topology_classes(const std::vector<GraphExecutionProfile>& profiles) {
@@ -301,7 +342,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     // Offloaded experts take the VRAM the Program leaves, so a generation Program's text KV pages grow
     // from them on demand (elastic KV): planned in their own region, backed beyond kElasticKvBaseTokens
     // as requests need. (Every capacity plans the region the same way, so the plan stays affine in it.)
-    const bool elastic_kv = parameters.model.offloaded_experts() && !plan.causal_scoring;
+    // Without CUDA virtual memory management there is no region to reserve: the planes are planned in the
+    // persistent arena, whole, as the expert frames fall back to one allocation (ExpertResidency).
+    const bool elastic_kv =
+        parameters.model.offloaded_experts() && !plan.causal_scoring && VmmArena::supported(plan.device);
     LayoutBuilder text_pages;
     out.decoder = qwen3_5::plan_decoder_state(
         builder, qwen3_5::DecoderStateSpec{
@@ -469,6 +513,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
             add_tensor(builder, DType::BF16,
                        {dimension(config.hidden_size), static_cast<std::int32_t>(kCausalScoreTile)},
                        "causal score hidden staging");
+        out.score_layer_hidden =
+            add_tensor(builder, DType::BF16,
+                       {dimension(config.hidden_size), dimension(config.num_hidden_layers)},
+                       "causal score layer hidden states");
     }
     qwen3_5::complete_round_state_layout(builder, out.round);
     if (!plan.causal_scoring) {
@@ -565,7 +613,18 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                    std::int32_t max_width,
                                    ops::CausalAttentionExecutionEnvelope envelope) {
         const bool wide_verification = wide_residual_verification(phase, min_width, max_width);
+        // --ablate: a cut lane copies the residual columns it writes first (TextContext::snapshot_residual), one BF16
+        // [H, T] held through the lane's write; the sidecar's table says which lanes (a plan-only model has it too).
+        // Without a sidecar nothing is reserved.
+        const models::AblateSidecarBinding* ablate = parameters.model.ablate();
+        const auto reserve_cut_output = [&](WorkspaceLayoutBuilder& at, std::size_t layer,
+                                            models::AblateParameters::Lane lane) {
+            if (ablate != nullptr && ablate->sidecar.alpha_for(static_cast<std::uint32_t>(layer), lane) != 0.0F) {
+                (void)at.alloc(DType::BF16, {dimension(config.hidden_size), last});
+            }
+        };
         for (const auto& block : text.layers) {
+            const auto layer = static_cast<std::size_t>(&block - text.layers.data());
             {
                 auto stage = layout.scope();
                 if (const auto* attention =
@@ -580,11 +639,18 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                          dimension(config.attention->num_key_value_heads)},
                                         plan.kv_storage, envelope, batch_size, min_width, max_width,
                                         device_execution));
+                    // --lora: o_proj's U (attention_output_lora), held under the output projection's scratch.
+                    if (attention->lora_output) {
+                        (void)layout.alloc(DType::BF16, {attention->lora_output->a.rows, last});
+                    }
+                    reserve_cut_output(layout, layer, models::AblateParameters::Lane::Attn);
                     add_scratch(layout, attention->output, first, last, wide_verification);
                 } else {
                     const auto& gdn = std::get<execution::GdnParameters>(block.mixer);
                     const auto* control = std::get_if<execution::LinearParameters>(&gdn.control);
                     (void)workspace::gdn_control(layout, config, last);
+                    // --lora: the adapted inputs' U (text.cpp gdn_mix), held through the projection.
+                    if (gdn.lora_input) { (void)layout.alloc(DType::BF16, {gdn.lora_input->a.rows, last}); }
                     scratch(layout, ops::gdn_norm_gating_proj_workspace_capacity_bytes(
                                         dimension(config.gdn->linear_num_value_heads),
                                         dimension(config.hidden_size),
@@ -612,10 +678,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                     dimension(config.gdn->linear_num_value_heads), first, last));
                     }
                     (void)workspace::gdn_normalized_output(layout, config, last);
+                    // --lora: out_proj's U (gdn_output_lora), held under the output projection's scratch.
+                    if (gdn.lora_output) { (void)layout.alloc(DType::BF16, {gdn.lora_output->a.rows, last}); }
+                    reserve_cut_output(layout, layer, models::AblateParameters::Lane::Attn);
                     add_scratch(layout, gdn.output, first, last, wide_verification);
                 }
             }
             auto stage = layout.scope();
+            reserve_cut_output(layout, layer, models::AblateParameters::Lane::Mlp);
             (void)workspace::post_mixer_hidden(layout, config, last);
             const ops::LinearRoutes ffn_routes = plan.execution_schedule.linear_routes;
             const ops::offloaded_moe::WideA16 expert_wide = plan.execution_schedule.expert_wide;
@@ -680,8 +750,15 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         if (plan.execution_schedule.sampled_mtp_drafts) {
             matrix(layout, DType::I32, kMtpSampledDraftRanks, columns);
             matrix(layout, DType::FP32, kMtpSampledDraftRanks, columns);
-        } else if (plan.execution_schedule.mtp_draft_confidence) {
-            scratch(layout, ops::argmax_with_probability_workspace_bytes(DType::BF16, head_rows, head_rows, columns));
+        } else {
+            if (plan.execution_schedule.mtp_draft_confidence) {
+                scratch(layout,
+                        ops::argmax_with_probability_workspace_bytes(DType::BF16, head_rows, head_rows, columns));
+            }
+            // QK-04: the Gumbel-max routes re-draw sampled rows' argmax drafts under the target's keys.
+            if (plan.execution_schedule.gumbel_sampling) {
+                scratch(layout, ops::speculative_couple_drafts_workspace_bytes(head_rows, columns));
+            }
         }
     };
     const auto mtp_stem = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens,
@@ -1213,6 +1290,9 @@ void validate_target_options(const execution::Parameters& parameters,
     // tier): the loaded model's choice stands.
     auto expected           = models::load_options(options, Architecture::Qwen3_5);
     expected.stream_experts = parameters.model.options().stream_experts;
+    // The Engine decides --a8-activations' dense binding from the artifact's directory (LoadOptions::a8_dense):
+    // the loaded model's choice stands where the flag is set.
+    expected.a8_dense = options.a8_activations && parameters.model.options().a8_dense;
     if (parameters.model.options() != expected) {
         throw std::invalid_argument(
             "loaded components do not match the requested execution options");
@@ -1473,9 +1553,16 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                                (split_batches ? impl->max_concurrency : 1U);
             }
         }
+        const std::size_t lora_per_site = impl->execution_schedule.lossless ? kGraphLoraSiteAllowanceLossless
+                                          : impl->execution_schedule.column_invariant_decode
+                                              ? kGraphLoraSiteAllowanceColumnInvariant
+                                              : kGraphLoraSiteAllowance;
+        const std::size_t per_executable =
+            (impl->execution_schedule.column_invariant_decode ? kGraphExecutableAllowanceColumnInvariant
+                                                              : kGraphExecutableAllowance) +
+            static_cast<std::size_t>(lora_per_site * lora_sites(*impl->parameters));
         impl->graph_allowance_bytes = checked_add(
-            kGraphDriverAllowance,
-            checked_mul(kGraphExecutableAllowance, executables, "CUDA Graph executable allowance"),
+            kGraphDriverAllowance, checked_mul(per_executable, executables, "CUDA Graph executable allowance"),
             "CUDA Graph allowance");
     }
 
@@ -1599,7 +1686,11 @@ ExecutionSchedule execution_schedule(const execution::Parameters& parameters,
                                            ? static_cast<std::int32_t>(options.max_context)
                                            : 0,
             .lossless_design         = {.active = options.reference, .kv = options.kv_cache},
-            .gumbel_sampling         = !options.fast_paths || options.lossless,
+            .gumbel_sampling         = !options.fast_paths || options.lossless ||
+                                       fast_paths.selected(FastPath::GumbelSampling),
+            .coupled_mtp_steps       = std::holds_alternative<MoeConfig>(parameters.model.config().text.ffn)
+                                           ? 1U
+                                           : std::numeric_limits<std::uint32_t>::max(),
             .logits                  = options.logits_dtype == LogitsDtype::BF16 ? DType::BF16 : DType::FP32};
 }
 // The fast INT8, NVFP4, VQ2 and K4V2 prompt kernels and the MXFP8 tiled kernel of FP8 and K8V4 KV
@@ -1685,6 +1776,10 @@ std::uint32_t resolve_auto_draft_length_impl(const execution::Parameters& parame
     options.speculative.draft_tokens =
         std::min(options.speculative.draft_tokens,
                  auto_fixed_draft_tokens(fast.configuration, options.speculative.backend));
+    // A --no-fast-path of the policy has acted: it made the length fixed, where the policy no longer
+    // applies, so a later selection must not refuse it as an exclusion of a path that is not selected.
+    std::erase(options.fast_path_exclusions, FastPath::AdaptiveMtp);
+    std::erase(options.fast_path_exclusions, FastPath::AdaptiveDFlash);
     return options.speculative.draft_tokens;
 }
 

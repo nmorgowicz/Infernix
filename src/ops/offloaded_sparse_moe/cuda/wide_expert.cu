@@ -46,7 +46,7 @@ __global__ void __launch_bounds__(kPlanThreads)
         if (job < jobs) {
             const int expert  = dispatch.jobs[job];
             const int columns = dispatch.offsets[expert + 1] - dispatch.offsets[expert];
-            if (wide_route(columns, scales[expert])) { n = (columns + kTileColumns - 1) / kTileColumns; }
+            if (wide_route(route_count(dispatch, expert), scales[expert])) { n = (columns + kTileColumns - 1) / kTileColumns; }
         }
         scan[tid] = n;
         __syncthreads();
@@ -85,7 +85,7 @@ __global__ void __launch_bounds__(kQuantizeThreads)
         for (int task = static_cast<int>(threadIdx.x); task < count * kGateUpBlocks; task += kQuantizeThreads) {
             const int i = task / kGateUpBlocks, b = task % kGateUpBlocks;
             const int p = first + i;
-            const int t = dispatch.entries[p] / top_k;
+            const int t = entry_column(dispatch.entries[p], top_k, dispatch.shared_first);
             const auto* source = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t) * kHidden + 16 * b);
             const uint4 v0 = source[0], v1 = source[1];
             std::uint16_t v[16];
@@ -171,7 +171,6 @@ struct Offsets {
     std::size_t x_acts, h_acts, ring_jobs, ring_counters; // the narrow ring (ring_call)
     bool has_ring;
     bool has_nmma; // the A4 residual routes' x limbs, x_emax and job_ctas for the tensor-core narrow jobs
-    bool has_rows4; // a W4A4 call's BF16 h rows for the row-pair narrow kernels (kA4RowsMaxColumns)
     bool has_a4_counts; // a W4A4 call's job_ctas for the narrow kernels' per-job waits (kMaxColumns)
     std::size_t end;
 };
@@ -231,11 +230,8 @@ Offsets offsets(const ExpertShape& shape, std::int32_t max_jobs, std::int32_t en
     } else {
         o.h_blocks = take(e * kHBlocks * sizeof(canon::A4Block));
         o.x_plane  = take(e * kXRowBytes);
-        o.has_rows4 = shape == kFlashNextShape && a4_rows_columns(columns);
-        // The narrow kernels' per-job counts at decode and verify widths: the row-pair kernels' h elements, the
-        // tensor-core kernels' gate/up CTAs (candidates ZK-04).
+        // The tensor-core narrow kernels' per-job gate/up CTA counts at decode and verify widths (candidates ZK-04).
         o.has_a4_counts = shape == kFlashNextShape && columns <= kMaxColumns;
-        if (o.has_rows4) { o.h_rows = take(e * h_row); }
         if (o.has_a4_counts) { o.job_ctas = take(j * sizeof(std::uint32_t)); }
     }
     if (ring_call(shape, activation, wide_a16, columns)) {
@@ -631,7 +627,6 @@ ExpertsWorkspace carve_experts_workspace(void* base, const ExpertShape& shape, s
     } else {
         w.h_blocks = reinterpret_cast<canon::A4Block*>(p + o.h_blocks);
         w.x_plane  = reinterpret_cast<std::uint8_t*>(p + o.x_plane);
-        if (o.has_rows4) { w.h_rows = reinterpret_cast<std::uint8_t*>(p + o.h_rows); }
         if (o.has_a4_counts) { w.job_ctas = reinterpret_cast<std::uint32_t*>(p + o.job_ctas); }
     }
     if (o.has_ring) {
@@ -669,7 +664,9 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
     call.h_plane     = reinterpret_cast<std::uint8_t*>(workspace.h_blocks);
     call.outputs     = static_cast<std::uint16_t*>(outputs.data);
     call.passes      = (max_jobs + pass_jobs - 1) / pass_jobs;
-    call.mean_job_columns = entries / max_jobs;
+    // The routed experts' mean (the rule's measurements were routed-only): a shared job's entries and job left out.
+    const int shared_job  = dispatch.shared_first != 0x7FFFFFFF ? 1 : 0;
+    call.mean_job_columns = (shared_job != 0 ? dispatch.shared_first : entries) / std::max(1, max_jobs - shared_job);
     plan_kernel<<<1, kPlanThreads, 0, stream>>>(dispatch, source.scales, max_jobs, pass_jobs, call.passes,
                                                 workspace.tiles, workspace.pass_tiles);
     check_launch("plan");

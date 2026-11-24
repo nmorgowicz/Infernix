@@ -1,5 +1,6 @@
 #include "models/qwen3_5/proposal_head.h"
 #include "infernix/engine.h"
+#include "runtime/contract/execution.h"
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -13,6 +14,7 @@
 #include <filesystem>
 #include <functional>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -297,6 +299,71 @@ void settled(const infernix::RuntimeStats& stats, bool prefix_cache = false) {
             "completed recovery retained physical resources with history disabled");
 }
 
+// An orderly stop while a request is paused (audit 2026-11-18 F-4): the Engine answers every client, the paused one
+// included, before the Program's shutdown cleanup (an attached prefix cache file's save, seconds for a large Host
+// tier). The cleanup hook waits up to 5 s for both clients' answers: a paused client answered only after the cleanup
+// cannot have its answer while the hook holds the worker.
+std::atomic<int> g_clients_answered{0};
+std::atomic<int> g_answered_at_cleanup{-1};
+
+void record_answered_at_cleanup() {
+    const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (g_clients_answered.load() < 2 && std::chrono::steady_clock::now() < limit) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    g_answered_at_cleanup.store(g_clients_answered.load());
+}
+
+void shutdown_paused(const std::filesystem::path& artifact, infernix::SpeculativeBackend selected) {
+    std::cout << "shutdown with a paused request\n";
+    auto engine = std::make_unique<infernix::Engine>(engine_options(artifact, selected));
+    // As in exercise(): both prompts fit together, their growth does not, so one request is paused.
+    std::vector<infernix::TokenId> first_prompt(kPromptTokens, 198), second_prompt(kPromptTokens, 198);
+    first_prompt.front()  = 1000;
+    second_prompt.front() = 1001;
+    g_clients_answered.store(0);
+    g_answered_at_cleanup.store(-1);
+    std::vector<std::thread> clients;
+    std::string outcomes[2];
+    const auto started = std::chrono::steady_clock::now();
+    const auto since   = [&] {
+        return std::to_string(std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count()) + " s";
+    };
+    for (std::size_t row = 0; row < 2; ++row) {
+        auto* prompt = row == 0 ? &first_prompt : &second_prompt;
+        auto handle  = std::make_shared<infernix::GenerationHandle>(
+            engine->submit(engine->prepare_tokens(std::move(*prompt)), request(kOutputTokens)));
+        clients.emplace_back([handle, row, &outcomes, &since] {
+            try {
+                const infernix::GenerationResult result = handle->wait();
+                outcomes[row] = "completed " + std::to_string(result.generated_token_ids.size()) + " tokens, " +
+                                std::to_string(result.scheduling.preemptions) + " pauses";
+            } catch (const std::exception& error) { outcomes[row] = std::string("error: ") + error.what(); }
+            outcomes[row] += " at " + since();
+            ++g_clients_answered;
+        });
+    }
+    const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+    while (engine->runtime_stats().paused_requests == 0 && std::chrono::steady_clock::now() < limit) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool paused = engine->runtime_stats().paused_requests != 0;
+    std::cout << "stop at " << since() << " (paused requests published: " << paused << ")\n";
+    // The handles keep the Engine alive (destroying it would wait for both requests to finish): stop() ends them
+    // within one unit and runs the cleanup, whose hook returns once both clients have their answers (or after 5 s).
+    infernix::runtime::testing::shutdown_cleanup_hook().store(&record_answered_at_cleanup);
+    engine->stop();
+    for (std::thread& client : clients) { client.join(); }
+    engine.reset();
+    infernix::runtime::testing::shutdown_cleanup_hook().store(nullptr);
+    std::cout << "client 0: " << outcomes[0] << "\nclient 1: " << outcomes[1] << '\n';
+    require(paused, "no request was paused before the stop");
+    const std::string answered = "an orderly stop answered " + std::to_string(g_answered_at_cleanup.load()) +
+                                 " of 2 clients before its shutdown cleanup (-1: the cleanup never ran)";
+    std::cout << answered << '\n';
+    require(g_answered_at_cleanup.load() == 2, answered.c_str());
+}
+
 void exercise(const std::filesystem::path& artifact, infernix::SpeculativeBackend selected,
               std::string_view backend_name, CancelStage cancel_stage = CancelStage::None,
               bool prefix_cache = false) {
@@ -546,7 +613,9 @@ void exercise(const std::filesystem::path& artifact, infernix::SpeculativeBacken
 
 // NW-01, the shape of NInfer #434's fairness test (a754fcf3): two long generations that cannot stay
 // resident together. Bounded service turns (resource-scheduling §5.2) must give both repeated
-// service — at least two recoveries each, every one with new committed output — before either ends;
+// service — at least two recoveries each, every one with new committed output — before either ends
+// (with one-second turns set by the test seam: the product's 30-second turn, QN-01, lets a generation this
+// short finish within its turn, by design);
 // a short request submitted while one is paused keeps its queue deadline (fresh admission waits under
 // pressure); the cancelled cohort settles with no membership or physical state left.
 constexpr std::uint32_t kFairnessCapacity = 2048;
@@ -554,6 +623,11 @@ constexpr std::uint32_t kFairnessCapacity = 2048;
 void fairness(const std::filesystem::path& artifact, infernix::SpeculativeBackend selected,
               std::string_view backend_name, bool prefix_cache) {
     using Clock  = std::chrono::steady_clock;
+    // The turn mechanics within the test's time: one-second turns (runtime::testing::service_quantum_ns).
+    infernix::runtime::testing::service_quantum_ns().store(1'000'000'000ULL);
+    struct ResetTurn {
+        ~ResetTurn() { infernix::runtime::testing::service_quantum_ns().store(0); }
+    } reset_turn;
     auto options = engine_options(artifact, selected, prefix_cache);
     // One context of KV for two: each request fits alone, together they pass it at about half.
     options.max_context = kFairnessCapacity;
@@ -639,6 +713,91 @@ void fairness(const std::filesystem::path& artifact, infernix::SpeculativeBacken
             "pressure recovery did not reopen admission");
 }
 
+// Two greedy conversations whose contexts do not fit the KV pool together (each fits alone), run turn
+// by turn side by side with the prefix cache on (2026-11-14: two agent conversations on the 27B paused
+// each other every service turn and replayed 12.8M tokens). Each turn sends back the previous prompt
+// and its output with a short new message. Criteria, fixed before measuring:
+// - pressure engaged: the turns paused each other at least once;
+// - every later turn resumes from at least its previous turn's whole context (prompt and output) less
+//   one block: neither the pauses nor the other conversation cost it its cached history;
+// - Replay recomputes no more than one prefill chunk per pause on a backend whose pause publishes the
+//   lane's state at its frontier (none, MTP); a DFlash2 prefill pause whose ring YE-01 left incomplete
+//   replays from its deepest snapshot, so it is reported, not bounded.
+void conversations(const std::filesystem::path& artifact, infernix::SpeculativeBackend selected,
+                   std::string_view backend_name) {
+    constexpr std::uint32_t kPool      = 4096;
+    constexpr std::uint32_t kSystem    = 1024;
+    constexpr std::uint32_t kFirstUser = 256;
+    constexpr std::uint32_t kNextUser  = 64;
+    constexpr std::uint32_t kReply     = 384;
+    constexpr std::uint32_t kTurns     = 3;
+    auto options        = engine_options(artifact, selected, true);
+    options.max_context = kPool;
+    options.kv_capacity = infernix::KvCapacityPolicy::explicit_capacity(kPool);
+    // The service turns' own pacing; the 64-token ladder of engine_options would tap every block.
+    options.context_cache.hybrid.tap_ladder_tokens  = {};
+    options.context_cache.hybrid.tap_min_gap_tokens = {};
+    infernix::Engine engine(options);
+    const auto before = engine.runtime_stats();
+
+    std::array<std::vector<infernix::TokenId>, 2> history;
+    for (std::size_t row = 0; row < 2; ++row) {
+        history[row].resize(kSystem + kFirstUser);
+        for (std::size_t at = 0; at < history[row].size(); ++at) {
+            history[row][at] = static_cast<infernix::TokenId>(1000 + 50 * row + (at * 7919U) % 40000U);
+        }
+    }
+    std::array<std::uint32_t, 2> previous_context{};
+    std::uint64_t worst_shortfall = 0;
+    for (std::uint32_t turn = 0; turn < kTurns; ++turn) {
+        std::array<infernix::GenerationHandle, 2> handles;
+        for (std::size_t row = 0; row < 2; ++row) {
+            if (turn != 0) {
+                for (std::uint32_t at = 0; at < kNextUser; ++at) {
+                    history[row].push_back(static_cast<infernix::TokenId>(2000 + 97 * turn + 13 * row + at));
+                }
+            }
+            handles[row] = engine.submit(engine.prepare_tokens(history[row]), request(kReply, true),
+                                         infernix::OutputConsumerMode::Aggregate);
+        }
+        for (std::size_t row = 0; row < 2; ++row) {
+            const infernix::GenerationResult result = handles[row].wait();
+            require(result.generated_token_ids.size() == kReply, "a conversation turn ended early");
+            std::cout << "conversations backend=" << backend_name << " turn=" << turn << " row=" << row
+                      << " prompt=" << history[row].size() << " reused=" << result.reused_prompt_tokens
+                      << " computed=" << result.computed_prefill_tokens
+                      << " preemptions=" << result.scheduling.preemptions
+                      << " snapshot_restores=" << result.scheduling.snapshot_restores
+                      << " replay_restores=" << result.scheduling.replay_restores
+                      << " replayed=" << result.scheduling.replayed_tokens << '\n';
+            if (turn != 0) {
+                const std::uint32_t floor = previous_context[row] - 63U;
+                if (result.reused_prompt_tokens < floor) {
+                    worst_shortfall = std::max<std::uint64_t>(worst_shortfall, floor - result.reused_prompt_tokens);
+                }
+            }
+            history[row].insert(history[row].end(), result.generated_token_ids.begin(),
+                                result.generated_token_ids.end());
+            previous_context[row] = static_cast<std::uint32_t>(history[row].size());
+        }
+    }
+    (void)engine.memory_summary(); // the completed worker boundary
+    const auto after                 = engine.runtime_stats();
+    const std::uint64_t preemptions  = after.preemptions - before.preemptions;
+    const std::uint64_t replayed     = after.replayed_tokens - before.replayed_tokens;
+    const std::uint64_t direct       = after.snapshot_restores - before.snapshot_restores;
+    const std::uint64_t replay_count = after.replay_restores - before.replay_restores;
+    std::cout << "conversations backend=" << backend_name << " preemptions=" << preemptions
+              << " snapshot_restores=" << direct << " replay_restores=" << replay_count
+              << " replayed_tokens=" << replayed << " worst_reuse_shortfall=" << worst_shortfall << '\n';
+    require(preemptions != 0, "the two conversations never paused each other: the pool did not press");
+    require(worst_shortfall == 0, "a later turn lost its previous turn's cached context");
+    if (selected != infernix::SpeculativeBackend::DFlash2) {
+        require(replayed <= preemptions * options.prefill_chunk, "Replay recomputed more than a chunk per pause");
+    }
+    settled(after, true);
+}
+
 } // namespace
 
 int main() {
@@ -656,9 +815,10 @@ int main() {
         const auto scenario     = setting("INFERNIX_PREEMPTION_REAL_SCENARIO", "all");
         require(scenario == "all" || scenario == "replay" || scenario == "cancel-paused" ||
                     scenario == "cancel-replay" || scenario == "cache-replay" || scenario == "fairness" ||
-                    scenario == "cache-fairness",
+                    scenario == "cache-fairness" || scenario == "conversations" || scenario == "shutdown-paused",
                 "INFERNIX_PREEMPTION_REAL_SCENARIO must be all, replay, cancel-paused, "
-                "cancel-replay, cache-replay, fairness or cache-fairness");
+                "cancel-replay, cache-replay, fairness, cache-fairness, conversations or shutdown-paused");
+        if (scenario == "all" || scenario == "shutdown-paused") { shutdown_paused(artifact, selected); }
         if (scenario == "all" || scenario == "replay") { exercise(artifact, selected, backend_name); }
         if (scenario == "all" || scenario == "cancel-paused") {
             exercise(artifact, selected, backend_name, CancelStage::Paused);
@@ -675,6 +835,10 @@ int main() {
         if ((scenario == "all" && setting("INFERNIX_TEST_CONSTRAINT", "none") == "none") ||
             scenario == "cache-fairness") {
             fairness(artifact, selected, backend_name, true);
+        }
+        if ((scenario == "all" && setting("INFERNIX_TEST_CONSTRAINT", "none") == "none") ||
+            scenario == "conversations") {
+            conversations(artifact, selected, backend_name);
         }
     } catch (const std::exception& error) {
         std::cerr << "real Engine preemption test failed: " << error.what() << '\n';

@@ -3,6 +3,12 @@ add_library(infernix_ops STATIC)
 infernix_internal_includes(infernix_ops)
 infernix_cuda_archive(infernix_ops)
 target_link_libraries(infernix_ops PUBLIC infernix_core PRIVATE infernix_nvfp4_non_rdc infernix_gemma4_ops)
+# The kernel images' RAM estimate follows the build's image size (launcher/kernel_images.cu): one source's definition,
+# so switching the option recompiles every CUDA source for the flag itself and nothing else for this.
+if(INFERNIX_CUDA_LINEINFO)
+  set_source_files_properties("${CMAKE_CURRENT_LIST_DIR}/launcher/kernel_images.cu"
+    PROPERTIES COMPILE_DEFINITIONS INFERNIX_CUDA_LINEINFO=1)
+endif()
 
 # Warp-specialized SM120 NVFP4 kernels use setmaxnreg to transfer registers from
 # producer to consumer warpgroups. RDC makes ptxas discard that contract. These
@@ -29,6 +35,7 @@ include(basic_sources.cmake)
 include("${CMAKE_CURRENT_LIST_DIR}/attn_input_proj/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/candidate_selector/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/context_kv_materialize/sources.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/direction_cut/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/dynamic_grouped_conv/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/gdn_gating_proj/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/gdn_input_proj/sources.cmake")
@@ -43,6 +50,7 @@ include("${CMAKE_CURRENT_LIST_DIR}/linear_swiglu/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_topk/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/offloaded_sparse_moe/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/ple/sources.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/lora/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/lossless/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/projection_fp32/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/qsa/sources.cmake")

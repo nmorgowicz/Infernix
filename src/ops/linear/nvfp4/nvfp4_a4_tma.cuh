@@ -11,6 +11,7 @@
 #include "ops/common/math.h"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/common/vector_output.cuh"
+#include "ops/lora/lora_device.cuh"
 
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -156,6 +157,16 @@ union alignas(128) Nvfp4A4TmaScratch {
     }();
     unsigned char epilogue_scratch[kEpilogueBytes];
     __nv_bfloat16 output[Schedule::kBlockTokens * (Schedule::kBlockRows + 8)];
+    // A wide adapter instance's term operands: B's rows and one segment's U columns over the whole tile in unpadded
+    // rows (lora_add_tokens_tile_staged_swizzled); one byte for every other instance, whose size is unchanged.
+    static constexpr int kLoraBytes = [] {
+        if constexpr (kLoraEpilogue<Epilogue>) {
+            if constexpr (kLoraStageRank<Epilogue> > kLoraNarrowRank)
+                return (Schedule::kBlockRows + Schedule::kBlockTokens) * 2 * kLoraStageRank<Epilogue>;
+        }
+        return 1;
+    }();
+    unsigned char lora_scratch[kLoraBytes];
 };
 
 template <class Schedule, class Rows, class Epilogue>
@@ -243,7 +254,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
     constexpr int loaded_rows = Schedule::kBlockRows / branches;
     static_assert(Schedule::kStages >= 2, "the activation-scale buffer needs two slots");
 
-    extern __shared__ __align__(128) unsigned char shared_bytes[];
+    extern __shared__ __align__(1024) unsigned char shared_bytes[];
     auto& shared =
         *reinterpret_cast<Nvfp4A4TmaSharedStorage<Schedule, Rows, Epilogue>*>(shared_bytes);
     int block_x = 0;
@@ -470,6 +481,30 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
             output, shared_bytes, accumulators, row_begin, token_begin, output_rows, token_count);
     };
     static_assert(!Rows::kPaired || collective, "paired TMA rows require a collective epilogue");
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        // The scaled values (the rounded multiply below), the term, then the epilogue scaling by 1 (exact).
+#pragma unroll
+        for (int mt = 0; mt < Schedule::kMmaTokens; ++mt)
+#pragma unroll
+            for (int mr = 0; mr < Schedule::kMmaRows; ++mr)
+#pragma unroll
+                for (int v = 0; v < 4; ++v) accumulators[mt][mr][v] = __fmul_rn(accumulators[mt][mr][v], alpha);
+        // The tensor storage is free (every consumer passed the barrier above): the term's operands stage there.
+        constexpr int per_branch = Schedule::kMmaRows / branches;
+        lora_add_tokens_tile_staged<Schedule::kBlockTokens, Schedule::kBlockRows,
+                                    static_cast<int>(sizeof(shared.scratch))>(
+            epilogue.lora, accumulators,
+            [&](int mt, int i) { return warp_m * Schedule::kWarpTokens + mt * 16 + i; },
+            [&](int mr, int j) {
+                return (mr / per_branch) * loaded_rows + warp_n * (Schedule::kWarpRows / branches) +
+                       (mr % per_branch) * 8 + j;
+            },
+            [&](int i) { return row_begin + (i / loaded_rows) * (output_rows / 2) * (branches - 1) + i % loaded_rows; },
+            token_begin, token_count, reinterpret_cast<unsigned char*>(&shared.scratch), consumer_thread,
+            Schedule::kConsumerThreads,
+            [] { asm volatile("bar.sync 1, %0;" : : "r"(Schedule::kConsumerThreads) : "memory"); });
+        alpha = 1.0F;
+    }
     // Scale with an explicit rounded multiply: the residual add after it must not contract into one
     // FMA in the FullTokens instance only, or a column's bits would depend on whether its tile is
     // full (NInfer Neroued/ninfer#374). Every A4 route rounds the product, then the sum.
@@ -547,7 +582,7 @@ void launch_nvfp4_a4_tma_mma(const Nvfp4A4Operands& p, Output output, Epilogue e
         // Static: MSVC 2022 rejects the lambda's use of an automatic constexpr local (C2326).
         static constexpr int bytes   = sizeof(Nvfp4A4TmaSharedStorage<Schedule, Rows, Epilogue>);
         static constexpr auto kernel = nvfp4_a4_tma_kernel<Schedule, Epilogue, Output, Rows, InPlace>;
-        (void)nvfp4_prepare_shared<bytes, kernel, true>();
+        (void)prepare_dynamic_shared<bytes, kernel, true>();
         for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
             const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, Schedule::kBlockTokens));
             kernel<<<grid, Schedule::kThreads, bytes, stream>>>(parameter, p.alpha, epilogue, output,

@@ -160,11 +160,24 @@ public:
         std::optional<DeviceKVPageLease> tail_lease; // handed over as the Device tail when present
         runtime::prefix_cache::SnapshotKind kind = runtime::prefix_cache::SnapshotKind::Tap;
         double claim = 0.0; // the new snapshot's estimate_priority
+        // The claim its publication takes a snapshot entry with when the table is full (absent: its own priority,
+        // PrefixCacheIndex::publish_host_snapshot). A pause's resume point passes kResumePointClaim, as for its
+        // slabs: refused an entry, its image is dropped and the resume replays.
+        std::optional<double> publish_claim;
         StateImageHeader meta;
         std::optional<runtime::prefix_cache::SnapshotRef> supersedes;
         // When `supersedes` is the snapshot the lane resumed from: the lane's tokens from its frontier
         // on, so the endpoints the lineage went past are superseded too (PrefixCacheIndex::supersede).
         std::vector<TokenId> continuation;
+        // What the capture replaces in its own lineage when the Host tier has no room for it, so that it does not
+        // lose its conversation's state to a low claim (hybrid-prefix-cache-spec §9.3): the snapshot the lane resumed
+        // from (`continuation` as above), and for an endpoint of a lineage that resumes at endpoints the capture id of
+        // this turn's generation-opener tap, which that lineage's next turn does not read. The tap is also superseded
+        // once the endpoint publishes, so it is the first to give way.
+        std::optional<runtime::prefix_cache::SnapshotRef> replaces_source;
+        std::uint64_t replaces_opener = 0;
+        // `replaces_source` was superseded for this capture's room: undone if nothing is published.
+        bool source_superseded = false;
     };
     // Returns false when no slabs could be reserved for its claim (the capture is skipped).
     [[nodiscard]] bool capture(std::uint32_t lane, Capture&& capture, cudaStream_t producer);
@@ -173,8 +186,12 @@ public:
     // so each group (with that layer's planes of the tail page) is copied once the walk has enqueued
     // that layer of the frontier's chunk, and the capture is committed after the span. Opening
     // reserves the slabs (nothing when none could be reserved: the capture is skipped) and the
-    // events the lane's next writes to each group wait on (staged_events, layer order).
-    [[nodiscard]] std::optional<std::uint64_t> open_staged_capture(bool tail, double claim);
+    // events the lane's next writes to each group wait on (staged_events, layer order). `replaces_source` and
+    // `continuation` as Capture's: the source is superseded for its room, and retained again if the capture is
+    // abandoned.
+    [[nodiscard]] std::optional<std::uint64_t>
+    open_staged_capture(bool tail, double claim, std::optional<runtime::prefix_cache::SnapshotRef> replaces_source,
+                        std::span<const TokenId> continuation);
     void capture_group(std::uint64_t staged, std::uint32_t group, std::uint32_t lane,
                        std::optional<DeviceKVPageHandle> tail_page, cudaStream_t producer);
     [[nodiscard]] std::span<const cudaEvent_t> staged_events(std::uint64_t staged) const;
@@ -197,6 +214,13 @@ public:
     void poll();
     // Waits for every capture, write and restore in flight and publishes them.
     void drain();
+    // Room-making's wait: for the oldest transfer whose landing can free Device memory, and publishes what landed. A
+    // Host write unpins its blocks and a capture hands over its tail page as it lands, so the oldest of those goes
+    // first (one transfer stream: everything queued before it lands with it); without one, the oldest restore,
+    // while blocks are held only by transfers. False when nothing in flight could free anything. Unlike drain(), it
+    // never waits for every restore at once: another lane's restore lands blocks that lane maps, and waiting for
+    // all of them stalled every lane behind gigabytes of copies.
+    bool settle_oldest_transfer();
 
     // ---- SSD tier (hybrid-prefix-cache-spec §5.7) ----------------------------------------------
     [[nodiscard]] runtime::prefix_cache::SsdTier* ssd() noexcept { return ssd_.get(); }
@@ -211,16 +235,28 @@ public:
     void make_lossless_room(std::uint64_t slabs);
     // Whether service_ssd would start a write-back now.
     [[nodiscard]] bool ssd_due() const noexcept { return ssd_ && ssd_->write_back_due(); }
+    [[nodiscard]] std::optional<std::chrono::steady_clock::time_point> ssd_retry_at() const noexcept {
+        return ssd_ ? ssd_->write_back_retry_at() : std::nullopt;
+    }
     // Starts reading the parts of `snapshot` only on the SSD into the Host tier.
     [[nodiscard]] runtime::prefix_cache::SsdTier::Promotion promote(runtime::prefix_cache::SnapshotRef snapshot);
     [[nodiscard]] bool transfers_pending() const noexcept {
         return !captures_.empty() || !writes_.empty() || !landing_.empty();
     }
-    // Waits for an endpoint copy-out a prompt extends (its anchor is on the prompt's matched `path`
-    // and its tail tokens continue the prompt), and publishes it. Only such a prompt waits; the
-    // copy is first in the transfer stream, at most an image's copy time. Returns whether it waited.
-    [[nodiscard]] bool await_extended_endpoint(std::span<const runtime::prefix_cache::NodeRef> path,
-                                               std::span<const TokenId> tokens);
+    // Waits for the copy-outs a prompt extends (a capture whose anchor is on the prompt's matched `path` and whose
+    // tail tokens continue the prompt), and publishes them. Only such a prompt waits, at most the copy time of the
+    // images queued up to the last of them. An endpoint is the previous turn's; a tap or boundary is one a lane
+    // still prefilling, or just past its prompt, took: a tap of a prompt's last unit lands after that unit's
+    // progress, so a request coalesced onto it finds it here at its next quote instead of at some later event.
+    // `endpoints` false (no free cache resume: an endpoint serves no resume) leaves endpoints out. Returns whether
+    // it waited.
+    [[nodiscard]] bool await_extended_capture(std::span<const runtime::prefix_cache::NodeRef> path,
+                                              std::span<const TokenId> tokens, bool endpoints);
+    // Waits for capture `id` alone (and what the transfer stream holds before it) and publishes it; false when it
+    // is not in flight (landed, skipped or unknown): nothing is waited for.
+    bool await_capture(std::uint64_t id);
+    // Whether capture `id` is still copying (not yet published). A forgotten result is not pending.
+    [[nodiscard]] bool capture_pending(std::uint64_t id) const noexcept { return !capture_events(id).empty(); }
     // The publication of a landed capture (absent while it is in flight); forget it when done.
     [[nodiscard]] std::optional<runtime::prefix_cache::PublishResult> capture_result(std::uint64_t id) const;
     void forget_capture(std::uint64_t id) noexcept;
@@ -247,6 +283,9 @@ public:
     // Waits on the host for a landing batch (and every batch before it) and retires what landed.
     void await_restore(RestoreTicket ticket);
     void abort_restore() noexcept;
+    // An activation failed with the batch open, possibly part enqueued: waits for the restore stream, then aborts
+    // the batch, so no later restore finds one open and no page returns under a copy.
+    void fail_restore() noexcept;
 
     // Releases every reference the cache holds; the index is rebuilt empty.
     void clear() noexcept;
@@ -299,7 +338,17 @@ private:
         bool tail = false;
         std::vector<cudaEvent_t> events; // decoder layers, then MTP; each recorded once its group is copied
         std::uint32_t copied = 0;        // groups copied
+        // The source its reservation superseded for room (open_staged_capture).
+        std::optional<runtime::prefix_cache::SnapshotRef> superseded;
     };
+    // Reserves a capture's image: on a shortage its lineage's source gives way, then `replaces_opener`'s tap (the
+    // wait for that tap's copy is an image's copy time). `superseded` names the source when it was superseded here.
+    [[nodiscard]] std::optional<runtime::prefix_cache::HostImageReservation>
+    reserve_capture(bool tail, double claim, std::optional<runtime::prefix_cache::SnapshotRef> replaces_source,
+                    std::span<const TokenId> continuation, std::uint64_t replaces_opener,
+                    std::optional<runtime::prefix_cache::SnapshotRef>& superseded);
+    // The snapshot of a published capture that is a generation-opener tap.
+    [[nodiscard]] std::optional<runtime::prefix_cache::SnapshotRef> published_opener(std::uint64_t id) const;
     // The image's segments, as HostImage takes them.
     [[nodiscard]] std::vector<std::byte*> image_segments(const runtime::prefix_cache::HostImageReservation& image) const;
     // Group g's copy-out (its layer's planes of a tail page first) on the transfer stream.
@@ -318,7 +367,8 @@ private:
         bool open = false;
         RestoreTicket ticket;
         std::vector<runtime::prefix_cache::NodeRef> nodes; // Filling until the batch lands
-        std::vector<runtime::prefix_cache::NodeRef> pins;
+        std::vector<runtime::prefix_cache::NodeRef> pins;    // restore destinations (pin_node)
+        std::vector<runtime::prefix_cache::NodeRef> retains; // Host slabs a copy reads (retain_node)
         std::vector<runtime::prefix_cache::SnapshotRef> snapshot_pins;
         std::vector<PageCopy> pages;
         std::optional<runtime::prefix_cache::SnapshotRef> image;

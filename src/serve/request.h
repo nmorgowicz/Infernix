@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -35,6 +36,17 @@ struct ApiError {
     // A queue-pressure answer's Retry-After (seconds; 0 sends none): the server's admission window.
     std::uint32_t retry_after_seconds = 0;
 };
+
+// The 500 for an exception a request's handling did not expect, with its message. `type` is the protocol's name for
+// it: OpenAI Chat Completions' internal_error, the Responses API's server_error.
+[[nodiscard]] inline ApiError internal_server_error(const std::exception& exception,
+                                                    std::string type = "internal_error") {
+    ApiError error;
+    error.status  = 500;
+    error.type    = std::move(type);
+    error.message = exception.what();
+    return error;
+}
 
 class ApiException : public std::runtime_error {
 public:
@@ -63,6 +75,7 @@ enum class ContentKind {
     Text,
     Image,
     Video,
+    Document, // a document or search result, resolved before translation (documents.h)
 };
 
 struct CacheBoundary {
@@ -79,12 +92,59 @@ struct CacheBoundary {
     [[nodiscard]] friend constexpr bool operator==(CacheBoundary, CacheBoundary) noexcept = default;
 };
 
+// A document or search result as the client sent it. resolve_documents (documents.h) decodes, chunks and renders
+// it after parsing, so parsing stays free of I/O and Count Tokens resolves exactly what Messages runs.
+struct DocumentSource {
+    enum class Kind : std::uint8_t {
+        Document,     // Anthropic `document`; OpenAI file inputs
+        SearchResult, // Anthropic `search_result`
+    };
+    enum class Format : std::uint8_t {
+        Text,    // `text`: plain text, chunked into sentences
+        Content, // `blocks`: custom content (a document's content source, a search result's content), a chunk each
+        Pdf,     // `pdf`: a PDF file, each page's text chunked into sentences
+    };
+    Kind kind     = Kind::Document;
+    Format format = Format::Text;
+    std::string title;   // optional for a document, required for a search result
+    std::string context; // a document's context: shown to the model, never cited
+    std::string source;  // a search result's source (its URL or name)
+    std::string text;
+    std::vector<std::string> blocks;
+    infernix::product::media_acquire::Source pdf;
+    std::string filename; // an OpenAI file input's name, the title when it has none
+    bool citations = false;
+};
+
+// A citation an assistant history text block carries (the location fields of an Anthropic citation), so the
+// block renders back as the cite tag the model wrote (documents.h).
+struct CitationLocation {
+    enum class Kind : std::uint8_t {
+        Char,         // char_location: [start, end) in code points
+        Page,         // page_location: [start, end) page numbers, 1-based
+        ContentBlock, // content_block_location: [start, end) content blocks
+        SearchResult, // search_result_location: [start, end) content blocks of a search result
+    };
+    Kind kind                = Kind::Char;
+    std::size_t source_index = 0; // document_index, or search_result_index
+    std::uint64_t start      = 0;
+    std::uint64_t end        = 0;
+    std::string cited_text;
+
+    [[nodiscard]] friend bool operator==(const CitationLocation&, const CitationLocation&) = default;
+};
+
 struct ContentPart {
     ContentKind kind = ContentKind::Text;
     std::string text;     // populated for Text
     std::string type_raw; // original wire "type" string for diagnostics
     infernix::product::media_acquire::Source source;
     infernix::ImageResizePolicy image_resize_policy = infernix::ImageResizePolicy::Downsize;
+    std::shared_ptr<const DocumentSource> document; // populated for Document
+    std::vector<CitationLocation> citations;        // an assistant text block's citations
+    // A PDF page image resolve_documents rendered: the vision budget bounds it, so the request's media byte budget,
+    // already charged with the PDF, does not count it again.
+    bool derived = false;
     std::optional<CacheBoundary> cache_boundary_after;
 };
 
@@ -97,8 +157,19 @@ struct ToolDefinition {
     // A deferred tool is declared for parsing and constraints but left out of the prompt's tool
     // list; the model sees its definition only where a later turn loads it (ChatTurn::loaded_tools).
     bool deferred = false;
+    // Declared by an Anthropic mid-conversation tool_addition without defer_loading: the model saw it where it was
+    // added (`deferred` is set as well, so the tool section never lists it), so a server tool search does not offer
+    // it again.
+    bool shown_in_messages = false;
     std::optional<std::string> input_examples_json;
     std::optional<CacheBoundary> cache_boundary_after;
+};
+
+// A declared tool an Anthropic conversation withdrew (tool_removal) or redefined (a tool_addition of another
+// definition), as at the end of its history: `definition` is the newer one, nullopt a withdrawal.
+struct ToolContractChange {
+    std::string name;
+    std::optional<ToolDefinition> definition;
 };
 
 struct ToolCall {
@@ -198,6 +269,10 @@ struct GenerationRequest {
     NgramSessionHints ngram_session;
     std::vector<ChatTurn> messages;
     std::vector<ToolDefinition> tools;
+    // Declared tools the conversation withdrew or redefined after declaring them (Anthropic mid-conversation
+    // system messages). The prompt keeps every declaration where the conversation saw it; the output contract
+    // follows these (translate.cpp contract_declarations).
+    std::vector<ToolContractChange> tool_contract_changes;
     // The client knows tools it does not declare (Anthropic Messages with a deferred tool and no
     // server tool search: Claude Code's MCP tools, listed by name only): infernix::PromptOptions::open_tool_names.
     bool open_tool_names = false;
@@ -262,6 +337,18 @@ struct GenerationRequest {
         for (auto tool = tools.rbegin(); tool != tools.rend(); ++tool) {
             if (!tool->deferred) { return &*tool; }
         }
+        return nullptr;
+    }
+
+    // Where a request-level (automatic) prompt-cache boundary goes, or nullptr: after the last turn that has tool
+    // calls or loaded tools, else after the last turn's last content part, else after the last listed tool.
+    [[nodiscard]] std::optional<CacheBoundary>* automatic_cache_boundary_target() noexcept {
+        for (auto turn = messages.rbegin(); turn != messages.rend(); ++turn) {
+            // Calls and loaded tool definitions render after the turn's content parts.
+            if (!turn->tool_calls.empty() || !turn->loaded_tools.empty()) { return &turn->cache_boundary_after; }
+            if (!turn->content.empty()) { return &turn->content.back().cache_boundary_after; }
+        }
+        if (ToolDefinition* listed = last_listed_tool()) { return &listed->cache_boundary_after; }
         return nullptr;
     }
 };

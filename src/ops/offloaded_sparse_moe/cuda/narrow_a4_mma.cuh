@@ -1,7 +1,6 @@
 // The tensor-core narrow route of NVFP4 W4A4 experts (design §16.2's arithmetic), included by moe_layer.cu after the
 // A16 tensor-core route: the jobs of a call of at most moe::kMaxColumns columns (decode and verification at one
-// lane; calls of at most moe::wide::kA4RowsMaxColumns take narrow_rows_a4.cuh's row pairs where its workspace planes
-// exist) at Qwen3.8-Flash-Next's geometry, for banks whose experts all share their gate and up input scales
+// lane) at Qwen3.8-Flash-Next's geometry, for banks whose experts all share their gate and up input scales
 // (a4_nmma_call). Every row sum S = sum_b P_b e4m3_scaled(w_b) e4m3_scaled(a_b), with P_b the block's exact sum of
 // doubled E2M1 code products, is the same int64 as the one-column kernels' (unit_sums) and the CPU engine's, so the
 // outputs are theirs bit for bit wherever an expert runs.
@@ -27,7 +26,7 @@ constexpr int kNmma4GuWarps    = kNmma4Warps * kNmma4KSplit;
 constexpr int kNmma4GuThreads  = 32 * kNmma4GuWarps;   // a gate/up CTA
 constexpr int kNmma4StageUnits = 8;  // units per stage of a gate/up warp's ring (1,152 bytes)
 constexpr int kNmma4Depth      = 3;  // stages in a gate/up warp's ring
-constexpr int kNmma4EncodeMinColumns = 4; // calls from this width encode x once per job (encode_nmma4_kernel)
+constexpr int kNmma4EncodeMinColumns = 2; // calls from this width encode x once per job (encode_nmma4_kernel)
 
 template <class G>
 struct Nmma4Shape {
@@ -145,8 +144,8 @@ __global__ void __launch_bounds__(G::kHidden / 16) encode_nmma4_kernel(Nmma4Args
     if (pass_record(a.phase, a.source, expert, a.job_records, job) == nullptr) { return; } // another pass's job
     const moe::ExpertScales scales = a.source.scales[expert];
     const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
-    if (c >= count || moe::wide_route(count, scales)) { return; }
-    const int token = dispatch.entries[first + c] / a.top_k;
+    if (c >= count || moe::wide_route(moe::route_count(dispatch, expert), scales)) { return; }
+    const int token = moe::wide::entry_column(dispatch.entries[first + c], a.top_k, dispatch.shared_first);
     nmma4_encode_block<G>(a.x + static_cast<std::size_t>(token) * G::kHidden, scales.input_gate, static_cast<int>(threadIdx.x),
                           a.x_rows + static_cast<std::size_t>(first + c) * Nmma4Shape<G>::kXRowBytes);
 }
@@ -204,7 +203,7 @@ __global__ void __launch_bounds__(kNmma4GuThreads) gate_up_nmma4_kernel(Nmma4Arg
     if (record == nullptr) { return idle(); }
     const moe::ExpertScales scales = a.source.scales[expert];
     const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
-    if (moe::wide_route(count, scales)) { return idle(); }
+    if (moe::wide_route(moe::route_count(dispatch, expert), scales)) { return idle(); }
     const int lane = static_cast<int>(threadIdx.x) % 32, warp = static_cast<int>(threadIdx.x) / 32;
     const int g = lane / 4, t = lane % 4;
     const int rg = warp % kNmma4Warps, k_half = warp / kNmma4Warps; // this warp's row group in the CTA and K half
@@ -234,7 +233,7 @@ __global__ void __launch_bounds__(kNmma4GuThreads) gate_up_nmma4_kernel(Nmma4Arg
         // The job's columns' A4(x) while the rings fill: one block of one column a thread.
         for (int i = static_cast<int>(threadIdx.x); i < count * (G::kHidden / 16); i += kNmma4GuThreads) {
             const int c = i / (G::kHidden / 16), b = i % (G::kHidden / 16);
-            const int token = dispatch.entries[first + c] / a.top_k;
+            const int token = moe::wide::entry_column(dispatch.entries[first + c], a.top_k, dispatch.shared_first);
             nmma4_encode_block<G>(a.x + static_cast<std::size_t>(token) * G::kHidden, scales.input_gate, b, sm.x[c]);
         }
     }
@@ -339,7 +338,7 @@ __global__ void __launch_bounds__(kNmma4Threads) down_nmma4_kernel(Nmma4Args a) 
         scales = a.source.scales[expert];
         first  = dispatch.offsets[expert];
         count  = dispatch.offsets[expert + 1] - first;
-        if (moe::wide_route(count, scales)) { record = nullptr; }
+        if (moe::wide_route(moe::route_count(dispatch, expert), scales)) { record = nullptr; }
     }
     const int lane = static_cast<int>(threadIdx.x) % 32, warp = static_cast<int>(threadIdx.x) / 32;
     const int g = lane / 4, t = lane % 4;
@@ -392,6 +391,16 @@ __global__ void __launch_bounds__(kNmma4Threads) down_nmma4_kernel(Nmma4Args a) 
     }
 }
 
+// Clears the call's jobs' gate/up CTA counts (prepare_x: once per call, before its passes).
+__global__ void __launch_bounds__(kThreads) a4_nmma_clear_kernel(std::uint32_t* __restrict__ job_counts, int max_jobs) {
+    for (int j = static_cast<int>(threadIdx.x); j < max_jobs; j += kThreads) { job_counts[j] = 0U; }
+}
+
+void launch_prepare_a4_nmma(int max_jobs, const moe::wide::ExpertsWorkspace& layout, cudaStream_t stream) {
+    a4_nmma_clear_kernel<<<1, kThreads, 0, stream>>>(layout.job_ctas, max_jobs);
+    check_launch("A4 tensor-core prepare");
+}
+
 // One pass of the tensor-core narrow kernels: a gate/up CTA per kNmma4Warps row groups and a down CTA per
 // kNmma4Warps output row groups of each job.
 void launch_expert_pass_a4_nmma(const bf16* x, int columns, const MoeDispatch& dispatch, const MoeExpertSource& source,
@@ -404,7 +413,9 @@ void launch_expert_pass_a4_nmma(const bf16* x, int columns, const MoeDispatch& d
     // Calls of kNmma4EncodeMinColumns columns or more encode each job's x once (encode_nmma4_kernel); narrower ones in
     // each gate/up CTA. FP4-Local with per-job x (2026-11-02, DFlash2 auto, three interleaved runs each): never encoding
     // lost 0.4-0.6 % on every workload, encoding at every width was level (conv +0.2 %, after a 16K prompt +0.2 %,
-    // struct -0.2 %); op bench: T = 1-3 0.88-0.95x the time without it, T = 4-8 level to 3 % faster.
+    // struct -0.2 %); op bench: T = 1-3 0.88-0.95x the time without it, T = 4-8 level to 3 % faster. From two columns
+    // since these kernels took one to three columns again (2026-11-20, design §19.3.53): Dense8's op bench (a4, frames,
+    // CUDA graph, cold L2, same hashes) T = 2 47.1 -> 45.1 us, T = 3 59.4-61.5 -> 57.3-59.4, T = 1 34.8 either way.
     const bool encoded = layout.x_plane != nullptr && std::min(columns, moe::kMaxColumns) >= kNmma4EncodeMinColumns;
     Nmma4Args args{reinterpret_cast<const std::uint16_t*>(x), dispatch, source, top_k, job_records, flags, base,
                    layout.h_blocks, outputs, phase, encoded ? layout.x_plane : nullptr};

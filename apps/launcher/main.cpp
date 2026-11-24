@@ -8,11 +8,11 @@
 
 #include <curl/curl.h>
 
-#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -32,7 +32,27 @@ namespace {
 using infernix::launcher::Launcher;
 using infernix::launcher::LauncherOptions;
 
-std::atomic<Launcher*> g_launcher{nullptr};
+// The launcher the stop handlers (the console control handler, the POSIX signal thread) act on, null outside main's
+// hold of it. The mutex is held while a handler stops it and while main lets it go, so a handler never uses a launcher
+// main has destroyed; the mutex itself is never destroyed, so a signal during static destruction still finds it.
+std::mutex& launcher_mutex() {
+    static auto* mutex = new std::mutex;
+    return *mutex;
+}
+Launcher* g_launcher = nullptr; // launcher_mutex()
+
+void set_launcher(Launcher* launcher) {
+    std::lock_guard lock(launcher_mutex());
+    g_launcher = launcher;
+}
+
+void stop_launcher() {
+    std::lock_guard lock(launcher_mutex());
+    if (g_launcher == nullptr) { return; }
+    std::printf("\nstopping: the loaded model is stopped in order (it saves its caches)...\n");
+    std::fflush(stdout);
+    g_launcher->stop();
+}
 
 void print_usage(const char* program) {
     std::printf(
@@ -48,6 +68,8 @@ void print_usage(const char* program) {
         "  --serve FILE      the infernix-serve executable (default: beside the launcher)\n"
         "  --no-browser      do not open the web UI in a browser\n"
         "  --ui-dir DIR      serve the web UI from DIR instead of the built-in copy (development)\n"
+        "  --ablate-tool DIR the sidecar fitter the Ablation page runs: the folder holding\n"
+        "                    ablate.py (default: the ablate folder beside the launcher)\n"
         "  --version         print the build and exit\n"
         "  --help, -h        show this help and exit\n",
         program, infernix::launcher::path_utf8(infernix::launcher::user_data_dir()).c_str());
@@ -61,11 +83,7 @@ BOOL WINAPI on_console_event(DWORD event) {
     case CTRL_CLOSE_EVENT:
     case CTRL_LOGOFF_EVENT:
     case CTRL_SHUTDOWN_EVENT:
-        if (Launcher* launcher = g_launcher.load()) {
-            std::printf("\nstopping: the loaded model is stopped in order (it saves its caches)...\n");
-            std::fflush(stdout);
-            launcher->stop();
-        }
+        stop_launcher();
         return TRUE;
     default: return FALSE;
     }
@@ -115,6 +133,8 @@ int main(int argc, char** argv) {
             options.serve_executable = std::filesystem::absolute(infernix::launcher::utf8_path(value()));
         } else if (arg == "--ui-dir") {
             options.ui_dir = std::filesystem::absolute(infernix::launcher::utf8_path(value()));
+        } else if (arg == "--ablate-tool") {
+            options.ablate_tool = std::filesystem::absolute(infernix::launcher::utf8_path(value()));
         } else if (arg == "--no-browser") {
             options.open_browser = false;
         } else {
@@ -168,16 +188,15 @@ int main(int argc, char** argv) {
             curl_global_cleanup();
             return 1;
         }
-        g_launcher = launcher.get();
+        set_launcher(launcher.get());
 #ifdef _WIN32
         SetConsoleCtrlHandler(on_console_event, TRUE);
 #else
-        std::thread([&launcher, signals] {
+        // Left blocked in sigwait when main returns first; it touches only launcher_mutex() and g_launcher.
+        std::thread([signals] {
             int received = 0;
             sigwait(&signals, &received);
-            std::printf("\nstopping: the loaded model is stopped in order (it saves its caches)...\n");
-            std::fflush(stdout);
-            launcher->stop();
+            stop_launcher();
         }).detach();
 #endif
         const std::string url = launcher->ui_url();
@@ -195,7 +214,7 @@ int main(int argc, char** argv) {
         std::fflush(stdout);
         launcher->serve();
         launcher->stop();
-        g_launcher = nullptr;
+        set_launcher(nullptr); // waits for a handler still stopping it
     }
     curl_global_cleanup();
     return status;

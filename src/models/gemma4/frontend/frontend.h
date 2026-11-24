@@ -42,6 +42,8 @@ public:
     [[nodiscard]] std::string render(const PromptInput& input) const;
     [[nodiscard]] ChatTokens tokenize_chat(PromptInput input) const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const noexcept { return {}; }
+    // Text-only runtime: no attached vision processor, so every image-budget dimension is zero.
+    [[nodiscard]] VisionImageBudget vision_image_budget() const noexcept { return {}; }
     [[nodiscard]] OutputSession make_output_session(const PreparedPrompt& prompt,
         const StopPolicy& caller_stop, const OutputOptions& output = {},
         const ThinkingControlOptions& thinking = {},

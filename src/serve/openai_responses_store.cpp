@@ -15,6 +15,13 @@ std::size_t estimate_turn_bytes(const ChatTurn& turn) {
         bytes += sizeof(ContentPart) + part.text.size() + part.type_raw.size() +
                  part.source.value.size() + part.source.media_type.size() +
                  part.source.bytes.size();
+        if (const DocumentSource* document = part.document.get()) {
+            // A stored input_file keeps its PDF (base64 or URL) for the chain's later turns.
+            bytes += sizeof(DocumentSource) + document->title.size() + document->context.size() +
+                     document->source.size() + document->filename.size() + document->text.size() +
+                     document->pdf.value.size() + document->pdf.bytes.size();
+            for (const std::string& block : document->blocks) { bytes += block.size(); }
+        }
     }
     for (const ToolCall& call : turn.tool_calls) {
         bytes += sizeof(ToolCall) + call.id.size() + call.name.size() + call.arguments_json.size();
@@ -108,6 +115,23 @@ std::shared_ptr<const StoredOpenAIResponse> OpenAIResponsesStore::get(const std:
     if (found == records_.end()) { return {}; }
     lru_.splice(lru_.begin(), lru_, found->second.lru);
     return found->second.response;
+}
+
+void OpenAIResponsesStore::check_input_capacity(const OpenAIResponseContext& previous,
+                                                const std::vector<ChatTurn>& input_turns,
+                                                const std::vector<nlohmann::json>& input_items) const {
+    std::size_t bytes = sizeof(StoredOpenAIResponse) + (previous ? previous->cumulative_bytes : 0U);
+    for (const ChatTurn& turn : input_turns) { bytes += estimate_turn_bytes(turn); }
+    for (const nlohmann::json& item : input_items) { bytes += sizeof(nlohmann::json) + item.dump().size(); }
+    if (bytes <= max_bytes_) { return; }
+    ApiError error;
+    error.status  = 400;
+    error.code    = "response_store_capacity_exceeded";
+    error.param   = "store";
+    error.message = "the request needs " + std::to_string((bytes + (1U << 20) - 1U) >> 20) +
+                    " MiB of the local response store, more than its " + std::to_string(max_bytes_ >> 20) +
+                    " MiB (--response-store-max-mib): send it with store: false";
+    throw ApiException(std::move(error));
 }
 
 void OpenAIResponsesStore::put(StoredOpenAIResponse response) {

@@ -18,6 +18,11 @@
 
 namespace infernix::ops {
 
+// The checks ggml_linear and ggml_linear_encoded make of a call's outputs and segments (one dtype, BF16 or FP32;
+// GGML formats whose blocks divide K; layouts their formats support; rows inside their outputs): the 8-bit
+// encoded entry, which takes no ggml_linear call first, makes them too.
+void ggml_linear_validate_call(int k, int columns, std::span<const GgmlSegment> segments, std::span<Tensor* const> outs);
+
 // The widest call of the narrow route (ggml_linear's narrow calls: one below its tiles' kTileMinColumns).
 inline constexpr std::int32_t kA8MaxColumns = 31;
 // The narrowest call of the wide route (ggml_linear's wide calls, whose K is also a multiple of 64).
@@ -42,6 +47,11 @@ void ggml_linear_a8(const Tensor& x, std::span<const GgmlSegment> segments, std:
 // encoded column of K = k (codes, slice scales, then the sums where `sums`; ggml_linear_a8's column stride).
 [[nodiscard]] bool a8_linear_sums(std::span<const GgmlSegment> segments);
 [[nodiscard]] std::int32_t a8_linear_column_words(std::int32_t k, bool sums);
+
+// Every column of x (BF16 [K, T], K a multiple of 32) encoded by ops/ggml/ggml_a8.h's codec into `encoded` (I32
+// [a8_linear_column_words(K, false), T], no code sums): column t's K int8 codes, then its K / 32 binary32 slice
+// scales, columns 16-byte aligned. The 8-bit activations of the NVFP4 and other dense routes of `--a8-activations`.
+void a8_encode_columns(const Tensor& x, Tensor& encoded, cudaStream_t stream);
 
 // The wide route (ggml_linear_a8_wide.cu), for a call of kA8WideMinColumns or more columns of K a multiple of 64
 // with ggml_linear's validated arguments: the segments' decoded planes (at most kA8WidePlaneBytes) and the encoded

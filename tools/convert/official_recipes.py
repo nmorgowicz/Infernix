@@ -35,11 +35,14 @@ _DRAFT_BF16 = (
 )
 
 
-def _optional(model, recipe, *, method=grouped_absmax):
+def _optional(model, recipe, *, method=grouped_absmax, vision=True):
+    """The vision tower's grouped formats (``vision=False``: its stored values) and the drafters' Q8."""
     for name, parameter in model.parameters.items():
         if not parameter.projection:
             continue
         if name.startswith("vision/"):
+            if not vision:
+                continue
             if name == "vision/patch_embedding":
                 format = Q6
             elif name.startswith("vision/merger/"):
@@ -72,7 +75,7 @@ def _dflash_drafters(model, recipe, *, method=grouped_absmax):
 
 def _share_draft_context(model, recipe):
     for backend in ("dflash", "dflash2"):
-        if backend not in model.components:
+        if backend not in model.components or backend in model.grafted:
             continue
         layers = model.components[backend]["config"]["num_hidden_layers"]
         for layer in range(layers):
@@ -82,8 +85,9 @@ def _share_draft_context(model, recipe):
 
 
 def _dflash2_nvfp4_gate_up(model, recipe):
-    """Store each DFlash2 layer's MLP gate/up parent as NVFP4 with 16-bit activations."""
-    if "dflash2" not in model.components:
+    """Store each DFlash2 layer's MLP gate/up parent as NVFP4 with 16-bit activations (a grafted
+    drafter keeps its stored form)."""
+    if "dflash2" not in model.components or "dflash2" in model.grafted:
         return
     layers = model.components["dflash2"]["config"]["num_hidden_layers"]
     for layer in range(layers):
@@ -243,18 +247,49 @@ def qwen3_8_27b_nvfp4(model, recipe, sources):
         )
 
 
+# The MTP stem NVIDIA's Qwen3.8-27B-NVFP4-QAD export omits; its MTP decoder layer is byte for byte the
+# one nvidia/Qwen3.8-27B-NVFP4 carries, so that checkpoint's stem completes it (``--source mtp=PATH``).
+_MTP_STEM = {
+    "mtp/input_projection": "mtp.fc.weight",
+    "mtp/embedding_norm": "mtp.pre_fc_norm_embedding.weight",
+    "mtp/hidden_norm": "mtp.pre_fc_norm_hidden.weight",
+    "mtp/final_norm": "mtp.norm.weight",
+}
+
+
+def _stored_modelopt_format(model, name, store) -> str:
+    """A text projection's stored ModelOpt encoding: ``nvfp4`` (E2M1 codes, E4M3 block scales, FP32 global
+    and input scales) or per-tensor FP8 (``fp8_e4m3fn_row_bf16``), read from its first row."""
+    try:
+        stored = model.source(name, store).read_encoded(0, 1).format
+    except (TypeError, ValueError):  # no encoded rows: an unquantized matrix
+        stored = None
+    if stored not in ("nvfp4", FP8):
+        raise ValueError(f"{name}: expected a ModelOpt NVFP4 or per-tensor FP8 matrix, not {stored or 'values'}")
+    return stored
+
+
 def qwen3_8_27b_nvfp4_nvidia(model, recipe, sources):
-    """nvidia/Qwen3.8-27B-NVFP4 (ModelOpt AutoQuant) layout: every text MLP
-    projection is NVFP4; attention and GDN projections are per-row FP8. The
-    source output head is NVFP4, but the runtime registers the vocabulary
-    projection only for FP8, so it is dequantised and re-quantised there.
-    The DFlash2 drafter's MLP gate/up is quantized to NVFP4 (A16), the rest of
-    the drafter to Q8."""
+    """NVIDIA's ModelOpt mixed NVFP4/FP8 Qwen3.8-27B exports: nvidia/Qwen3.8-27B-NVFP4 (AutoQuant: every
+    text MLP projection NVFP4, attention and GDN projections per-tensor FP8) and
+    nvidia/Qwen3.8-27B-NVFP4-QAD (also the GDN projections of 38 of its 48 GDN layers NVFP4). Each text
+    projection keeps its stored encoding (``import_encoded``): NVFP4 codes and block scales with the
+    rounded reciprocal of ``weight_scale_2`` as the divisor and of ``input_scale`` as the A4 divisor
+    (``AllowA4``); FP8 codes with the per-tensor scale rounded to BF16 in every row (``AllowA8``). The
+    source output head is NVFP4, but NInfer registers the vocabulary projection only for Q8, Q6 and FP8, so
+    it is dequantised and re-quantised to Q8 (``grouped_absmax``, A16): on the QAD's quick perplexity corpus
+    0.0026 nats/token closer to the exact head than row-scaled FP8, for 0.5 % of NInfer's decode
+    (2026-11-19). An MTP stem the checkpoint lacks comes from ``--source mtp``
+    (``_MTP_STEM``). The DFlash2 drafter's MLP gate/up is quantized to NVFP4 (A16), the rest of the
+    drafter to Q8; a grafted one keeps its stored form."""
     if "num_experts" in model.config:
         raise ValueError("this official recipe requires Qwen3.5 Dense mathematics")
     _optional(model, recipe)
     _dflash2_nvfp4_gate_up(model, recipe)
     quantized = sources["quantized"]
+    if "mtp" in model.components and not sources["base"].has(_MTP_STEM["mtp/input_projection"]):
+        for name in _MTP_STEM:
+            recipe.assign(name, source=model.source(name, sources["mtp"]))
     recipe.assign("text/token_embedding", format=FP8, method=fp8_row_maxabs)
     for name, parameter in model.parameters.items():
         if not name.startswith("text/") or name == "text/token_embedding":
@@ -268,17 +303,13 @@ def qwen3_8_27b_nvfp4_nvidia(model, recipe, sources):
         if name == "text/output_head":
             recipe.assign(
                 name,
-                format=FP8,
-                method=fp8_row_maxabs,
+                format=Q8,
+                method=grouped_absmax,
                 source=source,
-                activation_policy="AllowA8",
+                activation_policy="A16Only",
             )
             continue
-        format = (
-            "nvfp4"
-            if name.startswith("text/layers/") and "/mlp/" in name
-            else FP8
-        )
+        format = _stored_modelopt_format(model, name, quantized)
         recipe.assign(
             name,
             format=format,
@@ -286,6 +317,63 @@ def qwen3_8_27b_nvfp4_nvidia(model, recipe, sources):
             source=model.source(name, quantized, format),
             activation_policy="AllowA4" if format == "nvfp4" else "AllowA8",
         )
+
+
+def qwen3_8_27b_nvfp4_nvidia_exact(model, recipe, sources):
+    """NVIDIA's ModelOpt mixed NVFP4/FP8 Qwen3.8-27B exports (nvidia/Qwen3.8-27B-NVFP4-QAD, and the same
+    layout of nvidia/Qwen3.8-27B-NVFP4), bit-exact: every weight NVIDIA stores keeps its words and FP32 scales.
+
+    - NVFP4 text projections and the output head: ``nvfp4_mul`` in ``block_scale_k16_m128x4_v1`` (E2M1 codes,
+      E4M3 block scales, ``weight_scale_2`` as the multiplier). The projections are ``AllowA4`` with the
+      matrix's ``input_scale`` as the activation scale (NVIDIA's W4A4: the engine encodes with fl32(1 / s) and
+      scales the products by fl32(s * weight_scale_2), as vLLM does); the head is ``A16Only``.
+    - Per-tensor FP8 projections: ``fp8_e4m3fn_row_f32`` (``weight_scale`` in every row), ``AllowA8`` with the
+      static ``input_scale`` (NVIDIA's W8A8).
+    - Every BF16 tensor keeps its value (token embedding, GDN a/b, norms, convolutions, the vision tower), and
+      ``A_log`` and ``dt_bias`` widen exactly to FP32.
+    - Only drafters are re-quantized, as the exact Flash-Next recipes do: the MTP layer (Q8 projections; a
+      stem the checkpoint lacks from ``--source mtp``, ``_MTP_STEM``), the proposal head, and a converted
+      DFlash2 (``_dflash2_nvfp4_gate_up`` and Q8); a grafted drafter keeps its stored form.
+    """
+    if "num_experts" in model.config:
+        raise ValueError("this official recipe requires Qwen3.5 Dense mathematics")
+    _optional(model, recipe, vision=False)
+    _dflash2_nvfp4_gate_up(model, recipe)
+    quantized = sources["quantized"]
+    if "mtp" in model.components and not sources["base"].has(_MTP_STEM["mtp/input_projection"]):
+        for name in _MTP_STEM:
+            recipe.assign(name, source=model.source(name, sources["mtp"]))
+    for name, parameter in model.parameters.items():
+        if not name.startswith("text/"):
+            continue
+        source = model.source(name, quantized)
+        if (
+            name == "text/token_embedding"
+            or not parameter.projection
+            or name.endswith(("/gdn/a_projection", "/gdn/b_projection"))
+        ):
+            recipe.assign(name, source=source)
+            continue
+        stored = _stored_modelopt_format(model, name, quantized)
+        if name == "text/output_head" and stored != "nvfp4":
+            raise ValueError("text/output_head: this recipe imports NVIDIA's NVFP4 head (the engine registers it)")
+        if stored == "nvfp4":
+            recipe.assign(
+                name,
+                format="nvfp4_mul",
+                layout="block_scale_k16_m128x4_v1",
+                method=import_encoded,
+                source=model.source(name, quantized, "nvfp4_mul"),
+                activation_policy="A16Only" if name == "text/output_head" else "AllowA4",
+            )
+        else:
+            recipe.assign(
+                name,
+                format=FP8_F32,
+                method=import_encoded,
+                source=model.source(name, quantized, FP8_F32),
+                activation_policy="AllowA8",
+            )
 
 
 def qwen3_8_27b_nvfp4_orcarouter(model, recipe, sources):
@@ -453,6 +541,8 @@ def qwen3_8_flash_next_nvfp4(model, recipe, sources):
 
     if model.config.get("architectures") != ["Qwen4ExpForCausalLM"]:
         raise ValueError("this official recipe requires Qwen4Exp mathematics")
+    if any(name.endswith("/moe/shared_expert") for name in model.parameters):
+        raise ValueError("NVFP4 shared experts take the NVFP4-QAD recipe (qwen3_8_flash_next_nvfp4_qad)")
     for name, parameter in model.parameters.items():
         if name.startswith("text/layers/") and name.endswith("/moe/experts"):
             if weight_only_bank(parameter.source):
@@ -667,6 +757,86 @@ def qwen3_8_flash_next_fp4_local(model, recipe, sources):
     _flash_next_drafter(model, recipe)
 
 
+# The MXFP8 dense projections of NVIDIA's Flash-Next checkpoints (FP4-Local, NVFP4-QAD): GDN q/k/v/z and output, the
+# QSA query/gate/key/value, indexer and output. FP4-Local also stores its shared experts so; NVFP4-QAD stores them NVFP4.
+_NVIDIA_MXFP8_ROLES = (
+    "/gdn/query", "/gdn/key", "/gdn/value", "/gdn/z", "/gdn/output",
+    "/attention/query", "/attention/gate", "/attention/key", "/attention/value",
+    "/attention/index_query", "/attention/index_key", "/attention/output",
+)
+
+
+def qwen3_8_flash_next_nvfp4_qad(model, recipe, sources):
+    """nvidia/Qwen3.8-Flash-Next-NVFP4-QAD (design §6.1.3): NVIDIA's quantization-aware-distilled mixed-precision
+    checkpoint, bit-exact, run W4A4 as NVIDIA serves it (the owner's choice, 2026-11-17).
+
+    - The routed experts keep their NVFP4 codes, plain E4M3 block scales and FP32 multipliers as ``nvfp4_mul`` banks in
+      ``nvfp4_expert_rg16_v1`` with their FP32 activation scales, ``AllowA4``: W4A4 (design §16.2), as recipe A.
+    - The shared experts, NVFP4 at the routed experts' geometry with their own activation scales, are one-record banks
+      of the same layout (``moe/shared_expert``, the builder's), which the routed experts' call runs as its last job
+      in the same exact W4A4 arithmetic (design §8.6).
+    - The MXFP8 GDN, QSA and indexer projections keep their E4M3FN codes and UE8M0 group scales
+      (``fp8_e4m3fn_g32_e8m0``, W8A16), FP4-Local's route; the GDN a/b projections become their exact BF16 values.
+    - Every BF16 tensor (HC mixers, router, shared-expert gate, PLE projections, ``lm_head``, embedding, vision, norms)
+      keeps its dtype; the FP8 n-gram table is recipe A's (bind its volume with ``--ngram-reuse``).
+    - Only the MTP drafter is re-quantized (``_flash_next_drafter``; its block-FP8 experts as ``q4_g64_fp16``)."""
+
+    from .expert_banks import ExpertBankSource, import_expert_bank
+
+    if model.config.get("architectures") != ["Qwen4ExpForCausalLM"]:
+        raise ValueError("this official recipe requires Qwen4Exp mathematics")
+    banks = [name for name in model.parameters if name.startswith("text/layers/") and name.endswith("/moe/experts")]
+    shared = [name for name in model.parameters if name.startswith("text/layers/") and name.endswith("/moe/shared_expert")]
+    w4a4 = lambda name: isinstance(model.parameters[name].source, ExpertBankSource) and \
+        not model.parameters[name].source.weight_only
+    if not banks or len(shared) != len(banks) or not all(w4a4(name) for name in banks + shared):
+        raise ValueError("the NVFP4-QAD recipe imports W4A4 ModelOpt NVFP4 routed and shared experts "
+                         "(nvidia/Qwen3.8-Flash-Next-NVFP4-QAD)")
+    if model.config["ngram_table"]["format"] != "fp8_e4m3fn":
+        raise ValueError("the NVFP4-QAD recipe binds the checkpoint's FP8 n-gram table")
+    base = sources["base"]
+    for name, parameter in model.parameters.items():
+        if not name.startswith("text/layers/"):
+            continue
+        if name.endswith(("/moe/experts", "/moe/shared_expert")):
+            recipe.assign(
+                name,
+                format="nvfp4_mul",
+                layout="nvfp4_expert_rg16_v1",
+                method=import_expert_bank,
+                activation_policy="AllowA4",
+            )
+            recipe.group(name, shape=parameter.shape)
+        elif name.endswith(_NVIDIA_MXFP8_ROLES):
+            recipe.assign(
+                name,
+                format=MXFP8,
+                method=import_encoded,
+                source=model.source(name, base, MXFP8),
+                activation_policy="A16Only",
+            )
+    _flash_next_drafter(model, recipe)
+
+
+def qwen3_8_flash_next_nvfp4_qad_dense8(model, recipe, sources):
+    """The NVFP4-QAD recipe plus recipe B's dense-byte saving where the checkpoint is still BF16: the hyper-connection
+    mixers, the PLE key/value projections, the final mixer and ``lm_head`` in ``q8_g32_fp16`` (W8A16), as recipe C
+    stores its BF16 classes. The NVFP4 experts and the MXFP8 projections (already 4 and 8 bits, and trained so) keep
+    their words; the router, shared-expert gate, GDN a/b, embedding and vision stay as the exact recipe has them."""
+
+    qwen3_8_flash_next_nvfp4_qad(model, recipe, sources)
+    dense8 = (
+        "/attn_hc/down", "/attn_hc/inject", "/attn_hc/up",
+        "/mlp_hc/down", "/mlp_hc/inject", "/mlp_hc/up",
+        "/ple/key_projection", "/ple/value_projection",
+    )
+    for name in model.parameters:
+        if name.startswith("text/layers/") and name.endswith(dense8):
+            _assign(recipe, name, Q8)
+    for name in ("text/final_mixer/down", "text/final_mixer/up", "text/output_head"):
+        _assign(recipe, name, Q8)
+
+
 # FP4-Local's weight-only NVFP4 vision matrices: each layer's MLP and the merger.
 _FP4_LOCAL_VISION_NVFP4 = ("/mlp/fc1", "/mlp/fc2", "/merger/fc1", "/merger/fc2")
 
@@ -849,6 +1019,7 @@ RECIPES = {
     "qwen3_8_27b_q6": qwen3_8_27b_q6,
     "qwen3_8_27b_nvfp4": qwen3_8_27b_nvfp4,
     "qwen3_8_27b_nvfp4_nvidia": qwen3_8_27b_nvfp4_nvidia,
+    "qwen3_8_27b_nvfp4_nvidia_exact": qwen3_8_27b_nvfp4_nvidia_exact,
     "qwen3_8_27b_nvfp4_orcarouter": qwen3_8_27b_nvfp4_orcarouter,
     "qwen3_5_gguf_q8_0": qwen3_5_gguf_q8_0,
     "qwen3_6_35b_a3b": qwen3_6_35b_a3b,
@@ -858,6 +1029,8 @@ RECIPES = {
     "qwen3_8_flash_next_nvfp4_orcarouter": qwen3_8_flash_next_nvfp4_orcarouter,
     "qwen3_8_flash_next_fp8": qwen3_8_flash_next_fp8,
     "qwen3_8_flash_next_fp4_local": qwen3_8_flash_next_fp4_local,
+    "qwen3_8_flash_next_nvfp4_qad": qwen3_8_flash_next_nvfp4_qad,
+    "qwen3_8_flash_next_nvfp4_qad_dense8": qwen3_8_flash_next_nvfp4_qad_dense8,
     "qwen3_8_flash_next_gsq_rco_iq3s": qwen3_8_flash_next_gsq_rco_iq3s,
     "qwen3_8_flash_next_dflash2": qwen3_8_flash_next_dflash2,
     "gemma4_31b_bf16": gemma4_31b_bf16,

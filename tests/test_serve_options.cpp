@@ -10,7 +10,10 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <map>
+#include <regex>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -39,6 +42,54 @@ std::string parse_error(std::vector<std::string> arguments) {
         (void)parse(std::move(arguments));
     } catch (const std::exception& error) { return error.what(); }
     return {};
+}
+
+// The help's options as the launcher (launcher/serve_help.cpp) and tools/ablate (serve_flags.arities_from_help) read
+// them: "  --flag[, -x] [ARG]   description" at an indent of 2 to 4, continued by lines indented further, the first
+// listing of a flag counting; a flag takes a value when ARG is given and repeats when its description says
+// "(...; repeatable)".
+struct HelpOption {
+    bool takes_value = false;
+    std::string description;
+};
+std::map<std::string, HelpOption> help_options(const std::string& help) {
+    std::map<std::string, HelpOption> options;
+    std::string* current = nullptr;
+    std::istringstream lines(help);
+    for (std::string line; std::getline(lines, line);) {
+        const std::size_t lead = line.find_first_not_of(' ');
+        if (lead == std::string::npos) {
+            current = nullptr;
+            continue;
+        }
+        if (lead >= 2 && lead <= 4 && line.compare(lead, 2, "--") == 0) {
+            const std::string rest = line.substr(lead);
+            const std::size_t gap  = rest.find("  ");
+            const std::string head = rest.substr(0, gap);
+            const std::size_t space = head.find(' ');
+            std::string flag        = head.substr(0, space);
+            if (!flag.empty() && flag.back() == ',') { flag.pop_back(); }
+            std::string arg = space == std::string::npos ? std::string{} : head.substr(space + 1);
+            if (arg.starts_with("-")) { arg.clear(); }
+            // The NOTES section names options again ("  --greedy forces temperature 0"): the first listing counts.
+            if (options.contains(flag)) {
+                current = nullptr;
+                continue;
+            }
+            HelpOption& option = options[flag];
+            option.takes_value = !arg.empty();
+            option.description = gap == std::string::npos ? std::string{} : rest.substr(gap);
+            current            = &option.description;
+            continue;
+        }
+        if (current != nullptr && lead > 4) { *current += " " + line.substr(lead); }
+    }
+    return options;
+}
+
+bool says_repeatable(const std::string& description) {
+    static const std::regex pattern(R"([(;]\s*repeatable\))");
+    return std::regex_search(description, pattern);
 }
 
 // Replaces the scratch --config file's contents and returns its path.
@@ -78,9 +129,9 @@ int main() {
     failures += check(parse({"infernix-serve", "model.ninfer", "--max-context", "16384",
                               "--max-context", "auto"}).max_context_auto,
                       "last automatic context must replace numeric state");
-    failures += check(parse_error({"infernix-serve", "model.ninfer", "--max-context", "auto",
-                                    "--kv-capacity", "131072"}).find("requires --kv-capacity auto") != std::string::npos,
-                      "automatic context must refuse fixed explicit KV capacity actionably");
+    failures += check(parse({"infernix-serve", "model.ninfer", "--max-context", "auto",
+                              "--kv-capacity", "131072"}).kv_capacity.explicit_tokens == 131072,
+                      "the parser must retain Qwen's explicit auto-context ceiling; Gemma validates after model selection");
     failures += check(!parse_error({"infernix-serve", "model.ninfer", "--gemma4-key-only-kv=1"}).empty(),
                       "key-only KV must be a valueless opt-in flag");
     const auto auto_chunk = parse({"infernix-serve", "model.ninfer", "--prefill-chunk", "auto"});
@@ -105,7 +156,9 @@ int main() {
     for (const auto* host : {"127.0.0.1", "127.1.2.3", "localhost", "::1", "[::1]"}) {
         failures += check(is_loopback_host(host), "a loopback --host warned of external reach");
     }
-    for (const auto* host : {"0.0.0.0", "::", "192.168.1.20", "myhost", "128.0.0.1", ""}) {
+    // A name that only starts like a loopback address, and malformed quads (audit 2026-11-17 SS-08).
+    for (const auto* host : {"0.0.0.0", "::", "192.168.1.20", "myhost", "128.0.0.1", "", "127.example.com",
+                             "127.1.2.3.evil", "127.0.0.256", "127.0.0", "127..0.1"}) {
         failures += check(!is_loopback_host(host), "a --host reachable beyond this machine passed as loopback");
     }
     for (const auto* factor : {"1", "2.5", "4"}) {
@@ -129,6 +182,36 @@ int main() {
     failures += check(missing_yarn_rejected, "missing serving YaRN factor accepted");
     failures += check(serve_usage_text("infernix-serve").find("--rope-yarn-factor") != std::string::npos,
                       "serving help omits YaRN");
+    // The help lists exactly the options the parser accepts, each with its arity: the launcher and tools/ablate read
+    // a server's command line through its --help.
+    {
+        const std::map<std::string, HelpOption> listed = help_options(serve_usage_text("infernix-serve"));
+        std::set<std::string> table;
+        for (const infernix::product::ConfigOption& option : serve_option_arities()) {
+            table.insert(std::string(option.name));
+            const auto it = listed.find(std::string(option.name));
+            if (it == listed.end()) {
+                std::cerr << "serve help omits " << option.name << '\n';
+                ++failures;
+                continue;
+            }
+            if (it->second.takes_value != option.takes_value) {
+                std::cerr << "serve help gives " << option.name << " the wrong arity\n";
+                ++failures;
+            }
+            if (says_repeatable(it->second.description) != option.repeatable) {
+                std::cerr << "serve help " << (option.repeatable ? "omits" : "claims") << " that " << option.name
+                          << " repeats\n";
+                ++failures;
+            }
+        }
+        for (const auto& [flag, option] : listed) {
+            if (flag != "--help" && flag != "--config" && !table.contains(flag)) {
+                std::cerr << "serve help lists " << flag << ", which the parser refuses\n";
+                ++failures;
+            }
+        }
+    }
     // Integer options past int's range are refused, not saturated (Windows' long is int's size), and the pending
     // queue (one HTTP worker each) is bounded (candidates QA-13).
     for (const auto* option : {"--max-http-clients", "--pending-timeout-ms", "--max-pending-requests"}) {
@@ -139,6 +222,26 @@ int main() {
                       "--max-pending-requests 1024 refused");
     failures += check(!parse_error({"infernix-serve", "model.ninfer", "--max-pending-requests", "1025"}).empty(),
                       "--max-pending-requests past 1024 accepted");
+    // --max-context auto: the Engine sizes the context at startup (make_engine_options carries it); the KV
+    // capacity defaults to automatic even without the prefix cache, and an explicit one is the search's ceiling.
+    {
+        const ServeOptions sized = parse({"infernix-serve", "model.ninfer", "--max-context", "auto"});
+        const infernix::EngineOptions engine = make_engine_options(sized);
+        failures += check(sized.max_context_auto && engine.max_context_auto &&
+                              sized.kv_capacity.mode == infernix::KvCapacityMode::Automatic,
+                          "--max-context auto does not reach the Engine with an automatic KV capacity");
+        const ServeOptions uncached =
+            parse({"infernix-serve", "model.ninfer", "--max-context", "auto", "--no-prefix-reuse"});
+        failures += check(uncached.kv_capacity.mode == infernix::KvCapacityMode::Automatic,
+                          "--max-context auto without the prefix cache did not size the KV pool automatically");
+        const ServeOptions bounded =
+            parse({"infernix-serve", "model.ninfer", "--max-context", "auto", "--kv-capacity", "4096"});
+        failures += check(bounded.max_context_auto && bounded.kv_capacity.explicit_tokens == 4096,
+                          "--max-context auto refused an explicit KV capacity below its starting point");
+        failures += check(!parse({"infernix-serve", "model.ninfer"}).max_context_auto &&
+                              !parse_error({"infernix-serve", "model.ninfer", "--max-context", "automatic"}).empty(),
+                          "--max-context accepted a word other than auto");
+    }
     // --plan FILE: the start's options as given, plus where the plan goes; the Engine's options are the
     // start's (make_engine_options), so the plan sizes that start.
     {
@@ -500,6 +603,20 @@ int main() {
         parse({"infernix-serve", "model.ninfer", "--context-cost-presets", "local-costs.json"});
     failures += check(context_cost.context_cost_presets == "local-costs.json",
                       "--context-cost-presets did not preserve its path");
+
+    // --ablate: its own path, alone and beside --context-cost-presets (an earlier draft of this option
+    // split that option's branch, so --ablate checked the other path and always failed), and off by default.
+    const ServeOptions ablate = parse({"infernix-serve", "model.ninfer", "--ablate", "refusal/sidecar.json"});
+    failures += check(ablate.ablate_sidecar_path == std::filesystem::path("refusal/sidecar.json") &&
+                          ablate.context_cost_presets.empty(),
+                      "--ablate did not preserve its path on its own");
+    const ServeOptions ablate_beside = parse({"infernix-serve", "model.ninfer", "--context-cost-presets",
+                                              "local-costs.json", "--ablate", "refusal/sidecar.json"});
+    failures += check(ablate_beside.ablate_sidecar_path == std::filesystem::path("refusal/sidecar.json") &&
+                          ablate_beside.context_cost_presets == "local-costs.json",
+                      "--ablate and --context-cost-presets did not each keep their own path");
+    failures += check(parse({"infernix-serve", "model.ninfer"}).ablate_sidecar_path.empty(),
+                      "--ablate is not off by default");
 
     const ServeOptions thinking_budget =
         parse({"infernix-serve", "model.ninfer", "--default-thinking-budget", "37"});
@@ -1066,6 +1183,28 @@ int main() {
     }
     failures += check(rejected_cache_file({"--prefix-cache-save-mins", "15"}),
                       "--prefix-cache-save-mins was accepted without --prefix-cache-file");
+    // Output files that name the model artifact or one another (audit 2026-11-17 SS-07): a prefix cache save
+    // renames its file over its path, so --prefix-cache-file equal to the artifact would replace the model.
+    {
+        const std::string model = (std::filesystem::temp_directory_path() / "infernix-alias-test.infernix").string();
+        const auto refused = [&](std::vector<std::string> extra) {
+            std::vector<std::string> arguments{"infernix-serve", model};
+            arguments.insert(arguments.end(), extra.begin(), extra.end());
+            try {
+                (void)parse(std::move(arguments));
+            } catch (const std::invalid_argument&) { return true; }
+            return false;
+        };
+        failures += check(refused({"--prefix-cache-file", model}), "--prefix-cache-file accepted the model artifact");
+        failures += check(refused({"--route-trace", model}), "--route-trace accepted the model artifact");
+        failures += check(refused({"--log-file", "same.log", "--request-log-jsonl", "same.log"}),
+                          "--log-file and --request-log-jsonl accepted one file");
+        failures += check(!refused({"--log-file", "a.log", "--request-log-jsonl", "b.jsonl"}),
+                          "distinct output files were refused");
+    }
+    // Past a year the Engine's next-save time would overflow steady_clock (audit 2026-11-17 SS-04).
+    failures += check(rejected_cache_file({"--prefix-cache-file", "file.cache", "--prefix-cache-save-mins", "200000000"}),
+                      "a --prefix-cache-save-mins past a year was accepted");
     // The SSD tier (hybrid-prefix-cache-spec §5.7): off by default, GiB with an existing directory
     // (resolved absolute at launch), refused alone, without a Host tier or in a missing directory.
     {

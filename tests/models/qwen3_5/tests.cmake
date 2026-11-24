@@ -26,6 +26,10 @@ infernix_add_test(infernix_qwen3_5_calibrated_order_test
 infernix_add_test(infernix_qwen3_5_idle_prefill_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_idle_prefill.cpp")
 
+# The prefix cache's online cost corrections: the measured Host-to-Device rate and the prefill scale (host only).
+infernix_add_test(infernix_qwen3_5_online_cost_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_online_cost.cpp")
+
 infernix_add_test(infernix_qwen3_5_tree_width_controller_test SOURCES
   "${CMAKE_CURRENT_LIST_DIR}/test_tree_width_controller.cpp"
   "${PROJECT_SOURCE_DIR}/src/models/qwen3_5/program/speculative/tree_width_controller.cpp")
@@ -68,6 +72,11 @@ infernix_add_test(infernix_qwen3_5_loading_real_test
 infernix_add_test(infernix_qwen3_5_loading_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_loading.cpp"
   LIBRARIES infernix_model_loading)
+
+# --lora: a PEFT adapter's modules bound to a Qwen3.5 text configuration, and every refusal (host only).
+infernix_add_test(infernix_qwen3_5_lora_binding_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lora_binding.cpp"
+  LIBRARIES infernix_model_loading infernix::json)
 
 infernix_add_test(infernix_qwen3_5_frontend_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_frontend.cpp"
@@ -130,6 +139,14 @@ set_tests_properties(
   infernix_qwen3_5_resume_cold_real_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
+# A KV window (vq2) with no drafter: a generation prompt's trimmed last layer stores its skipped columns through the
+# batched append, which finds the window's row by slot (it failed every such prompt from 2026-11-12 to 11-17), and
+# the pair window keeps the cut there (hybrid spec §7.10).
+add_test(NAME infernix_qwen3_5_hybrid_prefix_vq2_real_test COMMAND infernix_qwen3_5_hybrid_prefix_real_test)
+set_tests_properties(infernix_qwen3_5_hybrid_prefix_vq2_real_test PROPERTIES
+  ENVIRONMENT "INFERNIX_HYBRID_KV_DTYPE=vq2;INFERNIX_HYBRID_REAL_SCENARIO=pair-window"
+  SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real")
+
 # Recovery from a unit out of device memory (fix sweep FS-01): an injected shortage at a sweep of CUDA_CHECK
 # counts fails the request in flight, the Engine keeps serving with an intact prefix cache, a queued request
 # completes, and eight failures in a row stop the Engine (tests/memory_exhausted_recovery.h).
@@ -138,6 +155,18 @@ infernix_add_test(infernix_qwen3_5_memory_exhausted_real_test
   LIBRARIES infernix_engine infernix_model_runtime)
 set_tests_properties(infernix_qwen3_5_memory_exhausted_real_test
   PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 1800)
+
+# --ablate on each Qwen3.5-family artifact (docs/ablate.md): the dense 27B, the 35B-A3B and the 122B-A10B with the
+# drafters each holds; INFERNIX_TEST_LORA adds the dense entry's --lora check.
+infernix_add_test(infernix_qwen3_5_ablate_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_ablate_real.cpp"
+  LIBRARIES infernix_engine
+  ARGS dense mtp dflash2)
+add_test(NAME infernix_qwen3_5_ablate_moe_real_test COMMAND infernix_qwen3_5_ablate_real_test moe mtp dflash)
+add_test(NAME infernix_qwen3_5_ablate_offloaded_real_test COMMAND infernix_qwen3_5_ablate_real_test offloaded mtp dflash2)
+set_tests_properties(infernix_qwen3_5_ablate_real_test infernix_qwen3_5_ablate_moe_real_test
+  infernix_qwen3_5_ablate_offloaded_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
 infernix_add_test(infernix_qwen3_5_score_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_score_real.cpp"

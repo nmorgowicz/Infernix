@@ -405,30 +405,44 @@ int run_q8() {
     return failures;
 }
 
-// The Q8 parent's verification-tree form (the 35B-A3B's DFlash trees): the projection materialized
-// into the record, then the tree convolution. A chain-shaped tree row is the chain form over its
-// valid prefix, so at batch sizes where the record form also composes from the materialized
-// projection every output equals the record form's bit for bit, idle columns included. Branched
-// rows are the projected tree convolution's (test_speculative_tree).
-int run_q8_tree() {
-    constexpr std::int32_t kHidden   = 2048;
-    constexpr std::int32_t kValueRows = 4096;
-    constexpr std::int32_t kZRows    = 4096;
-    constexpr std::int32_t kChannels = kQueryRows + kKeyRows + kValueRows;
-    constexpr std::int32_t kSlots    = 8;
+// The verification-tree form of the Q8 parent (the 35B-A3B's DFlash trees) and of the NVFP4 parent (the NVFP4
+// 27B's n-gram and DFlash2 trees): the projection materialized into the record over the call's columns, then the
+// tree convolution. A chain-shaped tree row is the chain form over its valid prefix, so at batch sizes where the
+// record form also composes from the materialized projection (B >= 2) every output equals the record form's bit for
+// bit, idle columns included. Branched rows are the projected tree convolution's (test_speculative_tree).
+struct TreeParent {
+    const char* name;
+    QType qtype;
+    std::int32_t hidden, value_rows, z_rows;
+    [[nodiscard]] std::int32_t rows() const { return kQueryRows + kKeyRows + value_rows + z_rows; }
+};
+
+int run_tree(const TreeParent& parent_shape) {
+    const std::int32_t kHidden    = parent_shape.hidden;
+    const std::int32_t kValueRows = parent_shape.value_rows;
+    const std::int32_t kZRows     = parent_shape.z_rows;
+    const std::int32_t kChannels  = kQueryRows + kKeyRows + kValueRows;
+    constexpr std::int32_t kSlots = 8;
+    quantized_weight::PatternedWeightOptions options;
+    if (parent_shape.qtype == QType::NVFP4) { // run_nvfp4's scales
+        options.weight_scale_divisor = 0.125F;
+        options.input_scale_divisor  = 3.5F;
+    }
     DevicePackedWeight parent(
-        quantized_weight::make_patterned_weight(QType::Q8_G32_FP16, 12288, kHidden, 1601U));
+        quantized_weight::make_patterned_weight(parent_shape.qtype, parent_shape.rows(), kHidden, 1601U, options));
     int failures = 0;
     struct Shape {
         std::int32_t width;
         std::vector<std::int32_t> valid;
     };
     for (const Shape& shape : {Shape{9, {9, 4}}, Shape{16, {16, 11, 1}}, Shape{24, {16, 7}}}) {
+        // The NVFP4 record form's domain past T = 16 is B = 1 (its tree form's is T <= 32 at every B).
+        if (parent_shape.qtype == QType::NVFP4 && shape.width > 16) { continue; }
         const std::int32_t width   = shape.width;
         const auto batch           = static_cast<std::int32_t>(shape.valid.size());
         const std::int32_t columns = width * batch;
         const std::string label =
-            "Q8 tree B=" + std::to_string(batch) + " T=" + std::to_string(width);
+            std::string(parent_shape.name) + " tree B=" + std::to_string(batch) + " T=" + std::to_string(width);
         const std::vector<float> activation = make_bf16_activation(kHidden, columns, 1610U + width);
         const auto conv_bits =
             make_bf16_bits(static_cast<std::size_t>(kChannels) * 4, 1620U + width, -0.02F, 0.02F);
@@ -476,8 +490,12 @@ int run_q8_tree() {
             Tensor k(out.key.data(), DType::BF16, {kKeyRows, width, batch});
             Tensor v(out.value.data(), DType::BF16, {kValueRows, width, batch});
             Tensor z(out.z.data(), DType::BF16, {kZRows, width, batch});
-            const std::size_t bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-                kQueryRows, kKeyRows, kValueRows, batch, width, width);
+            const std::size_t bytes =
+                parent_shape.qtype == QType::NVFP4
+                    ? ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+                          QType::NVFP4, parent_shape.rows(), kHidden, ops::LinearPolicy::A16Only, batch, width, width)
+                    : ops::gdn_input_proj_conv_record_workspace_capacity_bytes(kQueryRows, kKeyRows, kValueRows,
+                                                                               batch, width, width);
             WorkspaceArena workspace(std::max<std::size_t>(256, bytes));
             if (tree) {
                 ops::gdn_input_proj_conv_record(x, parent.view(), conv, state, valid, initial_slots,
@@ -503,7 +521,7 @@ int run_q8_tree() {
         }
         failures += verify_preserved(label + " state", device_state, state_bits);
     }
-    failures += parent.verify_preserved("Q8 tree parent weight");
+    failures += parent.verify_preserved(std::string(parent_shape.name) + " tree parent weight");
     return failures;
 }
 
@@ -527,7 +545,8 @@ int run_nvfp4() {
         const std::size_t record_bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
             QType::NVFP4, kRows, kHidden, policy, batch, width, width);
         return run_case(
-            std::string("NVFP4 ") + (policy == ops::LinearPolicy::AllowA4 ? "A4" : "A16") +
+            std::string("NVFP4 ") +
+                (policy == ops::LinearPolicy::AllowA4 ? "A4" : ops::a8_only(policy) ? "A8" : "A16") +
                 " B=" + std::to_string(batch) + " T=" + std::to_string(width),
             kHidden, kValueRows, kZRows, width, batch, std::move(valid), snapshot_bytes,
             record_bytes,
@@ -561,6 +580,13 @@ int run_nvfp4() {
             failures += run(width, 8, ragged(width, 8), policy, 2690U + width);
         }
     }
+    // --a8-activations: the 8-bit projection at every width, adaptive drafting's two-column rounds included.
+    for (int width : {2, 3, 4, 5, 8, 16, 17, 33, 64}) {
+        failures += run(width, 1, {}, ops::LinearPolicy::A8Only, 3600U + width);
+    }
+    for (int width : {2, 4, 16}) {
+        failures += run(width, 8, ragged(width, 8), ops::LinearPolicy::A8Only, 3650U + width);
+    }
     failures += parent.verify_preserved("NVFP4 record parent weight");
     return failures;
 }
@@ -577,6 +603,8 @@ struct Fp8Parent {
 constexpr Fp8Parent kFp8RowBf16{QType::FP8_E4M3FN_ROW_BF16, 5120, 6144, 6144, 0.0F};
 // A static input scale of the checkpoint's kind: its reciprocal is inexact.
 constexpr Fp8Parent kFp8RowF32{QType::FP8_E4M3FN_ROW_F32, 3072, 8192, 8192, 0.0123456791F};
+// The 27B's [16384,5120] in FP32 row words with a static input scale (NVIDIA's NVFP4-QAD, bit-exact).
+constexpr Fp8Parent kFp8RowF32At5120{QType::FP8_E4M3FN_ROW_F32, 5120, 6144, 6144, 0.0123456791F};
 
 int run_fp8_case(const Fp8Parent& shape, DevicePackedWeight& parent, std::int32_t width, std::int32_t batch,
                  std::vector<std::int32_t> valid, ops::LinearPolicy policy, std::uint32_t seed) {
@@ -632,6 +660,12 @@ int run_fp8(const Fp8Parent& shape, std::uint32_t weight_seed) {
             failures += run_fp8_case(shape, parent, width, 8, ragged(width, 8), policy, 2790U + width);
         }
     }
+    for (int width : {2, 3, 4, 5, 16, 17, 64}) {
+        failures += run_fp8_case(shape, parent, width, 1, {}, ops::LinearPolicy::A8Only, 3700U + width);
+    }
+    for (int width : {2, 16}) {
+        failures += run_fp8_case(shape, parent, width, 8, ragged(width, 8), ops::LinearPolicy::A8Only, 3750U + width);
+    }
     failures += parent.verify_preserved(std::string(shape.name()) + " record parent weight");
     return failures;
 }
@@ -647,10 +681,12 @@ INFERNIX_OP_TEST(gdn_input_proj_conv_record) {
     int failures = test_record_capacity_domain();
     failures += run_q4_q5();
     failures += run_q8();
-    failures += run_q8_tree();
+    failures += run_tree({"Q8", QType::Q8_G32_FP16, 2048, 4096, 4096});
+    failures += run_tree({"NVFP4", QType::NVFP4, 5120, 6144, 6144});
     failures += run_nvfp4();
     failures += run_fp8(kFp8RowBf16, 1701U);
     failures += run_fp8(kFp8RowF32, 1703U);
+    failures += run_fp8(kFp8RowF32At5120, 1705U);
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_record\n";
     return failures == 0 ? 0 : 1;
 }

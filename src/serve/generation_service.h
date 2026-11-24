@@ -6,6 +6,7 @@
 #include "infernix/engine.h"
 #include "serve/prefix_miss.h"
 #include "serve/request.h"
+#include "serve/score.h"
 #include "serve/serve_options.h"
 
 #include <algorithm>
@@ -25,6 +26,9 @@ namespace infernix::serve {
 
 struct RequestLifetime;
 struct RequestCapacity;
+struct ScoreQueue;
+class CitationRegistry;
+class PdfCache;
 
 struct GenerationOutcome {
     std::string text;
@@ -63,7 +67,7 @@ struct GenerationOutcome {
     // 4-gram.
     std::optional<std::uint64_t> output_4grams;
     std::optional<std::uint64_t> output_4grams_in_prompt;
-    // With the request JSONL: why a large re-prefill missed the prefix cache (prefix_miss.h).
+    // Why a large re-prefill missed the prefix cache (prefix_miss.h).
     std::optional<PrefixMiss> prefix_miss;
     // That explanation gave up somewhere, so prefix_miss holds less than the request would explain
     // (prefix_miss.h). The generation itself is unaffected; only a real failure shows as one.
@@ -138,6 +142,8 @@ struct PreparedRequest {
     // Engine::prefill_next_turn. Unset for requests the next turn cannot follow (media, assistant
     // continuation, readouts, token constraints, no prefix reuse).
     std::optional<infernix::PromptInput> next_turn;
+    // The request's citable sources (documents.h), for the response's cite tags; null without one.
+    std::shared_ptr<const CitationRegistry> citations;
 };
 
 // The Engine's options for serving with `options`: the one mapping a start (GenerationService) and
@@ -162,6 +168,9 @@ public:
     // One reading of the device's memory and of this process's use of it (infernix::Engine::device_memory); none
     // for a backend without a device.
     [[nodiscard]] virtual infernix::DeviceMemoryReading device_memory() const { return {}; }
+    // Each request the Engine holds (infernix::Engine::request_monitor, GET /monitor); none for a
+    // backend without an Engine.
+    [[nodiscard]] virtual infernix::RequestMonitor request_monitor() const { return {}; }
     virtual void reset_execution_maxima() noexcept = 0;
     [[nodiscard]] virtual bool is_available() const = 0;
     // An Engine-wide execution failure, as opposed to an orderly stop.
@@ -198,6 +207,11 @@ public:
     // its answer.
     virtual bool admit(PreparedRequest& prepared, std::function<bool()> is_cancelled,
                        std::chrono::steady_clock::time_point until) const = 0;
+
+    // POST /v1/score (serve/score.h): teacher-forced scoring on a causal-scoring Engine. Not pure,
+    // so a backend that does not score refuses with scoring_not_enabled. `is_cancelled` (the client
+    // disconnected) ends a score still waiting for its turn; one that has started runs to its end.
+    [[nodiscard]] virtual ScoreOutcome score(const ScoreRequest& request, std::function<bool()> is_cancelled);
 
     // Begins the Engine's orderly stop: running and queued generations fail as Unavailable.
     virtual void stop() noexcept = 0;
@@ -237,6 +251,10 @@ public:
 
     [[nodiscard]] infernix::DeviceMemoryReading device_memory() const override {
         return engine_->device_memory();
+    }
+
+    [[nodiscard]] infernix::RequestMonitor request_monitor() const override {
+        return engine_->request_monitor();
     }
 
     void reset_execution_maxima() noexcept override { engine_->reset_execution_maxima(); }
@@ -279,6 +297,9 @@ public:
     bool admit(PreparedRequest& prepared, std::function<bool()> is_cancelled,
                std::chrono::steady_clock::time_point until) const override;
 
+    [[nodiscard]] ScoreOutcome score(const ScoreRequest& request, std::function<bool()> is_cancelled) override;
+
+    // Generates, so a causal-scoring Engine (ServeOptions::causal_scoring) skips it.
     void warmup();
 
     void stop() noexcept override { engine_->stop(); }
@@ -316,12 +337,16 @@ private:
 
     ServeOptions options_;
     std::unique_ptr<infernix::Engine> engine_;
-    // The recent contexts behind GenerationOutcome::prefix_miss (with the request JSONL only).
+    // The recent contexts behind GenerationOutcome::prefix_miss.
     std::unique_ptr<PrefixMissTracker> prefix_misses_;
     std::shared_ptr<RequestCapacity> request_capacity_;
     // Token counting runs the whole preparation path on handler threads, so it has its own bound:
     // a flood of counts is rejected before it can occupy the threads generation prepares on.
     std::shared_ptr<RequestCapacity> count_capacity_;
+    // POST /v1/score's turn on a causal-scoring Engine, in arrival order (ScoreQueue).
+    std::shared_ptr<ScoreQueue> score_queue_;
+    // Recently read PDF documents (documents.h).
+    std::shared_ptr<PdfCache> pdf_cache_;
 };
 
 } // namespace infernix::serve

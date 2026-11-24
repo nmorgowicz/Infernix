@@ -116,7 +116,13 @@ struct Arm {
 };
 
 Arm run_arm(const Setup& setup, std::string_view drafter, bool fast_paths, bool startup_capture) {
-    infernix::models::qwen4_exp::testing::set_startup_capture(startup_capture);
+    // The switch holds for this arm's Engine and is cleared on every path, a throw included.
+    struct CaptureSwitch {
+        explicit CaptureSwitch(bool on) { infernix::models::qwen4_exp::testing::set_startup_capture(on); }
+        ~CaptureSwitch() { infernix::models::qwen4_exp::testing::set_startup_capture(std::nullopt); }
+        CaptureSwitch(const CaptureSwitch&)            = delete;
+        CaptureSwitch& operator=(const CaptureSwitch&) = delete;
+    } capture_switch(startup_capture);
     Arm arm;
     std::mutex mutex;
     auto options = engine_options(setup, drafter, fast_paths);
@@ -148,7 +154,6 @@ Arm run_arm(const Setup& setup, std::string_view drafter, bool fast_paths, bool 
         }
         for (auto& handle : handles) { arm.together.push_back(handle.wait().generated_token_ids); }
     }
-    infernix::models::qwen4_exp::testing::set_startup_capture(std::nullopt);
     std::fflush(stdout);
     return arm;
 }
@@ -223,18 +228,32 @@ int main(int argc, char** argv) {
         std::printf("SKIP: set INFERNIX_QWEN4_ARTIFACT\n");
         return 77;
     }
+    if (argc < 2) {
+        // No case named: report it instead of passing with nothing checked.
+        std::fprintf(stderr, "FAIL: usage: infernix_qwen4_exp_startup_capture_real_test plain|mtp|dflash2...\n");
+        return 2;
+    }
     try {
         int failures = 0;
+        int cases    = 0;
         for (int i = 1; i < argc; ++i) {
             const std::string_view drafter = argv[i];
             if (drafter == "dflash2" && (setup.drafter == nullptr || *setup.drafter == '\0')) {
                 std::printf("skip dflash2: INFERNIX_QWEN4_DFLASH2 is not set\n");
                 continue;
             }
-            for (const bool fast_paths : {false, true}) { failures += run(setup, drafter, fast_paths); }
+            for (const bool fast_paths : {false, true}) {
+                failures += run(setup, drafter, fast_paths);
+                ++cases;
+            }
         }
-        std::printf(failures == 0 ? "startup capture against first-use capture passed\n" : "FAIL: %d checks failed\n",
-                    failures);
+        if (cases == 0) {
+            std::printf("SKIP: every named case was skipped\n");
+            return 77;
+        }
+        std::printf(failures == 0 ? "startup capture against first-use capture passed (%d cases)\n"
+                                  : "FAIL: %d checks failed\n",
+                    failures == 0 ? cases : failures);
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());

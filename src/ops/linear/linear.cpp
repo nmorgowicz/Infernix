@@ -58,6 +58,7 @@ void validate_linear_policy(LinearPolicy policy) {
     case LinearPolicy::A16ColumnInvariant:
     case LinearPolicy::AllowA4Residual:
     case LinearPolicy::AllowA8Residual:
+    case LinearPolicy::A8Only:
         return;
     }
     throw std::invalid_argument("linear: invalid compute policy");
@@ -69,7 +70,7 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
         throw std::invalid_argument("linear: x must be BF16 and out BF16 or FP32");
     }
     if (out.dtype == DType::FP32 && !linear_fp32_output(w.qtype)) {
-        throw std::invalid_argument("linear: FP32 output needs a Q6, Q8, BF16, row FP8 or nvfp4_rg16 weight");
+        throw std::invalid_argument("linear: FP32 output needs a Q6, Q8, BF16, row FP8 or NVFP4 vocabulary head");
     }
     (void)checked_numel(x, "x");
     (void)checked_numel(out, "out");
@@ -153,11 +154,11 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
 
 } // namespace
 
-// The formats a vocabulary head is stored in.
+// The formats a vocabulary head is stored in (NVFP4: the 27B head NVIDIA's QAD artifact stores as NVFP4).
 bool linear_fp32_output(QType qtype) noexcept {
     return qtype == QType::Q6_G64_FP16 || qtype == QType::Q8_G32_FP16 || qtype == QType::BF16 ||
            qtype == QType::BF16_P12 || qtype == QType::FP8_E4M3FN_ROW_BF16 || qtype == QType::FP8_E4M3FN_ROW_F32 ||
-           qtype == QType::NVFP4_MUL;
+           qtype == QType::NVFP4_MUL || qtype == QType::NVFP4;
 }
 
 bool linear_column_invariant_route(QType qtype, std::int32_t output_rows,
@@ -166,6 +167,7 @@ bool linear_column_invariant_route(QType qtype, std::int32_t output_rows,
     if (qtype == QType::Q6_G64_FP16) { return detail::q6_column_invariant_route(output_rows, input_rows); }
     if (qtype == QType::Q8_G32_FP16) { return detail::q8_column_invariant_route(output_rows, input_rows); }
     if (is_fp8_row(qtype)) { return detail::fp8_linear_column_invariant_route(qtype, output_rows, input_rows); }
+    if (qtype == QType::NVFP4) { return detail::nvfp4_linear_column_invariant_route(output_rows, input_rows); }
     // nvfp4_rg16_v1 sums exactly: every route is column-invariant.
     if (qtype == QType::NVFP4_MUL) { return true; }
     // bf16_p12: the packed skinny GEMV, 16 columns a pass (bf16_p12_dispatch.h).
@@ -200,6 +202,9 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     validate_linear_policy(policy);
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("linear workspace: invalid token interval");
+    }
+    if (a8_only(policy) && qtype != QType::NVFP4 && !is_fp8_row(qtype)) {
+        throw std::invalid_argument("linear: A8Only takes NVFP4 or row-scaled FP8 weights");
     }
     if (column_invariant(policy) && !linear_column_invariant_route(qtype, output_rows, input_rows)) {
         // One A16 call per column.
@@ -261,6 +266,9 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
     if (!valid_linear_routes(routes)) {
         throw std::invalid_argument("linear: unsupported route set");
     }
+    if (a8_only(policy) && w.qtype != QType::NVFP4 && !is_fp8_row(w.qtype)) {
+        throw std::invalid_argument("linear: A8Only takes NVFP4 or row-scaled FP8 weights");
+    }
     if (column_invariant(policy) && !linear_column_invariant_route(w.qtype, w.n, w.k)) {
         // No dedicated column-invariant route: the exact one-column route, once per column.
         for (std::int32_t column = 0; column < x.ne[1]; ++column) {
@@ -296,8 +304,17 @@ bool linear_qsa_group_supported(const Weight& w, const Tensor* const* parts, Lin
 void linear_qsa_group(const Tensor& x, const Weight& w, Tensor* const* parts, LinearPolicy policy,
                       WorkspaceArena& workspace, cudaStream_t stream, LinearRoutes routes) {
     if (!linear_qsa_group_supported(w, parts, policy) || !valid_linear_routes(routes) || x.dtype != DType::BF16 ||
-        !x.is_contiguous() || x.ne[0] != w.k || x.ne[1] != parts[0]->ne[1] || x.ne[1] <= 0) {
+        !x.is_contiguous() || x.ne[0] != w.k || x.ne[1] != parts[0]->ne[1] || x.ne[1] <= 0 || x.ne[2] != 1 ||
+        x.ne[3] != 1 || !aligned_to(x.data, 16)) {
         throw std::invalid_argument("linear_qsa_group: unsupported weight, segments or input");
+    }
+    // The x checks linear() makes, and no segment over x (the kernels read x while they write the segments).
+    const auto x_begin = reinterpret_cast<std::uintptr_t>(x.data);
+    for (std::int32_t i = 0; i < kQsaGroupSegments; ++i) {
+        const auto part_begin = reinterpret_cast<std::uintptr_t>(parts[i]->data);
+        if (part_begin < x_begin + x.bytes() && x_begin < part_begin + parts[i]->bytes()) {
+            throw std::invalid_argument("linear_qsa_group: a segment overlaps x");
+        }
     }
     detail::QsaGroupParts out{};
     for (std::int32_t i = 0; i < kQsaGroupSegments; ++i) { out.data[i] = static_cast<__nv_bfloat16*>(parts[i]->data); }

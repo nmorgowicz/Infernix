@@ -45,6 +45,16 @@ use the same architecture, binding and execution path. It also implements `Qwen4
 the SSD behind a VRAM expert cache. The implementation targets `sm_120a` and is tuned on NVIDIA
 GeForce RTX 5090.
 
+The `gemma4` branch also implements dense Gemma 4 31B text generation and causal scoring
+(`Gemma4ForCausalLM`), with one execution lane, its BF16-source MTP assistant, native/GGUF
+weight routes, BF16/FP8 global KV and QK, opt-in key-only globals/FP8 sliding rings, and
+Host-only checkpoints. Conversion preserves source vision objects; the text serving route
+does not accept vision/audio inputs. Gemma's supported profiles and conversion presets live
+in [weight conversion](docs/weight-conversion.md). Research presets, including
+`iq3-xxs-feedback`, retain their stated qualification limits. Shared Qwen NVFP4 kernels,
+runtime LoRA/ablation and hidden-state capture do not automatically support Gemma; its
+loader, dispatch and option contracts remain authoritative.
+
 Generation uses one GPU, one resident model, one to eight resident execution lanes fixed at startup,
 bounded FIFO ingress with finite bypass, resource-pressure preemption with Replay recovery,
 one content-addressed prefix cache, and one compact decode batch per round.
@@ -61,12 +71,15 @@ Keep these ownership boundaries visible when selecting a design:
 
 - The v3 container (`.infernix`, or `.ninfer` from NInfer) is the only C++ product artifact; CLI,
   serving, and inference benchmarks use the public Engine. Infernix has no Python model-inference
-  route or installed/exported C++ SDK.
+  route or installed/exported C++ SDK. A runtime LoRA adapter (`--lora`, [LoRA adapters](docs/lora.md))
+  is read from its own Hugging Face PEFT files (`adapter_model.safetensors` and `adapter_config.json`)
+  beside the artifact; it is not converted or stored in one.
 - The launcher (`infernix-launcher`, `src/launcher`, web UI in `apps/launcher/web`) runs no
   inference: it supervises one `infernix-serve` process per loaded model, proxies its HTTP
   endpoints, switches models on request, downloads artifacts and keeps per-model launch parameters.
   It links neither the Engine nor CUDA; what it shows of a server comes from the server's own HTTP
-  endpoints and log.
+  endpoints and log. Its Ablation page runs `tools/ablate` (Python) as a child that starts its own
+  `infernix-serve` engines; the launcher holds model loads off while that run has the GPU.
 - Core owns physical primitives and raw transfers; artifact owns generic framing and
   materialization; Ops own closed mathematical and state-transition implementations.
 - Models own fixed mathematics, config interpretation, logical parameter binding, frontend

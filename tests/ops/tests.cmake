@@ -104,6 +104,15 @@ infernix_add_family_op_test(infernix_offloaded_moe_fp8_test FAMILY offloaded_moe
 infernix_add_family_op_test(infernix_offloaded_moe_qwen3_5_122b_test FAMILY offloaded_moe
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_qwen3_5_122b.cu"
   LIBRARIES infernix_ops)
+# The shared expert as the call's last job on NVFP4 banks at Flash-Next's geometry (NVIDIA's NVFP4-QAD) in every
+# arithmetic its artifacts run (W4A4; --a16-activations' W4A16 exact; expert-a4-residual's terms; --a8-activations'
+# 8-bit route): frames, zero-copy, staged, forked and CPU-served misses, narrow and wide widths, against the exact
+# host experts bit for bit where they bind and against the same record run as a routed expert, and the combine
+# against the FP64 formula.
+infernix_add_family_op_test(infernix_offloaded_moe_shared_a4_test FAMILY offloaded_moe
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_shared_a4.cu"
+  LIBRARIES infernix_ops)
+set_tests_properties(infernix_offloaded_moe_shared_a4_test PROPERTIES TIMEOUT 900)
 # The expert-a4-residual fast paths (two and three NVFP4 terms) at that geometry, 24 to 16,384 columns:
 # gate/up, down and end to end against the FP64 expert oracle, narrow entries against the exact host
 # expert bit for bit, repeat and staging determinism; 4,096 columns and more on the 64-token warp tiles.
@@ -154,6 +163,11 @@ set_tests_properties(infernix_ggml_linear_a8_wide_test PROPERTIES TIMEOUT 900)
 # and exact fallback), against a host wide-integer oracle.
 infernix_add_family_op_test(infernix_lossless_linear_test FAMILY lossless
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lossless_linear.cpp"
+  LIBRARIES infernix_ops)
+# --lora on the lossless route: u = fp32(A x), d = fp32(B u) and y = bf16(fp32(y + fp32(d s))) against an exact
+# host oracle (wide-integer sums, rounded once).
+infernix_add_family_op_test(infernix_lossless_lora_test FAMILY lossless
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lossless_lora.cpp"
   LIBRARIES infernix_ops)
 # Its correctly rounded binary32/BF16 functions against an exact decimal oracle (every BF16 input and
 # random binary32 ones); the Python driver writes the vectors and runs the executable. Both exact
@@ -375,24 +389,40 @@ foreach(kv_dtype bf16 int8 fp8 nvfp4 k8v4)
 endforeach()
 
 # Every softmax attention entry's oracle runs on all host threads (ops/host_parallel.h) and its
-# kernels fill the GPU, so entries started together only oversubscribe both: the bf16 entry, 62 s
-# alone, timed out at 900 s beside five others (2026-10-22). They take turns; other tests still run
-# beside them.
-set(infernix_attention_oracle_tests infernix_softmax_attention_test infernix_softmax_attention_extended_test)
-foreach(kv_dtype bf16 int8 fp8 nvfp4 k8v4)
-  list(APPEND infernix_attention_oracle_tests infernix_softmax_attention_${kv_dtype}_test
-    infernix_softmax_attention_wide_${kv_dtype}_test)
+# kernels fill the GPU, so many entries started together only oversubscribe both: the bf16 entry,
+# 62 s alone, timed out at 900 s beside five others (2026-10-22). Most of an entry is one thread,
+# though (its cases' fixtures, cache snapshots and checks: 6.3 of 32 threads busy on average, the wide
+# fp8 entry alone, 2026-11-18), and one turn-taking chain of all twelve was the whole suite's critical
+# path (2,068 of 2,517 s at -j 8). So they take turns in three chains, three at a time, balanced by their
+# times beside each other at -j 8 (697, 676 and 765 s with measured costs, 2026-11-19); other tests still run
+# beside them. Each entry is slower beside the other chains than alone or in one chain (the twelve's sum rose
+# from 1,738 to 2,138 s), the run shorter (36.6 to 21.3 min).
+set(infernix_attention_chain_a infernix_softmax_attention_int8_test infernix_softmax_attention_fp8_test
+  infernix_softmax_attention_wide_fp8_test infernix_softmax_attention_test)
+set(infernix_attention_chain_b infernix_softmax_attention_nvfp4_test infernix_softmax_attention_k8v4_test
+  infernix_softmax_attention_extended_test)
+set(infernix_attention_chain_c infernix_softmax_attention_bf16_test)
+foreach(kv_dtype bf16 int8 nvfp4 k8v4)
+  list(APPEND infernix_attention_chain_c infernix_softmax_attention_wide_${kv_dtype}_test)
 endforeach()
-set_tests_properties(${infernix_attention_oracle_tests} PROPERTIES RESOURCE_LOCK infernix_attention_oracle)
-# Their turns are the run's critical path, so a tree without measured costs (CTestCostData.txt, which
+foreach(chain a b c)
+  set_tests_properties(${infernix_attention_chain_${chain}} PROPERTIES RESOURCE_LOCK infernix_attention_oracle_${chain})
+endforeach()
+# Their chains are the run's critical path, so a tree without measured costs (CTestCostData.txt, which
 # replaces COST once present) starts them first, with the longest single entry.
-set(infernix_attention_first ${infernix_attention_oracle_tests} infernix_lossless_ops_test)
+set(infernix_attention_first ${infernix_attention_chain_a} ${infernix_attention_chain_b} ${infernix_attention_chain_c}
+  infernix_lossless_ops_test)
 set_tests_properties(${infernix_attention_first} PROPERTIES COST 1000)
 
 add_test(NAME infernix_sparse_moe_wide_test
   COMMAND ${infernix_sparse_moe_test_COMMAND} --wide-only)
 set_tests_properties(infernix_sparse_moe_wide_test
   PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 RUN_SERIAL TRUE)
+# Routes over every expert (the token-oriented prefill route) and every job-tile residue, per-token inputs.
+add_test(NAME infernix_sparse_moe_routed_test
+  COMMAND ${infernix_sparse_moe_test_COMMAND} --routed-only)
+set_tests_properties(infernix_sparse_moe_routed_test
+  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900 RUN_SERIAL TRUE)
 
 foreach(mode IN ITEMS ngram-only onehot-distribution mtp-onehot mtp-distribution ngram-negative-penalties wide-accept wide-distribution)
   string(REPLACE "-" "_" test_suffix "${mode}")
@@ -404,9 +434,11 @@ endforeach()
 set_tests_properties(infernix_speculative_wide_accept_test PROPERTIES TIMEOUT 600)
 # The acceptance suites on FP32 verification logits (every vocabulary head writes FP32).
 add_test(NAME infernix_speculative_round_fp32_test COMMAND ${infernix_speculative_round_test_COMMAND} --fp32-logits)
-# Thousands of small synchronous launches: 119 s alone, past 900 s beside the suite's GPU-heavy tests (2026-10-27,
-# -j 8), whose kernels it waits behind at every synchronization.
-set_tests_properties(infernix_speculative_round_fp32_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 RUN_SERIAL TRUE)
+# Thousands of small synchronous launches, which wait behind other tests' kernels at every synchronization: past 900 s
+# beside the suite's GPU-heavy tests on 2026-10-27 (-j 8, when the attention entries still ran six at a time), so it
+# ran alone; its BF16 twin (infernix_speculative_round_test, the same suites) takes 111-143 s beside them at -j 8
+# (2026-11-18), so it runs beside them too, with the default 900 s bound.
+set_tests_properties(infernix_speculative_round_fp32_test PROPERTIES SKIP_RETURN_CODE 77)
 foreach(mode IN ITEMS ngram-only mtp-onehot onehot-distribution mtp-distribution)
   string(REPLACE "-" "_" test_suffix "${mode}")
   add_test(NAME infernix_speculative_${test_suffix}_fp32_test
@@ -439,6 +471,12 @@ infernix_add_family_op_test(infernix_hyper_connection_test FAMILY projection
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_hyper_connection.cpp"
   LIBRARIES infernix_linear_test_support)
 set_tests_properties(infernix_hyper_connection_test PROPERTIES SKIP_RETURN_CODE 77)
+# The direction cut and inject (--ablate) against the FP64 cut, inject and combine, its column invariance and graph
+# replay, and an inactive cut as the plain inject.
+infernix_add_family_op_test(infernix_direction_cut_test FAMILY elementwise
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_direction_cut.cpp"
+  LIBRARIES infernix_ops)
+set_tests_properties(infernix_direction_cut_test PROPERTIES SKIP_RETURN_CODE 77)
 # hyper_connection_stream_mean (DFlash2's target features) against the FP64 stream mean.
 infernix_add_family_op_test(infernix_hyper_connection_stream_mean_test FAMILY elementwise
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_hyper_connection_stream_mean.cpp"
@@ -494,7 +532,7 @@ infernix_add_family_op_test(infernix_offloaded_moe_team_test FAMILY offloaded_mo
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_team.cpp"
   LIBRARIES infernix_offloaded_moe_cpu)
 
-# The GPU narrow route against the golden hashes and the CPU engine, bit for bit.
+# The narrow route's canonical scalar functions and E2M1 decoders on the GPU against the CPU header.
 infernix_add_family_op_test(infernix_offloaded_moe_cuda_test FAMILY offloaded_moe
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_cuda.cu"
   LIBRARIES infernix_ops)
@@ -543,6 +581,24 @@ set_tests_properties(infernix_offloaded_moe_wide_test PROPERTIES TIMEOUT 900)
 # (2026-10-22), so they run alone; the rest of the layer test runs beside other tests.
 add_test(NAME infernix_offloaded_moe_layer_idle_test COMMAND ${infernix_offloaded_moe_layer_test_COMMAND} --idle-only)
 set_tests_properties(infernix_offloaded_moe_layer_idle_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
+# LoRA (include/infernix/ops/lora.h): the MMA element assumption the canonical arithmetic rests on; the shrink against
+# its oracle and its canonical bits; every adapted Op's term on zero base weights at the 27B shapes and routes; and
+# A16ColumnInvariant column bits with the term.
+infernix_add_family_op_test(infernix_lora_mma_position_test FAMILY lora
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lora_mma_position.cu"
+  LIBRARIES infernix_ops)
+infernix_add_family_op_test(infernix_lora_test FAMILY lora
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lora.cpp"
+  LIBRARIES infernix_ops)
+set_tests_properties(infernix_lora_test PROPERTIES TIMEOUT 3600 RESOURCE_LOCK gpu_memory)
+# The Gated DeltaNet input projection's term (NVFP4, row-scaled FP8 and the Q4/Q5 pair at the 27B shapes): against the
+# no-term call plus the FP64 term at every route and policy, zero-B identity, A16ColumnInvariant column bits, and the
+# snapshot and record forms bit for bit against the projection with the term and the convolution over it.
+infernix_add_family_op_test(infernix_lora_gdn_test FAMILY lora
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lora_gdn.cpp"
+  LIBRARIES infernix_ops)
+set_tests_properties(infernix_lora_gdn_test PROPERTIES TIMEOUT 3600 RESOURCE_LOCK gpu_memory)
 
 # The family executables of every op test above (infernix_ops_<family>_test).
 infernix_finish_op_families()

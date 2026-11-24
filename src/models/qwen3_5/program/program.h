@@ -195,6 +195,7 @@ struct HybridPrefixCacheStats {
     std::uint64_t taps_created               = 0;
     std::uint64_t taps_skipped               = 0;
     std::uint64_t taps_skipped_no_slot       = 0;
+    std::uint64_t taps_retried               = 0;
     std::uint64_t endpoints_created          = 0;
     std::uint64_t endpoints_skipped          = 0;
     std::uint64_t host_image_write_refusals  = 0;
@@ -304,6 +305,9 @@ struct PrefillProgress {
     // Qwen3.5 lends nothing to a prefill, so no capacity comes back between its calls (the Engine
     // re-runs admission when a Qwen4Exp prompt returns lent frames, GitHub #24).
     bool capacity_released = false;
+    // This unit published a snapshot to the prefix cache (a tap; hybrid spec §12.2): a queued request coalesced
+    // onto this lane's prefill may now resume from it, so the Engine re-runs admission.
+    bool snapshot_published = false;
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch> pending;
     std::optional<PromptReadout> readout;
@@ -344,12 +348,18 @@ struct FinishResult {
     // With the prefix cache: the prompt tokens past the reused prefix whose state this request's
     // snapshots made reusable (its deepest snapshot within the prompt).
     std::optional<std::uint32_t> cache_created_prompt_tokens;
+    // A device failure while finishing (an out-of-memory synchronize, a failed publication): the lane was released
+    // in place without an endpoint (status Consumed), or could not be (not Consumed). The Engine completes the request
+    // when its lane was released, then raises this for the device's recovery.
+    std::exception_ptr device_error;
 };
 
 struct AbortResult {
     runtime::ConsumeStatus status = runtime::ConsumeStatus::InvariantMismatch;
     GenerationTimings timings;
     SpeculativeStats speculative;
+    // As FinishResult::device_error, for a release that hit a device failure.
+    std::exception_ptr device_error;
 };
 
 struct ReplayProgress {
@@ -402,6 +412,11 @@ public:
     // state up to the frontier and replays the rest.
     [[nodiscard]] bool start_pause(SequenceHandle sequence,
                                    runtime::ExecutionTiming* timing = nullptr);
+    // The tokens a pause of `sequence` now would recompute on its resume: none where the pause
+    // publishes the lane's state at its frontier, else the frontier past the lane's deepest
+    // snapshot (a prefill whose DFlash2 ring is not whole there, YE-01). A prediction for choosing
+    // a pressure victim; the pause's publication still decides.
+    [[nodiscard]] std::uint32_t pause_replay_tokens(SequenceHandle sequence) const noexcept;
     [[nodiscard]] ContextProgress poll_context(runtime::CancellationFlagView cancellation);
     [[nodiscard]] bool has_context_transaction() const noexcept;
     [[nodiscard]] bool context_blocks(SequenceHandle sequence) const noexcept;
@@ -472,10 +487,13 @@ public:
     // Evicts unpinned cached Device blocks, and the Device copies of cached snapshot images, until
     // the shortage is covered or nothing evictable remains. Returns whether anything was freed.
     [[nodiscard]] bool hybrid_reclaim(runtime::ContextResourceUsage shortage);
-    // Copies Host-only blocks a waiting request resumes from into Device pages the pools can
+    // Copies Host-only blocks a queued request resumes from into Device pages the pools can
     // spare as cache (hybrid-prefix-cache-spec §6.6), so its admission restores less. Returns the
-    // blocks whose copy started; absent while a prefetch or an admission is still in flight.
-    [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan& base);
+    // blocks whose copy started; absent while a prefetch or an admission is still in flight. With
+    // `spare_only` (a request that is not the next to bind) room is made only from free pages and
+    // cached blocks no queue hold names.
+    [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan& base,
+                                                               bool spare_only = false);
     // Device pages a prefetch could fill now: free ones and host-backed cached ones.
     [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept;
     // Holds the snapshot each queued request would resume from now, in admission order
@@ -498,6 +516,7 @@ public:
     [[nodiscard]] bool hybrid_source_pending() const noexcept;
     // Whether the SSD tier would start a write-back now: the idle Engine runs maintain() for it.
     [[nodiscard]] bool hybrid_storage_due() const noexcept;
+    [[nodiscard]] std::optional<std::chrono::steady_clock::time_point> hybrid_storage_retry_at() const noexcept;
     // The positions a request can resume from: every position with free-cache-resume, else the
     // prefill chunk grid (the reproducible route).
     [[nodiscard]] std::uint32_t hybrid_resume_grid() const noexcept;

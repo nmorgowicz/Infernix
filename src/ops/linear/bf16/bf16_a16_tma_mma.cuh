@@ -120,7 +120,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_t
     int tile_r, tile_t;
     bf16_mma_tile_coordinates<Schedule>(blockIdx.x, tiles_r, tiles_t, tile_r, tile_t);
     const int row_begin = tile_r * BR, token_begin = token_offset + tile_t * BT;
-    extern __shared__ __align__(128) unsigned char storage[];
+    extern __shared__ __align__(1024) unsigned char storage[];
     auto* a = reinterpret_cast<__nv_bfloat16*>(storage);
     auto* b = a + S * BR * BK;
     auto* full =
@@ -191,7 +191,7 @@ void launch_bf16_a16_tma_mma(const Bf16A16Operands& p, Output output, Epilogue e
                 constexpr auto kernel = bf16_a16_tma_mma_kernel<Schedule, Full, Output, Epilogue, InPlace>;
                 constexpr int bytes =
                     bf16_tma_scratch_bytes<Schedule, Epilogue> + Schedule::kBarrierBytes;
-                bf16_prepare_shared<bytes, kernel>();
+                prepare_dynamic_shared<bytes, kernel, true>();
                 kernel<<<static_cast<unsigned>(blocks), Schedule::kThreads, bytes, stream>>>(
                     parameter, output, epilogue, p.rows, p.k, offset, count);
                 CUDA_CHECK(cudaGetLastError());

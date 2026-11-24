@@ -52,6 +52,20 @@ INFERNIX_WIDE_HD bool wide_route(int columns, const ExpertScales& scales) {
     return columns > kMaxColumns && scales.input_gate == scales.input_up;
 }
 
+// The entry count that chooses expert `expert`'s route in this call (wide_route, a GGUF or FP8 job's narrow_max):
+// the reference call's (MoeDispatch::route_offsets, a trimmed last layer) or this call's. Every such choice reads
+// it; the jobs iterate their own entries.
+INFERNIX_WIDE_HD int route_count(const MoeDispatch& dispatch, int expert) {
+    const std::int32_t* offsets = dispatch.route_offsets != nullptr ? dispatch.route_offsets : dispatch.offsets;
+    return offsets[expert + 1] - offsets[expert];
+}
+
+// The column count that chooses this call's width-dependent routes (MoeExpertSource::route_columns): a wide call,
+// ggml-bf16-prefill's BF16 tiles, the 8-bit routes. The narrow kernels and the workspace take the call's own.
+INFERNIX_WIDE_HD int route_width(const MoeExpertSource& source, int columns) {
+    return source.route_columns > 0 ? source.route_columns : columns;
+}
+
 namespace wide {
 
 inline constexpr int kTileColumns = 64; // columns (routed entries of one expert) per work tile
@@ -290,12 +304,8 @@ inline constexpr std::size_t kCpuCallBytes = 2304; // 2 words + 512 indices, rou
 // pp65536 -0.4 %.
 inline constexpr int kA16NmmaCallColumns = 4096;
 INFERNIX_WIDE_HD constexpr bool a16_nmma_columns(int columns) { return columns <= kA16NmmaCallColumns; }
-// W4A4 calls of at most kA4RowsMaxColumns columns at Flash-Next's geometry may take the row-pair narrow kernels
-// (moe_layer.cu's narrow_rows_a4.cuh), so their workspace also holds each entry's BF16 h row (h_rows) and the per-job
-// h counts (job_ctas) beside the A4 planes; calls of at most kMaxColumns columns hold job_ctas for the tensor-core narrow
-// kernels' per-job waits as well (candidates ZK-04).
-inline constexpr int kA4RowsMaxColumns = 3;
-INFERNIX_WIDE_HD constexpr bool a4_rows_columns(int columns) { return columns <= kA4RowsMaxColumns; }
+// W4A4 calls of at most kMaxColumns columns at Flash-Next's geometry hold the per-job gate/up CTA counts (job_ctas)
+// beside the A4 planes for the tensor-core narrow kernels' per-job waits (candidates ZK-04).
 // `columns` is the call's T (entries = top_k * T); the activation and W4A16 wide route select the planes.
 // `shape` is the bank's geometry (MoeExpertSource::shape; shape_supported).
 [[nodiscard]] std::size_t experts_workspace_bytes(const ExpertShape& shape, std::int32_t max_jobs, std::int32_t entries,
@@ -323,7 +333,7 @@ struct Call {
     std::uint16_t* outputs                    = nullptr; // BF16 [H, entries]
     const void* descriptors                   = nullptr;
     std::int32_t passes                       = 0;
-    std::int32_t mean_job_columns             = 0; // entries / max_jobs (kWarpTile64MinColumns' rule)
+    std::int32_t mean_job_columns             = 0; // routed entries / routed jobs (kWarpTile64MinColumns' rule)
     bool a16                                  = false;
     // W4A16 (wide_expert_a16.cuh)
     const std::uint8_t* x_limbs = nullptr; // [T][kA16XRowBytes]

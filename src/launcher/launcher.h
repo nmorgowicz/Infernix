@@ -6,6 +6,7 @@
 // supervisor's watchdog reports crashes, lock-ups and stalls; the launcher restarts the model (at
 // most kRestartLimit times in kRestartWindow) and records everything in its event log.
 
+#include "launcher/ablation.h"
 #include "launcher/artifact_scan.h"
 #include "launcher/chats.h"
 #include "launcher/downloads.h"
@@ -45,6 +46,8 @@ struct LauncherOptions {
     std::optional<int> port;
     std::optional<std::filesystem::path> serve_executable;
     std::optional<std::filesystem::path> ui_dir;
+    // The folder holding tools/ablate's ablate.py (--ablate-tool); otherwise found beside the launcher.
+    std::optional<std::filesystem::path> ablate_tool;
     bool open_browser = true;
     std::string version;
     // The command-line arguments, for starting again after an update.
@@ -112,13 +115,20 @@ private:
                                       const LibraryScan& scan) const;
     [[nodiscard]] EnvVars effective_env(const std::string& config_id) const;
     [[nodiscard]] Args model_default_args(const ScannedModel& model, const LibraryScan& scan) const;
+    // The context a configuration serves: its --max-context, or with --max-context auto the context the
+    // loaded server resolved (its /metrics engine.max_context) and, before it loads, the model's own
+    // (at most 262,144 tokens, what auto reaches with enough VRAM).
+    [[nodiscard]] std::uint64_t advertised_context(const std::string& config_id, const ScannedModel& model,
+                                                   const Args& args) const;
     // The configuration using this model id, if any.
     [[nodiscard]] std::optional<std::string> alias_owner(const std::string& alias) const;
     // POST /scripts/import: the script's server commands, matched to the library.
     [[nodiscard]] Json import_script_json(const std::string& text, const std::string& file_name) const;
-    // POST /models/{id}/plan: infernix-serve --plan for these parameters, as a FitPlan.
+    // POST /models/{id}/plan: infernix-serve --plan for these parameters, as a FitPlan; a plan not
+    // finished within `timeout` is reported as not finished.
     [[nodiscard]] Json fit_plan_json(const std::string& config_id, const ScannedModel& model, const Args& args,
-                                     const EnvVars& env) const;
+                                     const EnvVars& env,
+                                     std::chrono::milliseconds timeout = std::chrono::minutes(3)) const;
     [[nodiscard]] std::string effective_alias(const std::string& config_id, const ScannedModel& model,
                                               const LibraryScan& scan) const;
     // Not under the library lock: it may run --help and looks for the files the arguments name.
@@ -130,8 +140,19 @@ private:
 
     // Model lifecycle and the watchdog's incidents.
     Router::Loaded load_model(const std::string& key);
+    // The Ablation page's run holds the GPU: no model loads (load_model refuses, without holding the model off as a
+    // failed load) until it ends. take_gpu_for_ablation unloads the model and returns once no server runs (false,
+    // with the GPU released again, when `abort` or the launcher's exit came first).
+    bool take_gpu_for_ablation(const std::function<bool()>& abort);
+    void release_gpu_from_ablation();
+    [[nodiscard]] bool ablation_holds_gpu() const;
+    // The run of a configuration: its command line (managed flags and --ablate removed) and environment.
+    [[nodiscard]] AblationRun ablation_run_for(const std::string& config_id);
     [[nodiscard]] Json instance_json() const;
+    // Each takes its snapshot and publishes it in one step (threads publishing at once never publish an older state
+    // after a newer one, which the UI would show until the next change).
     void publish_instance();
+    void publish_library();
     void on_instance_changed(const InstanceSnapshot& snapshot);
     void handle_incident(const InstanceSnapshot& snapshot);
     // A load that did not fit ("vram" or "ram"): the error and the launch-parameter changes to try.
@@ -176,8 +197,25 @@ private:
 
     // HTTP.
     void register_routes();
-    void register_management_routes();
     void register_public_routes();
+    // The management API (/launcher/api, management_routes.cpp): one registrar per area, called in this order
+    // (httplib answers a request with the first route that matches it).
+    void register_management_routes();
+    void register_settings_routes(const std::string& api);
+    void register_config_routes(const std::string& api);
+    void register_status_routes(const std::string& api);
+    void register_download_routes(const std::string& api);
+    void register_update_routes(const std::string& api);
+    void register_disk_routes(const std::string& api);
+    void register_key_routes(const std::string& api);
+    void register_chat_routes(const std::string& api);
+    void register_usage_routes(const std::string& api);
+    void register_fs_routes(const std::string& api);
+    void register_event_routes(const std::string& api);
+    void register_ablation_routes(const std::string& api);
+    // A management route's handler behind admin_allowed, its exceptions answered as JSON errors (400 for an
+    // invalid argument or invalid JSON, 502 for any other failure).
+    [[nodiscard]] httplib::Server::Handler admin(httplib::Server::Handler handler);
     // The management API: this computer, or (remote management on) anyone while no key exists and
     // an admin key or its sign-in once one does; always after page_checks. Otherwise the error is written (401 "sign_in" when signing in helps).
     bool admin_allowed(const httplib::Request& request, httplib::Response& response);
@@ -237,13 +275,14 @@ private:
     // Publishes the new log and event records to the web UI and writes the server's log file, every
     // 150 ms until stop() has ended everything that logs.
     void flush_logs_loop();
-    // A line for the launcher's console, printed in order by console_loop(): a console that does not
+    // A line for the launcher's console, printed in order by the console writer: a console that does not
     // take output (a QuickEdit selection holds it) delays only that thread.
     void print_console(std::string line);
-    void console_loop();
     void toast(const std::string& level, const std::string& message);
     [[nodiscard]] Json state_json() const;
     [[nodiscard]] Json hf_files_json(const std::string& repo) const;
+    // The LoRA adapters on the Hub for a base model: Harness Hub's first, then the most downloaded.
+    [[nodiscard]] Json hf_adapters_json(const std::string& base, const std::string& search) const;
     void download_finished(const std::filesystem::path& dest_dir, const std::filesystem::path& target_dir);
 
     static constexpr std::size_t kRestartLimit = 3;
@@ -255,6 +294,7 @@ private:
     Store store_;
     EventLog event_log_;
     LogBuffer logs_;
+    std::mutex log_dir_mutex_; // apply_log_dir: the compare, the member and both set_dir calls
     std::filesystem::path applied_log_dir_;
     EventHub events_;
     EventHub model_events_; // llama.cpp's /models/sse
@@ -271,6 +311,11 @@ private:
     std::unique_ptr<Router> router_;
     std::unique_ptr<Telemetry> telemetry_;
     std::unique_ptr<Downloads> downloads_;
+    std::unique_ptr<Ablation> ablation_;
+    // An ablation run holds the GPU. Read without the lock (a server's start publishes the instance, which reads it);
+    // closed under it, which load_model holds around a server's start, so it closes between starts.
+    std::mutex gpu_gate_mutex_;
+    std::atomic<bool> gpu_gate_{false};
 
     mutable std::mutex activity_mutex_;
     std::deque<ProxyRecord> activity_;
@@ -284,10 +329,18 @@ private:
     std::vector<EventRecord> pending_events_;
     std::atomic<bool> stop_flushing_{false};
 
-    std::mutex console_mutex_;
-    std::condition_variable console_cv_;
-    std::vector<std::string> console_lines_;
-    bool console_stopping_ = false;
+    // The console writer's queue, shared with its thread: stop() waits for it a few seconds and then leaves it (a
+    // console held by a QuickEdit selection would otherwise hold up the exit), and the thread keeps the queue alive.
+    struct ConsoleQueue {
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::vector<std::string> lines;
+        bool stopping = false;
+        bool done     = false; // the writer printed everything and ended
+    };
+    // The writer: touches only its queue and stdout.
+    static void console_loop(const std::shared_ptr<ConsoleQueue>& queue);
+    std::shared_ptr<ConsoleQueue> console_ = std::make_shared<ConsoleQueue>();
 
     // The instance transitions already reported, the latest incident and the recent restarts.
     mutable std::mutex incident_mutex_;
@@ -307,12 +360,15 @@ private:
     std::unique_ptr<InfernixUpdate> infernix_update_;
 
     std::atomic<bool> restart_required_{false};
-    // load_model's current start may be retried on another port (an automatic port, attempts left).
-    std::atomic<bool> port_retry_allowed_{false};
     std::atomic<bool> stopping_{false};
     std::mutex stop_mutex_;
     bool stopped_ = false;
     std::thread scanner_;
+    std::thread autoloader_; // settings.autoload: loads the model once the first scan has found it
+    std::mutex publish_instance_mutex_; // publish_instance (taken with no other launcher lock held)
+    std::mutex publish_library_mutex_;  // publish_library (likewise)
+    std::mutex install_stopper_mutex_;
+    std::thread install_stopper_; // POST /infernix/install: stops the server after the answer went out
     std::thread log_flusher_;
     std::thread console_writer_;
     httplib::Server server_;

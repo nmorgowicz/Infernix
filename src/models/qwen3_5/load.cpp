@@ -45,6 +45,8 @@ struct LoadPlan::Impl {
     InstanceInfo info;
     std::uint64_t embedding_bytes = 0; // offloaded experts: the token embedding's stored bytes (pinned)
     std::uint64_t mtp_expert_pinned = 0; // the MTP drafter's routed experts' stored bytes, pinned behind the drafter pool
+    std::optional<LoraBinding> lora;     // LoadOptions::lora
+    std::optional<AblateSidecarBinding> ablate; // LoadOptions::ablate, read at planning so a broken one fails early
 };
 
 LoadPlan::LoadPlan(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -105,7 +107,9 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     artifact::Binder binder(reader);
     out->resources = loading::bind_resources(binder, out->config);
     // The lossless route binds every Use A16Only; the design reference keeps the declared permissions.
-    loading::Bindings bindings(binder, options.lossless && !options.reference);
+    // --a16-activations binds every Use A16Only too: the artifact's 4- and 8-bit permissions go unused.
+    loading::Bindings bindings(binder, (options.lossless && !options.reference) || options.a16_activations,
+                               options.a8_dense && !options.lossless);
     const auto& text  = out->config.text;
     out->weights.text = loading::bind_text(bindings, text, options);
     // Offloaded experts are all or nothing: every text block binds the bank form, or none does.
@@ -232,6 +236,20 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
         out->vision_overlay =
             compute_vision_overlay_layout(out->weights, out->pending, out->materialization);
     }
+    if (!options.lora.empty()) {
+        // The adapter adapts a dense model's text projections on every route (the lossless route in PEFT's FP32
+        // arithmetic, lossless-route.md §2).
+        if (!std::holds_alternative<DenseConfig>(out->config.text.ffn)) {
+            throw artifact::ArtifactError("LoRA adapter " + options.lora.string() +
+                                          " is refused: this artifact's MLPs are mixtures of experts, and Infernix "
+                                          "applies LoRA adapters to the dense Qwen3.5-family models (the 27B) only");
+        }
+        out->lora = bind_lora(options.lora, out->config.text);
+    }
+    if (!options.ablate.empty()) {
+        out->ablate = bind_ablate(options.ablate, static_cast<std::uint32_t>(out->config.text.num_hidden_layers),
+                                  static_cast<std::uint32_t>(out->config.text.hidden_size));
+    }
     out->info.name = reader.directory().metadata.value(
         "name", std::string(architecture_name(text.architecture)));
     out->info.metadata_json   = reader.directory().metadata.dump();
@@ -335,11 +353,13 @@ std::unique_ptr<Model> plan_model(LoadPlan&& plan) {
     auto backing = artifact::materialize_geometry(reader, std::move(data->materialization));
     BoundModel parts =
         bind_model(data->config, data->options, data->weights, std::move(data->pending), backing, reader);
-    return std::unique_ptr<Model>(new Model(
+    auto model = std::unique_ptr<Model>(new Model(
         std::move(data->config), data->options, std::move(data->weights), std::move(parts.bound),
         std::move(data->resources), std::move(data->info), std::nullopt, std::move(backing), std::move(parts.banks),
         std::move(parts.shared_banks), std::move(parts.shared_multipliers), std::move(parts.store),
-        runtime::expert_offload::CsfTables{}));
+        runtime::expert_offload::CsfTables{}, std::move(data->lora)));
+    model->ablate_ = std::move(data->ablate);
+    return model;
 }
 
 std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
@@ -407,11 +427,13 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
     runtime::expert_offload::CsfTables csf_tables = data->options.expert_csf
                                                         ? runtime::expert_offload::compress_banks(parts.banks)
                                                         : runtime::expert_offload::CsfTables{};
-    return std::unique_ptr<Model>(new Model(
+    auto model = std::unique_ptr<Model>(new Model(
         std::move(data->config), data->options, std::move(data->weights), std::move(parts.bound),
         std::move(data->resources), std::move(data->info), std::move(overlay),
         std::move(backing), std::move(parts.banks), std::move(parts.shared_banks),
-        std::move(parts.shared_multipliers), std::move(parts.store), std::move(csf_tables)));
+        std::move(parts.shared_multipliers), std::move(parts.store), std::move(csf_tables), std::move(data->lora)));
+    model->ablate_ = std::move(data->ablate);
+    return model;
 }
 
 std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions options,

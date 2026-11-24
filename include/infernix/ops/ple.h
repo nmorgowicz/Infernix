@@ -31,6 +31,15 @@ namespace infernix::ops {
 /// out[h*W + j, t] = bf16(e4m3(rows[j, h, t]) * scale).
 void ple_embed(const Tensor& rows, const Tensor& scale, Tensor& out, cudaStream_t stream);
 
+/// BF16 P12 rows (a lossless 12-bit volume): rows U8 [W + W/2 + 16, heads, T], row bytes
+///   0 .. W-1     W code bytes: sign << 7 | mantissa7 of value j at byte j
+///   W .. W+W/2-1 W/2 nibbles: value 2j in the low nibble of nibble j/2, 2j+1 in the high
+///   W+W/2        the base b (the exponent window starts at b); q = exponent - b (0..14), 15 escapes
+///   W+W/2+1      the escape count K (0..4)
+///   W+W/2+2      K 3-byte escapes: column u8, BF16 bits u16 little-endian; the rest zero
+/// out: BF16 [heads*W, T], each value its exact BF16 bits.
+void ple_embed_bf16_p12(const Tensor& rows, Tensor& out, cudaStream_t stream);
+
 /// NVFP4 rows (NVIDIA FP4-Local's table): rows U8 [W/2 + W/16, heads, T], each row its W/2 code
 /// bytes (E2M1, element 2i in the low nibble of byte i) then its W/16 E4M3FN block scales;
 /// multiplier: FP32 [1], positive and finite. out: BF16 [heads*W, T],
@@ -47,7 +56,9 @@ void ple_gate(const Tensor& key, const Tensor& value, const Tensor& residual,
 
 /// The T columns form `sequences` runs of T / sequences consecutive columns. Sequence i reads its
 /// convolution history from state slot source_slots[i] and writes the updated history to slot
-/// destination_slots[i] (both I32 [sequences]; equal slots update in place). An empty
+/// destination_slots[i] (both I32 [sequences]; equal slots update in place). The sequences update
+/// in parallel: a destination slot must be its own sequence's source or a slot no sequence reads
+/// (a swap or a chain of slots races). An empty
 /// destination_slots leaves every state unchanged (speculative verification, committed later by
 /// ple_conv_commit). weight: BF16 [C, K] (tap j of channel c at j*C + c); states: BF16
 /// [C, span, slots] with span = (K-1) * dilation, oldest column first. residual is updated in

@@ -70,9 +70,19 @@ infernix_add_test(infernix_decide_schema_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_decide_schema.cpp"
   LIBRARIES infernix_serve)
 
+infernix_add_test(infernix_score_schema_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_score_schema.cpp"
+  LIBRARIES infernix_serve)
+
 infernix_add_test(infernix_anthropic_schema_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_anthropic_schema.cpp"
   LIBRARIES infernix_serve)
+
+# Citations and PDF documents: chunking, the cite-tag parser at every split, rendering, history identity, the
+# response blocks, and PDFs through PDFium (skipped in a build without it).
+infernix_add_test(infernix_citations_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_citations.cpp"
+  LIBRARIES infernix_serve infernix_media_pdf infernix_media_decode)
 
 infernix_add_test(infernix_tool_search_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_tool_search.cpp"
@@ -153,10 +163,28 @@ infernix_add_test(infernix_http_reasoning_restore_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_reasoning_restore.cpp"
   LIBRARIES infernix_serve infernix_product_logging)
 
+# A --causal-scoring server's routes over loopback HTTP: generation refused (generation_not_enabled), /v1/score
+# answered; a generation server refusing /v1/score (scoring_not_enabled).
+infernix_add_test(infernix_http_scoring_routes_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_scoring_routes.cpp"
+  LIBRARIES infernix_serve infernix_product_logging)
+
 # Streaming requests refused before their stream starts (queue answers, a context overflow), over
 # loopback HTTP against a refusing generation backend.
 infernix_add_test(infernix_http_stream_refusals_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_stream_refusals.cpp"
+  LIBRARIES infernix_serve infernix_product_logging)
+
+# How the streaming routes end a stream that fails or is cut (an API error, an exception, a refused event, terminal
+# output contradicting the stream, a cancelled generation), over loopback HTTP against a scripted backend.
+infernix_add_test(infernix_http_stream_failures_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_stream_failures.cpp"
+  LIBRARIES infernix_serve infernix_product_logging)
+
+# The server-side tool loops (Anthropic tool search, Responses hosted tool_search) over loopback HTTP against a
+# scripted backend: every way a loop ends, and one streamed answer per API.
+infernix_add_test(infernix_http_server_tool_rounds_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_server_tool_rounds.cpp"
   LIBRARIES infernix_serve infernix_product_logging)
 
 # --claude-code-usage-compat on a streamed Messages answer, over loopback HTTP through the real route:
@@ -178,6 +206,12 @@ infernix_add_test(infernix_http_stream_stall_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_stream_stall.cpp"
   LIBRARIES infernix_serve infernix_product_logging)
 set_tests_properties(infernix_http_stream_stall_test PROPERTIES TIMEOUT 60)
+
+# Audit 2026-11-17 SV-07: non-streamed answers of a cancelled generation over loopback HTTP: Anthropic 499
+# request_cancelled, a cancelled Response answered but not stored, Chat's cut answer.
+infernix_add_test(infernix_http_cancelled_answer_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_cancelled_answer.cpp"
+  LIBRARIES infernix_serve infernix_product_logging)
 
 infernix_add_test(infernix_http_transport_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_transport.cpp"

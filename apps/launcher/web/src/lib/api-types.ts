@@ -159,8 +159,11 @@ export interface ModelConfig {
   idle_unload_min: number | null;
   /** args, env or alias differ from the defaults (named configurations: always true). */
   customized: boolean;
-  /** Effective --max-context (8192 when absent). */
+  /** Effective --max-context (8192 when absent); with --max-context auto, the loaded server's resolved
+   * context, or the model's own before it loads. */
   context_length: number;
+  /** --max-context auto: the server sizes the context at startup. */
+  context_auto: boolean;
   /** The artifact has a vision tower and these parameters enable it (--vision): images can be sent. */
   vision: boolean;
   updated_at: UnixMs | null;
@@ -250,13 +253,80 @@ export interface NgramVolume {
   modified: UnixMs;
 }
 
+/** What a PEFT LoRA adapter's adapter_config.json says (null where it does not say it). */
+export interface AdapterConfig {
+  peft_type: string | null;
+  /** base_model_name_or_path: the model it was trained on. */
+  base_model: string | null;
+  /** r */
+  rank: number | null;
+  /** The largest of r and the rank_pattern's ranks. */
+  max_rank: number | null;
+  /** lora_alpha */
+  alpha: number | null;
+  /** target_modules, when the config lists them (empty for a pattern). */
+  target_modules: string[];
+  rslora: boolean;
+}
+
+/** A LoRA adapter (--lora): a folder holding adapter_config.json and adapter_model.safetensors. */
+export interface LoraAdapter {
+  /** 32 hex digits of its folder's path's SHA-256. */
+  key: string;
+  /** Its folder's name (the repository's, when the launcher downloaded it). */
+  name: string;
+  /** The folder: what --lora takes. */
+  path: string;
+  dir: string;
+  /** adapter_model.safetensors */
+  bytes: number;
+  config: AdapterConfig;
+  /** Keys of library models of the base model it names (dense Qwen3.8-27B or Qwen3.6-27B). */
+  compatible_models: string[];
+  modified: UnixMs;
+}
+
+/** An ablation sidecar (--ablate): a sidecar.json of format ablate-direction-v2 with its direction file beside it.
+ * Sidecars that cut no layer, and the trial sidecars of a tools/ablate run's fit/ folder, are not listed. */
+export interface AblationSidecar {
+  /** 32 hex digits of its sidecar.json's path's SHA-256. */
+  key: string;
+  /** Its folder's name. */
+  name: string;
+  /** The sidecar.json: what --ablate takes. */
+  path: string;
+  dir: string;
+  /** The direction file. */
+  bytes: number;
+  /** The hidden size it was fitted for. */
+  direction_dim: number;
+  /** 1 (one shared direction) or one per layer. */
+  rows: number;
+  /** Layers whose attention and MLP lanes it cuts. */
+  attn_layers: number;
+  mlp_layers: number;
+  /** The artifact it was fitted on (32 hex digits), when it says. */
+  artifact_id: string | null;
+  /** That artifact's file name (generation.fitted_under.artifact), when it says. */
+  fitted_artifact: string | null;
+  /** generation.source: what produced its direction. */
+  source: string | null;
+  /** Keys of library models whose geometry it fits. */
+  compatible_models: string[];
+  /** Of those, the model it was fitted on. */
+  fitted_models: string[];
+  modified: UnixMs;
+}
+
 export interface ModelDir {
   path: string;
   exists: boolean;
   models: number;
   drafters: number;
   ngram_volumes: number;
-  /** Bytes of the models, drafters and volumes found in it. */
+  adapters: number;
+  sidecars: number;
+  /** Bytes of the models, drafters, volumes, adapters and sidecars found in it. */
   library_bytes: number;
   /** The drive holding it. */
   free_bytes: number | null;
@@ -276,6 +346,8 @@ export interface Library {
   models: ModelArtifact[];
   drafters: DrafterArtifact[];
   ngram_volumes: NgramVolume[];
+  adapters: LoraAdapter[];
+  sidecars: AblationSidecar[];
   issues: LibraryIssue[];
 }
 
@@ -403,6 +475,8 @@ export interface InstanceInfo {
   memory: { working_set: number; private_bytes: number } | null;
   /** The watchdog's latest incident in this launcher session; null when none. */
   incident: Incident | null;
+  /** An ablation run (the Ablation page) has the GPU: no model loads until it ends. */
+  ablation_holds_gpu: boolean;
 }
 
 /** crash/hang/stall: a ready server failed; vram/ram: a load did not fit (the server's own sizing
@@ -486,7 +560,7 @@ export interface LogPaths {
   events_file: string;
   /** Written only while Settings.log_bodies is on. */
   requests_file: string;
-  /** Per-run server console logs (serve-<time>-<model>.log, newest 20 kept). */
+  /** Per-run server console logs (serve-<time>-<run>-<model>.log, newest 20 kept). */
   serve_dir: string;
 }
 
@@ -638,14 +712,17 @@ export interface MetricsSnapshot {
 export type MemoryPartKey =
   | "weights"
   | "drafter"
+  | "adapter"
   | "experts"
   | "kv_cache"
+  | "mtp_kv"
   | "state"
   | "prefix_cache"
   | "workspace"
   | "cuda_graphs"
   | "staging"
-  | "ngram";
+  | "ngram"
+  | "ngram_archive";
 
 /** One category of what the server holds in a pool. Parts never overlap. */
 export interface MemoryPart {
@@ -809,7 +886,15 @@ export interface Catalog {
   entries: CatalogEntry[];
 }
 
-export type RepoFileRole = "model" | "model-part" | "drafter" | "ngram" | "expert-state" | "report" | "other";
+export type RepoFileRole =
+  | "model"
+  | "model-part"
+  | "drafter"
+  | "ngram"
+  | "expert-state"
+  | "report"
+  | "adapter"
+  | "other";
 
 export interface RepoFile {
   path: string;
@@ -817,14 +902,42 @@ export interface RepoFile {
   sha256: string | null;
   role: RepoFileRole;
   default_selected: boolean;
-  /** Local path of an existing file with the same name and size, if any. */
+  /** Local path of an existing file with the same name and size, if any (an adapter's: in a folder of the
+   * repository's name). */
   present_locally: string | null;
 }
 
 export interface RepoListing {
   repo: string;
   revision: string;
+  /** "adapter" for a LoRA adapter repository (adapter_config.json and adapter_model.safetensors at its root). */
+  kind: "model" | "drafter" | "ngram" | "adapter";
   files: RepoFile[];
+  /** An adapter repository's adapter_config.json, read before the download. */
+  adapter: AdapterConfig | null;
+  /** Why the adapter's config could not be read. */
+  adapter_error: string | null;
+}
+
+/** GET /launcher/api/hf/adapters?base=&search=: LoRA adapters on the Hub that --lora reads. */
+export interface HubAdapter {
+  repo: string;
+  /** The Hub's count of the last 30 days. */
+  downloads: number;
+  likes: number;
+  /** ISO 8601 */
+  last_modified: string;
+  /** Its files need a token from an account that accepted its terms. */
+  gated: boolean;
+  /** Harness Hub's (huggingface.co/harness-hub), trained for an agent harness. */
+  harness_hub: boolean;
+}
+
+export interface HubAdapterSearch {
+  base: string;
+  search: string;
+  /** Harness Hub's first, then the most downloaded. */
+  adapters: HubAdapter[];
 }
 
 export type DownloadFileState = "queued" | "downloading" | "verifying" | "done" | "failed" | "paused" | "skipped";
@@ -948,6 +1061,127 @@ export interface LauncherEvents {
   logs: LogPaths;
   infernix_release: InfernixRelease;
   model_updates: ModelUpdates;
+  ablation: AblationState;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Ablation (the Ablation page: the launcher runs tools/ablate, which fits a refusal-ablation sidecar). GET
+// /launcher/api/ablation -> AblationState (the first call looks for a Python: a second or two). POST .../ablation/python
+// `{ path }` ("" finds one again), .../ablation/python/detect, .../ablation/setup (pip installs the tool's packages),
+// .../ablation/prompts/{preset} (download and convert), .../ablation/runs `{ config, preset, trials, name }` and
+// .../ablation/stop `{ now? }` answer the same; the SSE event `ablation` carries it on every change.
+
+export interface AblationSource {
+  name: string;
+  title: string;
+  licence: string;
+  /** What the licence asks of its users, in a few words. */
+  licence_note: string;
+  home: string;
+}
+
+/** A public prompt set the tool downloads (from pinned files, checked by SHA-256) and converts. */
+export interface AblationPreset {
+  name: string;
+  title: string;
+  description: string;
+  harmful: { source: string; count: number };
+  harmless: { source: string; count: number };
+  test: { harmful: string; benign: string };
+  sources: AblationSource[];
+}
+
+/** A downloaded prompt set (<data>/ablation/prompts/<preset>). */
+export interface AblationFetched {
+  title: string;
+  fetched: string;
+  counts: Record<string, number>;
+  /** The sets and their licences in words: the sidecar's generation.source. */
+  source_text: string;
+  dir: string;
+}
+
+export interface AblationTask {
+  kind: "setup" | "fetch";
+  preset: string;
+  state: "running" | "done" | "failed";
+  message: string;
+  log: string[];
+  started: UnixMs;
+  ended: UnixMs | null;
+}
+
+export interface AblationRefusals {
+  refusals: number;
+  n: number;
+  errors?: number;
+  truncated?: number;
+}
+
+export type AblationPhase = "doctor" | "prompts" | "capture" | "direction" | "fit" | "pick" | "grade" | "export";
+
+/** The tool's own account of the run (its run folder's progress.json). */
+export interface AblationProgress {
+  state: "running" | "done" | "no_sidecar" | "stopped" | "failed";
+  phase: AblationPhase | null;
+  phases_done: AblationPhase[];
+  message: string;
+  /** Completed trials in the study; `seconds`: the recent trials' mean time. */
+  trials: { done: number; target: number; seconds?: number };
+  /** The stock model on the held-out harmful prompts. */
+  control: { refusals: number; n: number } | null;
+  /** The best trial so far by the pick's rule (fewest refusals with the KL below the target, then the lowest KL). */
+  best: { trial: number; refusals: number; kl: number; what: string } | null;
+  /** The test prompts' results, per arm ("stock" and the pick). */
+  grade: Record<
+    string,
+    { harmful: AblationRefusals; benign: AblationRefusals | null; kl: number | null; kl_stock_answered: number | null }
+  > | null;
+  export: string | null;
+  started: string;
+  updated: string;
+}
+
+export type AblationJobState = "waiting_gpu" | "running" | "stopping" | "done" | "no_sidecar" | "stopped" | "failed";
+
+export interface AblationJob {
+  run: { config_id: string; model_name: string; preset: string; trials: number; name: string };
+  run_dir: string;
+  state: AblationJobState;
+  /** The run is taking, or holds, the GPU. */
+  active: boolean;
+  message: string;
+  started: UnixMs;
+  ended: UnixMs | null;
+  progress: AblationProgress | null;
+  /** The tool's last lines of output. */
+  log: string[];
+  /** The exported sidecar.json (done). */
+  exported: string | null;
+}
+
+export interface AblationState {
+  tool: { found: true; dir: string } | { found: false; looked_in: string[] };
+  python: {
+    /** The Python chosen on the page ("": the launcher finds one). */
+    chosen: string;
+    found: { executable: string; version: string } | null;
+    tried: { path: string; result: string }[];
+    minimum: string;
+    /** The portable Python (python-build-standalone) Set up downloads into `dir`, beside the launcher, when no Python
+     * 3.11 or newer with pip is found; null where none is pinned for this platform. */
+    portable: { version: string; bytes: number; url: string; dir: string; installed: boolean } | null;
+  };
+  /** The tool's packages (numpy, optuna), installed for the Python found. */
+  packages: { ready: boolean; dir: string };
+  catalogue: AblationPreset[] | null;
+  catalogue_error: string | null;
+  prompts: Record<string, AblationFetched>;
+  prompts_dir: string;
+  sidecars_dir: string;
+  task: AblationTask | null;
+  job: AblationJob | null;
+  limits: { min_trials: number; max_trials: number };
 }
 
 // ---------------------------------------------------------------------------------------------

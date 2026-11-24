@@ -142,6 +142,10 @@ BindingReservation Program::start_binding(const RequestBasePlan& base, runtime::
     return impl_->start_binding(base, lane, source, resume, kind, tokens);
 }
 
+std::uint32_t Program::pause_replay_tokens(SequenceHandle h) const noexcept {
+    return impl_->pause_replay_tokens(h);
+}
+
 bool Program::start_pause(SequenceHandle h, runtime::ExecutionTiming* timing) {
     return impl_->start_pause(h, timing);
 }
@@ -315,7 +319,9 @@ void detail::ProgramImpl::maintain_ram(bool idle) {
     if (idle && tier != nullptr && tier->room_unfilled() && !tier->growth_pending()) {
         if (auto* quiet = quiet_expert_tier()) {
             const std::int32_t* frames = offload->engine().residency().host_table();
-            (void)quiet->fill_room([frames](std::uint32_t key) { return frames[key] >= 0; });
+            // One piece a call: a request arriving meanwhile waits for at most this piece's reads, not the whole room.
+            (void)quiet->fill_room([frames](std::uint32_t key) { return frames[key] >= 0; }, 1ULL << 30);
+            if (quiet->room_unfilled()) { ram_->poke(); } // the next piece at the next idle maintenance
         }
     }
     // A resize lasts until its memory work has run: a release until the worker has given the memory back, so the next
@@ -412,8 +418,8 @@ bool Program::hybrid_reclaim(runtime::ContextResourceUsage shortage) {
     return impl_->hybrid_reclaim(shortage);
 }
 
-std::optional<std::uint32_t> Program::hybrid_prefetch(const RequestBasePlan& base) {
-    return impl_->hybrid_prefetch(base);
+std::optional<std::uint32_t> Program::hybrid_prefetch(const RequestBasePlan& base, bool spare_only) {
+    return impl_->hybrid_prefetch(base, spare_only);
 }
 
 std::uint32_t Program::hybrid_prefetch_room() const noexcept {
@@ -438,6 +444,9 @@ bool Program::hybrid_poll_storage() { return impl_->hybrid_ && impl_->hybrid_->p
 bool Program::hybrid_source_pending() const noexcept { return impl_->hybrid_source_pending_; }
 
 bool Program::hybrid_storage_due() const noexcept { return impl_->hybrid_ && impl_->hybrid_->ssd_due(); }
+std::optional<std::chrono::steady_clock::time_point> Program::hybrid_storage_retry_at() const noexcept {
+    return impl_->hybrid_ ? impl_->hybrid_->ssd_retry_at() : std::nullopt;
+}
 
 std::uint32_t Program::hybrid_resume_grid() const noexcept {
     return impl_->execution_schedule.grid_cache ? impl_->prefill_chunk : 1U;

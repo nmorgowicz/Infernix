@@ -86,6 +86,13 @@ inline std::atomic<bool>& units_held() noexcept {
     return held;
 }
 inline void hold_units(bool held) noexcept { units_held().store(held); }
+// A pressure turn's service in nanoseconds instead of Scheduler::service_quantum_ns (30 s), for engine-level tests
+// of the turn mechanics (rotation, recovery, the queue deadline under pressure) within a test's time; 0 keeps the
+// built-in turn. Read at every turn check. Process-wide.
+inline std::atomic<std::uint64_t>& service_quantum_ns() noexcept {
+    static std::atomic<std::uint64_t> ns{0};
+    return ns;
+}
 // The no-progress watch's warning and heal bounds in milliseconds (EngineCore::kNoProgressWarning,
 // kNoProgressRecovery); 0 keeps the built-in bound. Read on every check. Process-wide.
 inline std::atomic<std::uint32_t>& no_progress_warning_ms() noexcept {
@@ -102,15 +109,38 @@ inline void set_no_progress_bounds(std::uint32_t warning_ms, std::uint32_t recov
 }
 
 // Out-of-memory injection for the Engine's recovery (fix sweep FS-01): the worker takes the request at its
-// next iteration and arms its own thread (infernix::testing::arm_memory_exhausted_here), so the `after`-th
-// later CUDA_CHECK of the work it runs throws DeviceMemoryExhausted. 0 disarms. Process-wide.
+// first iteration with a request queued or resident and arms its own thread
+// (infernix::testing::arm_memory_exhausted_here), so the `after`-th later CUDA_CHECK of the work it runs throws
+// DeviceMemoryExhausted; idle iterations before the request arrives do not count. 0 disarms at once. Process-wide.
 inline constexpr std::uint64_t kMemoryFaultDisarm = ~std::uint64_t{0};
 inline std::atomic<std::uint64_t>& memory_fault_request() noexcept {
     static std::atomic<std::uint64_t> request{0};
     return request;
 }
 inline void request_memory_fault(std::uint64_t after) noexcept {
+    // A disarm reaches the worker's countdown at its next CUDA_CHECK, not only at its next iteration: an iteration
+    // already running when the swept request returned could admit the next request and fail it with what is left.
+    if (after == 0) { ::infernix::testing::disarm_memory_exhausted_everywhere(); }
     memory_fault_request().store(after == 0 ? kMemoryFaultDisarm : after);
+}
+// A device failure inside the Program's finish or abort call (a request's release): the Engine arms its thread just
+// before the next such call, so the `after`-th CUDA_CHECK of that call throws DeviceMemoryExhausted, and disarms after
+// it. One shot; 0: off.
+inline std::atomic<std::uint64_t>& finish_fault_request() noexcept {
+    static std::atomic<std::uint64_t> request{0};
+    return request;
+}
+inline std::atomic<std::uint64_t>& abort_fault_request() noexcept {
+    static std::atomic<std::uint64_t> request{0};
+    return request;
+}
+inline void request_finish_fault(std::uint64_t after) noexcept { finish_fault_request().store(after); }
+inline void request_abort_fault(std::uint64_t after) noexcept { abort_fault_request().store(after); }
+// Called on the worker as an orderly stop enters the Program's shutdown cleanup (an attached prefix cache file's save),
+// for a test of what was answered before it. Null: none. Process-wide.
+inline std::atomic<void (*)()>& shutdown_cleanup_hook() noexcept {
+    static std::atomic<void (*)()> hook{nullptr};
+    return hook;
 }
 } // namespace testing
 

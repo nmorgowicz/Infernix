@@ -13,6 +13,8 @@ import {
   HardDrive,
   Image as ImageIcon,
   Layers,
+  Puzzle,
+  Scissors,
   ScrollText,
   Sparkles,
   Wrench,
@@ -26,9 +28,11 @@ import type { Control } from "./controls";
 
 const offloaded = (model: ModelArtifact) => model.offloaded_experts;
 const flashNext = (model: ModelArtifact) => model.needs_ngram_volume;
-const qwen35 = (model: ModelArtifact) => !model.needs_ngram_volume;
+const qwen35 = (model: ModelArtifact) => !model.needs_ngram_volume && model.model_type !== "gemma4_text";
 const gemma4 = (model: ModelArtifact) => model.model_type === "gemma4_text";
 const vision = (model: ModelArtifact) => model.has_vision;
+/** Qwen3.5 with dense MLPs (the 27B): the models --lora adapts. */
+const denseQwen35 = (model: ModelArtifact) => qwen35(model) && !model.num_experts;
 const fp4Local = (model: ModelArtifact) => /fp4[-_]?local/i.test(`${model.recipe ?? ""} ${model.name} ${model.file_name}`);
 /** Flash-Next conversions whose routed experts are NVIDIA's W4A4 NVFP4 (recipe A and Dense8). */
 const w4a4Experts = (model: ModelArtifact) =>
@@ -87,6 +91,64 @@ const CONTEXT: FormSection = {
         { value: "fp8", label: "FP8 (needs FP8 KV)" },
       ],
       unsetLabel: "BF16 (default)",
+      more: true,
+      when: gemma4,
+    },
+    {
+      kind: "switch",
+      flag: "--gemma4-key-only-kv",
+      label: "Gemma 4 key-only global KV",
+      help: "Experimental: store global FP8 keys alone and reconstruct values. Needs FP8 KV; changes arithmetic and remains explicit, never implied by a Q5 profile.",
+      when: gemma4,
+      more: true,
+    },
+    {
+      kind: "select",
+      flag: "--gemma4-sliding-kv",
+      label: "Gemma 4 sliding KV",
+      help: "BF16 rings by default. FP8 saves memory but changes numerics and needs FP8 global KV.",
+      options: [
+        { value: "bf16", label: "BF16" },
+        { value: "fp8", label: "FP8 (approximate)" },
+      ],
+      unsetLabel: "BF16 (default)",
+      when: gemma4,
+      more: true,
+    },
+    {
+      kind: "select",
+      flag: "--gemma4-q5-prefill",
+      label: "Gemma 4 native Q5 prefill",
+      help: "Native Q5 trunk projections at 64+ columns: preserve stored A16 policy, or opt into FP8 / INT8 g32 / INT8 g64. Narrow decode and MTP stay A16; Q4 cells keep their stored routes.",
+      options: [
+        { value: "a16", label: "A16 (artifact policy)" },
+        { value: "fp8", label: "FP8 (approximate)" },
+        { value: "int8-g32", label: "INT8 group32 (approximate)" },
+        { value: "int8-g64", label: "INT8 group64 (approximate)" },
+      ],
+      unsetLabel: "A16 (default)",
+      when: gemma4,
+      more: true,
+    },
+    {
+      kind: "switch",
+      flag: "--allow-shared-memory",
+      label: "Allow Gemma 4 shared GPU memory",
+      help: "Explicit last resort: start even if weights plus runtime do not fit resident VRAM. The shortfall lives in system RAM over PCIe and may be much slower; not resident capacity.",
+      when: gemma4,
+      more: true,
+    },
+    {
+      kind: "select",
+      flag: "--shared-memory-placement",
+      label: "Gemma 4 spill placement",
+      help: "With shared memory allowed: runtime reserves ring/KV/workspace residency before weights; blind leaves placement to the driver.",
+      options: [
+        { value: "runtime", label: "Runtime resident" },
+        { value: "blind", label: "Driver placement" },
+      ],
+      unsetLabel: "Runtime resident (default)",
+      when: gemma4,
       more: true,
     },
     {
@@ -318,7 +380,7 @@ const PREFIX_CACHE: FormSection = {
       kind: "number",
       flag: "--device-snapshot-slots",
       label: "GPU snapshot slots",
-      help: "State snapshot slots kept on the GPU (default: concurrency + 1; + 2 without a Host tier).",
+      help: "State snapshot slots kept on the GPU (default: 1, their VRAM being KV cache; concurrency + 2 without a Host tier).",
       placeholder: "default",
       min: 0,
       when: qwen35,
@@ -377,11 +439,10 @@ const EXPERTS: FormSection = {
       kind: "text",
       flag: "--expert-state",
       label: "Expert cache state file",
-      help: "Read at startup to fill the VRAM expert cache, written at stop and every 10 minutes between requests (default: the artifact's path + .expert-state). \"off\" keeps none.",
+      help: "Read at startup to fill the VRAM expert cache, written at stop and every 10 minutes between requests (default: the artifact's path + .expert-state). \"off\" starts with an empty cache and saves none.",
       placeholder: "beside the artifact (default)",
       mono: true,
       wide: true,
-      when: flashNext,
       more: true,
     },
     {
@@ -392,7 +453,6 @@ const EXPERTS: FormSection = {
       placeholder: "none",
       mono: true,
       wide: true,
-      when: flashNext,
       more: true,
     },
   ],
@@ -732,6 +792,13 @@ const CLIENTS: FormSection = {
       min: 0,
       more: true,
     },
+    {
+      kind: "switch",
+      flag: "--causal-scoring",
+      label: "Scoring server",
+      help: "Start for teacher-forced scoring only: POST /v1/score returns per-token log-probabilities and top_k for a given continuation, one request at a time. Nothing generates: chat and coding tools are refused (generation_not_enabled). Needs a fixed Max context (not auto). docs/serving.md",
+      more: true,
+    },
   ],
 };
 
@@ -852,7 +919,7 @@ const ROUTES: FormSection = {
       kind: "switch",
       flag: "--a16-activations",
       label: "16-bit expert activations",
-      help: "NVIDIA's W4A4 experts (the NVFP4 and Dense8 conversions): run them with 16-bit activations instead of the 4-bit ones the checkpoint specifies. Changes the output; the default follows NVIDIA and is recommended.",
+      help: "NVIDIA's W4A4 experts (the NVFP4, NVFP4 Dense8 and NVFP4-QAD conversions; on QAD the shared experts too): run them with 16-bit activations instead of the 4-bit ones the checkpoint specifies. Changes the output; the default follows NVIDIA and is recommended.",
       when: w4a4Experts,
     },
     {
@@ -924,6 +991,28 @@ const ROUTES: FormSection = {
       more: true,
     },
   ],
+};
+
+const LORA: FormSection = {
+  id: "lora",
+  title: "LoRA adapter",
+  description: "A fine-tune applied on top of the model's weights at load",
+  icon: Puzzle,
+  when: denseQwen35,
+  // The page's own field: the library's adapters (Discover > LoRA adapters downloads them), or a path.
+  fields: ["--lora"],
+  controls: [],
+};
+
+const ABLATE: FormSection = {
+  id: "ablate",
+  title: "Ablation sidecar",
+  description: "A direction cut out of the model's residual writes at load (refusal removal)",
+  icon: Scissors,
+  when: (model) => !gemma4(model),
+  // The page's own field: the library's sidecars that fit the model (the Ablation page makes them), or a path.
+  fields: ["--ablate"],
+  controls: [],
 };
 
 const LOGGING: FormSection = {
@@ -1013,6 +1102,8 @@ export const FORM_SECTIONS: readonly FormSection[] = [
   SAMPLING,
   VISION,
   ROUTES,
+  LORA,
+  ABLATE,
   LOGGING,
 ];
 

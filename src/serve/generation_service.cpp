@@ -2,11 +2,15 @@
 #include "serve/generation_service.h"
 
 #include "product/media_acquire/acquire.h"
+#include "serve/documents.h"
+#include "serve/request_validation.h"
 #include "serve/translate.h"
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <exception>
 #include <iterator>
 #include <mutex>
@@ -41,6 +45,16 @@ struct RequestLifetime {
     std::shared_ptr<RequestCapacity> capacity;
     std::chrono::steady_clock::time_point started;
     std::chrono::steady_clock::time_point deadline;
+};
+
+// POST /v1/score's turn (GenerationService::score): the scoring Engine runs one call at a time, so requests wait here
+// in arrival order, where one whose client disconnects or that outlives --pending-timeout-ms still gives up. A score
+// that has started runs to its end.
+struct ScoreQueue {
+    std::mutex mutex;
+    std::condition_variable turn;
+    std::deque<std::uint64_t> waiting; // tickets in arrival order; the front one scores
+    std::uint64_t next = 0;
 };
 
 std::string vision_overflow_note(const infernix::ContextLengthDetails& details) {
@@ -219,10 +233,11 @@ using Clock = std::chrono::steady_clock;
     throw ApiException(std::move(error));
 }
 
-infernix::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point deadline,
-                                   const std::function<bool()>& is_cancelled,
-                                   std::size_t& remaining_bytes,
-                                   std::uint32_t retry_after_seconds) {
+// A media or document source's bytes, charged to the request's aggregate media budget.
+std::vector<std::uint8_t> acquire_source_bytes(const infernix::product::media_acquire::Source& source,
+                                               Clock::time_point deadline,
+                                               const std::function<bool()>& is_cancelled,
+                                               std::size_t& remaining_bytes, std::uint32_t retry_after_seconds) {
     if (remaining_bytes == 0) {
         throw_media_error(infernix::product::media_acquire::Error(
             infernix::product::media_acquire::ErrorKind::BudgetExceeded,
@@ -234,14 +249,24 @@ infernix::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point de
     policy.is_cancelled = is_cancelled;
     std::vector<std::uint8_t> source_bytes;
     try {
-        source_bytes = infernix::product::media_acquire::acquire_bytes(part.source, policy);
+        source_bytes = infernix::product::media_acquire::acquire_bytes(source, policy);
     } catch (const infernix::product::media_acquire::Error& exception) {
         throw_media_error(exception, retry_after_seconds);
     } catch (const std::invalid_argument& exception) {
         throw_invalid_input(exception, "invalid_media");
     }
-
     remaining_bytes -= source_bytes.size();
+    return source_bytes;
+}
+
+infernix::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point deadline,
+                                   const std::function<bool()>& is_cancelled,
+                                   std::size_t& remaining_bytes,
+                                   std::uint32_t retry_after_seconds) {
+    // A rendered PDF page is bounded by the vision budget; the PDF's own bytes were charged already.
+    std::size_t derived_budget = infernix::kMaximumPromptMediaBytes;
+    std::vector<std::uint8_t> source_bytes = acquire_source_bytes(
+        part.source, deadline, is_cancelled, part.derived ? derived_budget : remaining_bytes, retry_after_seconds);
     infernix::OwnedMedia media;
     media.kind =
         part.kind == ContentKind::Image ? infernix::MediaKind::Image : infernix::MediaKind::Video;
@@ -281,6 +306,24 @@ void check_preparation_control(Clock::time_point deadline,
                                                    "inference request expired during preparation"),
                             "structured_outputs.grammar", {}, retry_after_seconds);
     }
+}
+
+// The request's documents resolved (documents.h): their bytes charged to the media budget, PDF pages read
+// under the deadline and cancellation.
+DocumentResolution resolve_request_documents(const GenerationRequest& request, const infernix::Engine& engine,
+                                             PdfCache& cache, Clock::time_point deadline,
+                                             const std::function<bool()>& is_cancelled,
+                                             std::size_t& remaining_media_bytes, std::uint32_t retry_after_seconds) {
+    if (!has_documents(request)) { return {}; }
+    DocumentResolveOptions options;
+    options.vision      = engine.vision_image_budget();
+    options.max_context = engine.options().max_context;
+    options.acquire = [&](const infernix::product::media_acquire::Source& source) {
+        return acquire_source_bytes(source, deadline, is_cancelled, remaining_media_bytes, retry_after_seconds);
+    };
+    options.checkpoint = [&] { check_preparation_control(deadline, is_cancelled, retry_after_seconds); };
+    options.cache      = &cache;
+    return resolve_documents(request, options);
 }
 
 class ServiceOutputSink final : public infernix::OutputSink {
@@ -353,6 +396,8 @@ infernix::EngineOptions make_engine_options(const ServeOptions& options, Startup
                                             DiagnosticObserver diagnostic_observer) {
     infernix::EngineOptions engine_options;
     engine_options.artifact_path            = options.artifact_path;
+    engine_options.lora_path                = options.lora_path;
+    engine_options.ablate_sidecar_path      = options.ablate_sidecar_path;
     engine_options.chat_template_path       = options.chat_template_path;
     engine_options.ngram_volume_path        = options.ngram_volume_path;
     engine_options.ngram_residency          = options.ngram_residency;
@@ -391,6 +436,7 @@ infernix::EngineOptions make_engine_options(const ServeOptions& options, Startup
     // The lossless route runs no fast path.
     engine_options.fast_paths                    = options.fast_paths && !options.lossless;
     engine_options.lossless                      = options.lossless;
+    if (options.causal_scoring) { engine_options.purpose = infernix::EnginePurpose::CausalScoring; }
     engine_options.fast_path_candidates          = options.fast_path_candidates;
     engine_options.fast_path_exclusions          = options.fast_path_exclusions;
     engine_options.kv_cache                  = options.kv_cache;
@@ -423,18 +469,17 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_ = std::make_unique<infernix::Engine>(
         make_engine_options(options_, std::move(startup_observer), std::move(diagnostic_observer)));
     options_.max_context = engine_->options().max_context;
-    if (!options_.request_log_jsonl.empty()) {
-        // The bytes, not the validated text: a window starts and ends on a token, so its first and
-        // last character are usually cut, and the tracker replaces those bytes itself.
-        prefix_misses_ = std::make_unique<PrefixMissTracker>(
-            [engine = engine_.get()](std::span<const infernix::TokenId> ids) {
-                return engine->detokenize_bytes(ids);
-            });
-    }
+    // The bytes, not the validated text: a window starts and ends on a token, so its first and last
+    // character are usually cut, and the tracker replaces those bytes itself. Always kept: the
+    // `req#N done` line names a miss's kind, the request JSONL carries the whole record.
+    prefix_misses_ = std::make_unique<PrefixMissTracker>(
+        [engine = engine_.get()](std::span<const infernix::TokenId> ids) { return engine->detokenize_bytes(ids); });
     request_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
     count_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
+    score_queue_ = std::make_shared<ScoreQueue>();
+    pdf_cache_   = std::make_shared<PdfCache>(kPdfCacheBytes);
 }
 
 std::shared_ptr<RequestLifetime>
@@ -526,8 +571,14 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         const auto acquisition_started = Clock::now();
         std::size_t remaining_media_bytes =
             std::min(options_.max_request_bytes, infernix::kMaximumPromptMediaBytes);
+        DocumentResolution documents =
+            resolve_request_documents(request, *engine_, *pdf_cache_, prepared.lifetime->deadline, is_cancelled,
+                                      remaining_media_bytes, queue_retry_after_seconds());
+        prepared.citations             = std::move(documents.citations);
+        const GenerationRequest& lowered = documents.request ? *documents.request : request;
+        const bool lowered_has_media     = lowered.media_item_count() != 0;
         infernix::PromptInput input =
-            to_prompt_input(request, semantics, [&](const ContentPart& part) {
+            to_prompt_input(lowered, semantics, [&](const ContentPart& part) {
                 return acquire_media(part, prepared.lifetime->deadline, is_cancelled,
                                      remaining_media_bytes, queue_retry_after_seconds());
             });
@@ -541,7 +592,7 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         if (cache_participation == CacheParticipation::ReadWrite && cache.enabled &&
             cache.hybrid.next_turn_prefill_quiet.value_or(std::chrono::milliseconds{0}).count() > 0 &&
             request.continuation == infernix::PromptContinuationMode::NewAssistantTurn &&
-            !request_has_media && request.readout_tokens.empty() &&
+            !lowered_has_media && request.readout_tokens.empty() &&
             request.token_constraint.empty() && !request.ignore_eos && request.max_tokens > 0) {
             prepared.next_turn = input;
         }
@@ -631,8 +682,10 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
     try {
         std::size_t remaining_media_bytes =
             std::min(options_.max_request_bytes, infernix::kMaximumPromptMediaBytes);
+        const DocumentResolution documents = resolve_request_documents(
+            request, *engine_, *pdf_cache_, deadline, is_cancelled, remaining_media_bytes, queue_retry_after_seconds());
         infernix::PromptInput input =
-            to_prompt_input(request, semantics, [&](const ContentPart& part) {
+            to_prompt_input(documents.request ? *documents.request : request, semantics, [&](const ContentPart& part) {
                 return acquire_media(part, deadline, is_cancelled, remaining_media_bytes,
                                      queue_retry_after_seconds());
             });
@@ -781,7 +834,125 @@ void GenerationService::schedule_next_turn(PreparedRequest& prepared,
     engine_->prefill_next_turn(std::move(conversation));
 }
 
+ScoreOutcome GenerationBackend::score(const ScoreRequest&, std::function<bool()>) {
+    throw ApiException(ApiError{.status  = 501,
+                                .type    = "not_supported",
+                                .message = "this server does not score: start infernix-serve with --causal-scoring",
+                                .code    = "scoring_not_enabled"});
+}
+
+ScoreOutcome GenerationService::score(const ScoreRequest& request, std::function<bool()> is_cancelled) {
+    if (engine_->options().purpose != infernix::EnginePurpose::CausalScoring) {
+        return GenerationBackend::score(request, std::move(is_cancelled));
+    }
+    // Admission as a generation's: at most --max-pending-requests wait beside the one scoring, each until
+    // --pending-timeout-ms.
+    const std::shared_ptr<RequestLifetime> lifetime =
+        acquire_request_lifetime(DeadlinePolicy::ClientPendingTimeout, false);
+    ScoreOutcome outcome;
+    outcome.chat_template_applied = request.apply_chat_template;
+    outcome.top_k                 = request.top_k;
+    std::vector<infernix::TokenId> tokens;
+    try {
+        if (request.apply_chat_template) {
+            // The prompt /v1/chat/completions would prefill for the same turns, generation prompt
+            // included: the same semantics, translation and Engine::prepare.
+            const ResolvedPromptSemantics semantics = resolve_prompt_semantics(request.chat, options_);
+            outcome.enable_thinking                 = semantics.enable_thinking;
+            infernix::PromptInput input = to_prompt_input(request.chat, semantics, [](const ContentPart&) -> infernix::OwnedMedia {
+                throw std::invalid_argument("scoring takes text only");
+            });
+            const infernix::PreparedPrompt prepared = engine_->prepare(std::move(input));
+            tokens.assign(prepared.token_ids().begin(), prepared.token_ids().end());
+        } else {
+            tokens = engine_->tokenize_text(request.prompt);
+        }
+    } catch (const ApiException&) { throw; } catch (const infernix::RequestError& exception) {
+        throw_request_error(exception, "structured_outputs.grammar", {}, queue_retry_after_seconds());
+    } catch (const std::invalid_argument& exception) {
+        throw_invalid_input(exception, "invalid_prompt");
+    }
+    if (tokens.empty()) { bad_request("the prompt encodes to no tokens", "prompt", "empty_prompt"); }
+    outcome.prompt_tokens                       = static_cast<std::uint32_t>(tokens.size());
+    const std::vector<infernix::TokenId> scored = engine_->tokenize_text(request.continuation);
+    if (scored.empty()) {
+        bad_request("the continuation encodes to no tokens", "continuation", "continuation_required");
+    }
+    tokens.insert(tokens.end(), scored.begin(), scored.end());
+    if (tokens.size() > engine_->options().max_context) {
+        bad_request("prompt and continuation are " + std::to_string(tokens.size()) +
+                        " tokens, past the scoring window of " +
+                        std::to_string(engine_->options().max_context),
+                    "continuation", "context_length_exceeded");
+    }
+    infernix::ScoreOptions score_options;
+    score_options.top_k                = request.top_k;
+    score_options.prompt_hidden_states = request.hidden_states;
+    infernix::ScoreResult result;
+    {
+        // The scoring Engine's turn, in arrival order (ScoreQueue): a request whose client disconnects, or that is
+        // still waiting at its deadline, leaves the queue; one that has started scoring runs to its end.
+        ScoreQueue& queue = *score_queue_;
+        std::unique_lock lock(queue.mutex);
+        const std::uint64_t ticket = queue.next++;
+        queue.waiting.push_back(ticket);
+        while (queue.waiting.front() != ticket) {
+            queue.turn.wait_for(lock, std::chrono::milliseconds(10));
+            if (queue.waiting.front() == ticket) { break; }
+            lock.unlock();
+            const bool cancelled = is_cancelled && is_cancelled();
+            const bool expired   = Clock::now() >= lifetime->deadline;
+            lock.lock();
+            if ((cancelled || expired) && queue.waiting.front() != ticket) {
+                queue.waiting.erase(std::find(queue.waiting.begin(), queue.waiting.end(), ticket));
+                lock.unlock();
+                if (cancelled) {
+                    throw ApiException(ApiError{.status  = 499,
+                                                .type    = "request_cancelled",
+                                                .message = "client disconnected while the score waited for its turn",
+                                                .code    = "client_disconnected"});
+                }
+                throw_request_error(infernix::RequestError(RequestErrorKind::QueueTimeout,
+                                                           "the score waited past --pending-timeout-ms for its turn"),
+                                    "structured_outputs.grammar", {}, queue_retry_after_seconds());
+            }
+        }
+        lock.unlock();
+        struct Turn {
+            ScoreQueue& queue;
+            ~Turn() {
+                std::lock_guard done(queue.mutex);
+                queue.waiting.pop_front();
+                queue.turn.notify_all();
+            }
+        } turn{queue};
+        try {
+            result = engine_->score_tokens(std::move(tokens), outcome.prompt_tokens, score_options);
+        } catch (const std::invalid_argument& exception) {
+            bad_request(exception.what(), {}, "invalid_score_request");
+        }
+    }
+    const auto text = [this](infernix::TokenId id) {
+        return engine_->detokenize_bytes(std::span<const infernix::TokenId>(&id, 1));
+    };
+    outcome.positions.reserve(scored.size());
+    for (std::size_t i = 0; i < scored.size(); ++i) {
+        ScoredPosition position{.id = scored[i], .text = text(scored[i]), .logprob = result.logprobs[i], .top = {}};
+        position.top.reserve(request.top_k);
+        for (std::size_t k = 0; k < request.top_k; ++k) {
+            const std::size_t at = i * request.top_k + k;
+            position.top.push_back(ScoredAlternative{
+                .id = result.top_ids[at], .text = text(result.top_ids[at]), .logprob = result.top_logprobs[at]});
+        }
+        outcome.positions.push_back(std::move(position));
+    }
+    outcome.hidden_states       = std::move(result.hidden_states);
+    outcome.hidden_state_layers = result.hidden_state_layers;
+    return outcome;
+}
+
 void GenerationService::warmup() {
+    if (engine_->options().purpose == infernix::EnginePurpose::CausalScoring) { return; }
     const auto generate = [this](int max_tokens, bool ignore_eos) {
         GenerationRequest request;
         ChatTurn turn;

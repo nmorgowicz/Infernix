@@ -145,6 +145,9 @@ public:
     // never admitted into a slot, a VRAM eviction keeps it (T3), and its promotions pin nothing.
     [[nodiscard]] bool held(std::uint32_t key) const { return held_[key] != 0; }
     [[nodiscard]] std::size_t held_count() const { return held_count_; }
+    // A held key a VRAM promotion still needs: queued for a load (queued) or being copied (promotion_issued), until
+    // unqueued or promotion_completed. Its record must stay: unhold refuses it.
+    [[nodiscard]] bool held_pinned(std::uint32_t key) const { return held_pins_[key] != 0; }
     [[nodiscard]] SlotState state(std::uint32_t slot) const { return slots_[slot].state; }
     [[nodiscard]] std::uint32_t key(std::uint32_t slot) const { return slots_[slot].key; }
     [[nodiscard]] std::uint8_t pins(std::uint32_t slot) const { return slots_[slot].pins; }
@@ -175,9 +178,15 @@ public:
     // its class has none left or the key already has a host copy. The caller writes the bytes
     // before the first round.
     bool prefill(std::uint32_t key, std::int32_t& slot);
+    // Whether prefill would place the key given a free slot of its class (no host copy, not held, not being copied).
+    [[nodiscard]] bool placeable(std::uint32_t key) const { return !host_copy(key) && !held(key) && copying_[key] == 0; }
     // The same for a key VRAM holds (the warm start's spare slots): the slot is its shadow, so its
     // eviction from VRAM (a lend's or a decode victim's) needs no copy back (T3).
     bool prefill_shadow(std::uint32_t key, std::int32_t& slot);
+    // Takes back a prefill / prefill_shadow / prefill_kept whose bytes were never written (the read failed): the
+    // key has no host copy again and its slot is a free resident slot of its class. No loss is counted. No-op for
+    // a key without a slot.
+    void undo_prefill(std::uint32_t key);
     // The pre-fill of a reused tier (HostExpertTier over a HostSlotPool): places each (key, slot) of `kept` whose
     // slot is a free resident slot of the key's class and whose key has no host copy and is not held, as prefill
     // (prefill_shadow with `shadow`) would, but into that slot, whose bytes already are the key's record. Returns
@@ -192,7 +201,8 @@ public:
     // Marks `key` held outside the slots (see held); false when it has a slot copy or is held.
     bool hold(std::uint32_t key);
     // Ends key's hold (the caller gives its record back): it is SSD-only afterwards unless VRAM holds it (which the
-    // tier does not know, so no loss is counted), and a landing of it may be admitted. False when it is not held.
+    // tier does not know, so no loss is counted), and a landing of it may be admitted. False when it is not held, or
+    // when a VRAM promotion still needs its record (held_pinned): the key then stays held.
     bool unhold(std::uint32_t key);
     // Seeds the decayed LFU at the current time with a saved session's use counts, each capped at
     // `cap`, so the first admissions and demotions rank RAM residents by what that session used
@@ -200,10 +210,15 @@ public:
     // first). Counts the cap ties keep their uncapped order (a key's seed gains under half a use in
     // proportion to its uncapped count). The seeds decay like any use.
     void seed_uses(std::span<const std::uint32_t> counts, std::uint32_t cap);
-    // Frees every unpinned shadow slot: its key stays readable in its VRAM frame, and a later VRAM
-    // eviction demotes it (T4) or drops it (T5) like any key without a host copy. Returns how many.
-    // The warm start uses it so RAM holds the keys ranked below the VRAM seeds, not copies of them.
-    std::uint32_t release_shadows();
+    // Frees the key's shadow slot: the key stays readable in its VRAM frame, and a later VRAM eviction
+    // demotes it (T4) or drops it (T5) like any key without a host copy. False when it has none, or the
+    // slot is pinned or listed. The warm start uses it so RAM holds the keys ranked below the VRAM seeds,
+    // not copies of them (HostExpertTier::refill_over_seeds).
+    bool release_shadow(std::uint32_t key);
+    // Frees every unpinned, unlisted shadow slot of class c as release_shadow does; returns how many.
+    std::uint32_t release_shadows(std::uint8_t c);
+    // Class c's shadow slots.
+    [[nodiscard]] std::uint32_t shadows_in(std::uint8_t c) const { return classes_[c].shadows; }
     // ---- lending (engine thread, no round in flight)
     // Lends up to per_class[c] resident slots of each class c (free ones first, then the lowest-ranked
     // unpinned residents, shadows before residents, which leave RAM; a class with a shadow floor lends
@@ -278,7 +293,9 @@ public:
     // shadow, otherwise (evicted from VRAM while loading) it stays resident.
     void promotion_completed(std::uint32_t key, bool published);
     // The eviction gate: may the VRAM policy evict `key` now? Consumes one unit of the demotion
-    // allowance when the eviction will be a demotion.
+    // allowance when the eviction will be a demotion, and promises it one of its class's demotion or free slots:
+    // the gate refuses once every such slot is promised (T6), so no victim it passed is dropped for want of one
+    // (vram_evicted, which runs after the boundary's every gate). The promises end at the next begin_round.
     [[nodiscard]] bool allow_evict(std::uint32_t key);
     // Whether evicting `key` (no host copy) would be worth a demotion.
     [[nodiscard]] bool demotion_worthy(std::uint32_t key);
@@ -323,6 +340,7 @@ private:
         std::uint32_t floor           = 0; // the configured shadow floor, which shadow_floor scales (retire)
         std::uint32_t shadow_floor    = 0;
         std::uint32_t shadows         = 0;
+        std::uint32_t promised        = 0; // demotion or free slots allow_evict promised since the last begin_round
         bool transit_pitch            = false;
     };
     // Whether class c's shadows are its first victims (more of them than its floor).
@@ -371,6 +389,7 @@ private:
     std::vector<std::uint8_t> heap_class_[2]; // per kind and slot: the class whose heap holds it
     std::vector<std::int32_t> slot_of_;
     std::vector<std::uint8_t> held_;
+    std::vector<std::uint8_t> held_pins_; // per held key: kPinQueue | kPinH2D of its VRAM promotion (held_pinned)
     std::size_t held_count_ = 0;
     std::vector<std::uint32_t> ring_, prefetch_;
     std::vector<std::uint32_t> lent_; // lend(): slots out of the classes' resident partitions

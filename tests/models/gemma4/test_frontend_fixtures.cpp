@@ -733,6 +733,10 @@ int main() {
             ? read_file(model / "generation_config.json") : std::string(R"({"eos_token_id":[1,106,50]})");
         const g4::Frontend frontend = make_frontend(tokenizer_json, embedded_template, generation, 262144, fixed_template);
         const g4::Frontend reference = make_frontend(tokenizer_json, embedded_template, generation, 262144, {});
+        const auto vision_budget = frontend.vision_image_budget();
+        check(vision_budget.prompt_tokens == 0 && vision_budget.token_edge == 0 &&
+                  vision_budget.min_pixels == 0 && vision_budget.max_pixels == 0,
+              "text-only Gemma frontend must report no runtime vision budget");
 
         const g4::Tokenizer tokenizer(tokenizer_json);
         const Json strings = Json::parse(read_file(fixtures / "tok_fixtures.json"));

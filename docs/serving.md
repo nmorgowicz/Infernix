@@ -89,7 +89,10 @@ weight into VRAM or pinned RAM, and allocates no KV cache, workspace, expert cac
 weights are bound at their planned offsets in reserved, inaccessible address space, so the planner
 sees the shapes and formats a loaded model has). From the artifact it reads the directory, the
 resources and the few scale words the binding needs, and it logs the Engine's diagnostics (its RAM
-plan) as a start does. It writes one JSON object to `FILE` and exits:
+plan) as a start does. Since it allocates nothing, it cannot run the start's 64 MiB-step probe: while
+other programs hold more VRAM than the headroom, a resident model's automatic KV capacity and
+`--max-context auto` plan larger than the start then gives them ([`--kv-capacity`](cli.md)). It writes
+one JSON object to `FILE` and exits:
 
 | Exit | Meaning |
 |---:|---|
@@ -131,8 +134,9 @@ plan's `error`.
 | `vram.bytes_per_page_group`, `page_group_tokens` | Qwen3.5 family: each further 64-token KV page group's bytes, the capacity curve's slope |
 | `vram.workspace_bytes`, `graph_allowance_bytes` | the Program workspace and the CUDA Graph allowance (Qwen3.8-Flash-Next: the expert cache's reserve for graph executables) |
 | `vram.expert_frames`, `expert_cache_bytes` | offloaded experts: the VRAM expert cache's frames and bytes |
+| `vram.draft_screen_bytes`, `adapter_bytes` | Qwen3.5 family, beside the weights' arena: the DFlash2 drafter's proposal-head screen, and a LoRA adapter's factors (`--lora`) and an ablation sidecar's direction (`--ablate`; their per-call workspace is in `workspace_bytes`); `null` when the start has none |
 | `vram.headroom_bytes` | VRAM left free for the display and other programs (`--vram-headroom-mib` or the automatic headroom) |
-| `vram.planned_bytes`, `left_bytes` | everything planned on the device, and what free VRAM leaves beside it, the headroom and the expert cache's reserve |
+| `vram.planned_bytes`, `left_bytes` | everything planned on the device (the weights, the draft screen and the adapter, the Program's reservation, the expert cache), and what free VRAM leaves beside it, the headroom and the expert cache's reserve |
 | `ram.total_bytes`, `available_bytes`, `ram_free_bytes` | physical RAM, what is available now, and the reserve (`--ram-free-mib`) |
 | `ram.experts_bytes`, `tier`, `expert_ram_layout` | offloaded experts: the RAM the ledger gives the routed experts; `full` when none is read from the SSD (all in RAM, or with the exclusive layout in RAM or VRAM), `ssd` when part are; and `full` or `exclusive` |
 | `ram.pinned_bytes` | the weights the load pins in RAM (offloaded experts, the token embedding with them or with `--embedding-host`, an offloaded vision tower and, on the Qwen3.5 family without offloaded experts, the pinned mirror of the device weights its window evicts: the embedding, the heads, MTP) |
@@ -157,7 +161,8 @@ What is exact and what is estimated (`estimated` is always `true`):
   (under Windows with a DXGI budget, at most the budget less the process's usage, which can be GiBs
   below the driver's free figure; a KV sized past it would be demoted to system memory), less
   the weights' arena the plan did not upload (with `--vision-offload on`, in whole 16 MiB chunks: the
-  vision window borrows the evicted ones). A start reads it after the upload, which may differ by the
+  vision window borrows the evicted ones) and the draft screen and adapter it did not allocate (a start
+  allocates both before it sizes the KV). A start reads it after the upload, which may differ by the
   driver's allocation granularity; an automatic `kv_tokens` and `kv_bytes` follow from it.
 - The CUDA Graph allowance is the planned one. When a start's graphs need more, an automatic KV
   capacity retries once with 1 GiB more headroom (fewer KV pages); the plan cannot see that.
@@ -178,6 +183,7 @@ What is exact and what is estimated (`estimated` is always `true`):
 | `GET /health` | Engine readiness |
 | `GET /metrics` | Prometheus counters, gauges and latency histograms |
 | `GET /metrics?format=json` | JSON snapshot: engine identity, live gauges, totals, and the last 128 terminal requests (`Accept: application/json` also selects it) |
+| `GET /monitor` | each request the Engine holds now: phase, lane, service turn, recovery and progress ([Request monitor](#request-monitor)) |
 | `GET /v1/models` | configured OpenAI model alias, effective `max_model_len`, and llama.cpp-compatible `meta` and `chat_template_caps` objects |
 | `GET /v1/models/{id}` | lookup of the configured alias, `max_model_len`, `meta` and `chat_template_caps` |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
@@ -190,6 +196,7 @@ What is exact and what is estimated (`estimated` is always `true`):
 | `POST /v1/messages` | Anthropic-style message generation |
 | `POST /v1/messages/count_tokens` | Engine-native expanded input-token count |
 | `POST /v1/decide` (alias `/v1/systemone`) | typed decisions read from the next-token distribution, with nothing generated ([Decisions](#decisions)) |
+| `POST /v1/score` | teacher-forced log-probabilities of a given continuation, with the top-k at every scored position and nothing generated; needs `--causal-scoring` ([Teacher-forced scoring](#teacher-forced-scoring)) |
 
 Anthropic SDKs append `/v1/messages` to their base URL, so their base URL is
 `http://127.0.0.1:8080`, while OpenAI SDKs take `http://127.0.0.1:8080/v1`. A client given the
@@ -245,7 +252,8 @@ How failures end:
   with `the Engine made no progress for N s while holding requests` (logged as an Error with the
   count), their state is discarded and queued requests are admitted again;
   `infernix_no_progress_recoveries_total` and `live.no_progress_recoveries` count these. A state
-  the recovery does not handle (a binding in flight) is left as it is, with an Error line.
+  the recovery does not handle now (a binding in flight) is left as it is, with an Error line, and
+  the heal is tried again after another two minutes while the requests are still held.
 
 The listener's port is its own: a second server cannot bind it beside a running one (Windows sets
 `SO_EXCLUSIVEADDRUSE`, which also refuses a wildcard bind beside another program's `127.0.0.1`
@@ -278,6 +286,12 @@ connection when the downstream client disappears. A client that stops reading ke
 the generation goes on, and a write waits up to 60 seconds for the client once its socket buffers
 are full (on Linux a zero receive window held for the 15-second retransmission limit can end the
 connection sooner) before the request is cancelled as disconnected.
+
+A non-streamed request whose generation is cancelled (its client disconnected, or the server is
+stopping) answers as far as a client still reads it: Chat Completions returns the cut answer, which
+is not kept for reasoning continuation; Responses returns a `cancelled` Response, which is not
+stored even with `store: true`; Anthropic Messages, which has no cancelled message, answers HTTP 499
+with `request_cancelled`.
 
 ## Models
 
@@ -607,8 +621,8 @@ their spelling. Generated reasoning ends at the model's `</think>` token whereve
 without a following line break, and `<tool_call>` opens a call only as the model's `<tool_call>`
 token, on both the constrained and the unconstrained route and in the recovery from unclosed
 thinking. A `</think>` token after the reasoning has closed (or in a turn without reasoning) is
-stray framing and publishes nothing, so it never enters the history a client sends back; raw output
-(`--raw`, preserved special tokens) keeps its bytes. The same spellings written with ordinary text
+stray framing and publishes nothing, so it never enters the history a client sends back; the CLI's raw
+output (`--raw-output`, preserved special tokens; the server has none) keeps its bytes. The same spellings written with ordinary text
 tokens (for example while the model discusses a chat template) stay text in their channel. The model writes the marker tokens when it
 quotes them too: a quoted `</think>` token ends the reasoning, and a quoted `<tool_call>` token stays
 text only by the Markdown code rule above or when its region does not parse. Leading whitespace of
@@ -632,7 +646,8 @@ The three protocols share one constrained tool implementation:
 | Anthropic named `tool` | One or more calls to that tool |
 | OpenAI `parallel_tool_calls:false` / Anthropic `disable_parallel_tool_use:true` | At most one call; exactly one when a call is required |
 
-OpenAI `allowed_tools` supports `auto` and `required`. Selection changes generation permissions,
+OpenAI `allowed_tools` supports `auto` and `required`; an entry naming a tool as the other kind (a
+declared function as `custom`, or the reverse) is a 400 `invalid_tool_choice`. Selection changes generation permissions,
 while all declarations retain their original order in the prompt. Requests with tools enable
 **basic structural constraints by default**, including ordinary `auto` calls without `strict`.
 The model can answer normally or start a tool call; a call must use the model's tool framing and a
@@ -924,14 +939,17 @@ finish-reason chunk and `[DONE]` (Responses `response.incomplete`, Anthropic `me
 
 A failure after the stream has started is sent as OpenAI does: one unnamed `data:` event whose
 payload is the usual error body (`{"error": {...}}`, which OpenAI SDKs raise as an API error), then
-the connection closes without a finish-reason chunk, usage chunk or `[DONE]`. A stream's response
-(status 200 and its headers) starts at Engine admission, or 5 s after the request was queued if it is
-still waiting then: a queue timeout or an orderly stop within those 5 s answers as a plain HTTP status
-on every route, and a request still queued starts its stream and waits there, with an SSE comment
-(`: keep-alive`; Responses: `response.created`, then a repeated `response.in_progress`) every 5 s, so a
-client that gives up on a connection that stays silent (one agent client closed every request queued
-for 120 s) keeps it. Its queue's later answer is then the stream's error in the form above (Anthropic:
-`message_start`, then an `error` event; Responses: `response.failed`).
+the connection closes without a finish-reason chunk, usage chunk or `[DONE]`. A Chat Completions
+stream's response (status 200 and its headers) starts at Engine admission, so a queue timeout or an
+orderly stop while it waits answers as a plain HTTP status: some clients record an error event after a
+200 as a successful empty reply and retry it at once. A Messages or Responses stream starts at
+admission, or 5 s after the request was queued if it is still waiting then: within those 5 s the
+queue's answers are a plain HTTP status, and a request still queued starts its stream and waits there,
+with an SSE comment (`: keep-alive`; Responses: `response.created`, then a repeated
+`response.in_progress`) every 5 s, so a client that gives up on a connection that stays silent (one
+agent client closed every request queued for 120 s) keeps it. Its queue's later answer is then the
+protocol's own error event (Anthropic: `message_start`, then an `error` event; Responses:
+`response.failed`).
 
 ### llama.cpp-compatible request observations
 
@@ -1017,7 +1035,10 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   }'
 ```
 
-OpenAI image and video sources may be HTTP(S) URLs or base64 data URLs.
+OpenAI image and video sources may be HTTP(S) URLs or base64 data URLs. A `file` part
+(`{"type":"file","file":{"file_data":"data:application/pdf;base64,...","filename":"report.pdf"}}`) in a
+user or tool message is a PDF document, read as described in
+[Documents, PDFs and citations](#documents-pdfs-and-citations); `file_id` needs a Files API and is refused.
 
 Text and media requests use one complete-prompt context contract. After chat-template rendering and
 media-token expansion, the result must fit Engine `--max-context`. The current Vision runtime also
@@ -1155,12 +1176,12 @@ wire response contains typed `output` Items.
 | `tools` | direct function and free-form `custom` definitions, or namespace groups containing them; see below |
 | `tool_choice` | `auto`, `none`, `required`, a named function or `custom` tool, or `allowed_tools` of function and custom entries with mode `auto`/`required`; namespaced selection carries both `namespace` and `name` |
 | `parallel_tool_calls` | `true` by default; `false` enforces at most one call |
-| `max_tool_calls` | non-negative integer accepted as a hosted-tool no-op; Infernix does not execute hosted tools |
+| `max_tool_calls` | non-negative integer: once the Response's hosted `tool_search` calls reach it, no further generation runs and the Response ends `completed` after that generation's searches, which all run ([tool search](#deferred-tools-and-tool-search)); Infernix executes no other hosted tool |
 | `truncation` | omitted or `disabled`; overlong input fails instead of silently dropping Items |
 | `top_logprobs` | omitted or `0` |
 | `service_tier` | omitted, `auto`, or `default`; the response reports `default` |
 | `background` | omitted or `false` |
-| `include` | omitted, empty, or `["reasoning.encrypted_content"]`; the supported value requests the local raw-reasoning mirror described below |
+| `include` | omitted, null, empty, or `["reasoning.encrypted_content"]`; the supported value requests the local raw-reasoning mirror described below |
 | `stream_options.include_obfuscation` | optional boolean; accepted as a transport hint, but this local server emits no padding |
 | cache and client hints | `prompt_cache_key`, `prompt_cache_options`, `prompt_cache_retention`, and explicit breakpoints follow [OpenAI prompt caching](#openai-prompt-caching); `safety_identifier` and `user` are accepted as client hints |
 
@@ -1210,7 +1231,10 @@ An `input_text`, `input_image`, or tool-result part may carry
 identity or output semantics. String message status/phase metadata is accepted but has no Qwen
 prompt representation.
 
-`input_file`, `input_audio`, image `file_id`, image detail other than `auto` or `high`, reasoning metadata without raw
+An `input_file` part in a user message or a tool result is a PDF document (`file_data`, a base64 PDF
+as a data URL or bare, or `file_url`; `filename` titles it), read as described in
+[Documents, PDFs and citations](#documents-pdfs-and-citations). A `file_id` input, `input_audio`, image `file_id`,
+image detail other than `auto` or `high`, reasoning metadata without raw
 reasoning text, partial tool Items, and other Item/content types are not supported. HTTP media URLs
 stored in a response chain are fetched again when that chain is continued; use data URIs when the
 historical media bytes must be immutable.
@@ -1267,7 +1291,8 @@ sends its result back as a `custom_tool_call_output` Item.
 
 Functions and custom tools, top-level or in a namespace, accept `defer_loading:true` together with a
 `tool_search` tool; `tool_search_call`, `tool_search_output` and `additional_tools` Items are accepted
-as input. See [Deferred tools and tool search](#deferred-tools-and-tool-search). A hosted
+as input (a loaded namespace's `description` is a string or null, else a 400 `input`). See
+[Deferred tools and tool search](#deferred-tools-and-tool-search). A hosted
 `web_search` declaration (`{"type":"web_search", ...}`, which Codex sends on every turn unless its
 configuration sets `web_search = "disabled"`) is accepted and echoed in the response's `tools`, but
 the model is not offered it, since Infernix runs no search; a `tool_choice` naming it is a 400.
@@ -1364,7 +1389,8 @@ On the unconstrained route, malformed tool markup is flushed back as ordinary te
 ### Local response state and resources
 
 `store` defaults to `true`. Stored Responses live only in this server process and are bounded by an
-LRU store. They are lost on restart and are not OpenAI's durable cloud retention service.
+LRU store. They are lost on restart and are not OpenAI's durable cloud retention service. A
+cancelled Response is not stored.
 
 `previous_response_id` reconstructs the complete stored input/output Item history before the new
 input. The current `instructions` value is placed first but is not saved into the continuation
@@ -1395,10 +1421,12 @@ Resource behavior:
 | `POST /v1/responses/compact` | explicitly fails with `compaction_not_supported` |
 
 `store:false` Responses cannot be retrieved or used as `previous_response_id`. LRU eviction and
-explicit deletion also make an ID unavailable. A single Response larger than the configured store
-capacity fails with `response_store_capacity_exceeded` rather than silently pretending it was
-stored. Generation has finished by then, but its output is not returned: an aggregate request gets
-only the error and a streamed one ends with `response.failed`. Repeat it with `store:false` or a
+explicit deletion also make an ID unavailable. A stored request whose input alone (the context it
+extends, its input Items and their files and images) exceeds the configured store capacity is refused
+before it runs, with HTTP 400 `response_store_capacity_exceeded` (`param: store`). One whose output
+then takes it past the capacity fails with the same code rather than silently pretending it was
+stored: generation has finished by then, but its output is not returned (an aggregate request gets
+only the error and a streamed one ends with `response.failed`). Repeat it with `store:false` or a
 larger `--response-store-max-mib`.
 
 ### Responses input token count
@@ -1407,7 +1435,8 @@ larger `--response-store-max-mib`.
 It accepts `model`, `input`, `instructions`, `previous_response_id`, reasoning, function tools and
 tool choice, supported text/truncation values, and the `preserve_thinking` extension. Parent lookup,
 call-ID normalization, template rendering, and media expansion are therefore identical to the
-corresponding Create request:
+corresponding Create request, and so is the tool choice check: a choice Create refuses (an undeclared
+tool, `required` without a callable tool) is a 400 `tool_choice` here too:
 
 ```bash
 curl http://127.0.0.1:8080/v1/responses/input_tokens \
@@ -1444,7 +1473,29 @@ blocks, Thinking history, tool-use history, tool results, user-defined tools, ag
 and Anthropic SSE. Consecutive User or Assistant messages are joined without adding separators.
 Mid-conversation System messages retain their text and input position; where the active chat
 template rejects them there, Infernix instead renders them under the User role (role only, never
-text or position). A final Assistant message
+text or position). As in the Anthropic API, a System message with content follows a User message
+(or an Assistant message ending in a server tool's result) and ends `messages` or precedes an
+Assistant message; an empty one that only sets `output_config.effort` may follow any turn, renders
+nothing and sets the reply's effort (the latest one wins over the top-level value).
+
+Mid-conversation tool changes: a System message may also carry `tool_addition` and `tool_removal`
+blocks (Anthropic's `mid-conversation-tool-changes` / `inline-tools` betas; the headers are not
+required). `tool_addition` takes a `tool_reference` to a tool in `tools` (a deferred one is shown
+from there on, a removed one offered again) or a `tool_definition` holding a custom tool entry,
+which declares or redefines that tool from there on; `tool_removal` takes a `tool_reference` and
+withdraws the tool from there on. Each message shows its net change where it stands: added or
+redefined definitions as the loaded-tools block that tool search results use, withdrawn tools as one
+line naming them. The tool section and every earlier turn keep their tokens, so the prefix cache
+still hits. The output contract takes the tools as at the end of the history: a tool defined by
+value joins it as a deferred declaration, a withdrawn one leaves it (the tool section still lists a
+withdrawn listed tool, as the conversation saw it), and a redefined one is constrained by its newer
+definition. `tool_choice` may name a tool the history defines and may not force one it withdrew.
+With a `tool_addition` in the messages, every top-level tool may be deferred. `cache_control` on a
+tool block (or its definition, not both) is a breakpoint after the System message. Refused:
+`tool_reference_unresolved` for a name in neither `tools` nor an earlier definition,
+`tool_name_conflict` for a definition under a server tool's name, `mcp_servers_not_supported` for
+MCP references and toolsets, `invalid_cache_control` for a deferred definition with a breakpoint.
+Turn-scoped messages (`clear_at`) are not interpreted. A final Assistant message
 is an Assistant prefill: generation continues its existing text instead of opening another turn.
 Assistant prefill cannot contain media and cannot start with Thinking enabled; a turn cut by the
 output limit may carry reasoning content. It cannot carry `tool_use` blocks: every `tool_use`
@@ -1581,9 +1632,10 @@ fields and semantics (`cache_n` equals `cache_read_input_tokens`). It is not an 
 stream attaches it only to the terminal `message_delta` event; `timings_per_token` and
 `return_progress` are Chat Completions options and have no Messages equivalent.
 
-Documents, Search Results, Files, Structured Outputs, server-tool blocks other than tool search,
-container uploads, and other execution-dependent blocks are rejected with the missing capability
-identified. Metadata,
+Documents (plain text, custom content, and base64 or URL PDFs) and search results, with or without
+citations, are described in [Documents, PDFs and citations](#documents-pdfs-and-citations). Files
+API sources (`file_id`), server-tool blocks other than tool search, container uploads, and other
+execution-dependent blocks are rejected with the missing capability identified. Metadata,
 service tier, inference geography, protocol-version/beta headers, cache TTL, and unknown advisory
 fields do not block an otherwise executable request. The request `model` is any non-empty local
 proxy label and is echoed in the response; it does not select the resident artifact.
@@ -1610,6 +1662,86 @@ curl http://127.0.0.1:8080/v1/messages/count_tokens \
     "messages": [{"role": "user", "content": "Count this prompt."}]
   }'
 ```
+
+## Documents, PDFs and citations
+
+The Anthropic route accepts `document` blocks (a `text` source, a `content` source of text blocks, a
+`base64` PDF with `media_type` `application/pdf`, or a `url` PDF) and `search_result` blocks, in a User
+message or a `tool_result`. A `file` source needs the Files API and is refused (`files_not_supported`),
+as is a base64 source that is not a PDF (`documents_not_supported`). The OpenAI routes accept PDFs
+as Chat `file` parts and Responses `input_file` parts; they have no citations.
+
+**Prompt form.** Each block is rendered where it stands, from its own content alone, so a
+conversation that resends the same documents renders the same tokens and keeps its prefix cache:
+`<document>` with its `<title>` and `<context>`, then its text (a content source's blocks separated
+by blank lines); `<search_result>` with its `<source>` and `<title>`, then its blocks; a PDF as
+`<document>` with its title (or an OpenAI file's `filename`) and context, then per page
+`<page number="N">`, the page's image and its text.
+
+**PDFs** are read with PDFium, which the build needs (`tools/deps/fetch_pdfium.py` downloads the
+pinned release; `build_native.bat` and the Dockerfile use it). A build without it refuses PDF
+documents (`documents_not_supported`). One that needs a password or an unsupported security handler
+is refused (`pdf_encrypted`), and bytes PDFium cannot open are `invalid_pdf`. Each page's text comes
+from its text layer. With `--vision`, each page is also rendered and enters the prompt as an image,
+sized to the processor's 32-pixel grid so it is not resized again: at most 1,024 vision tokens a page
+(about a million pixels), out of a budget of `min(32768, --max-context / 4)` tokens that the
+request's PDFs spend in request order, less 1,024 for each image or video before them, so a page's
+size depends only on what precedes it. A PDF whose pages cannot all get the processor's smallest
+image (64 tokens, 256 x 256 pixels; about 256 pages at `--max-context 65536`) gives its remaining
+budget to its pages without a text layer, and the others stay text only. A page left with neither
+text nor an image carries a fixed note saying so, so the model knows it was not read. Without
+`--vision` a PDF is text only, and one with no text layer at all (a scanned document) is refused with
+`pdf_no_text`. Read PDFs (text and page images) stay in a 256 MiB server cache by their bytes, so an
+agent that resends a PDF on every turn reads it once (a PDF over 128 MiB is read again each time).
+
+What limits a PDF is the context: its pages' text, chunk IDs and images must fit `--max-context`,
+and a prompt that does not fit is answered like any other (`context_length_exceeded`, "prompt is too
+long"). Neither pages nor bytes say how many tokens a PDF holds: of four NVIDIA manuals of 598-884
+pages, the 19.2 MiB PTX ISA holds the same 1.2 MiB of text as the 2.3 MiB Runtime API, and each is
+315,590-412,095 tokens on the Qwen3.8 tokenizer (a 120-page excerpt 89,185), past a 262,144-token
+context. Bytes are already bounded by the request
+body (`--max-request-mib`) and the request's media byte budget (256 MiB at most), which counts a PDF's
+bytes but not its rendered pages (the vision budget bounds those). A request's PDFs may hold at most
+1,000 pages together (`pdf_too_many_pages`), which bounds only the reading before the context check:
+about 1 ms a page for the text (0.65-0.98 ms measured on those manuals), 1-2 ms a page for the
+smallest images and 3-6 ms for the largest. PDFium serves one page at a time across the server, in
+arrival order, so concurrent PDF requests take turns by page.
+
+**Citations.** `citations: {"enabled": true}` is accepted on all of a request's documents or on none,
+and separately on all of its search results or none (HTTP 400 otherwise), and not together with
+`output_config.format`. A citable source is cut into chunks: the sentences of plain text and of each
+PDF page (a sentence keeps the whitespace after it, so the chunks concatenate to the text; a full stop
+before a lowercase word, after an abbreviation a number follows ("Fig. 3") or after a line's leading
+number ("1. Install"), and a contents line's dot leader, end none), or each block of
+custom content and of a search result. Each chunk's ID costs about 5-8 prompt tokens: those manuals
+give 9-13 chunks a page, so citations add 74-100 tokens a page (10-20 % of their prompt). The model reads each chunk after its ID `[S.C]` (S
+counts the request's citable sources from 0, C the source's chunks from 0) and, once, right after the
+first citable source, an instruction to put the words of its answer that a passage supports in
+`<cite ids="S.C,...">...</cite>`. The response turns each tag into a text block of its own, whose
+`citations` hold one entry per run of consecutive chunks of one source, in the order the tag lists
+them, each with its `cited_text` (the chunks' text):
+
+| Source | Citation |
+|---|---|
+| plain text document | `char_location`: `document_index`, `document_title`, `start_char_index`, `end_char_index` (Unicode code points, end exclusive) |
+| PDF document | `page_location`: `document_index`, `document_title`, `start_page_number`, `end_page_number` (1-based, end exclusive) |
+| custom content document | `content_block_location`: `document_index`, `document_title`, `start_block_index`, `end_block_index` (end exclusive) |
+| search result | `search_result_location`: `search_result_index`, `source`, `title`, `start_block_index`, `end_block_index` |
+
+`document_index` and `search_result_index` count the request's documents and search results in
+order. A stream sends a cited block's `citations_delta` events right after its `content_block_start`,
+then its `text_delta` events; text that may begin a tag is held back until it is decided. A tag
+whose IDs name no chunk is dropped with its closing tag and its text stays plain; IDs it names among
+valid ones are dropped; `<cite>` without IDs, and a `</cite>` that closes nothing, stay text; an
+empty tag gives no block; a tag around punctuation alone (a model that writes
+`claim <cite ids="0.1">.</cite>`, as Qwen models without thinking often do) gives its citations to the
+text block before it, which the punctuation ends; a tag still open when the text ends (the output
+limit, a tool call) closes there, and one the end cut part-way is dropped. The model never cites
+inside its thinking. An assistant text block with citations sent back as history is rendered as the
+cite tag it came from, so the next turn's prompt repeats what the model wrote and keeps the prefix
+cache (a punctuation tag's block comes back as one tag around the whole block, which differs from
+the generated text from that block on). `output_tokens`
+counts the generated tokens, the tags included; `cited_text` is not generated and costs nothing.
 
 ## Deferred tools and tool search
 
@@ -1853,6 +1985,86 @@ curl http://127.0.0.1:8080/v1/decide -H 'Content-Type: application/json' -d '{
 - Each question is one engine request in the request log and metrics (`protocol: "decide"`): a
   readout with one staged output token that is never returned, a generated primitive with its run.
 
+## Teacher-forced scoring
+
+`POST /v1/score` returns the log-probability of every token of a given continuation after a given
+prompt, and the engine's own top-k next-token distribution at each of those positions. Nothing is
+generated: the whole sequence is scored in one teacher-forced pass by `Engine::score_tokens`. It
+needs a server started with `--causal-scoring`; a generation server answers `501` with
+`code: "scoring_not_enabled"`. A scoring server generates nothing: `/v1/chat/completions`,
+`/v1/responses`, `/v1/messages` and `/v1/decide` answer `501` with `code: "generation_not_enabled"`
+before anything runs (token counting still answers). It scores one request at a time without
+speculation, vision or the prefix cache, and its startup log names the settings of a generation
+configuration (`--max-concurrency`, a drafter, `--prefix-cache-file`) that this leaves unused. It
+takes a fixed `--max-context N` (the longest prompt plus continuation it scores): `--max-context auto`
+sizes a generation server and is refused, and the launcher's preview says so when the switch is on.
+
+Requests wait for their turn in arrival order. At most `--max-pending-requests` wait beside the one
+being scored (more are refused as the generation queue refuses them), and a request still waiting
+when its client disconnects (`499`) or when `--pending-timeout-ms` passes (`503`
+`request_queue_timeout`) leaves the queue. A score that has started runs to its end.
+
+Uses: KL divergence between two models or settings over the same prompts (each response carries
+the distribution at every position, not only the target token's probability), and the
+log-likelihood requests of evaluation harnesses such as lm-evaluation-harness.
+
+| Field | Meaning |
+|---|---|
+| `apply_chat_template` | **Required**, `true` or `false`. `true` renders the prompt exactly as `/v1/chat/completions` renders it, generation prompt included; `false` encodes `prompt` as raw text with no template and no special tokens. There is no default, because it decides which distribution is measured. |
+| `prompt` | A string. With the template it is one user message. |
+| `messages` | Chat Completions turns, text only (`score_text_only` otherwise). Needs `apply_chat_template: true`. Exactly one of `prompt` and `messages`. |
+| `enable_thinking`, `reasoning_effort`, `preserve_thinking`, `chat_template_kwargs` | Template options, parsed as on `/v1/chat/completions`. Refused when `apply_chat_template` is false (`template_option_without_template`). |
+| `continuation` | **Required**, non-empty. Encoded as raw text after the prompt; each of its tokens is one scored position. Position 0 is the prompt's own next-token distribution, whatever the continuation's first token is. |
+| `top_k` | `0` to `256`: the most probable tokens returned per position, in descending order. Above `256` is refused (`top_k_out_of_range`), never narrowed. |
+| `hidden_states` | Optional, `true` or `false` (default). Qwen families: `true` returns every layer's hidden state at the prompt's last token, whose distribution is position 0. Gemma4 and `--lossless` refuse this option (`invalid_score_request`); ordinary Gemma scoring remains supported. |
+| `model` | Optional. Resolved as on `/v1/chat/completions`: another name than the server's answers `404` `model_not_found` (unless `--any-model-name`). The response's `model` is the server's public model ID. |
+
+An unknown field is refused with `400` and `code: "unknown_field"`. Prompt plus continuation must fit
+the server's `--max-context` (`context_length_exceeded`).
+
+A request (Qwen3.8-Flash-Next, NVIDIA NVFP4-QAD):
+
+```json
+{"model": "pr1test", "apply_chat_template": true, "messages": [{"role": "user", "content": "Say hello."}],
+ "enable_thinking": false, "continuation": " Hello there", "top_k": 2}
+```
+
+and its response:
+
+```json
+{
+  "object": "score",
+  "model": "pr1test",
+  "chat_template_applied": true,
+  "enable_thinking": false,
+  "top_k": 2,
+  "max_top_k": 256,
+  "positions": [
+    {"token_id": 21251, "token": " Hello", "logprob": -9.647107124328613,
+     "top_logprobs": [{"token_id": 9419, "token": "Hello", "logprob": -0.0006939148879610002},
+                      {"token_id": 12675, "token": "Hi", "logprob": -8.805469512939453}]},
+    {"token_id": 1017, "token": " there", "logprob": -5.637060165405273,
+     "top_logprobs": [{"token_id": 0, "token": "!", "logprob": -0.01845814660191536},
+                      {"token_id": 248046, "token": "<|im_end|>", "logprob": -4.612805366516113}]}
+  ],
+  "usage": {"prompt_tokens": 15, "continuation_tokens": 2}
+}
+```
+
+The continuation's own tokens are scored whatever their rank. Here the model's first choice after
+the generation prompt is `Hello` with no leading space, so the continuation's ` Hello` scores −9.65:
+write the continuation as the text that follows the prompt, boundary spacing included.
+
+`enable_thinking` is the template's thinking switch as rendered (`null` without a template).
+Repeating a request returns byte-identical output.
+
+With `"hidden_states": true` the response also carries `hidden_states`: one row per layer, `hidden_size` numbers
+each (the BF16 values exactly), at the prompt's last token. Row `L` is the hidden state layer `L` hands on: on the
+Qwen3.5 family the residual after layer `L`; on Qwen3.8-Flash-Next, whose residual is four hyper-connection streams,
+layer `L + 1`'s mixer input, and for the last layer its MoE input. It is what
+[fitting an ablation sidecar](ablate-fitting.md) measures directions from; the scores are the same with and without
+it. A 27B's rows are 64 x 5,120 numbers, so the response grows by a few MB.
+
 ## Authentication and CORS
 
 Pass `--api-key VALUE` to require the same value as an OpenAI bearer token or Anthropic
@@ -1871,6 +2083,11 @@ curl http://127.0.0.1:8080/v1/models \
 
 The table lists executable defaults. The startup example selects a long-context FP8/MTP3 profile.
 
+Gemma4 keeps its own one-lane text/MTP route. It does not inherit Qwen runtime LoRA/ablation,
+hidden-state capture, SSD/persistent prefix caches, lossy recurrent snapshot precision,
+or multi-lane serving merely because these options share a parser. Unsupported combinations
+are refused; source vision objects may be retained by conversion but are not text-serving inputs.
+
 | Option | Meaning | Default |
 |---|---|---:|
 | `--config FILE` | read options, and the artifact path, from a TOML file ([Configuration file](#configuration-file)); command-line options override it | unset |
@@ -1881,16 +2098,19 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--model-id ID` | override the public OpenAI model alias | artifact `metadata.name`, or architecture name |
 | `--any-model-name` | serve OpenAI-route requests whatever non-empty `model` they name, reporting the public model ID (see Chat Completions) | off: other names are 404 `model_not_found` |
 | `--chat-template FILE` | replace the artifact's chat template at startup; it must be one the target accepts | artifact template |
+| `--lora PATH` | apply a LoRA adapter at runtime: a Hugging Face PEFT adapter's folder, or its `adapter_model.safetensors` with `adapter_config.json` beside it. Qwen3.5 dense models (the 27Bs); `--lossless` computes it as PEFT does. `--model-id` names the adapted model ([LoRA adapters](lora.md)) | none |
+| `--ablate FILE` | apply an ablation sidecar at runtime: `sidecar.json` and its direction file, cutting the residual writes of the listed layers and lanes. Qwen families only; Gemma4 refuses it. Refused with `--lossless` ([Ablation sidecars](ablate.md)) | none |
 | `--claude-code-prompt as-sent\|local` | Anthropic Messages from Claude Code: use its System prompt as sent, or replace its Claude-specific parts with a short local-agent preamble ([Anthropic Messages](#anthropic-messages)) | `as-sent` |
 | `--rope-yarn-factor F` | startup-fixed runtime YaRN factor, finite `[1,4]`; extends allowed ceiling only | `1` |
-| `--max-context N\|auto` | logical context ceiling of each sequence. Gemma4-only `auto` fits a page-aligned ceiling from actual resident free VRAM, bounded by 131072/native positions, and requires `--kv-capacity auto`. It refuses below 9216 tokens; an explicit number is never silently reduced. See [the opt-in 16 GB profile](weight-conversion.md#opt-in-16-gb-memory-profile) | `8192` |
+| `--max-context N\|auto` | logical context ceiling. Resident Qwen3.5-family `auto` sizes to the largest context whose reservation fits beside the weights, bounded by native positions and an explicit KV ceiling. Gemma4 `auto` instead requires automatic KV and fits page-aligned resident VRAM up to 131072/native, refusing below 9216 ([16 GB profile](weight-conversion.md#opt-in-16-gb-memory-profile)). Numeric contexts never shrink. Startup, `/v1/models` and `/metrics` report the resolved value. KV defaults to `auto`, including with `--no-prefix-reuse`. Offloaded experts refuse automatic context because it would starve their expert cache | `8192` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory (with offloaded experts, as on Qwen3.8-Flash-Next and Qwen3.5-122B-A10B, `auto` is `--max-context` x `--max-concurrency` and the expert cache takes the rest); omitted means `auto` with the prefix cache and `--max-context` with `--no-prefix-reuse` | `auto` |
 | `--vram-headroom-mib N\|auto` | VRAM in MiB that startup sizing leaves free for the display and other programs (`auto` = 1024 with a display on the GPU or when that is unknown, 256 without). Qwen3.5: after `--kv-capacity auto` sizes the KV pool (requires `auto`). Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B): after the expert cache takes the rest ([details](qwen3_8-flash-next.md#vram)) | `auto` |
 | `--vram-past-budget` | Windows: also size into the VRAM the Windows per-process budget withholds (~0.6 GiB on an RTX 5090), measured at startup: with offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B) the expert cache (~240 more expert frames), otherwise the KV pool of `--kv-capacity auto` (more KV, so more context in VRAM and a larger Device prefix cache). Every startup reading, the Program's check that its allocations landed in VRAM and the free VRAM the server reports count it. That memory may be moved to system memory if another program needs VRAM: an expert cache then shrinks, while a KV pool stays and runs slower until the VRAM frees ([details](qwen3_8-flash-next.md#vram)) | off |
 | `--expert-tail-skip R` | Artifacts with offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B), approximate: trades quality for decode speed. In decode and verification rounds, a routed expert missing from VRAM that every token of the round routes at top-k rank `R` or lower (`1..k-1`, 0-based, with k = 10 on Flash-Next and 8 on the 122B; k-1 skips least) is neither copied nor computed: it adds zero and the other experts keep their router weights. The output changes, is slightly worse, and depends on which experts the cache holds; prefill is unchanged; the reproducible route (`--reproducible`) refuses it. Strata does the same by default at rank 7 (`STRATA_ROUTE_TAIL_SKIP=7`) ([details](qwen3_8-flash-next.md#expert-tail-skip)) | off |
-| `--expert-state FILE\|off` | Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B): the expert cache's saved state. At startup the engine fills the VRAM expert cache with the experts the file ranks highest (about 1 s for a full cache) and starts their use counts from it; it writes the file when it stops and every 10 minutes between requests (through `FILE.tmp` and a rename). A file from another artifact or of another size is ignored and replaced. Without a usable file Qwen3.8-Flash-Next seeds the cache from a built-in calibrated expert order instead, and with one the SSD tier's RAM takes the experts the file never ranked in that order; the 122B seeds it the same way from its own calibrated order once one is generated into the build (none is yet, so today it starts with an empty cache that each prompt's routes seed). `off` starts with an empty cache, no seed, and saves nothing; cold benchmarks need it | `<artifact>.expert-state` |
+| `--expert-state FILE\|off` | Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B): the expert cache's saved state. At startup the engine fills the VRAM expert cache with the experts the file ranks highest (about 1 s for a full cache) and starts their use counts from it; it writes the file when it stops and every 10 minutes between requests (through `FILE.tmp` and a rename). A file from another artifact or of another size is ignored and replaced. Without a usable file Qwen3.8-Flash-Next seeds the cache from a built-in calibrated expert order instead, and with one the SSD tier's RAM takes the experts the file never ranked in that order; the 122B seeds half its frames the same way from its own built-in calibrated order. `off` starts with an empty cache, no seed, and saves nothing; cold benchmarks need it. Beside it, `FILE.cpu-rates` keeps the CPU expert team's settled rates for this CPU, artifact and team: every start still reads the rates, and when its first two readings agree with the stored ones within 10 % it skips the 4 s settling pause (otherwise it settles in full and, on a quiet CPU, stores its own); the session always uses that start's readings, and a changed machine or configuration is simply a new entry | `<artifact>.expert-state` |
 | `--expert-stripe FILE` | Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B) with the SSD expert tier: an expert stripe (`tools/flash_next/expert_stripe.py`) holding the tail of every expert record on a second drive; each record not in RAM is then read in two parts, its head from the artifact and its tail from the stripe, at the same time. The stripe must belong to the artifact. Unused when every expert fits in RAM ([guide](qwen3_8-flash-next.md#ssd-expert-tier)) | none |
 | `--max-concurrency N` | resident execution lanes; valid range `1..8` | `1` |
+| `--causal-scoring` | start the engine for teacher-forced scoring (the `CausalScoring` purpose `perplexity` and `certify` use): `POST /v1/score` answers and nothing generates, so there is no warm-up ([Teacher-forced scoring](#teacher-forced-scoring)) | off |
 | `--max-pending-requests N` | additional requests allowed to wait for admission, 1 to 1024 (the HTTP pool starts a worker for each admitted or waiting request) | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
 | `--keep-alive-timeout-sec N` | how long an HTTP connection stays open after its response finishes, for the client's next request on the same connection (valid range `1..3600`). The server advertises it as `Keep-Alive: timeout=N` and closes an idle connection 10 s later. Client pools reuse connections between turns; when the server closes a connection first, a client can write its next request onto it (even one that checks a pooled socket before reusing it, if the close is in flight between the check and the write) and loses that request: Bun's `fetch` and the AI SDK do not retry a POST. The timeout close is graceful (a FIN first, then a short drain of anything the client sent), and a request that does arrive re-arms the window on both sides. Two kinds of client pool meet it: one that reads `Keep-Alive: timeout` retires the connection by the advertised deadline, before the server's close; one that ignores the header keeps its own idle timeout, which the window must exceed. Bun's `fetch` (opencode's client) is of the second kind, with a 5-minute idle timeout that fires 4-5 minutes after the last response, so the default outlasts it. Set the window above the longest idle timeout of the header-blind client pools you serve. Each open connection holds a request worker (an idle one wakes every 10 ms) for its whole idle window; the pool ceiling (`--max-http-clients`) bounds how many | `360` |
@@ -1904,20 +2124,21 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--fast-path NAME` | also run this fast path (a name from the [registry](maintainer/model-quality.md#67-fast-path-registry)), qualified for the configuration or not; repeatable. For qualification and timing runs (with `--reproducible`, it times one path against the reproducible route): a path that cannot apply to the loaded model fails startup | none |
 | `--no-fast-path NAME` | leave this fast path out of the default route's selection; repeatable. For leave-one-out timing runs (the default route against itself without one path): a path the configuration does not select, one also given to `--fast-path`, `--reproducible` and `--lossless` fail startup | none |
 | `--expert-a4-activations` | [nvidia/Qwen3.8-Flash-Next-FP4-Local](qwen3_8-flash-next.md#nvidia-fp4-local-checkpoint) only: run the routed experts with 4-bit NVFP4 activations (W4A4) at the activation scales NVIDIA calibrated for this checkpoint, instead of the 16-bit activations NVIDIA serves it with. Changes the output (a saved prefix-cache file from the other setting is not loaded). Every other artifact refuses it: their experts' arithmetic is fixed by the conversion | off: 16-bit expert activations |
-| `--a16-activations` | Qwen3.8-Flash-Next artifacts whose routed experts are NVIDIA's W4A4 NVFP4 (Dense8 and recipe A): run them with 16-bit activations, the weight-only banks' exact arithmetic, instead of the 4-bit activations the checkpoint specifies at NVIDIA's calibrated scales. Changes the output, and the engine warns at launch: the default follows NVIDIA's specification and reads long prompts faster (Dense8, RTX 5090, 2026-10-31: 128K prompts 16.7 s against 12.2 s; decode rounds 2-6 % faster; [guide](qwen3_8-flash-next.md#a16-activations)). Artifacts whose experts already run 16-bit accept it unchanged; `--expert-a4-activations`, `--a8-activations` and `--lossless` refuse it | off |
-| `--a8-activations` | Approximate: 8-bit activations instead of a projection's own arithmetic where that measured faster (a route stays only where it does). Decode and verification calls: int8 codes with an FP32 scale per 32 values (as llama.cpp's Q8_1) in a GGUF import's dense projections (calls of up to 31 columns) and in routed experts (GGUF blocks, NVFP4 W4A16 banks; calls of up to 128 columns) with their CPU-served misses. Prefill calls: on the same codec, a GGUF import's dense projections (32 or more columns) and those routed experts (more than 128 columns, in place of `expert-a4-residual`'s A4 terms where that runs); a groupwise Q4 MLP gate/up with int8 activations per token (the groupwise 27B artifacts with Q4 gate/up; 256 or more columns); MXFP8 dense projections with two E4M3 terms per 32 values (NVIDIA FP4-Local). Every other call keeps its route: the Q8, FP8, NVFP4 and BF16 dense projections (the NVFP4 27B's FP8 and NVFP4 sites already take the 8- and 4-bit activations their artifact permits), resident experts, and block-FP8 experts; NVIDIA's W4A4 experts (Dense8, recipe A) take the 8-bit route in place of their 4-bit one, with a launch warning (on Dense8 it decodes 5-9 % faster but reads long prompts 28 % slower). On a GGUF import it also rewrites the BF16 hyper-connection matrices as 8-bit weights at load, lossy too ([guide](qwen3_8-flash-next.md#a8-activations)). Changes the output (a saved prefix-cache file from the other setting is not loaded); `--reproducible`, `--lossless` and artifacts with none of these routes refuse it (the NVFP4 Qwen3.8-27B, the Qwen3.6-35B-A3B and the official FP8 import among them) | off |
+| `--a16-activations` | 16-bit activations where the checkpoint specifies fewer bits. Qwen3.8-Flash-Next artifacts whose routed experts are NVIDIA's W4A4 NVFP4 (Dense8, recipe A and the NVFP4-QAD artifacts, whose shared experts follow): run them with 16-bit activations, the weight-only banks' exact arithmetic, instead of the 4-bit activations the checkpoint specifies at NVIDIA's calibrated scales. NVIDIA's NVFP4 Qwen3.8-27B artifacts (and NVFP4-QAD's bit-exact conversion): every text projection 16-bit, its NVFP4 layers instead of 4-bit and its FP8 layers instead of 8-bit prompt activations (with its own fast paths, those measured faster under the flag: [model-quality](maintainer/model-quality.md#67-fast-path-registry)). Changes the output, and the engine warns at launch: the default follows NVIDIA's specification and reads long prompts faster (Dense8, RTX 5090, 2026-10-31: 128K prompts 16.7 s against 12.2 s; decode rounds 2-6 % faster; [guide](qwen3_8-flash-next.md#a16-activations)). Artifacts whose experts already run 16-bit accept it unchanged; `--expert-a4-activations`, `--a8-activations` and `--lossless` refuse it | off |
+| `--a8-activations` | Approximate: 8-bit activations instead of a projection's own arithmetic where that measured faster (a route stays only where it does), and on the NVFP4 Qwen3.8-27B artifacts at every NVFP4 and FP8 projection (below). Decode and verification calls: int8 codes with an FP32 scale per 32 values (as llama.cpp's Q8_1) in a GGUF import's dense projections (calls of up to 31 columns) and in routed experts (GGUF blocks, NVFP4 W4A16 banks; calls of up to 128 columns) with their CPU-served misses. Prefill calls: on the same codec, a GGUF import's dense projections (32 or more columns) and those routed experts (more than 128 columns, in place of `expert-a4-residual`'s A4 terms where that runs); a groupwise Q4 MLP gate/up with int8 activations per token (the groupwise 27B artifacts with Q4 gate/up; 256 or more columns); MXFP8 dense projections with two E4M3 terms per 32 values (NVIDIA FP4-Local). Every call, decode included: a dense artifact whose NVFP4 projections permit 4-bit activations and whose other 4- and 8-bit text projections are NVFP4 or row-scaled FP8 (the NVFP4 Qwen3.8-27B artifacts: NVIDIA's exports and NInfer's official NVFP4, Quasar and Uncensored, all in their form) takes 8-bit activations at every width of every such projection, for precision comparisons rather than speed (NVFP4: the codec above; FP8: one E4M3 term, the static scale where the artifact stores one); the head and the drafters keep their routes. Every other call keeps its route: the Q8, FP8, NVFP4 and BF16 dense projections of other artifacts, resident experts, and block-FP8 experts; NVIDIA's W4A4 experts (Dense8, recipe A, and the NVFP4-QAD artifacts' routed and shared experts) take the 8-bit route in place of their 4-bit one, with a launch warning (on Dense8 it decodes 5-9 % faster but reads long prompts 28 % slower). On a GGUF import it also rewrites the BF16 hyper-connection matrices as 8-bit weights at load, lossy too ([guide](qwen3_8-flash-next.md#a8-activations)). Changes the output (a saved prefix-cache file from the other setting is not loaded); `--reproducible`, `--lossless` and artifacts with none of these routes refuse it (the Qwen3.6-35B-A3B and the official FP8 import among them) | off |
 | `--embedding-host` | Qwen3.5-family artifacts: keep the token embedding in pinned host memory and read its rows zero-copy, as artifacts with offloaded experts always do, so its VRAM (1.18 GiB on the 27B) goes to the KV and prefix caches. Same output; a prompt chunk reads its rows over PCIe. With `--vision-offload on` the encode window then borrows only the output head and whichever proposal head and MTP drafter the artifact has, so an image whose window needs more is refused (on the 27B the largest image `--vision-max-merged 12288` admits still fits) | off: in VRAM |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--log-stats-panel on\|off` | pin the session statistics panel beneath the console log on an interactive terminal | `on` |
 | `--log-colours on\|off` | colour the console statistics lines; never applies to file logs | `off` |
 | `--log-level trace\|debug\|info\|warning\|error\|critical\|off` | pretty stderr verbosity | `info` |
-| `--log-file PATH` | duplicate the console log records to a plain timestamped file (appended, each record written through as it is logged, so a crash leaves every earlier record in it, including records a console that stopped taking output dropped) beside, never instead of, the console; the file carries no logger-added colour or cursor control, and records that colour their own message under `--log-colours` (the serve panels) keep those escapes; a file that cannot be opened leaves the console logging, with a warning | none |
+| `--log-file PATH` | duplicate the console log records to a plain timestamped file (appended, each record written through as it is logged, so a crash leaves every earlier record in it, including records a console that stopped taking output dropped) beside, never instead of, the console; the file carries no logger-added colour or cursor control, and records that colour their own message under `--log-colours` (the serve panels) keep those escapes; a file that cannot be opened leaves the console logging, with a warning. `PATH` may not be the model artifact or another output file (`--request-log-jsonl`, `--route-trace`, `--prefix-cache-file`) | none |
 | `--device N` | CUDA device index | `0` |
 | `--ram-free-mib N` | physical Host RAM in MiB that everything Infernix keeps in RAM (weights, offloaded experts, the n-gram table, the prefix cache's Host tier) leaves free for other programs; startup refuses a lock that would take it, and Qwen3.8-Flash-Next plans every allocation against it in its RAM ledger | `4096` |
-| `--ram-resize auto\|off` | `auto`: the RAM tiers follow the RAM other programs need, while requests run as well as between them. With R = `--ram-free-mib`, once less than max(R / 2, 2 GiB) of physical RAM is available they give memory back in whole 1 GiB steps until R (at least 1 GiB above that point) is available again: the prefix cache's Host tier first (its least valuable entries go; the rest, a running request's cached blocks included, are copied below the cut; down to one chunk), then the offloaded experts' RAM copies when the [SSD expert tier](qwen3_8-flash-next.md#ssd-expert-tier) serves them (the `exclusive` layout, or less RAM than every expert needs; the experts given back are read from the artifact meanwhile). Once more than R plus 1 GiB has stayed available for 10 s they take back what stays above that, up to their startup sizes (an automatic prefix cache Host tier also past its startup size, see `--host-context-mib`), one piece of 1 GiB or one pinned expert chunk at a time, the experts first: rounds refill their slots and records with the experts they read from the artifact (a record by a background copy of what a round read and no slot took), and what is still empty once the Engine is idle is read from the artifact then. Between the two thresholds (R = 4 GiB, the default: 2 to 5 GiB available) nothing changes, so ordinary swings of other programs do not cycle the tiers. The copies, page-locking and releases run on a thread of their own (a hybrid CPU's slow cores); a round waits only for the bookkeeping between rounds, the driver's own stall of 1-3 ms per 64 MiB chunk the Host tier locks or unlocks, and, for the experts, the round in flight before a release and about 0.1 s per GiB of expert chunk locked again (while requests run, one chunk at most every 2 s). Each release and each completed growth is logged. `off`: every tier keeps its startup size | `auto` |
+| `--ram-resize auto\|off` | `auto`: the RAM tiers follow the RAM other programs need, while requests run as well as between them. With R = `--ram-free-mib`, once less than max(R / 2, 2 GiB) of physical RAM is available they give memory back in whole 1 GiB steps until R (at least 1 GiB above that point) is available again: the prefix cache's Host tier first (its least valuable entries go; the rest, a running request's cached blocks included, are copied below the cut; down to one chunk), then the offloaded experts' RAM copies when the [SSD expert tier](qwen3_8-flash-next.md#ssd-expert-tier) serves them (the `exclusive` layout, or less RAM than every expert needs; the experts given back are read from the artifact meanwhile). Once more than R plus 1 GiB has stayed available for 10 s they take back what stays above that, up to their startup sizes (an automatic prefix cache Host tier also past its startup size, see `--host-context-mib`), one piece of 1 GiB or one pinned expert chunk at a time, the experts first: rounds refill their slots and records with the experts they read from the artifact (a record by a background copy of what a round read and no slot took), and what is still empty once the Engine is idle is read from the artifact then. Between the two thresholds (R = 4 GiB, the default: 2 to 5 GiB available) nothing changes, so ordinary swings of other programs do not cycle the tiers. The copies, page-locking and releases run on a thread of their own (a hybrid CPU's slow cores); a round waits only for the bookkeeping between rounds, the driver's own stall of 1-3 ms per 64 MiB chunk the Host tier locks or unlocks, and, for the experts, the round in flight before a release and about 0.1 s per GiB of expert chunk locked again (while requests run, one chunk at most every 2 s). Each release and each completed growth is logged. "Available" is the lesser of the physical RAM and the commit the OS can still hand out (Windows with a small page file runs out of commit first), read once a second and ten times a second while less than twice the release point is available; a growth the OS refuses (its page-lock or commit limit) is tried again after 20 s, then 40 s, doubling to about ten minutes. Under WSL2 these readings are the Linux VM's, not the Windows host's (startup warns). `off`: every tier keeps its startup size | `auto` |
 | `--expert-ram-mib N\|auto` | Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B): Host RAM in MiB for the routed experts; less than all of them need (~64.5 GiB on Flash-Next, 60.75 GiB on the 122B) keeps that many in RAM and reads the rest from the artifact ([SSD expert tier](qwen3_8-flash-next.md#ssd-expert-tier)); more than is free is an error | `auto` (what the ledger leaves) |
 | `--expert-ram-layout exclusive\|full` | Qwen3.8-Flash-Next and the Qwen3.5-122B-A10B, when VRAM cannot hold every routed expert: `exclusive` keeps in RAM only the experts VRAM does not hold (plus copies of the ones a prefill borrows and the KV may take), `full` keeps a RAM copy of every expert whenever RAM allows. Same output bits either way. Flash-Next: `full` takes 4-6 GiB more RAM for the Dense8 and IQ3_S experts at 16K on an RTX 5090, at the same decode speed. 122B: `exclusive` holds 56.9 instead of 60.8 GiB of experts and decodes about 1 % slower after a 32K prompt (equal at short ones), prefill 0.4 % slower. Ignored with `--expert-ram-mib N` | `exclusive` (Flash-Next), `full` (122B) |
 | `--expert-csf` | Qwen3.8-Flash-Next and the Qwen3.5-122B-A10B, NVFP4 experts offloaded to RAM: their RAM copies (the pinned banks, or the SSD tier's slots) keep the block scales compressed (CSF: 4-bit offsets from per-row bases, ~5 % fewer bytes, about 3 GiB on Flash-Next), so each copy to VRAM and each CPU walk reads less. Same output bits. Measured on an RTX 5090 (2026-11-09): prompts 2-5 % faster on Dense8, FP4-Local and the 122B, decode 0.6-2 % slower (the CPU decodes the scales of the experts it computes) | off |
+| `--ngram-volume FILE` | Qwen3.8-Flash-Next: the PLE n-gram embedding volume, the artifact's own or any FP8, IQ4_NL, Q8_0, NVFP4, BF16 or BF16 P12 volume of the same table in place of its own ([formats](qwen3_8-flash-next.md#n-gram-table-formats)) | the artifact path + `.ngram` |
 | `--ngram-residency auto\|ram\|volume` | Qwen3.8-Flash-Next: where the PLE n-gram table lives. `ram` reads the whole table into Host RAM at startup, locked for the CPU but not page-locked for the GPU (27.1 GiB for a GGUF import's IQ4_NL table, 48.8 GiB for the FP8 table) and never reads the volume again; `volume` reads rows on demand through a 2^20-row cache; `auto` takes RAM only when the RAM ledger still keeps every expert in RAM beside it ([details](qwen3_8-flash-next.md#n-gram-table-in-ram)) | `auto` |
 | `--expert-pin-mib N\|auto` | Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B): at most N MiB of the experts' RAM page-locked for the GPU; the rest stays in RAM unpinned and the CPU serves it ([Page-locking limit](qwen3_8-flash-next.md#page-locking-limit)) | `auto` (what Windows lets the GPU page-lock) |
 | `--context-cost-presets FILE` | optional runtime context-cost preset registry | generic + compiled defaults |
@@ -1925,12 +2146,12 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--media-cache-mib N` | LRU-retained prepared BF16 media payloads; `0` disables retention | `1024` |
 | `--media-live-mib N` | all live prepared BF16 media payloads | `2048` |
 | `--media-preprocess-threads N` | bounded media preprocessing workers; `0` selects at most 16 from host concurrency | `0` |
-| `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
+| `--request-log-jsonl FILE` | append full-precision server/request records; `FILE` may not be the model artifact or the file of `--log-file`, `--route-trace` or `--prefix-cache-file` (the server refuses to start) | disabled |
 | `--request-log-max-mib N` | rotate the request log once it reaches `N` MiB ([Structured request log](#structured-request-log)); requires `--request-log-jsonl` | one file without a size limit |
 | `--request-log-keep N` | rotated request-log files kept (`0..1000`); requires `--request-log-max-mib` | `4` |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
-| `--route-trace PATH` | Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B) only: write the expert-routing trace `tools/expert_cache_replay/host_tier.py` replays — a header, one record per prefill, forced, decode and verify round, and one per CUDA-graph instantiation; no decode-path work when unset | disabled |
+| `--route-trace PATH` | Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B) only: write the expert-routing trace `tools/expert_cache_replay/host_tier.py` replays — a header, one record per prefill, forced, decode and verify round, and one per CUDA-graph instantiation; no decode-path work when unset. `PATH` may not be the model artifact or another output file (`--log-file`, `--request-log-jsonl`, `--prefix-cache-file`) | disabled |
 | `--kv-dtype bf16\|bf16p\|int8\|fp8\|nvfp4\|k8v4\|vq2\|k4v2` | KV-cache storage; `vq2` and `k4v2` are the 2-bit and 4-bit-K vector-quantized formats ([CLI](cli.md#context-and-memory)); `bf16` stores K as BF16 and V as FP16 (exact for every BF16 value with 2^-17 <= \|v\| < 2^16), and with `--lossless` V as BF16; `bf16p` stores the same values as `bf16` losslessly in 12 bits a value plus an 8-byte side record per row, 23 % fewer bytes (the same memory holds 1.31 times the tokens, in the KV cache and the prefix cache), with the same output as `bf16`; a request whose K or V holds a row with more than 6 values outside its 14-binade exponent window fails with an error (none was seen in the 27B's or 35B-A3B's KV) | `bf16` |
 | `--gemma4-qk bf16\|fp8` | Gemma4 only: precision of the global (D512) layers' attention QK. `bf16` (default) expands the cache to BF16 before QK; `fp8` runs QK on FP8 codes for prompt chunks of 64 or more tokens (shorter chunks and the sliding layers stay BF16). `fp8` requires `--kv-dtype fp8` and is refused with any other KV format and for every other model family. Gemma4 stores sliding layers as BF16 whatever `--kv-dtype` is unless `--gemma4-sliding-kv fp8`, accepts only `bf16` and `fp8`, and refuses `int8`; startup reports the requested, global and sliding KV formats, the QK mode and each side's payload bytes | `bf16` |
 | `--gemma4-key-only-kv` | Gemma4 only, experimental: keep global FP8 K and reconstruct V in attention, halving global KV payload; the sliding ring follows `--gemma4-sliding-kv`. Requires `--kv-dtype fp8` and compatible constant key-normalization weights. Changes arithmetic and can slow long-context attention; omission retains stored K/V. No environment variable enables it | off |
@@ -1964,7 +2185,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable the prefix cache: every request prefills from the root, and a paused request recovers by replay; rejected with `--host-context-mib` and the cache options below | prefix reuse on |
 | `--host-context-mib N\|auto` | pinned Host budget in decimal MiB that resolve to whole bytes: the slab pool the prefix cache's KV blocks and state snapshots share ([spec](maintainer/hybrid-prefix-cache-spec.md)), split at run time by eviction value. `0` keeps the cache on the Device only, and a nonzero budget below one snapshot is rejected. Qwen3.8-Flash-Next: must be positive (its state snapshots live in this pool). `auto` gives it all the RAM the model's own plan leaves beyond `--ram-free-mib`, the only headroom: the plan places the weights, the offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B) and the n-gram table first and counts the Program's later pins, the frontend's caches at their caps and the process's growth; the tier stays within what Windows still lets the process page-lock, in 256 MiB steps and at least 1 GiB. The size therefore depends on the RAM free at startup. Once the Engine is ready, an automatic tier also gives back, in 64 MiB chunks, what keeps less than `--ram-free-mib` available (the plan cannot count every buffer the running process holds), and `--ram-resize auto` gives part of it back while other programs need the RAM and, once RAM other programs held at startup stays free, grows it past its startup size (the experts first): up to what the plan would have given it with that RAM free, still within what Windows lets the process page-lock, so a tier sized beside a program that later closes does not stay small. The startup line `prefix cache | on | ... in RAM` (`..., up to ... as RAM frees` when it may grow) shows the result, and Qwen3.8-Flash-Next's `RAM plan:` line the RAM left free. A number is set aside before the experts instead. | `auto` |
-| `--device-snapshot-slots N` | Device state snapshot slots (`1..64`); not available for Qwen3.8-Flash-Next, whose snapshots live in the Host tier | `max-concurrency + 1`; `+ 2` without a Host tier; `1` for an artifact with offloaded experts (Qwen3.5-122B-A10B) with a Host tier, whose further slots would take expert frames |
+| `--device-snapshot-slots N` | Device state snapshot slots (`1..64`); not available for Qwen3.8-Flash-Next, whose snapshots live in the Host tier | `1` with a Host tier (snapshots restore from it, and each further slot is VRAM the KV cache would hold: 115-187 MiB on the 27B); `max-concurrency + 2` without a Host tier |
 | `--cache-taps-per-request N` | new prefill state snapshots per request (`0..64`) | `8`; `2` without a Host tier |
 | `--cache-tap-ladder N` | history-snapshot ladder base G; flexible taps at `prompt − G·2^k` | `max(4096, 2 * prefill-chunk)`; Qwen3.8-Flash-Next counts the chunk as at most `4096` |
 | `--cache-tap-min-gap N` | minimum tokens between ladder snapshots | `max(1024, prefill-chunk)`; Qwen3.8-Flash-Next counts the chunk as at most `4096` |
@@ -1972,11 +2193,11 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--cache-tool-hold-secs N` | Qwen3.5: after a reply that ends in a tool call, hold the snapshots its next turn resumes from (and their blocks) like a queued request's, after every queued one, for `N` seconds (`0..3600`), since an agent client usually sends the next turn once its tool has run; `0` turns the holds off. Qwen3.8-Flash-Next has none and refuses a nonzero value ([spec §9.7](maintainer/hybrid-prefix-cache-spec.md#97-tool-call-holds)) | `30` (Qwen3.5) |
 | `--cache-next-turn-ms N` | after a reply that ended on its own, once the server has had nothing to run for `N` ms (`0..3600000`), prefill the conversation's history as its next request will render it ([next-turn prefill](#next-turn-prefill), [spec §7.9](maintainer/hybrid-prefix-cache-spec.md#79-next-turn-prefill)); it yields to any request at its next unit and never changes output; `0` turns it off. Qwen3.8-Flash-Next: off by default, refused with `--reproducible` and `--lossless` | `150` (Flash-Next `0`) |
 | `--cache-host-state fp32\|fp24\|bf16` | Qwen3.5: Host-tier form of snapshot recurrent (Gated DeltaNet) state; the attention KV cache keeps `--kv-dtype` and the Device copies stay exact. `fp24` and `bf16` round it to 15 or 7 mantissa bits, shrinking each 27B snapshot by 36 or 72 MiB (about 19 % and 39 % of a DFlash2 image), so the same Host tier keeps more snapshots and restores move fewer bytes; a snapshot restored from the Host then resumes from the rounded state, so output is no longer bit-identical to `fp32`. A cache file written with another form is not loaded; `fp24` and `bf16` are refused with `--reproducible` (whether a turn resumes from the Host depends on eviction) and for Qwen3.8-Flash-Next ([spec §5.6](maintainer/hybrid-prefix-cache-spec.md#56-host-state-precision)). Under the `fp16-gdn-state` fast-path candidate the pool itself stores the state as FP16, and the Host keeps those bytes exactly whatever this option says | `fp32`: exact |
-| `--prefix-cache-file PATH` | at startup, restore the Host tier from `PATH` if the file exists; when the server stops ([Stop the server](#stop-the-server)), save it there once running and queued requests are cancelled (every Host-backed snapshot, including those a later turn superseded, which a retried or re-sent prompt resumes from, and the block path each resumes through). A save cut short is abandoned and the previous file kept: one more Ctrl+C during the stop also deletes the unfinished `PATH.tmp`, while Windows ending a closed console's process about 5 s after the close leaves it until the next save, so stop large caches with Ctrl+C. `PATH` may be relative (resolved against the launch directory) or absolute, e.g. `--prefix-cache-file "e:\NInfer-Deploy-V3\file.cache"`. Its directory must exist, and the flag needs a Host tier (not `--host-context-mib 0`). A file written for another artifact, KV format, speculative backend, RoPE scaling, prefill chunk, fast-path, lossless, 8-bit activation or `--expert-tail-skip` setting, `infernix-serve` binary or GPU model is ignored and replaced at shutdown. The startup log shows the read's progress and reports what was restored; with a `--host-context-mib` smaller than the file needs, the most valuable snapshots and only the blocks they resume through are restored, and the log warns with the size the file needs; when no snapshot fits, it warns that nothing was restored and that the save at shutdown replaces the file. Saving writes up to `--host-context-mib` of data. With `--ssd-context-gib`, the SSD tier is kept too: its file in `--ssd-context-dir` is named after `PATH` and stays when the server exits, the save names the snapshots and blocks it holds (with a hash of each slab, written beside the file's tables, so saving them writes no slab bytes), and the next start with the same `PATH`, SSD size and directory takes them back without reading them (the log reports `prefix cache SSD tier kept`); each is read only when a request resumes from it, and a slab whose bytes no longer match the saved hash (written over after the save, for example by a run that crashed) is dropped instead of used. | off: nothing is saved or restored |
+| `--prefix-cache-file PATH` | at startup, restore the Host tier from `PATH` if the file exists; when the server stops ([Stop the server](#stop-the-server)), save it there once running and queued requests are cancelled (every Host-backed snapshot, including those a later turn superseded, which a retried or re-sent prompt resumes from, and the block path each resumes through). A save cut short is abandoned and the previous file kept: one more Ctrl+C during the stop also deletes the unfinished `PATH.tmp`, while Windows ending a closed console's process about 5 s after the close leaves it until the next save, so stop large caches with Ctrl+C. `PATH` may be relative (resolved against the launch directory) or absolute, e.g. `--prefix-cache-file "e:\NInfer-Deploy-V3\file.cache"`. Its directory must exist, it may not be the model artifact or another output file (`--log-file`, `--request-log-jsonl`, `--route-trace`), and the flag needs a Host tier (not `--host-context-mib 0`). A file written for another artifact, KV format, speculative backend, RoPE scaling, prefill chunk, fast-path, lossless, 8-bit activation or `--expert-tail-skip` setting, `infernix-serve` binary or GPU model is ignored and replaced at shutdown. The startup log shows the read's progress and reports what was restored; with a `--host-context-mib` smaller than the file needs, the most valuable snapshots and only the blocks they resume through are restored, and the log warns with the size the file needs; when no snapshot fits, it warns that nothing was restored and that the save at shutdown replaces the file. Saving writes up to `--host-context-mib` of data. With `--ssd-context-gib`, the SSD tier is kept too: its file in `--ssd-context-dir` is named after `PATH` and stays when the server exits, the save names the snapshots and blocks it holds (with a hash of each slab, written beside the file's tables, so saving them writes no slab bytes), and the next start with the same `PATH`, SSD size and directory takes them back without reading them (the log reports `prefix cache SSD tier kept`); each is read only when a request resumes from it, and a slab whose bytes no longer match the saved hash (written over after the save, for example by a run that crashed) is dropped instead of used. | off: nothing is saved or restored |
 | `--ssd-context-gib N` | an SSD tier of `N` GiB below the Host tier, for every model ([spec §5.7](maintainer/hybrid-prefix-cache-spec.md#57-ssd-tier-opt-in)). When the Host tier fills, the snapshots it would give up next and their blocks are written to a scratch file in `--ssd-context-dir` (each block once while the SSD keeps it; superseded snapshots and blocks no snapshot needs are never written), and a request that resumes from them reads them back into the Host tier first (it waits in the queue meanwhile) instead of recomputing them. Snapshot images are stored losslessly compressed where that saves space (about 12 % of a Qwen3.8-Flash-Next image), and Qwen3.8-Flash-Next's copies leave out the DFlash2 drafter's context (about a quarter of an image; a restored request's drafter starts it afresh, which can cost speculative acceptance but never changes what the model computes). The file's space is reserved at startup and the file is removed when the server exits, unless `--prefix-cache-file` is set, which keeps it for the next start; it is read and written without the OS file cache, so it takes no RAM. Size it for the conversations you want to keep (a 160K-token Qwen3.8-Flash-Next conversation is about 2.4 GB with INT8 KV). WARNING: it writes to the drive whenever the Host tier fills, which wears an SSD, up to `--ssd-context-gib-per-hour`; the `throughput` log record (`context_cache.hybrid.ssd`) and `/metrics` (`ssd_context_write_bytes_total`) report what it wrote. Needs a Host tier and `--ssd-context-dir`. | off |
 | `--ssd-context-dir DIR` | the existing directory for the SSD tier's file: a fast local SSD (a regular NVMe drive reads it back at several GB/s). Required with `--ssd-context-gib` | none |
 | `--ssd-context-gib-per-hour N\|unlimited` | the SSD tier's write budget: at most `N` GiB written in any hour, the one setting that trades cache hits for SSD wear. It is a bucket of an hour's bytes that refills continuously; its level is kept in `--ssd-context-dir`, so restarting the server or switching models does not refill it. When the Host tier gives up more than the budget can write, only the snapshots most likely to save the most prefill are written (by the cache's value of each snapshot and how often snapshots of its kind were read back so far), at a pace the budget sustains; under lighter use everything is written. On the Qwen3.8-Flash-Next agentic replay, whose candidates add up to about 28 GB in 13 minutes, 8 GiB an hour kept 90.4-90.5 % of prompt tokens served from cache against 90.4-90.8 % with no budget, writing about a third as much (10 GB against 26-29 GB). `unlimited` writes everything the Host tier gives up. The `throughput` record reports the budget, its level and the snapshots it passed over. Needs `--ssd-context-gib` | `8` |
-| `--prefix-cache-save-mins N` | with `--prefix-cache-file`: also save the Host tier there every `N` minutes while serving, counted from the end of the previous save, and only when it changed since the last save or load. The save runs at the first point between execution units once due, also while requests run: they wait while it is written (the log reports the size, the save time and how long requests waited). It writes `PATH.tmp`, flushes it to the drive and only then replaces `PATH`, so a crash or power loss leaves the previous file or the new one, never a torn one; stopping the server during a periodic save abandons it before the shutdown save. Each save rewrites the whole file (up to `--host-context-mib`, several GB), so a short interval writes a lot to the drive and wears an SSD faster: at 7.5 GB every 5 minutes that is up to ~2 TB a day, every 30 minutes ~360 GB. | off: saved only when the server stops |
+| `--prefix-cache-save-mins N` | with `--prefix-cache-file`: also save the Host tier there every `N` minutes while serving, counted from the end of the previous save, and only when it changed since the last save or load; `N` is 1 to 525,600 (a year). The save runs at the first point between execution units once due, also while requests run: they wait while it is written (the log reports the size, the save time and how long requests waited). It writes `PATH.tmp`, flushes it to the drive and only then replaces `PATH`, so a crash or power loss leaves the previous file or the new one, never a torn one; stopping the server during a periodic save abandons it before the shutdown save. Each save rewrites the whole file (up to `--host-context-mib`, several GB), so a short interval writes a lot to the drive and wears an SSD faster: at 7.5 GB every 5 minutes that is up to ~2 TB a day, every 30 minutes ~360 GB. | off: saved only when the server stops |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--tolerant-tool-calls` | recover complete tool calls cut by a malformed wrapper, a trailing suffix or the output budget instead of demoting them to text, and (with `--end-in-thinking allow`) complete calls stranded in thinking the model never closed | off |
@@ -2048,6 +2269,19 @@ errors are warnings, and its warnings and notices, such as swscaler's `deprecate
 notice for each full-range (JPEG-coded) video, are `debug`. A terminal may use one
 transient line during startup, but Serve throughput is always a persistent record. Redirected
 stderr contains no terminal control sequences.
+
+Three records help with the prefix cache under pressure. A `throughput` record whose interval paused
+or resumed requests adds `pauses N, resumes S from snapshot, R by replay (T tok replayed, P of
+prefill)`: P is Replay's share of the interval's prefill work, the prompt tokens computed plus those
+replayed. A `req#N done` record whose prompt recomputed at least 4,096 tokens that one of the last 16
+requests' contexts held adds `miss diverged at K, L tok recomputed` (the client sent a history that
+departs from that context at token K, for example with its reasoning stripped) or `miss evicted,
+shared K, L tok recomputed` (the history matched but the cache had lost it); the request JSONL's
+`prefix_miss` has the detail. At `debug`, `engine | admission req N fresh|resume, prompt P: sources
+...; outcome` traces each admission: the sources the cache offered (reused tokens and kind, the one
+tried marked `*`, and the prompt's cached blocks) and what became of it (`bound`, `waits for a lane`,
+the shortage and whether the cache, a pause or the residents' release covers it, or `next source`). A
+request waiting across admission passes logs each distinct outcome once.
 
 One writer thread does every console write (records, the transient line and the statistics
 panel), and a thread that logs only queues its record, so a stderr that stops taking output, such
@@ -2271,14 +2505,17 @@ occupied share (KV pages holding requests' tokens, prefix-cache space holding en
 |---|---|---|---|
 | `weights` | the model's weights, the drafter's excepted | weights kept in RAM (pinned objects, the token embedding, packed-weight escapes) | |
 | `drafter` | the speculative drafter's weights (MTP, DFlash, DFlash2), its columns, rings and pools, and DFlash2's proposal-head screen | | |
+| `adapter` | a LoRA adapter's factors (`--lora`; its per-call U is in `workspace`) and an ablation sidecar's direction (`--ablate`; on Qwen3.5 a cut lane's copy of the residual is in `workspace`) | | |
 | `experts` | the VRAM expert cache's frames that hold experts (`count`: frames) | expert records in RAM (`count`: records) | records read from the artifact on use (`count`) |
-| `kv_cache` | the KV cache's backed pages and tables, less `prefix_cache`'s | | |
+| `kv_cache` | the KV cache's backed pages and tables, less `prefix_cache`'s and `mtp_kv` | | |
+| `mtp_kv` | the MTP drafter's own KV page pool (Qwen3.5 with `--spec mtp`; counted in `kv_cache` before 2026-11-15) | | |
 | `state` | recurrent (GDN) state, per-request rows and records, round inputs and outputs | | |
 | `prefix_cache` | Device snapshot slots and the KV pages only the prefix cache holds | the Host tier | the SSD tier's file |
 | `workspace` | the activation workspace, with the frames the expert cache lends a prompt while lent | | |
 | `cuda_graphs` | CUDA Graph executables, as measured when they were prepared | | |
 | `staging` | expert-miss staging and the expert cache's tables | the pinned upload ring and the Program's pinned buffers | |
 | `ngram` | | Qwen3.8-Flash-Next's n-gram table in RAM, or its row cache | |
+| `ngram_archive` | | the n-gram drafter's conversation archive (`--ngram-archive-mib`): what its sources hold | |
 
 The [launcher](launcher.md)'s dashboard draws `memory` as one bar per member, with the server's unnamed use
 (`process_bytes` less the parts) and other processes' use beside the parts.
@@ -2287,6 +2524,35 @@ The route follows the server's API-key authentication. The document contains no 
 tool argument, key, or client address, and no header value but the client's own request label
 (`X-Infernix-Request-Label`, accepted only as printable ASCII of at most 128 bytes). `requests` is a
 bounded window, not a durable log; use `--request-log-jsonl` when every request must be retained.
+
+### Request monitor
+
+`GET /monitor` shows how each request the Engine holds stands now, as the Engine's last statistics
+publication saw it (after NInfer's monitor snapshot): the residents in lane order, the one binding,
+the paused ones, then up to 32 queued ones in FIFO order. It follows the server's API-key
+authentication, sends `Cache-Control: no-store`, and carries no request text.
+
+```bash
+curl http://127.0.0.1:8080/monitor
+```
+
+| Field | Meaning |
+|---|---|
+| `schema` | `infernix.monitor/1` |
+| `time` | Unix seconds of the response |
+| `progress_owner` | the Engine id of the request that owns the current service turn under resource pressure ([scheduling](maintainer/resource-scheduling-and-context-cache.md)); `null` without pressure |
+| `no_progress_s` | as `infernix_no_progress_seconds` |
+| `queued_not_listed` | queued requests past the 32 listed |
+| `requests[].engine_id` | the Engine's request id (`engine_request_id` in the request log) |
+| `requests[].id`, `label`, `protocol` | the server's request id (`req#N`), its `X-Infernix-Request-Label` and protocol; `null` for the Engine's own idle-time prefill and for a request not admitted yet |
+| `requests[].phase` | `queued`, `binding` (restoring cached state into a lane), `prefill`, `replay` (a resume recomputing its history), `pausing`, `paused`, `decode`, `control` (forced control tokens) or `finishing` |
+| `requests[].lane` | its lane while it holds one, else `null` |
+| `requests[].background` | the Engine's idle-time prefill of a finished turn |
+| `requests[].progress_owner`, `recovery_pending` | it owns the service turn; a resumed request still protects its recovery capacity |
+| `requests[].recovery_route` | `replay` when its latest resume recomputed history, else `none` |
+| `requests[].prompt_tokens`, `reused_tokens`, `computed_prompt_tokens`, `output_tokens` | its prompt, the prefix its binding reused, the prompt tokens computed since, and the tokens it has generated |
+| `requests[].preemptions`, `snapshot_restores`, `replay_restores`, `replayed_tokens` | its pauses, its resumes from a snapshot at the paused frontier and by Replay, and the history tokens Replay recomputed |
+| `requests[].age_s`, `paused_s`, `since_progress_s` | seconds since submission, paused in total, and since its last committed progress (prompt prefilled, history replayed or output committed; `null` before any) |
 
 ## Structured request log
 
@@ -2307,7 +2573,7 @@ because another process holds `FILE` open without delete sharing on Windows, the
 warning, keeps appending to `FILE`, and tries again after another `N` MiB. Rotated names are also
 checked against the model artifact path.
 
-Every line is one `infernix_serve_request_log` schema-v31 JSON object. All events carry
+Every line is one `infernix_serve_request_log` schema-v33 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
 media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, payload-size fields, and
@@ -2328,7 +2594,8 @@ they do not infer request behavior from process-global counter deltas.
 unspecified. `enable_thinking` records whether the response starts in thinking mode.
 
 `request_done.prefix_miss` explains a large re-prefill, or is `null`. The server keeps the token
-contexts (prompt and output) of its last 16 requests while the request log is on. A request that
+contexts (prompt and output) of its last 16 requests (with or without the request log: the
+`req#N done` record names a miss's kind too). A request that
 computes at least 4,096 prompt tokens is compared with them, and the context sharing the longest
 prefix with its prompt (`common_prefix_tokens`) decides:
 
@@ -2393,7 +2660,8 @@ instead of rounded stderr strings.
 time. Replay rebuilds committed state without adding new output usage.
 
 `generation.admission` records the initial `preferred_reused_tokens`, `source_wait_seconds`, and
-`fallback_reason`. Source waiting is a subset of initial queue time; selecting a source does not
+`fallback_reason`. Source waiting is a subset of initial queue time, counted from the request's first source quote
+(made once a lane is free for it) to its binding; selecting a source does not
 itself count as a cache hit. Fallback reasons are `none`, `source_invalid`, `capacity_limit`, and
 `isolated_capacity`.
 
@@ -2430,10 +2698,17 @@ For `server_start.memory`, `workspace.capacity_bytes` is the only physical works
 When Vision is enabled, `vision_workspace` reports the aggregate prompt and maximum-item token
 bounds plus encode peak and handoff layout/usage within that same allocation; these bytes must not
 be added to `workspace.capacity_bytes`. The field is `null` when Vision is disabled.
+`draft_screen_bytes` and `adapter_bytes` are the Device memory beside the weights' arena: the DFlash2
+drafter's proposal-head screen and a LoRA adapter's factors (`--lora`) or an ablation sidecar's direction
+(`--ablate`; `0` without either), and
+`server_start.artifact.lora_adapter` names the adapter as the startup log does (`null` without one), and
+`server_start.artifact.ablate_sidecar` the ablation sidecar (`--ablate`; `null` without one).
 `cuda_graph_allowance_bytes` is the CUDA Graph memory
 the KV sizing reserved, and `cuda_graph_measured_bytes` the Device memory graph preparation
 actually took at startup (`0` without CUDA Graphs); the startup log warns when the second exceeds
-the first. When the graphs find no Device memory at all, a Qwen3.5-family engine with
+the first, unless `cuda_graph_excess_absorbed` is true: on Qwen3.8-Flash-Next the allowance is the expert
+frames' fixed 128 MiB reserve, and graphs past it take memory back from the elastic frames by design. When
+the graphs find no Device memory at all, a Qwen3.5-family engine with
 `--kv-capacity auto` warns and starts once more with 1 GiB more headroom (a smaller KV capacity);
 an explicit `--kv-capacity` fails startup instead.
 
@@ -2518,7 +2793,8 @@ committed blocks whose Device copy another request was using, so the request's p
 until it finished.
 `taps_created` and `taps_skipped` count planned prefill snapshots published and dropped, and
 `endpoints_created` end-of-answer snapshots. Publication refusals are counted too:
-`taps_skipped_no_slot` (of `taps_skipped`, no Device snapshot slot was available),
+`taps_skipped_no_slot` (of `taps_skipped`, no Device snapshot slot was available), `taps_retried`
+(flexible taps skipped for lack of room and then taken at a later prefill chunk boundary),
 `endpoints_skipped` (an end-of-answer snapshot that passed its checks but found no slot or could
 not be published), `host_image_write_refusals` and `host_block_write_refusals` (snapshots and
 blocks refused Host slabs, which then stay Device-only), `device_slot_evictions` (Device snapshot
@@ -2526,9 +2802,10 @@ slots taken from another snapshot) and `device_slot_refusals` (slot requests ref
 `free_device_snapshot_slots` is an end-of-interval gauge. `host_image_writes`, `host_block_writes`,
 `host_image_restores`, `host_block_restores`, `host_write_bytes`, and `host_restore_bytes` count
 Host-tier write-through and restores, and `host_write_copies` and `host_restore_copies` the copy
-calls that moved those bytes (many small copies queue behind other work on the copy engine; the
-Qwen3.8-Flash-Next prefix cache reports 0); `prefetched_blocks` counts the restored blocks copied for a
-waiting FIFO head before its admission. `evicted_blocks` counts Device block evictions,
+calls that moved those bytes (a restore enqueues its copies in batches, one call a model layer's KV
+planes; the Qwen3.8-Flash-Next prefix cache reports 0); `prefetched_blocks` counts
+the restored blocks copied for a queued request (the FIFO head or the request behind it) before its
+admission. `evicted_blocks` counts Device block evictions,
 `host_snapshot_evictions` snapshots evicted from the Host tier, `host_dead_reclaims` Host slabs
 reclaimed from KV that no snapshot can reach, and `unbacked_node_losses` Device evictions of blocks
 with no Host copy, which remove them and the blocks after them from the cache. With queue holds
@@ -2579,8 +2856,8 @@ capacity of the same size bounds how many run at once, and beyond it they are re
 overloaded, as generation requests are. The absolute
 `--pending-timeout-ms` deadline starts before preparation, covers media acquisition and Engine FIFO
 waiting, and returns HTTP 503 with code `request_queue_timeout` and the same `Retry-After` if admission
-does not occur in time; a streaming request still queued 5 s after it was queued has started its stream
-by then and gets the timeout as the stream's error event instead.
+does not occur in time; a Messages or Responses streaming request still queued 5 s after it was queued
+has started its stream by then and gets the timeout as the stream's error event instead.
 Once admitted, a request may pause for resource pressure without restarting this initial-admission
 deadline. Fresh requests enter in FIFO order with a bounded bypass allowance when an earlier request
 cannot fit. There is no admission ETA or unbounded overflow queue.

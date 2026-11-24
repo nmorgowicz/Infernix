@@ -445,6 +445,12 @@ struct Nvfp4Format {
     }
 };
 
+// nvfp4_mul in block_scale_k16_m128x4_v1 (ModelOpt's form): Nvfp4Format's planes, the sum multiplied by
+// the matrix's FP32 multiplier (weight_scale_2, in alpha[0] and alpha[1]).
+struct Nvfp4MulFormat : Nvfp4Format {
+    static constexpr Factor kFactor = Factor::Multiplier;
+};
+
 // Sixteen E4M3 codes as the three balanced base-128 digit planes of W = value 2^9.
 __device__ __forceinline__ void fp8_digits16(const std::uint8_t* src, std::int8_t* dst, int plane) {
     const uint4 packed = *reinterpret_cast<const uint4*>(src);
@@ -992,6 +998,7 @@ struct GemmArgs {
     int row_begin;
     const std::int32_t* tile_experts; // grouped: each 64-column tile's expert (-1: no columns), its rows
     int expert_stride;                // at expert * expert_stride + row_begin
+    int max_expert;                   // grouped: the last expert whose rows lie in the weight (a larger id: no columns)
     int tile_base;                    // the chunk's first tile
     int rows;
     int k;
@@ -1049,7 +1056,7 @@ __global__ __launch_bounds__(kThreads, 2) void lossless_gemm_kernel(const GemmAr
     int row_begin = args.row_begin;
     if (args.tile_experts != nullptr) {
         const int expert = args.tile_experts[args.tile_base + static_cast<int>(blockIdx.y)];
-        if (expert < 0) { return; }
+        if (expert < 0 || expert > args.max_expert) { return; } // never rows past the weight
         row_begin += expert * args.expert_stride;
     }
     WeightView w = args.w;
@@ -1509,6 +1516,7 @@ struct Call {
     const std::int32_t* in_columns  = nullptr;
     const std::int32_t* out_columns = nullptr;
     const float* act_column         = nullptr; // the activation scales of x's columns (w.act_div: the divisor)
+    int max_expert                  = 0;       // grouped (tile_experts): GemmArgs::max_expert
 };
 
 // The parts of a chunk a launch runs: `encode` encodes the chunk's activation columns (after zeroing the
@@ -1560,6 +1568,7 @@ void launch_chunk(const Call& c, std::int32_t first, std::int32_t columns, std::
         a.row_begin = c.row_begin;
         a.tile_experts  = c.tile_experts;
         a.expert_stride = c.expert_stride;
+        a.max_expert    = c.max_expert;
         a.tile_base = first / kTileTokens;
         a.rows      = c.rows;
         a.k         = k;
@@ -1611,7 +1620,7 @@ void launch_chunk(const Call& c, std::int32_t first, std::int32_t columns, std::
     }
 }
 
-enum class Route { None, Q2, Q4, Q5, Q6, Q8, Nvfp4, Fp8Row, Fp8RowF32, Bf16, Mxfp8, Ggml, Rg16, Fp8B128 };
+enum class Route { None, Q2, Q4, Q5, Q6, Q8, Nvfp4, Nvfp4Mul, Fp8Row, Fp8RowF32, Bf16, Mxfp8, Ggml, Rg16, Fp8B128 };
 
 // The GGUF formats' launches (lossless_linear_ggml_k.cu: the K-quants and IQ4; lossless_linear_ggml_i.cu:
 // IQ2/IQ3 and Q2_0).
@@ -1644,9 +1653,11 @@ inline Route route_of(const Weight& w) noexcept {
     case QType::Q6_G64_FP16: return w.layout == QuantLayout::RowSplit ? Route::Q6 : Route::None;
     case QType::Q8_G32_FP16: return w.layout == QuantLayout::RowSplit ? Route::Q8 : Route::None;
     case QType::NVFP4:
-        return w.layout == QuantLayout::BlockScaleK16M128x4 && w.n % 128 == 0 && w.k % 64 == 0 &&
-                       w.weight_scale_divisor > 0.0F
-                   ? Route::Nvfp4
+        // A divisor (nvfp4) or, from an nvfp4_mul parent, a multiplier (weight_scale_divisor 0).
+        if (w.layout != QuantLayout::BlockScaleK16M128x4 || w.n % 128 != 0 || w.k % 64 != 0) { return Route::None; }
+        if (w.weight_scale_divisor > 0.0F && w.weight_multiplier == 0.0F) { return Route::Nvfp4; }
+        return w.weight_scale_divisor == 0.0F && w.weight_multiplier > 0.0F && std::isfinite(w.weight_multiplier)
+                   ? Route::Nvfp4Mul
                    : Route::None;
     case QType::FP8_E4M3FN_ROW_BF16: return w.layout == QuantLayout::RowScale ? Route::Fp8Row : Route::None;
     case QType::FP8_E4M3FN_ROW_F32: return w.layout == QuantLayout::RowScale ? Route::Fp8RowF32 : Route::None;
@@ -1679,6 +1690,14 @@ inline WeightView view_of(const Weight& weight, Route route) {
         v.row_bytes = weight.k / 2;
         v.groups    = weight.k / 16;
         std::memcpy(&v.divisor, &weight.weight_scale_divisor, sizeof(v.divisor));
+        break;
+    }
+    case Route::Nvfp4Mul: {
+        v.row_bytes        = weight.k / 2;
+        v.groups           = weight.k / 16;
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, &weight.weight_multiplier, sizeof(bits));
+        v.alpha[0] = v.alpha[1] = bits;
         break;
     }
     case Route::Fp8Row:

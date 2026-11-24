@@ -31,32 +31,40 @@ HostSlabStore::HostSlabStore(std::size_t slab_bytes, std::uint32_t slabs, std::u
     chunks_.reserve(count);
     // Chunks in batches: committed, the pages of each touched by a thread of its own (the OS zeroes a page at its first
     // touch, the bulk of the time, which cudaMallocHost spent on one thread in its serial call), then registered one
-    // after another.
+    // after another by this thread while the next batch's pages are touched, so the driver calls add nothing to the
+    // time the touching takes.
     const std::uint32_t threads = std::clamp(std::thread::hardware_concurrency() / 2U, 1U, 8U);
-    for (std::uint32_t first = 0; first < count; first += threads) {
-        const std::uint32_t last = std::min(count, first + threads);
-        std::vector<Chunk> batch;
-        try {
+    const auto register_chunks  = [&](std::vector<Chunk>& touched) {
+        for (Chunk& chunk : touched) {
+            chunk->pin();
+            pinned += chunk->size();
+            chunks_.push_back(std::move(chunk));
+            if (progress) { progress(pinned, total); }
+        }
+        touched.clear();
+    };
+    std::vector<Chunk> touched; // the previous batch: its pages touched, not yet registered
+    try {
+        for (std::uint32_t first = 0; first < count; first += threads) {
+            const std::uint32_t last = std::min(count, first + threads);
+            std::vector<Chunk> batch;
             for (std::uint32_t c = first; c < last; ++c) {
                 const std::uint32_t begin = c * per_chunk_;
                 batch.push_back(std::make_unique<RegisteredHostBuffer>(
                     static_cast<std::size_t>(std::min(per_chunk_, slabs - begin)) * slab_bytes));
             }
-            std::vector<std::jthread> touch; // joined when it goes, a throw included
-            for (std::size_t i = 1; i < batch.size(); ++i) {
-                touch.emplace_back([chunk = batch[i].get()] { chunk->prefault(0, chunk->size()); });
+            {
+                std::vector<std::jthread> touch; // joined when it goes, a throw included, before `batch` is freed
+                touch.reserve(batch.size());
+                for (const Chunk& chunk : batch) {
+                    touch.emplace_back([memory = chunk.get()] { memory->prefault(0, memory->size()); });
+                }
+                register_chunks(touched);
             }
-            batch.front()->prefault(0, batch.front()->size());
-        } catch (const std::exception& error) { throw failure(error); }
-        for (Chunk& chunk : batch) {
-            try {
-                chunk->pin();
-            } catch (const std::exception& error) { throw failure(error); }
-            pinned += chunk->size();
-            chunks_.push_back(std::move(chunk));
-            if (progress) { progress(pinned, total); }
+            touched = std::move(batch);
         }
-    }
+        register_chunks(touched);
+    } catch (const std::exception& error) { throw failure(error); }
 }
 
 HostSlabStore::~HostSlabStore() {
@@ -139,12 +147,20 @@ std::uint64_t HostSlabStore::begin_growth(std::uint64_t bytes, HostMemoryWorker&
 void HostSlabStore::copy_moves(PrefixCacheIndex& index, HostMemoryWorker& worker) {
     const std::vector<PrefixCacheIndex::HostMove> moves = index.plan_host_moves();
     if (moves.empty()) { return; }
-    std::vector<std::pair<std::byte*, const std::byte*>> copies;
-    copies.reserve(moves.size());
-    for (const PrefixCacheIndex::HostMove& move : moves) { copies.emplace_back(slab(move.to), slab(move.from)); }
-    copy_ = worker.post([copies = std::move(copies), bytes = slab_bytes_] {
-        for (const auto& [to, from] : copies) { copy_streaming(to, from, bytes); }
-    });
+    // A move commits once copy_ is ready (step): one whose copy was never posted (an allocation failing under the very
+    // memory pressure a release answers, or a stopping worker) would hand its entry a `to` slab never written. The plan
+    // is undone instead, and a later step plans it again.
+    try {
+        std::vector<std::pair<std::byte*, const std::byte*>> copies;
+        copies.reserve(moves.size());
+        for (const PrefixCacheIndex::HostMove& move : moves) { copies.emplace_back(slab(move.to), slab(move.from)); }
+        copy_ = worker.post([copies = std::move(copies), bytes = slab_bytes_] {
+            for (const auto& [to, from] : copies) { copy_streaming(to, from, bytes); }
+        });
+    } catch (...) {
+        index.cancel_host_moves(moves);
+        throw;
+    }
 }
 
 HostSlabStore::Progress HostSlabStore::step(PrefixCacheIndex& index, bool restores_quiet, HostMemoryWorker& worker) {

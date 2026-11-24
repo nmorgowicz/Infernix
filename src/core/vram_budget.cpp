@@ -77,12 +77,15 @@ public:
         return memory.total - memory.reserved;
     }
 
-    [[nodiscard]] std::optional<std::uint64_t> free_bytes() const {
-        if (device_ == nullptr || memory_ == nullptr) { return std::nullopt; }
+    // Preserve an unknown reading separately from a known full device (zero free bytes).
+    [[nodiscard]] bool memory_info(std::uint64_t& used, std::optional<std::uint64_t>& free) const {
+        if (device_ == nullptr || memory_ == nullptr) { return false; }
         MemoryV2 memory{};
         memory.version = static_cast<unsigned>(sizeof(MemoryV2)) | (2U << 24U);
-        if (memory_(device_, &memory) != 0 || memory.free > memory.total) { return std::nullopt; }
-        return memory.free;
+        if (memory_(device_, &memory) != 0 || memory.free > memory.total) { return false; }
+        used = memory.used;
+        free = memory.free;
+        return true;
     }
 
     // 1 active, 0 inactive, -1 unknown.
@@ -179,7 +182,6 @@ public:
         out.device_free  = free_bytes;
         out.device_total = total_bytes;
         out.cuda_free = free_bytes;
-        if (resident_only_) { out.physical_free = nvml_->free_bytes(); }
 #ifdef _WIN32
         // An adapter's output list is a snapshot of its factory: recreate both after a hot-plug.
         if (factory_ != nullptr && !factory_->IsCurrent()) {
@@ -200,6 +202,7 @@ public:
                 // and the expert cache started empty (RTX 5090 beside an RTX 3090, mdbro's fork,
                 // 2026-10-11): the budget less usage is read directly there too.
                 if (allowance_ != 0 || several_devices_) {
+                    out.free_from_budget = true;
                     out.budget_allowance = allowance_;
                     out.local_budget += allowance_;
                     out.device_free = out.local_budget > out.local_usage
@@ -228,6 +231,17 @@ public:
             out.local_usage     = local;
         }
 #endif
+        (void)nvml_->memory_info(out.physical_used, out.physical_free);
+        // Free memory never exceeds what NVML finds free over every process: the OS budget does not see another
+        // process's VRAM, so past the budget (whose allowance is the card's usable memory less the budget, read
+        // once) the budget less this process's usage counted other programs' memory as this process's to take
+        // (2026-11-20, RTX 5090, headless: 25,221 MiB free against NVML's 25,052 with 534 MiB used by others; the
+        // expert frames then left ~180 MiB of the card free, and VRAM pressure from another program put the W4A4
+        // row-pair decode into a slow state that outlasted the process). Startup sizing, the frames' growth and
+        // the pressure check all read it here.
+        if (out.physical_free && *out.physical_free < out.device_free) {
+            out.device_free = static_cast<std::size_t>(*out.physical_free);
+        }
         const int active = nvml_->display_active();
         if (out.outputs > 0 || active == 1) {
             out.display = DisplayState::Attached;
@@ -335,8 +349,44 @@ std::uint64_t spill_shortfall(std::uint64_t free_before, std::uint64_t free_afte
     return missing > tolerance ? missing : 0;
 }
 
+std::uint64_t local_shortfall(std::uint64_t local_before, std::uint64_t local_after, std::uint64_t bytes,
+                              std::uint64_t tolerance) noexcept {
+    const std::uint64_t rose    = local_after > local_before ? local_after - local_before : 0;
+    const std::uint64_t missing = bytes > rose ? bytes - rose : 0;
+    return missing > tolerance ? missing : 0;
+}
+
+namespace {
+
+// A device-only step's spill between two readings (SpillGuard::end(bytes)).
+std::uint64_t device_step_spill(const VramSnapshot& before, const VramSnapshot& after, std::uint64_t bytes) {
+    if (before.has_local_usage && after.has_local_usage) {
+        return local_shortfall(before.local_usage, after.local_usage, bytes);
+    }
+    return spill_shortfall(before.device_free, after.device_free, bytes);
+}
+
+} // namespace
+
 std::uint64_t SpillGuard::end(std::uint64_t bytes) {
     after_ = source_.query();
+    if (device_step_spill(before_, after_, bytes) == 0) { return 0; }
+    after_ = source_.query();
+    return device_step_spill(before_, after_, bytes);
+}
+
+std::uint64_t spill_rise(std::uint64_t nonlocal_before, std::uint64_t nonlocal_after, std::uint64_t bytes,
+                         std::uint64_t pinned_bytes, std::uint64_t tolerance) noexcept {
+    const std::uint64_t rise    = nonlocal_after > nonlocal_before ? nonlocal_after - nonlocal_before : 0;
+    const std::uint64_t spilled = rise > pinned_bytes ? rise - pinned_bytes : 0;
+    return spilled > tolerance ? (spilled < bytes ? spilled : bytes) : 0;
+}
+
+std::uint64_t SpillGuard::end(std::uint64_t bytes, std::uint64_t pinned_bytes) {
+    after_ = source_.query();
+    if (before_.shared_system != 0 && after_.shared_system != 0) {
+        return spill_rise(before_.nonlocal_usage, after_.nonlocal_usage, bytes, pinned_bytes);
+    }
     if (spill_shortfall(before_.device_free, after_.device_free, bytes) == 0) { return 0; }
     after_ = source_.query();
     return spill_shortfall(before_.device_free, after_.device_free, bytes);
@@ -356,10 +406,22 @@ std::uint64_t SpillGuard::end_without_host_allocation(std::uint64_t bytes) {
 std::string SpillGuard::readings(std::uint64_t bytes) const {
     const auto mib = [](std::uint64_t value) { return std::to_string(value >> 20) + " MiB"; };
     std::string out = "free device memory " + mib(before_.device_free) + " before and " + mib(after_.device_free) +
-                      " after " + mib(bytes) + " of allocations";
+                      " after " + mib(bytes) + " of allocations" +
+                      (after_.free_from_budget ? " (the OS budget less this process's use)" : " (cudaMemGetInfo)");
+    if (before_.has_budget && after_.has_budget) {
+        out += "; OS budget " + mib(before_.local_budget) + " before and " + mib(after_.local_budget) + " after";
+    }
+    if (before_.has_local_usage && after_.has_local_usage) {
+        out += "; this process's device memory use " + mib(before_.local_usage) + " before and " +
+               mib(after_.local_usage) + " after";
+    }
     if (before_.shared_system != 0 && after_.shared_system != 0) {
         out += "; this process's shared system memory use " + mib(before_.nonlocal_usage) + " before and " +
                mib(after_.nonlocal_usage) + " after";
+    }
+    if (before_.physical_free || after_.physical_free) {
+        out += "; free over every process " + mib(before_.physical_free.value_or(0)) + " before and " + mib(after_.physical_free.value_or(0)) +
+               " after (NVML)";
     }
     return out;
 }

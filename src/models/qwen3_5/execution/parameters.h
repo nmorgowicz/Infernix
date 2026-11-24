@@ -1,7 +1,9 @@
 #pragma once
 
 #include "core/arena.h"
+#include "models/ablate/parameters.h"
 #include "models/qwen3_5/model.h"
+#include "infernix/ops/lora.h"
 #include "infernix/ops/rope.h"
 #include "infernix/ops/weight_input.h"
 
@@ -21,9 +23,10 @@ using LinearParameters = ops::SingleProjectionWeight;
 [[nodiscard]] inline ops::LinearPolicy residual_projection_policy(const LinearParameters& p,
                                                                   bool wide_verification) {
     // Keep the neural path's residual activation precision in wide copy verification. A
-    // column-invariant projection already runs 16-bit activations at every width.
+    // column-invariant projection already runs 16-bit activations at every width; an A8Only one
+    // (`--a8-activations`) keeps its 8-bit activations at every width.
     return wide_verification && is_fp8_row(p.weight.qtype) &&
-                   !ops::column_invariant(p.policy)
+                   !ops::column_invariant(p.policy) && !ops::a8_only(p.policy)
                ? ops::LinearPolicy::A16Only
                : p.policy;
 }
@@ -43,9 +46,31 @@ using LinearParameters = ops::SingleProjectionWeight;
     return static_cast<std::int32_t>(value);
 }
 
+// A LoRA adapter's operands at one projection input (models/qwen3_5/load/lora.h): A stacked over the adapters that read
+// the input (ops::lora_shrink) and the adapted parent's term. The call binds the term's U (addend.u, the shrink's
+// output over the call's columns); addend.u_rows is a.rows.
+using LoraSiteParameters = ops::LoraSite;
+
+// --lora on the --lossless route (docs/maintainer/lossless-route.md §2, LoRA adapter): a site's A as its three exact
+// BF16 planes (ops::lossless_lora_split3: [a_rows, 3 k]) and the adapted parent's FP32 B ([parent rows, rank], the
+// term's row order), with the term's segments (row ends, U rows, scales) as ops::LoraAddend gives them.
+struct LosslessLoraSite {
+    const void* a3      = nullptr;
+    std::int32_t a_rows = 0;
+    std::int32_t k      = 0;
+    const float* b      = nullptr;
+    std::int32_t rank   = 0;
+    std::int32_t segments = 0;
+    std::array<ops::LoraSegment, 4> segment{};
+};
+
 struct DenseParameters {
     LinearParameters gate_up;
     LinearParameters down;
+    // --lora (text layers only): gate_proj/up_proj over the gate/up parent, down_proj over down; on the lossless
+    // route the lossless_ forms instead.
+    std::optional<LoraSiteParameters> lora_gate_up, lora_down;
+    std::optional<LosslessLoraSite> lossless_lora_gate_up, lossless_lora_down;
 };
 
 // An offloaded MoE layer (weights.h OffloadedMoeWeights; ops/offloaded_sparse_moe.h): the router
@@ -75,6 +100,11 @@ struct AttentionParameters {
     ops::ProjectionWeights projection;
     Tensor query_norm, key_norm;
     LinearParameters output;
+    // --lora: q_proj/k_proj/v_proj over the projection (addend.b in the single parent's row order query, key, gate,
+    // value; a paired projection's second parent starts at gate), o_proj over output; on the lossless route the
+    // lossless_ forms instead.
+    std::optional<LoraSiteParameters> lora_input, lora_output;
+    std::optional<LosslessLoraSite> lossless_lora_input, lossless_lora_output;
 };
 
 struct GdnParameters {
@@ -82,6 +112,14 @@ struct GdnParameters {
     ops::ProjectionWeights control;
     Tensor a_log, dt_bias, convolution, norm;
     LinearParameters output;
+    // --lora: one shrink of h stacked over in_proj_qkv, in_proj_z, in_proj_a and in_proj_b (lora_input.a); the
+    // projection's term (lora_input.addend, B in the single parent's q/k/value/z row order; absent when neither
+    // in_proj_qkv nor in_proj_z is adapted) and the control's (lora_control: a rows, then b rows) over its U;
+    // out_proj over the output. On the lossless route the lossless_ forms instead (the input site's segments: the
+    // q/k/value channels, z, a, b).
+    std::optional<LoraSiteParameters> lora_input, lora_output;
+    ops::LoraAddend lora_control;
+    std::optional<LosslessLoraSite> lossless_lora_input, lossless_lora_output;
 };
 
 struct BlockParameters {
@@ -268,9 +306,37 @@ public:
     // the head is a 5,120-wide FP8 row or q8 head: ops::screened_head_topk serves its calls of at most 16 columns.
     DeviceBuffer draft_screen;
     std::optional<Weight> draft_head_screen;
+    // --lora: every adapted layer's factors in their device layout (prepare_lora: BF16, or on the lossless route A's
+    // BF16 planes and FP32 B); the text layers' sites point into it. A plan-only model allocates nothing and counts
+    // the bytes in planned_lora_bytes.
+    DeviceBuffer lora_factors;
     // A plan-only model's (Model::weights_resident false) device bytes these parameters would allocate at a start
-    // and did not (the draft screen): Engine::plan counts them beside the weights.
-    std::uint64_t planned_device_bytes = 0;
+    // and did not: the draft screen's and the adapter's. Engine::plan counts them beside the weights.
+    std::uint64_t planned_draft_screen_bytes = 0;
+    std::uint64_t planned_lora_bytes         = 0;
+    // The device bytes beside the weights' arena, allocated (a start) or planned (a plan-only model): the one source
+    // of these figures for sizing, the plan, the memory summary and the memory parts.
+    [[nodiscard]] std::uint64_t draft_screen_bytes() const noexcept {
+        return draft_screen.bytes + planned_draft_screen_bytes;
+    }
+    [[nodiscard]] std::uint64_t lora_bytes() const noexcept { return lora_factors.bytes + planned_lora_bytes; }
+    // --ablate (docs/ablate.md): the sidecar's direction on the device and each layer's two cuts; nullopt without one
+    // (and on a plan-only model, which counts the direction's bytes in planned_ablate_bytes).
+    std::optional<models::AblateParameters> ablate;
+    std::uint64_t planned_ablate_bytes = 0;
+    [[nodiscard]] std::uint64_t ablate_bytes() const noexcept {
+        return (ablate ? ablate->direction.bytes : 0) + planned_ablate_bytes;
+    }
+    // The adapters' device bytes beside the weights' arena (MemorySummary::adapter_bytes): a LoRA adapter's factors and
+    // an ablation sidecar's direction, allocated or planned; allocated_adapter_bytes counts the allocated ones only.
+    [[nodiscard]] std::uint64_t adapter_bytes() const noexcept { return lora_bytes() + ablate_bytes(); }
+    [[nodiscard]] std::uint64_t allocated_adapter_bytes() const noexcept {
+        return lora_factors.bytes + (ablate ? ablate->direction.bytes : 0);
+    }
+    // A layer's lane cut: inactive without --ablate or where the sidecar leaves the lane uncut.
+    [[nodiscard]] ops::DirectionCut ablate_cut(std::size_t layer, models::AblateParameters::Lane lane) const noexcept {
+        return ablate ? ablate->cut(static_cast<std::uint32_t>(layer), lane) : ops::DirectionCut{};
+    }
     std::optional<ProposalParameters> proposal;
     // `mtp` and the proposal head under LinearPolicy::A16ColumnInvariant, which the exact route's
     // batched draft calls run with (TextContext::mtp_forward_decode_batch, mtp_propose_batch).

@@ -61,7 +61,7 @@ RequestBasePlan Program::plan_request(PreparedPrompt&& prompt, const runtime::Re
 }
 
 std::vector<SourceCandidate> Program::hybrid_sources(const RequestBasePlan& base, const ResumeState* resume) {
-    return impl_->hybrid_sources(base, resume ? resume->frontier() : UINT32_MAX);
+    return impl_->hybrid_sources(base, resume);
 }
 
 BindingReservation Program::start_binding(const RequestBasePlan& base, runtime::LaneId lane,
@@ -84,9 +84,9 @@ bool Program::hybrid_reclaim(runtime::ContextResourceUsage shortage) {
     impl_->settle_deferred();
     return impl_->hybrid_reclaim(shortage);
 }
-std::optional<std::uint32_t> Program::hybrid_prefetch(const RequestBasePlan& base) {
+std::optional<std::uint32_t> Program::hybrid_prefetch(const RequestBasePlan& base, bool spare_only) {
     impl_->settle_deferred();
-    return impl_->hybrid_prefetch(base);
+    return impl_->hybrid_prefetch(base, spare_only);
 }
 std::uint32_t Program::hybrid_prefetch_room() const noexcept { return impl_->hybrid_prefetch_room(); }
 void Program::hybrid_hold_queue(std::span<const RequestBasePlan* const> queue,
@@ -100,6 +100,9 @@ bool Program::hybrid_poll_storage() { return impl_->hybrid_poll_storage(); }
 bool Program::hybrid_source_pending() const noexcept { return impl_->hybrid_source_pending(); }
 
 bool Program::hybrid_storage_due() const noexcept { return impl_->hybrid_storage_due(); }
+std::optional<std::chrono::steady_clock::time_point> Program::hybrid_storage_retry_at() const noexcept {
+    return impl_->hybrid_storage_retry_at();
+}
 std::uint32_t Program::hybrid_resume_grid() const noexcept { return impl_->hybrid_resume_grid(); }
 
 runtime::ResourceReservation Program::reserve_units(std::span<const ExecutionUnit> units) {
@@ -109,6 +112,10 @@ runtime::ResourceReservation Program::reserve_units(std::span<const ExecutionUni
 bool Program::start_pause(SequenceHandle sequence, runtime::ExecutionTiming*) {
     impl_->settle_deferred();
     return impl_->start_pause(sequence);
+}
+
+std::uint32_t Program::pause_replay_tokens(SequenceHandle sequence) const noexcept {
+    return impl_->pause_replay_tokens(sequence);
 }
 
 ReplayProgress Program::advance_replay(SequenceHandle sequence, runtime::ExecutionTiming*) {
@@ -147,6 +154,15 @@ FinishResult Program::finish(SequenceHandle sequence) noexcept {
     impl_->settle_deferred_or_drop();
     return impl_->finish(sequence);
 }
+
+bool Program::can_finish_held(SequenceHandle sequence) const noexcept { return impl_->can_finish_held(sequence); }
+
+FinishResult Program::finish_held(SequenceHandle sequence) noexcept {
+    impl_->settle_deferred_or_drop();
+    return impl_->finish_held(sequence);
+}
+
+void Program::release_finished(SequenceHandle sequence) noexcept { impl_->release_finished(sequence); }
 
 AbortResult Program::abort(SequenceHandle sequence) noexcept {
     impl_->settle_deferred_or_drop();

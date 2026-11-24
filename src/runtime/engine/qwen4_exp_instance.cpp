@@ -11,6 +11,7 @@
 #include "models/load_options.h"
 #include "models/qwen4_exp/config.h"
 #include "models/qwen4_exp/load.h"
+#include "models/ablate/binding.h"
 #include "runtime/expert_offload/expert_residency.h"
 #include "runtime/expert_offload/host_slot_pool.h"
 #include "runtime/expert_offload/memory_plan.h"
@@ -62,6 +63,17 @@ void report(const EngineOptions& options, DiagnosticLevel level, const std::stri
     report_engine(options, level, text);
 }
 
+// --ablate (docs/ablate.md): the startup log names the cut applied, and warns when the sidecar names another artifact
+// as the one its direction was fitted on (the geometry matches, so it loads, but it was not measured here).
+void report_ablate(const EngineOptions& options, const models::qwen4_exp::Model& model) {
+    const models::AblateSidecarBinding* ablate = model.ablate();
+    if (ablate == nullptr) { return; }
+    report(options, DiagnosticLevel::Info, "ablation sidecar " + ablate->path.string() + ": " + ablate->describe());
+    if (const std::string warning = ablate->artifact_mismatch(model.info().artifact_id); !warning.empty()) {
+        report(options, DiagnosticLevel::Warning, warning);
+    }
+}
+
 // The fast paths and --a8-activations' routes are chosen from the stored formats the load plan records
 // (TextConfig::dense_format, expert_format, ggml_projections) before any weight is read; the bound
 // Parameters must agree, or a route chosen for one format would run on another.
@@ -107,14 +119,16 @@ models::qwen3_5::FrontendOptions frontend_options(const EngineOptions& options) 
 // (check_expert_vram), into plan.vram, with the frames the Program sizes from that check less its
 // pools' chunk slack, and the largest --max-context whose device plan still leaves the expert cache
 // room (the check passes) with the other options as given. An explicit KV capacity equal to
-// --max-context (infernix-serve's default without the prefix cache) follows the context.
+// --max-context (infernix-serve's default without the prefix cache) follows the context. `adapter` is the device
+// memory beside the dense weights (an --ablate sidecar's direction), counted as a start counts it.
 void plan_device_memory(EnginePlan& plan, const EngineOptions& options,
                         const models::qwen4_exp::ProgramOptions& program_options, const models::qwen4_exp::Config& config,
-                        std::uint32_t public_tokens, std::uint64_t dense, const VramSnapshot& before) {
+                        std::uint32_t public_tokens, std::uint64_t dense, std::uint64_t adapter, const VramSnapshot& before) {
     const auto device_plan = models::qwen4_exp::Program::plan_device(program_options, config, public_tokens);
     const ExpertVramCheck check =
-        size_expert_vram(options, "Qwen3.8-Flash-Next", before, dense + device_plan.fixed_bytes(), device_plan.graph_bound,
-                         device_plan.expert_frame_bytes, device_plan.max_frames, device_contributors(dense, device_plan));
+        size_expert_vram(options, "Qwen3.8-Flash-Next", before, dense + adapter + device_plan.fixed_bytes(),
+                         device_plan.graph_bound, device_plan.expert_frame_bytes, device_plan.max_frames,
+                         device_contributors(dense, device_plan));
     const std::uint32_t slack = expert_offload::pool_slack_frames(
         config.text.expert_frame_pools, expert_offload::ExpertResidency::kChunkBytes, device_plan.expert_frame_bytes);
     EnginePlanVram& vram           = plan.vram;
@@ -129,7 +143,8 @@ void plan_device_memory(EnginePlan& plan, const EngineOptions& options,
     vram.headroom_bytes            = check.sizing.headroom;
     vram.expert_frames             = check.sizing.frames > slack ? check.sizing.frames - slack : 0U;
     vram.expert_cache_bytes        = static_cast<std::uint64_t>(*vram.expert_frames) * device_plan.expert_frame_bytes;
-    vram.planned_bytes             = dense + device_plan.fixed_bytes() + *vram.expert_cache_bytes;
+    if (adapter != 0) { vram.adapter_bytes = adapter; }
+    vram.planned_bytes             = dense + adapter + device_plan.fixed_bytes() + *vram.expert_cache_bytes;
     const std::uint64_t used       = vram.planned_bytes + check.sizing.headroom + check.sizing.reserve;
     vram.left_bytes                = before.device_free > used ? before.device_free - used : 0;
     if (!check.refusal.empty()) { plan_refuse(plan, check.refusal); }
@@ -141,7 +156,7 @@ void plan_device_memory(EnginePlan& plan, const EngineOptions& options,
         trial.max_context                       = context;
         if (kv_follows) { trial.kv_capacity_tokens = context; }
         const auto trial_plan = models::qwen4_exp::Program::plan_device(trial, config, public_tokens);
-        return size_expert_vram(options, "Qwen3.8-Flash-Next", before, dense + trial_plan.fixed_bytes(),
+        return size_expert_vram(options, "Qwen3.8-Flash-Next", before, dense + adapter + trial_plan.fixed_bytes(),
                                 trial_plan.graph_bound, trial_plan.expert_frame_bytes, trial_plan.max_frames, {})
             .refusal.empty();
     });
@@ -325,6 +340,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                    : format == models::qwen4_exp::NgramRowFormat::Iq4Nl ? std::string("IQ4_NL")
                    : format == models::qwen4_exp::NgramRowFormat::Nvfp4 ? std::string("NVFP4")
                    : format == models::qwen4_exp::NgramRowFormat::Q8_0  ? std::string("Q8_0")
+                   : format == models::qwen4_exp::NgramRowFormat::Bf16P12 ? std::string("BF16_P12")
                                                                         : std::string("FP8");
         };
         report(options, DiagnosticLevel::Info,
@@ -545,7 +561,24 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     // With --ram-resize auto it may grow later, into RAM other programs free.
     std::uint64_t prefix_growth = 0;
     if (prefix_auto) {
-        prefix_bytes = auto_host_context_bytes(expert_offload::plan_host_memory(snapshot, demand));
+        // The exclusive layout's cap is the plan's own: where the tier no longer fits beside it, the layout gives way
+        // to the plain SSD tier (plan_auto_host_tier); an --expert-ram-mib cap is the user's and stays.
+        if (exclusive) {
+            const AutoHostTier tier = plan_auto_host_tier(snapshot, demand);
+            prefix_bytes            = tier.bytes;
+            if (!tier.keeps_cap) {
+                demand.expert_cap.reset();
+                exclusive                            = false;
+                program_options.expert_ram_exclusive = false;
+                program_options.expert_shadow_share  = 0.0;
+                program_options.expert_seed_share    = models::qwen4_exp::ProgramOptions{}.expert_seed_share;
+                report(options, DiagnosticLevel::Debug,
+                       "RAM plan: the exclusive expert layout does not fit beside the automatic prefix cache; using "
+                       "the SSD tier's layout");
+            }
+        } else {
+            prefix_bytes = auto_host_context_bytes(expert_offload::plan_host_memory(snapshot, demand));
+        }
         if (options.ram_resize) { prefix_growth = auto_host_context_ceiling_bytes(snapshot, demand, prefix_bytes); }
         demand.prefix_cache = prefix_bytes;
     }
@@ -560,6 +593,16 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         if (cache.ssd_capacity_bytes != 0 && !cache.hybrid.persistent_file.empty()) {
             program_options.prefix_ssd_kept_file =
                 runtime::prefix_cache::kept_ssd_file(cache.ssd_directory, cache.hybrid.persistent_file);
+            // A prefix cache file no longer used leaves its kept SSD file behind, which nothing removes: the start
+            // names each (another running server's is among them, so none is deleted).
+            if (!plan_only) {
+                for (const runtime::prefix_cache::KeptSsdFile& other : runtime::prefix_cache::other_kept_ssd_files(
+                         cache.ssd_directory, program_options.prefix_ssd_kept_file)) {
+                    report(options, DiagnosticLevel::Info,
+                           "SSD prefix cache: " + other.path.string() + " (" + std::to_string(other.bytes >> 20) +
+                               " MiB) is not used by this server");
+                }
+            }
         }
     }
     // The SSD tier (design §19.3.7): the banks stay in the artifact; the Program pins RAM slots for
@@ -634,6 +677,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     const auto device_plan =
         models::qwen4_exp::Program::plan_device(program_options, plan.config(), plan.public_token_count());
     const std::uint64_t dense = plan.device_bytes();
+    // --ablate: the sidecar's direction, beside the dense weights (the Parameters allocate it before the frames).
+    const std::uint64_t adapter = plan.ablate() != nullptr ? plan.ablate()->device_bytes() : 0;
     const VramSnapshot before = vram->query();
     if (plan_only) {
         EnginePlanRam& planned_ram = planned->ram;
@@ -650,7 +695,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                                                    : models::qwen4_exp::NgramVolume::cache_bytes(table);
         planned_ram.ngram_residency = ngram_in_ram ? NgramResidency::Ram : NgramResidency::Volume;
         plan_ram_totals(*planned, ram.ledger.planned + ram.ledger.expert_ram);
-        plan_device_memory(*planned, options, program_options, plan.config(), plan.public_token_count(), dense,
+        plan_device_memory(*planned, options, program_options, plan.config(), plan.public_token_count(), dense, adapter,
                            before);
         // A start meets the pinned block's check in the load, after the VRAM check.
         if (std::string shortfall = artifact::pinned_shortfall(plan.materialization(), available_host_memory_bytes());
@@ -661,7 +706,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         (void)models::qwen3_5::make_frontend(plan.resources(), frontend_options(options));
         return {};
     }
-    (void)check_expert_vram(options, "Qwen3.8-Flash-Next", before, dense + device_plan.fixed_bytes(),
+    (void)check_expert_vram(options, "Qwen3.8-Flash-Next", before, dense + adapter + device_plan.fixed_bytes(),
                             device_plan.graph_bound, device_plan.expert_frame_bytes, device_plan.max_frames,
                             device_contributors(dense, device_plan));
 
@@ -672,7 +717,10 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     device.synchronize();
     // What the weights hold once loaded: packed projections replace the estimate with their size.
     const std::uint64_t loaded = model->device_weight_bytes();
-    if (const std::uint64_t spilled = guard.end(loaded); spilled != 0) {
+    // The load page-locks tens of GiB inside the guarded step (the pinned block with the expert banks, a packed
+    // embedding's own block, the CSF tables, the upload staging of the artifact and of a DFlash2 companion), which
+    // the guard takes off the shared system memory use it reads (Model::load_pinned_bytes).
+    if (const std::uint64_t spilled = guard.end(loaded, model->load_pinned_bytes()); spilled != 0) {
         throw std::runtime_error(std::to_string(mib(spilled)) +
                                  " MiB of the dense weights were placed in shared system memory by the driver's "
                                  "sysmem fallback: free VRAM and start again (" + guard.readings(loaded) + ")");
@@ -696,6 +744,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     auto instance = std::make_unique<Qwen4ExpInstance>(std::move(model), options);
     frontend.complete();
     check_selection_formats(instance->parameters, instance->model->config());
+    report_ablate(options, *instance->model);
 
     // The fast paths selected before the load.
     program_options.fast_paths        = fast.forward();
@@ -779,7 +828,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     const auto& sizing = instance->program->vram_sizing();
     const std::uint64_t frames_bytes =
         static_cast<std::uint64_t>(sizing.frames) * device_plan.expert_frame_bytes;
-    const std::uint64_t after_startup = vram->query().device_free;
+    const VramSnapshot after          = vram->query();
+    const std::uint64_t after_startup = after.device_free;
     {
         const char* display = before.display == DisplayState::Headless   ? "no display"
                               : before.display == DisplayState::Attached ? "display attached"
@@ -788,14 +838,21 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         const std::string past = before.budget_allowance == 0
                                      ? std::string()
                                      : " (" + std::to_string(mib(before.budget_allowance)) + " MiB past the OS budget)";
-        char line[704];
+        // NVML's device-wide figures, which see other processes' memory where the budget does not (issue #68).
+        const std::string physical =
+            before.physical_used == 0 && !after.physical_free
+                ? std::string()
+                : "; every process used " + std::to_string(mib(before.physical_used)) + " MiB before loading and " +
+                      std::to_string(mib(after.physical_free.value_or(0))) + " MiB is free after startup (NVML)";
+        char line[832];
         std::snprintf(line, sizeof(line),
                       "VRAM ledger: %llu MiB card, %s, %llu in use before loading%s; %s; reserve %llu (%u graphs); "
-                      "headroom %llu (%s); expert frames %u (%.2f GiB); %llu free after startup",
+                      "headroom %llu (%s); expert frames %u (%.2f GiB); %llu free after startup%s",
                       mib(before.device_total), display, mib(before.device_total - before.device_free), past.c_str(),
                       device_contributors(dense, device_plan).c_str(), mib(sizing.reserve), device_plan.graph_bound,
                       mib(sizing.headroom), options.vram_headroom_bytes ? "set" : "auto", sizing.frames,
-                      static_cast<double>(frames_bytes) / static_cast<double>(1ULL << 30), mib(after_startup));
+                      static_cast<double>(frames_bytes) / static_cast<double>(1ULL << 30), mib(after_startup),
+                      physical.c_str());
         report(options, DiagnosticLevel::Debug, line);
         const double gib = static_cast<double>(1ULL << 30);
         char summary[320];
@@ -839,6 +896,11 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         if (table.fp8_scale) { signature += ";scale=" + std::to_string(*table.fp8_scale); }
         if (table.nvfp4_scale) { signature += ";multiplier=" + std::to_string(*table.nvfp4_scale); }
         signature += instance->model->config().text.moe.a16_experts ? ";experts=a16" : ";experts=a4";
+        // The grid this Program's resumes sit on: 1 with free cache resume, else the prefill chunk it fitted to its
+        // expert cache at this launch (EngineOptions::prefill_chunk is only the request). A file saved under another
+        // grid holds taps whose state came from calls of another width, which this launch's cold prefill would not
+        // compute, so on the reproducible route a resume from them would make the output depend on the file.
+        signature += ";grid=" + std::to_string(instance->program->hybrid_resume_grid());
         // A DFlash2 drafter's ring rides in every snapshot: it belongs to that companion artifact.
         if (const auto& draft = instance->model->info().draft_artifact_id) {
             signature += ";draft=";
@@ -875,6 +937,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     LoadSummary summary;
     summary.architecture         = std::string(models::architecture_name(models::Architecture::Qwen4Exp));
     summary.model_name           = instance->model->info().name;
+    if (const auto* ablate = instance->model->ablate()) {
+        summary.ablate_sidecar = ablate->path.string() + ": " + ablate->describe();
+    }
     summary.load_seconds         = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     summary.upload_seconds       = stats.upload_seconds;
     summary.artifact_bytes_read  = stats.read_bytes;

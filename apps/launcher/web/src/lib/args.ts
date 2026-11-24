@@ -185,6 +185,8 @@ export function sameArgs(a: readonly string[], b: readonly string[]): boolean {
 export const KNOWN_SWITCHES: ReadonlySet<string> = new Set([
   "--any-model-name",
   "--vram-past-budget",
+  "--gemma4-key-only-kv",
+  "--allow-shared-memory",
   "--expert-csf",
   "--reproducible",
   "--lossless",
@@ -205,6 +207,7 @@ export const KNOWN_SWITCHES: ReadonlySet<string> = new Set([
   "--cors",
   "--usage-chunk-choice",
   "--claude-code-usage-compat",
+  "--causal-scoring",
   "--greedy",
   "--ngram-native-sessions",
   "--use-original-int8-prefill-kernel",

@@ -150,6 +150,9 @@ void validate_gemma4_options(const EngineOptions& options) {
     case Gemma4Q5Prefill::Int8G64: break;
     default: throw std::invalid_argument("invalid Gemma4 Q5 prefill mode");
     }
+    if (!options.lora_path.empty() || !options.ablate_sidecar_path.empty()) {
+        throw std::invalid_argument("Gemma4 does not support Qwen runtime --lora or --ablate sidecars");
+    }
     if (!options.fast_paths || options.lossless || options.reference) {
         throw std::invalid_argument("Gemma4 does not support --reproducible, --lossless or --reference");
     }

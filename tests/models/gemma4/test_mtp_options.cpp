@@ -80,7 +80,8 @@ int run() {
             bool refused = false;
             try { infernix::runtime::validate_engine_options(options, architecture); }
             catch (const std::invalid_argument&) { refused = true; }
-            failures += check(refused, "a non-Gemma family accepted a Gemma-only memory choice");
+            const bool expected = !automatic || architecture != infernix::models::Architecture::Qwen3_5;
+            failures += check(refused == expected, "automatic Qwen context or Gemma-only key storage was misclassified");
         }
     }
     for (const auto architecture : {infernix::models::Architecture::Qwen3_5,
@@ -92,6 +93,14 @@ int run() {
         try { infernix::runtime::validate_engine_options(options, architecture); }
         catch (const std::invalid_argument&) { refused = true; }
         failures += check(refused, "a non-Gemma family accepted shared GPU memory spill");
+    }
+    {
+        auto options = mtp_options();
+        options.ablate_sidecar_path = "sidecar.json";
+        failures += refuses(options, "Gemma silently accepted a Qwen ablation sidecar");
+        options.ablate_sidecar_path.clear();
+        options.lora_path = "adapter";
+        failures += refuses(options, "Gemma silently accepted a dense Qwen LoRA adapter");
     }
     // Non-affine context-dependent reservation: workspace/table steps belong to each candidate,
     // not to one high-ceiling curve reused with a smaller KV count.

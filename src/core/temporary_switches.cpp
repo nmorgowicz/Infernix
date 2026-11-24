@@ -57,10 +57,16 @@ constexpr Registration kSwitches[] = {
     // returns to the expert frames (models/qwen4_exp/program/program_impl.h apply_vram_target;
     // candidates §8.3 CF-06). Same bits.
     {"INFERNIX_TMP_KV_SHRINK_BUSY", Scope::Qwen4Exp, Kind::Flag},
+    // Qwen3.5 automatic KV capacity: =<percent> 1..20; idle-wide-prefill may take up to that share of the
+    // automatic capacity's pages for its wider prefill buffers and workspace (runtime/engine/model_instance.cpp).
+    // Unset: it takes pages only while every lane's full context still fits, so a pool below
+    // max-concurrency x max-context prefills chunk-wide (review 2026-11-14, M4). Same bits on every route that
+    // does not select idle-wide-prefill.
+    {"INFERNIX_TMP_IDLE_WIDE_KV_PERCENT", Scope::Qwen3_5, Kind::Value},
     // Offloaded-expert caches: =<fraction> (0, 1]; a prompt whose reused prefix covers at least that much
     // of it neither scores its prefill routes nor seeds its experts (Flash-Next: models/qwen4_exp/program/
     // program_impl.h apply_prompt_routes; the 122B: models/qwen3_5/program/offload.cpp end_pass; candidates
-    // CF-01). Same bits (placement only).
+    // CF-01). Parsed by continuing_prompt(). Same bits (placement only).
     {"INFERNIX_TMP_CONTINUING_PROMPT", Scope::All, Kind::Value},
     // Diagnostic (2026-10-29): =<MB/s>; the artifact read queues (core/direct_read_queue.cpp) hold each finished read
     // until a device of that rate would have delivered it, to measure the SSD tier on a slower drive. Same bits.
@@ -147,6 +153,16 @@ GwShape read_gw_shape() {
     return {static_cast<int>(rows), static_cast<int>(stages)};
 }
 
+double read_continuing_prompt() {
+    const auto v = value("INFERNIX_TMP_CONTINUING_PROMPT");
+    if (!v) { return 0.0; }
+    double fraction = 0.0;
+    if (!parse_double(*v, fraction) || !(fraction > 0.0 && fraction <= 1.0)) {
+        malformed("INFERNIX_TMP_CONTINUING_PROMPT", *v, "a fraction in (0, 1]");
+    }
+    return fraction;
+}
+
 OffloadSwitches read_offload() {
     OffloadSwitches s;
     const auto reject = [&](const char* name, const std::string& v) { s.errors.push_back(std::string(name) + "=" + v); };
@@ -220,6 +236,11 @@ double number(std::string_view name, double fallback, double lo, double hi) {
     return out;
 }
 
+double continuing_prompt() {
+    static const double fraction = read_continuing_prompt();
+    return fraction;
+}
+
 GwShape gw_shape() {
     static const GwShape shape = read_gw_shape();
     return shape;
@@ -236,6 +257,7 @@ std::string describe(Scope scope) {
     if ((static_cast<unsigned>(scope) & static_cast<unsigned>(Scope::Qwen3_5)) != 0) {
         (void)gw_shape();
     }
+    (void)continuing_prompt();
     std::string out;
     if ((static_cast<unsigned>(scope) & static_cast<unsigned>(Scope::Gemma4)) != 0) {
         (void)integer("INFERNIX_TMP_GEMMA4_ATTN_SPLIT_K", 0, 0, 13);

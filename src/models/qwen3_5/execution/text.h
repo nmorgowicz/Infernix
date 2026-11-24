@@ -42,6 +42,27 @@ struct NullTap {
     [[nodiscard]] static constexpr bool reads_layer(int) noexcept { return false; }
 };
 
+// Causal scoring's hidden-state capture (ScoreOptions::prompt_hidden_states): every layer's output residual (the
+// residual after layer L) at one absolute prompt position, into column L of `out` (BF16 [H, layers]); rows[L] counts
+// the writes. The prefill tells it each window's first position and width (begin_window).
+struct HiddenStateSink {
+    static constexpr bool enabled = true;
+    Tensor out;
+    std::int64_t position           = -1;
+    std::vector<std::uint8_t>* rows = nullptr;
+    std::int64_t window_first       = 0;
+    std::int32_t window_columns     = 0;
+
+    // Every layer is read, so the last layer's tail runs over every column (YC-01 trims none).
+    [[nodiscard]] static constexpr bool reads_layer(int) noexcept { return true; }
+    void begin(const Tensor&) noexcept {}
+    void begin_window(std::int64_t first, std::int32_t columns) noexcept {
+        window_first   = first;
+        window_columns = columns;
+    }
+    void capture_layer(int layer, const Tensor& value, cudaStream_t stream);
+};
+
 struct PrefillChunkResult {
     std::uint32_t processed_tokens = 0;
     bool finalized                 = false;
@@ -50,7 +71,8 @@ struct PrefillChunkResult {
 
 struct DFlashFeatureSink {
     static constexpr bool enabled = true;
-    using PrefillConsumer         = std::function<void(const Tensor&, const Tensor&, bool)>;
+    // A prefill window's features and positions from its column `first` on (a pair window's tail starts past 0).
+    using PrefillConsumer         = std::function<void(const Tensor& features, const Tensor& positions, std::int32_t first)>;
 
     Tensor* features                  = nullptr;
     Tensor* positions                 = nullptr;
@@ -71,7 +93,8 @@ struct DFlashFeatureSink {
     }
     void capture_layer(int layer, const Tensor& value, cudaStream_t stream);
     void capture_positions(const Tensor& source, cudaStream_t stream);
-    void consume_prefill_chunk(std::int32_t tokens, bool rewrite_checkpoint);
+    // The drafter takes the window's columns [first, first + count) (the call's capture covers them all).
+    void consume_prefill_columns(std::int32_t first, std::int32_t count);
 };
 
 class VisionPrefillSession;
@@ -87,6 +110,15 @@ struct SampledDraftStep {
     // FP32 [kMtpSampledDraftRanks,T] or empty: the head's log-probabilities of the ranks the draw
     // chose among, which rank a greedy row's alternatives in a tree round.
     Tensor scores;
+};
+
+// The Gumbel-max rows' coupling of one argmax MTP proposal step (ops::speculative_couple_drafts; the
+// reproducible and lossless routes): a sampled row's draft is re-drawn under the target's key for the
+// column that verifies it.
+struct CoupledDraftStep {
+    const ops::SamplingConfig* configs = nullptr; // device SamplingConfig[T]: the rows' samplers
+    Tensor frontiers;                             // I32 [T]: each row's length when the draft is verified
+    std::int32_t column = 0;                      // the draft's verification column (its step)
 };
 
 class TextContext {
@@ -134,6 +166,16 @@ public:
 
     void set_prefill_split_frontier(std::int64_t position) noexcept {
         prefill_split_frontier_ = position;
+    }
+
+    // QK-02, the pair window: an exact prefix-cache tap at `position` inside this call's one window, taken without
+    // splitting it. The GDN layers run their convolution and recurrence over the columns before the tap from the
+    // source slot into `slot` (the tap's state image), then over the rest from `slot` into the destination; the tap
+    // image also takes the continuation hidden at position - 1 and, with a drafter, its local ring as the columns
+    // before the tap leave it. Every projection, attention and FFN runs once over the whole window. -1: none.
+    void set_prefill_pair_tap(std::int64_t position, std::int32_t slot) noexcept {
+        prefill_pair_frontier_ = position;
+        prefill_pair_slot_     = slot;
     }
 
     // Execution settings: prefill chunks' prompt kernels, every launch's fast-path permission and
@@ -187,6 +229,10 @@ public:
                                                    std::uint32_t begin,
                                                    std::uint32_t nominal_length,
                                                    bool finalize_at_end, DFlashFeatureSink& sink);
+    [[nodiscard]] PrefillChunkResult prefill_chunk(std::span<const int> full_ids,
+                                                   std::uint32_t begin,
+                                                   std::uint32_t nominal_length,
+                                                   bool finalize_at_end, HiddenStateSink& sink);
     [[nodiscard]] PrefillChunkResult
     prefill_chunk(const qwen3_5::PreparedPromptData& input, std::uint32_t begin,
                   std::uint32_t nominal_length, VisionPrefillSession& vision, bool finalize_at_end);
@@ -221,9 +267,12 @@ public:
                                   Tensor& mtp_hidden);
     // `probabilities` (FP32 [batch], optional): each draft's drafter probability, from the argmax's
     // own pass (ops::argmax_with_probability). `sampled` (sampled-mtp-drafts): the drafts are drawn
-    // under each row's sampler instead, with their sparse proposals (no probabilities).
+    // under each row's sampler instead, with their sparse proposals (no probabilities). `coupled`
+    // (argmax drafts only): Gumbel-max rows re-draw their drafts under the target's keys, the
+    // probabilities following (CoupledDraftStep).
     void mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens,
-                           Tensor* probabilities = nullptr, const SampledDraftStep* sampled = nullptr);
+                           Tensor* probabilities = nullptr, const SampledDraftStep* sampled = nullptr,
+                           const CoupledDraftStep* coupled = nullptr);
     void mtp_forward_batch(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
                            ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden,
                            int logits_column, Tensor* logits, Tensor* draft_token,
@@ -245,10 +294,20 @@ private:
     [[nodiscard]] PagedKVBatchLayerView mtp_kv_batch_layer() const;
     [[nodiscard]] PagedKVLayerView mtp_kv_layer() const;
 
-    void attn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
-    void gdn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
+    void attn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase, std::size_t layer);
+    void gdn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase, std::size_t layer);
+    // The mixer's output projection added to the residual (ops::linear_add). On a layer whose attention lane an
+    // --ablate sidecar cuts (docs/ablate.md), the same call between a copy of the residual columns it writes and
+    // ops::residual_delta_cut; without a cut, the plain call alone.
+    void add_output_projection(const Tensor& input, const Weight& weight, Tensor& residual, ops::LinearPolicy policy,
+                               ops::LinearRoutes routes, const ops::LoraAddend* lora, std::size_t layer);
+    // The post-mixer norm and MLP added to x (mlp_write); a cut MLP lane wraps it as add_output_projection does.
     void mlp_tail(const BlockParameters& weights, Tensor& x, Phase phase,
                   const ops::SparseMoeHints& hints, std::size_t layer);
+    void mlp_write(const BlockParameters& weights, Tensor& x, Phase phase, const ops::SparseMoeHints& hints,
+                   std::size_t layer);
+    // --ablate: a workspace copy of the residual columns a cut lane is about to write (the planner reserves it).
+    [[nodiscard]] Tensor snapshot_residual(const Tensor& residual);
     [[nodiscard]] ops::SparseMoeHints next_projection_hints(int layer) const;
     // Per-request width of a bound sequence batch; an unbatched call is one row of all columns.
     [[nodiscard]] std::int32_t row_width(std::int32_t columns) const noexcept {
@@ -299,7 +358,8 @@ private:
                            ops::CausalAttentionExecutionEnvelope envelope, bool final_chunk,
                            Tensor* final_hidden, Tensor* logits, Tensor* draft_token);
     void proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens,
-                         Tensor* probabilities = nullptr, const SampledDraftStep* sampled = nullptr);
+                         Tensor* probabilities = nullptr, const SampledDraftStep* sampled = nullptr,
+                         const CoupledDraftStep* coupled = nullptr);
 
     struct MultimodalPrefill {
         std::span<const int> token_ids;
@@ -364,6 +424,10 @@ private:
     const Tensor* verification_tree_          = nullptr;
     const Tensor* tree_ancestor_masks_        = nullptr;
     std::int64_t prefill_split_frontier_      = -1;
+    // set_prefill_pair_tap; pair_column_ is the window's tap column while its layers run (gdn_mix), 0 otherwise.
+    std::int64_t prefill_pair_frontier_       = -1;
+    std::int32_t prefill_pair_slot_           = -1;
+    std::int32_t pair_column_                 = 0;
     Tensor* rewrite_checkpoint_hidden_output_ = nullptr;
     std::uint32_t mtp_proposal_extent_        = 0;
     std::span<const cudaEvent_t> layer_ready_;

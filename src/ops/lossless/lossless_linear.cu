@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <span>
 #include <vector>
 
@@ -54,6 +55,7 @@ void launch_route(const Call& c, Route route, int first, int count, std::uint8_t
     case Route::Q6: launch_chunk_stage<RowSplitFormat<6>>(c, first, count, base, l, stream, stage); break;
     case Route::Q8: launch_chunk_stage<RowSplitFormat<8>>(c, first, count, base, l, stream, stage); break;
     case Route::Nvfp4: launch_chunk_stage<Nvfp4Format>(c, first, count, base, l, stream, stage); break;
+    case Route::Nvfp4Mul: launch_chunk_stage<Nvfp4MulFormat>(c, first, count, base, l, stream, stage); break;
     case Route::Fp8Row: launch_chunk_stage<Fp8RowFormat>(c, first, count, base, l, stream, stage); break;
     case Route::Fp8RowF32: launch_chunk_stage<Fp8RowF32Format>(c, first, count, base, l, stream, stage); break;
     case Route::Bf16: launch_chunk_stage<Bf16GridFormat>(c, first, count, base, l, stream, stage); break;
@@ -138,8 +140,13 @@ Call projection_call(const Tensor& x, const Weight& weight, std::int32_t row_beg
     }
     require(scale.divisor == 0.0F || (std::isfinite(scale.divisor) && scale.divisor > 0.0F),
             "an activation divisor is positive and finite");
+    require(scale.multiplier == 0.0F || (std::isfinite(scale.multiplier) && scale.multiplier > 0.0F),
+            "an activation multiplier is positive and finite");
+    require(scale.divisor == 0.0F || scale.multiplier == 0.0F, "an activation scale is a divisor or a multiplier");
     Call c{&x, view_of(weight, route), row_begin, nullptr, 0, rows, &out, out_row, columns, weight.qtype};
     std::memcpy(&c.w.act_div, &scale.divisor, sizeof(c.w.act_div));
+    std::memcpy(&c.w.act_mul[0], &scale.multiplier, sizeof(c.w.act_mul[0]));
+    c.w.act_mul[1] = c.w.act_mul[0];
     c.act_column = scale.column_scales;
     return c;
 }
@@ -204,9 +211,12 @@ void lossless_linear_grouped(const Tensor& x, const Weight& weight, const Tensor
             "the rows must lie within the weight");
     check_out(out, columns, 0, rows);
     require(out.ne[0] == rows, "the grouped form's out is [rows, columns]");
-    run(Call{&x, view_of(weight, route), row_offset, static_cast<const std::int32_t*>(tile_experts.data),
-             expert_stride, rows, &out, 0, columns, weight.qtype},
-        route, workspace, stream);
+    Call call{&x, view_of(weight, route), row_offset, static_cast<const std::int32_t*>(tile_experts.data),
+              expert_stride, rows, &out, 0, columns, weight.qtype};
+    // The ids are device data: a tile naming an expert whose rows would pass the weight's end is left unwritten (as
+    // an unused tile) rather than read out of bounds.
+    call.max_expert = expert_stride > 0 ? (weight.n - row_offset - rows) / expert_stride : std::numeric_limits<int>::max();
+    run(call, route, workspace, stream);
 }
 
 namespace {

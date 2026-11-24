@@ -14,14 +14,16 @@
 //   --fake-experts            report an expert cache, expert memory and an SSD tier (offloaded-expert models)
 //   --fake-no-memory          report no memory breakdown (a server older than it)
 //   --plan FILE               write a plan (fits up to --max-context 225280) and exit
+//   --log-level L             above info (warning, error, critical, off): no Info records, "listening on" among them
 //   INFERNIX_FAKE_PROBE=TEXT  logged at startup (a configuration's environment reaches the server)
+//   INFERNIX_FAKE_HELP_DELAY_MS=N  wait N ms before printing --help (a slow first start)
 //   INFERNIX_FAKE_BIND_FAIL_ONCE=FILE  refuse the port once, as infernix-serve does when another
 //                             program holds it, and note it in FILE (later starts bind normally)
 //
 // A port that is really held is refused with infernix-serve's own message.
 //
 // Everything else on the command line (the artifact, launch parameters) is accepted and ignored,
-// except --host, --port, --model-id and --max-context.
+// except --host, --port, --model-id, --max-context and --log-level.
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -67,8 +69,12 @@ constexpr double kPrefillRate = 3200.0; // tokens/s
 constexpr auto kTokenEvery    = std::chrono::microseconds(6700);
 
 std::mutex g_log_mutex;
+// --log-level above info (warning, error, critical, off) drops the Info records, as infernix-serve's does: the
+// "listening on" line among them.
+bool g_info_logged = true;
 
 void log(const char* level, const std::string& message) {
+    if (!g_info_logged && std::strcmp(level, "INFO") == 0) { return; }
     const auto now         = std::chrono::system_clock::now();
     const std::time_t secs = std::chrono::system_clock::to_time_t(now);
     const auto millis      = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000;
@@ -123,6 +129,8 @@ struct State {
     bool stalled = false;
     bool experts = false;
     bool memory  = true; // --fake-no-memory: an older server without the memory breakdown
+    bool lora    = false; // --lora: a rank-32 adapter's factors on the device
+    bool ablate  = false; // --ablate: a shared direction (a dense 27B's 20 KiB, Flash-Next's 10 KiB)
     std::uint64_t next_id        = 1;
     std::uint64_t completed      = 0;
     std::uint64_t prefill_tokens = 0;
@@ -220,6 +228,8 @@ Json memory_json() {
         device   = {part("weights", 6608125952ull), part("drafter", 775946240ull), experts(8729, 2763828),
                     filled("kv_cache", 170 * kMiB, held * 8192), part("state", 680 * kMiB), part("prefix_cache", 0),
                     part("workspace", 356 * kMiB), part("cuda_graphs", 136 * kMiB), part("staging", 210 * kMiB)};
+        // An ablation sidecar's direction beside the experts, as Qwen3.8-Flash-Next reports it.
+        if (g_state.ablate) { device.insert(device.begin() + 2, part("adapter", 10240)); }
         ram_others = 14 * kGiB;
         host       = {part("weights", 910 * kMiB), experts(23808, 2815313), filled("prefix_cache", 4 * kGiB, computed * 24576),
                       part("ngram", kGiB), part("staging", 288 * kMiB)};
@@ -227,10 +237,15 @@ Json memory_json() {
     } else {
         headroom = kGiB;
         others   = 1229 * kMiB;
+        // An MTP drafter's own KV pool beside the KV cache, as a Qwen3.5 model with --spec mtp reports it.
         device   = {part("weights", static_cast<std::uint64_t>(21.4 * static_cast<double>(kGiB))), part("drafter", 740 * kMiB),
-                    filled("kv_cache", 2 * kGiB, held * 32768), part("state", 680 * kMiB),
+                    filled("kv_cache", 2 * kGiB, held * 32768), part("mtp_kv", 48 * kMiB), part("state", 680 * kMiB),
                     filled("prefix_cache", 256 * kMiB, g_state.completed * 24 * kMiB), part("workspace", 1500000000ull),
                     part("cuda_graphs", 530000000ull), part("staging", 64 * kMiB)};
+        // A dense model's adapters (a LoRA adapter's factors, an ablation sidecar's direction) after the drafter: the
+        // server omits a part that holds nothing.
+        const std::uint64_t adapter = (g_state.lora ? 304 * kMiB : 0) + (g_state.ablate ? 20480 : 0);
+        if (adapter != 0) { device.insert(device.begin() + 2, part("adapter", adapter)); }
         ram_others = 18 * kGiB;
         host       = {part("weights", 910 * kMiB), filled("prefix_cache", 4 * kGiB, computed * 24576), part("staging", 288 * kMiB)};
     }
@@ -605,6 +620,10 @@ void generate(const std::string& protocol, const Json& body, const std::string& 
 }
 
 void print_help() {
+    // A cold start (a first run after boot, a virus scan) can take seconds before the help appears.
+    if (const char* delay = std::getenv("INFERNIX_FAKE_HELP_DELAY_MS"); delay != nullptr && *delay != '\0') {
+        std::this_thread::sleep_for(std::chrono::milliseconds(std::atoi(delay)));
+    }
     // INFERNIX_FAKE_SERVE_HELP names a text file to print instead (a real infernix-serve's --help,
     // say), so the launcher offers that server's options while this one answers the requests.
     if (const char* file = std::getenv("INFERNIX_FAKE_SERVE_HELP"); file != nullptr && *file != '\0') {
@@ -626,7 +645,7 @@ void print_help() {
         "  --log-colours on|off       coloured console\n"
         "  --plan FILE                write the sizing plan to FILE and exit\n"
         "MODEL & CONTEXT\n"
-        "  --max-context N            max context tokens per request (default 8192)\n"
+        "  --max-context N|auto       max context tokens per request (default 8192)\n"
         "  --max-concurrency N        max concurrent sequences, 1-8 (default 1)\n"
         "  --kv-dtype T               KV storage\n"
         "  --vram-headroom-mib N|auto VRAM left free\n"
@@ -635,6 +654,8 @@ void print_help() {
         "  --host-context-mib N|auto  pinned Host pool\n"
         "  --expert-state FILE|off    expert cache state\n"
         "  --vision                   load the vision tower\n"
+        "  --lora PATH                a LoRA adapter (its factors: 304 MiB of VRAM)\n"
+        "  --ablate FILE              an ablation sidecar (its direction: 20 KiB of VRAM)\n"
         "FAKE\n"
         "  --fake-load-ms N           loading time\n"
         "  --fake-fail-load TEXT      fail the load\n"
@@ -645,16 +666,19 @@ void print_help() {
 
 // --plan: a plan that fits up to 225,280 tokens of context (2.03 GB + 33,792 bytes per token
 // beside 21.4 GiB of weights on a 32 GiB card), the shape infernix-serve writes.
+// `context` 0: --max-context auto, which takes the largest that fits.
 int write_plan(const std::string& file, std::uint64_t context) {
     constexpr double kGiB          = 1024.0 * 1024.0 * 1024.0;
     const std::uint64_t total      = static_cast<std::uint64_t>(32.0 * kGiB);
     const std::uint64_t free_bytes = static_cast<std::uint64_t>(31.4 * kGiB);
     const std::uint64_t weights    = static_cast<std::uint64_t>(21.4 * kGiB);
     const std::uint64_t headroom   = 1ull << 30;
-    const std::uint64_t minimum    = 2030000000ull + context * 33792ull;
-    const std::uint64_t planned    = weights + minimum + headroom;
-    const bool fits                = planned <= free_bytes;
     const std::uint64_t max_context = (free_bytes - weights - headroom - 2030000000ull) / 33792ull / 4096 * 4096;
+    if (context == 0) { context = max_context; }
+    const std::uint64_t minimum    = 2030000000ull + context * 33792ull;
+    const std::uint64_t adapter    = (g_state.lora ? 318767104ull : 0ull) + (g_state.ablate ? 20480ull : 0ull);
+    const std::uint64_t planned    = weights + adapter + minimum + headroom;
+    const bool fits                = planned <= free_bytes;
     const Json plan = {
         {"schema", 1},
         {"fits", fits},
@@ -677,6 +701,8 @@ int write_plan(const std::string& file, std::uint64_t context) {
           {"graph_allowance_bytes", 530000000ull},
           {"expert_cache_bytes", nullptr},
           {"expert_frames", nullptr},
+          {"draft_screen_bytes", nullptr},
+          {"adapter_bytes", adapter != 0 ? Json(adapter) : Json(nullptr)},
           {"headroom_bytes", headroom},
           {"planned_bytes", planned},
           {"left_bytes", fits ? free_bytes - planned : 0}}},
@@ -733,7 +759,8 @@ int main(int argc, char** argv) {
         } else if (arg == "--model-id") {
             g_state.model = value();
         } else if (arg == "--max-context") {
-            context = std::strtoull(value().c_str(), nullptr, 10);
+            const std::string text = value();
+            context                = text == "auto" ? 0 : std::strtoull(text.c_str(), nullptr, 10);
         } else if (arg == "--plan") {
             plan_file = value();
         } else if (arg == "--fake-load-ms") {
@@ -746,6 +773,15 @@ int main(int argc, char** argv) {
             g_state.experts = true;
         } else if (arg == "--fake-no-memory") {
             g_state.memory = false;
+        } else if (arg == "--lora") {
+            (void)value();
+            g_state.lora = true;
+        } else if (arg == "--ablate") {
+            (void)value();
+            g_state.ablate = true;
+        } else if (arg == "--log-level") {
+            const std::string level = value();
+            g_info_logged = level == "trace" || level == "debug" || level == "info";
         }
     }
     if (!plan_file.empty()) { return write_plan(plan_file, context); }
@@ -798,6 +834,19 @@ int main(int argc, char** argv) {
                                      "application/json");
                 return;
             }
+            // As infernix-serve: a negative output limit is a request error (the launcher's checks use it to have
+            // the server refuse a request that streams).
+            const auto limit = body.find("max_tokens");
+            if (limit != body.end() && limit->is_number_integer() && limit->get<long long>() < 0) {
+                response.status = 400;
+                response.set_content(protocol == "anthropic"
+                                         ? R"({"type":"error","error":{"type":"invalid_request_error",)"
+                                           R"("message":"max_tokens must be at least 1"}})"
+                                         : R"({"error":{"message":"max_tokens must be at least 1",)"
+                                           R"("type":"invalid_request_error","param":"max_tokens","code":null}})",
+                                     "application/json");
+                return;
+            }
             generate(protocol, body, request.get_header_value("X-Infernix-Request-Label"), response);
         };
     };
@@ -807,6 +856,12 @@ int main(int argc, char** argv) {
     server.Post(R"((?:/v1)?/v1/messages)", route("anthropic"));
     server.Post(R"((?:/v1)?/v1/messages/count_tokens)", [](const httplib::Request&, httplib::Response& response) {
         response.set_content(R"({"input_tokens":56})", "application/json");
+    });
+    // A --causal-scoring server's answer (docs/serving.md, Teacher-forced scoring), JSON whatever `stream` says.
+    server.Post(R"((?:/v1)?/v1/score)", [](const httplib::Request&, httplib::Response& response) {
+        response.set_content(R"({"object":"score","positions":[{"token_id":11,"logprob":-0.25,"top_logprobs":[]}],)"
+                             R"("usage":{"prompt_tokens":7,"continuation_tokens":1}})",
+                             "application/json");
     });
     // As infernix-serve (docs/serving.md, Resource behavior): compaction is refused, and this
     // stand-in stores no Response, so every id is unknown to cancel.
@@ -865,7 +920,7 @@ int main(int argc, char** argv) {
         return port_refused();
     }
     if (!server.bind_to_port(host, port)) { return port_refused(); }
-    std::thread loader([load_ms, hog_mib, fail_load] {
+    std::thread loader([load_ms, hog_mib, fail_load, host, port] {
         std::vector<std::unique_ptr<char[]>> hog;
         log("INFO", "loading weights | 21.4 GiB");
         for (int taken = 0; taken < hog_mib; taken += 256) {
@@ -883,8 +938,13 @@ int main(int argc, char** argv) {
         }
         hog.clear();
         log("INFO", "engine ready | " + g_state.model + " | total 1.5s");
-        std::lock_guard lock(g_state.mutex);
-        g_state.ready = true;
+        {
+            std::lock_guard lock(g_state.mutex);
+            g_state.ready = true;
+        }
+        // The real server's ready line (OperationalLog::server_ready): the launcher takes /health only from a server
+        // that logged it.
+        log("INFO", "listening on http://" + host + ":" + std::to_string(port) + " | model " + g_state.model + " | auth none");
     });
     loader.detach();
     server.listen_after_bind();

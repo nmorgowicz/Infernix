@@ -762,10 +762,29 @@ int test_messages_and_media() {
         Json::array({Json{{"type", "input_audio"}, {"input_audio", Json::object()}}});
     failures += check(api_error([&] { (void)parse(body); }).code == "modality_not_supported",
                       "input audio rejected");
+    // A file part is a PDF document (serve/documents.h); a Files API id is refused.
     body["messages"][0]["content"] =
         Json::array({Json{{"type", "file"}, {"file", Json::object()}}});
-    failures += check(api_error([&] { (void)parse(body); }).code == "modality_not_supported",
-                      "file input rejected");
+    failures += check(api_error([&] { (void)parse(body); }).param == "messages", "an empty file input was accepted");
+    body["messages"][0]["content"] =
+        Json::array({Json{{"type", "file"}, {"file", Json{{"file_id", "file-1"}}}}});
+    failures += check(api_error([&] { (void)parse(body); }).code == "file_inputs_not_supported",
+                      "a Files API file input was accepted");
+    body["messages"][0]["content"] = Json::array(
+        {Json{{"type", "file"}, {"file", Json{{"file_data", "data:application/pdf;base64,JVBERi0="},
+                                              {"filename", "report.pdf"}}}}});
+    {
+        const auto parsed = parse(body);
+        const ContentPart& file = parsed.generation.messages[0].content[0];
+        failures += check(file.kind == ContentKind::Document && file.document->format == DocumentSource::Format::Pdf &&
+                              file.document->filename == "report.pdf" &&
+                              file.document->pdf.value == "data:application/pdf;base64,JVBERi0=",
+                          "a file part was not read as a PDF document");
+    }
+    body["messages"][0]["content"] =
+        Json::array({Json{{"type", "file"}, {"file", Json{{"file_data", "data:text/plain;base64,SGk="}}}}});
+    failures += check(api_error([&] { (void)parse(body); }).code == "file_inputs_not_supported",
+                      "a file input that is not a PDF was accepted");
 
     // GitHub #33: an agent framework's first tool round names the system, assistant and tool
     // messages. Every string name is accepted and ignored: the request parses to the same history
@@ -998,7 +1017,12 @@ int test_stops_and_ranges() {
         check(api_error([&] { (void)parse(body); }).param == "stop", "empty stop string rejected");
 
     body                                  = base_request();
-    body["top_k"]                         = 21;
+    for (const int top_k : {0, 20, 21, 64}) {
+        body["top_k"] = top_k;
+        failures += check(options(parse(body).generation).execution.sampling.top_k == top_k,
+                          "common Engine translator preserves the generic [0,64] sampler domain");
+    }
+    body["top_k"]                         = 65;
     const GenerationRequest invalid_top_k = parse(body).generation;
     failures += check(api_error([&] { (void)options(invalid_top_k); }).param == "top_k",
                       "Engine translator owns sampler value range");
@@ -1282,6 +1306,61 @@ int test_stream_observations() {
     return failures;
 }
 
+
+int test_lazy_stream_timing() {
+    int failures = 0;
+    const infernix::GenerationTimingObservation timing{
+        .generated_tokens = 3, .prompt_elapsed_ns = 110000000, .generation_elapsed_ns = 20000000};
+    OpenAIChatStream unadmitted(identity(), true, true, false);
+    failures += check(throws_logic([&] { unadmitted.note_timing(timing); }),
+                      "live timing before generation admission must be rejected");
+    OpenAIChatStream disabled(identity(), true, false, false);
+    disabled.note_start(infernix::GenerationStart{.prompt = {.prompt_tokens = 32}, .reused_prompt_tokens = 12});
+    failures += check(throws_logic([&] { disabled.note_timing(timing); }),
+                      "live timing without opt-in must be rejected");
+
+    for (int channel = 0; channel < 3; ++channel) {
+        OpenAIChatStream lazy(identity(), true, true, false);
+        lazy.note_start(infernix::GenerationStart{.prompt = {.prompt_tokens = 32}, .reused_prompt_tokens = 12});
+        const bool rejected = throws_logic([&] { lazy.note_timing(timing); });
+        failures += check(!rejected, "timing before lazy stream start must be accepted");
+        if (rejected) { continue; }
+        failures += check(lazy.keep_alive().empty(), "timing bookkeeping must not open the stream");
+        const Json role = parse_sse(lazy.start());
+        failures += check(role["choices"][0]["delta"]["role"] == "assistant" && !role.contains("timings"),
+                          "lazy start must preserve the untimed assistant-role chunk");
+        Json delta;
+        GenerationOutcome outcome = sample_outcome();
+        if (channel == 0) {
+            delta = parse_sse(lazy.content_delta("answer"));
+            outcome.reasoning.clear();
+        } else if (channel == 1) {
+            delta = parse_sse(lazy.reasoning_delta("thought"));
+            outcome.text.clear();
+        } else {
+            delta = parse_sse(lazy.tool_call_delta({.index = 0, .name = "Edit", .arguments = "{}", .complete = true}));
+            outcome.text.clear();
+            outcome.reasoning.clear();
+            outcome.tool_calls.push_back(infernix::GeneratedToolCall{.name = "Edit", .arguments_json = "{}"});
+        }
+        failures += check(delta["timings"]["prompt_n"] == 20 && delta["timings"]["predicted_n"] == 3 &&
+                              delta["timings"]["predicted_per_second"] == 100.0,
+                          "first content, reasoning or tool output must retain committed timing");
+        failures += check(throws_logic([&] { lazy.note_timing({.generated_tokens = 0}); }) &&
+                              throws_logic([&] { lazy.note_timing({.generated_tokens = 2,
+                                  .prompt_elapsed_ns = 110000000, .generation_elapsed_ns = 20000000}); }) &&
+                              throws_logic([&] { lazy.note_timing({.generated_tokens = 3,
+                                  .prompt_elapsed_ns = 110000001, .generation_elapsed_ns = 20000000}); }) &&
+                              throws_logic([&] { lazy.note_timing({.generated_tokens = 3,
+                                  .prompt_elapsed_ns = 110000000, .generation_elapsed_ns = 19999999}); }),
+                          "zero-token and non-cumulative timing must remain rejected");
+        (void)lazy.finish(outcome);
+        failures += check(throws_logic([&] { lazy.note_timing(timing); }),
+                          "live timing after stream finish must remain rejected");
+    }
+    return failures;
+}
+
 int test_common_objects() {
     int failures = 0;
     const infernix::ModelMetadata metadata{
@@ -1518,6 +1597,7 @@ int main() {
     failures += test_aggregate_response();
     failures += test_stream_response();
     failures += test_stream_observations();
+    failures += test_lazy_stream_timing();
     failures += test_common_objects();
     failures += test_assistant_continuation_mode();
     failures += test_late_system_and_developer_roles_parse();

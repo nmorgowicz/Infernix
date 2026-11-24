@@ -302,8 +302,8 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                     0,
                     sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend)
                                          : 0,
-                    dflash_prefill_host_ingress,
-                    sequence.rope_delta};
+                    dflash_prefill_host_ingress};
+                schedule_state.rope_delta        = sequence.rope_delta; // by name: see PrefillContext
                 schedule_state.prefill_gpu_timer = &prefill_gpu_timer_;
                 mark_workspace_usage(speculative_backend == SpeculativeBackend::Mtp
                                          ? workspace_plan.mtp_prefill
@@ -482,6 +482,9 @@ CommitResult ProgramImpl::commit(PendingBatch&& pending,
 
         for (std::size_t row = 0; row < row_count; ++row) {
             if (!discarded[row]) { settle_unit(lanes[row]); }
+            if (!discarded[row] && pending_kinds[row] == PendingKind::Begin) {
+                hybrid_after_begin(sequences[lanes[row]]);
+            }
         }
         // A round's commit is part of its execution: its span joins its rows' decode time (the prefill's for the
         // prefill's first token), as the decode and prefill calls charge theirs.
@@ -580,7 +583,14 @@ FinishResult ProgramImpl::finish(SequenceHandle handle) noexcept {
         hybrid_finish_lane(sequences[lane], true, &out.cache_created_prompt_tokens);
         clear_lane(sequences[lane], request);
         out.status = runtime::ConsumeStatus::Consumed;
-    } catch (...) { clear_lane(sequences[lane], request); }
+    } catch (...) {
+        // The reply is whole on the host; the device failed under the work still enqueued (an out-of-memory
+        // synchronize). The lane goes without an endpoint (its state may hold that failed work: clear_lane releases
+        // its prefix-cache pins and path), and the Engine completes the request, then recovers the device.
+        out.device_error = std::current_exception();
+        clear_lane(sequences[lane], request);
+        out.status = runtime::ConsumeStatus::Consumed;
+    }
     return out;
 }
 
@@ -590,14 +600,20 @@ AbortResult ProgramImpl::abort(SequenceHandle handle) noexcept {
     const auto lane = ContractAccess::lane(handle).value;
     out.timings     = requests[lane].timings;
     out.speculative = std::move(requests[lane].speculative_stats);
+    bool synchronized = true;
     try {
         device.synchronize();
-    } catch (...) { return out; }
+    } catch (...) {
+        // The device failed under the enqueued work: the lane is released as below but leaves no endpoint, and the
+        // Engine recovers the device once this request is answered.
+        out.device_error = std::current_exception();
+        synchronized     = false;
+    }
     if (context_transaction_ && context_transaction_->lane == lane) {
         abort_context();
     }
     if (requests[lane].lifecycle != Lifecycle::Empty) {
-        hybrid_finish_lane(sequences[lane], endpoint_consistent(requests[lane], sequences[lane]));
+        hybrid_finish_lane(sequences[lane], synchronized && endpoint_consistent(requests[lane], sequences[lane]));
     }
     clear_lane(sequences[lane], requests[lane]);
     out.status = runtime::ConsumeStatus::Consumed;
@@ -614,19 +630,20 @@ bool ProgramImpl::recover_after_failure() noexcept {
     abort_context();
     // Offloaded experts: a round that failed an expert read left undefined outputs, which prefix
     // entries it published may hold.
+    bool failed_round = false;
     if (offload) {
         offload->drop_round();
-        if (offload->engine().take_failed_round() && hybrid_) {
-            if (device.transfer_stream != nullptr) { (void)cudaStreamSynchronize(device.transfer_stream); }
-            hybrid_->clear();
-            hybrid_withdrawal_ = {}; // its references would name the rebuilt index's entries
-        }
+        failed_round = offload->engine().take_failed_round();
     }
+    // The lanes go first: each releases references into the index (its path, its pins, its snapshots), which a
+    // rebuilt index no longer knows (a stale reference throws inside the lane's noexcept release). A lane of a
+    // failed round publishes no endpoint: the round's state is undefined.
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
         if (requests[lane].lifecycle == Lifecycle::Empty) { continue; }
-        hybrid_finish_lane(sequences[lane], endpoint_consistent(requests[lane], sequences[lane]));
+        hybrid_finish_lane(sequences[lane], !failed_round && endpoint_consistent(requests[lane], sequences[lane]));
         clear_lane(sequences[lane], requests[lane]);
     }
+    if (failed_round) { hybrid_reset_cache(); }
     return true;
 }
 
@@ -647,13 +664,19 @@ void ProgramImpl::fail_all_cleanup() noexcept {
             offload->return_stream(device.stream);
         } catch (...) {}
     }
-    if (hybrid_) {
-        if (device.transfer_stream != nullptr) {
-            (void)cudaStreamSynchronize(device.transfer_stream);
-        }
-        hybrid_->clear();
-        hybrid_withdrawal_ = {};
-    }
+    hybrid_reset_cache();
+}
+
+void ProgramImpl::hybrid_reset_cache() noexcept {
+    if (!hybrid_) { return; }
+    if (device.transfer_stream != nullptr) { (void)cudaStreamSynchronize(device.transfer_stream); }
+    hybrid_->clear();
+    // Everything that names an entry of the old index goes with it: a rebuilt index restarts its generations, so a
+    // stale reference could alias a new entry (a tool-call hold would hold the wrong snapshot until its deadline).
+    hybrid_withdrawal_         = {};
+    hybrid_finished_sources_   = {};
+    hybrid_tool_holds_changed_ = !hybrid_tool_holds_.empty();
+    hybrid_tool_holds_.clear();
 }
 
 void ProgramImpl::shutdown_cleanup() noexcept {

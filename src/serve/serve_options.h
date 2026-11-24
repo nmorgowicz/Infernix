@@ -1,12 +1,14 @@
 #pragma once
 
 #include "infernix/types.h"
+#include "product/config/config_file.h"
 #include "product/logging/logging.h"
 #include "serve/request.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -49,7 +51,11 @@ struct ServeOptions {
     // the plan to FILE as JSON (serve/plan_report.h) and exit.
     std::filesystem::path plan_path;
     std::string artifact_path;
+    // --lora PATH: a LoRA adapter applied at runtime (EngineOptions::lora_path).
+    std::filesystem::path lora_path;
     std::filesystem::path chat_template_path;
+    // --ablate FILE: the ablation sidecar (docs/ablate.md). Empty: byte-identical standard.
+    std::filesystem::path ablate_sidecar_path;
     std::filesystem::path ngram_volume_path;
     NgramResidency ngram_residency = NgramResidency::Auto;
     // --expert-state FILE|off: absent uses the artifact path + .expert-state, "off" disables.
@@ -66,7 +72,8 @@ struct ServeOptions {
     std::filesystem::path route_trace;            // empty => no trace written
     float rope_yarn_factor             = 1.0F;
     std::uint32_t max_context          = 8192;
-    bool max_context_auto = false; // Gemma4 only; max_context is the upper ceiling
+    // Engine sizes the context at startup; the resolved value is engine_options().max_context.
+    bool max_context_auto = false;
     bool gemma4_key_only_kv = false;
     KvCacheStorage gemma4_sliding_kv = KvCacheStorage::BFloat16; // Gemma4 only: the sliding rings' format
     Gemma4Q5Prefill gemma4_q5_prefill = Gemma4Q5Prefill::A16; // Gemma4 native Q5: artifact policy or FP8/INT8 prefill
@@ -112,6 +119,9 @@ struct ServeOptions {
     bool original_nvfp4_prefill_kernel = false;
     bool fast_paths                    = true; // off with --reproducible or --lossless (EngineOptions)
     bool lossless                      = false; // --lossless (EngineOptions)
+    // --causal-scoring: start the Engine for teacher-forced scoring (EnginePurpose::CausalScoring):
+    // POST /v1/score answers and nothing generates (no warm-up). Off: /v1/score refuses.
+    bool causal_scoring                = false;
     // --fast-path NAME (repeatable): also run these, qualified or not (qualification and timing
     // runs; EngineOptions::fast_path_candidates).
     std::vector<FastPath> fast_path_candidates;
@@ -227,6 +237,9 @@ const char* reasoning_loop_name(infernix::ReasoningLoopAction action) noexcept;
 std::string resolve_public_model_id(const ServeOptions& options,
                                     std::string_view artifact_model_name);
 std::string serve_usage_text(const char* argv0);
+// Every option the command line and --config accept after the artifact path: its name, whether it takes a value and
+// whether it repeats. serve_usage_text lists each of them (the launcher and tools/ablate read the arity from it).
+std::span<const product::ConfigOption> serve_option_arities() noexcept;
 // Whether a --host value accepts connections from this machine only (127.0.0.0/8, ::1, localhost).
 bool is_loopback_host(std::string_view host) noexcept;
 

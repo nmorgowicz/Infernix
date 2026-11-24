@@ -77,24 +77,28 @@ g4::PendingBatch decode(g4::Program& p, g4::SequenceHandle sequence, std::uint32
 }
 
 g4::SequenceHandle pause_replay(g4::Program& p, const g4::RequestBasePlan& plan,
-                                g4::SequenceHandle sequence, std::uint32_t frontier) {
+                                g4::SequenceHandle sequence, std::uint32_t frontier, std::uint32_t expected_replay) {
+    const auto predicted = p.pause_replay_tokens(sequence);
+    require(predicted == expected_replay, "pause replay quote disagrees with the checkpoint schedule");
     require(p.start_pause(sequence), "pause refused");
     auto paused = p.poll_context({});
     require(paused.paused && paused.paused->frontier() == frontier, "pause frontier changed");
+    CUDA_CHECK(cudaDeviceSynchronize());
+    p.maintain();
     released(p);
     for (const auto& source : p.hybrid_sources(plan, &*paused.paused)) {
         if (!p.start_binding(plan, rt::LaneId{0}, source, &*paused.paused)) { continue; }
         auto bound = p.poll_context({});
         require(bound.published && bound.sequence.has_value(), "resume did not publish");
+        std::uint32_t replayed = 0;
         if (bound.replaying) {
-            std::uint32_t replayed = 0;
             for (;;) {
                 auto progress = p.advance_replay(*bound.sequence);
                 replayed += progress.processed_tokens;
                 if (progress.complete) { break; }
             }
-            require(replayed == frontier, "cold resume did not replay its exact frontier");
-        } else { require(frontier == 0, "cold resume unexpectedly skipped replay"); }
+        }
+        require(replayed == predicted, "resume did not replay exactly the quoted tokens");
         return *bound.sequence;
     }
     throw std::runtime_error("no resume source bound");
@@ -120,7 +124,10 @@ Outcome continuation(g4::Program& p, const g4::Frontend& frontend, const Tokens&
     Outcome out;
     out.tokens.push_back(first.tokens()[0]);
     (void)commit(p, std::move(first), 1);
-    if (pause) { sequence = pause_replay(p, plan, sequence, static_cast<std::uint32_t>(prompt.size())); }
+    if (pause) {
+        const auto frontier = static_cast<std::uint32_t>(prompt.size());
+        sequence = pause_replay(p, plan, sequence, frontier, frontier);
+    }
     bool paused_round = false;
     std::uint64_t previous_rounds = 0;
     while (out.tokens.size() < outputs) {
@@ -132,8 +139,8 @@ Outcome continuation(g4::Program& p, const g4::Frontend& frontend, const Tokens&
         require(row.speculative_counters.rounds >= previous_rounds, "resume reset speculative counters");
         previous_rounds = row.speculative_counters.rounds;
         if (pause && !paused_round && !terminal && previous_rounds >= 2) {
-            sequence = pause_replay(p, plan, sequence,
-                static_cast<std::uint32_t>(prompt.size() + out.tokens.size() - 1));
+            const auto frontier = static_cast<std::uint32_t>(prompt.size() + out.tokens.size() - 1);
+            sequence = pause_replay(p, plan, sequence, frontier, frontier);
             paused_round = true;
         }
     }
@@ -238,6 +245,55 @@ int main() {
                 exits(program, frontend, prompt, drafts);
             }
             require(accepted > 0 && rejected > 0, "matrix failed to exercise both draft acceptance and rejection");
+            for (const bool free_resume : {false, true}) {
+                auto cached_options = options;
+                cached_options.prefix_cache = true;
+                cached_options.host_bytes = host_bytes_from_env();
+                cached_options.free_cache_resume = free_resume;
+                g4::Program cached(parameters, device, cached_options);
+                const auto prompt = tokens(3 * chunk + 1, 93);
+                auto plan = cached.plan_request(frontend.prepare_tokens(prompt), greedy_execution(16, true));
+                const auto sources = cached.hybrid_sources(plan, nullptr);
+                require(sources.size() == 1 && sources.front().reused_tokens == 0,
+                        "an empty Host cache offered a non-root source");
+                require(static_cast<bool>(cached.start_binding(plan, rt::LaneId{0}, sources.front())),
+                        "cached pause test did not bind");
+                auto bound = cached.poll_context({});
+                require(bound.published && bound.sequence, "cached pause binding did not publish");
+                auto sequence = *bound.sequence;
+                std::uint64_t seen_publications = 0;
+                bool notified = false;
+                const auto observe_publication = [&](const g4::PrefillProgress& progress) {
+                    const auto stats = cached.hybrid_stats();
+                    const auto now = stats.taps_created + stats.endpoints_created;
+                    require(progress.snapshot_published == (now != seen_publications),
+                            "prefill notification disagrees with actual Host snapshot publication");
+                    seen_publications = now;
+                    notified = notified || progress.snapshot_published;
+                };
+                for (int call = 0; call < 2; ++call) {
+                    auto progress = cached.advance_prefill(sequence);
+                    observe_publication(progress);
+                    require(!progress.pending && !progress.complete, "prefill reached the output too early");
+                }
+                sequence = pause_replay(cached, plan, sequence, 2 * chunk, 0);
+                for (;;) {
+                    auto progress = cached.advance_prefill(sequence);
+                    observe_publication(progress);
+                    if (progress.pending) {
+                        (void)commit(cached, std::move(*progress.pending), 1);
+                        break;
+                    }
+                    require(!progress.complete, "prefill completed without its first token");
+                }
+                require(notified, "no actual snapshot publication exercised the admission notification");
+                sequence = pause_replay(cached, plan, sequence, static_cast<std::uint32_t>(prompt.size()),
+                                        free_resume ? 0U : 1U);
+                const auto aborted = cached.abort(sequence);
+                require(aborted.status == rt::ConsumeStatus::Consumed && !aborted.device_error,
+                        "cached pause test did not release its lane");
+                released(cached);
+            }
         }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());

@@ -245,6 +245,9 @@ struct PrefillProgress {
     // each layer-walk span), so a request waiting for KV growth may be admitted: the Engine re-runs
     // admission (GitHub #24).
     bool capacity_released = false;
+    // This unit published a snapshot to the prefix cache (a tap; hybrid spec §12.2): a queued request coalesced
+    // onto this lane's prefill may now resume from it, so the Engine re-runs admission.
+    bool snapshot_published = false;
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch> pending;
     std::optional<PromptReadout> readout;
@@ -284,12 +287,18 @@ struct FinishResult {
     // With the prefix cache: the prompt tokens past the reused prefix whose state this request's
     // snapshots made reusable (its deepest accepted capture within the prompt).
     std::optional<std::uint32_t> cache_created_prompt_tokens;
+    // A device failure while finishing (an out-of-memory synchronize, a failed publication): the lane was released
+    // in place without an endpoint (status Consumed), or could not be (not Consumed). The Engine completes the request
+    // when its lane was released, then raises this for the device's recovery.
+    std::exception_ptr device_error;
 };
 
 struct AbortResult {
     runtime::ConsumeStatus status = runtime::ConsumeStatus::InvariantMismatch;
     GenerationTimings timings;
     SpeculativeStats speculative;
+    // As FinishResult::device_error, for a release that hit a device failure.
+    std::exception_ptr device_error;
 };
 
 struct ReplayProgress {
@@ -632,9 +641,12 @@ public:
     [[nodiscard]] bool context_blocks(SequenceHandle sequence) const noexcept;
     // Evicts unpinned cached Device blocks until the shortage is covered; whether anything was freed.
     [[nodiscard]] bool hybrid_reclaim(runtime::ContextResourceUsage shortage);
-    // Copies the blocked FIFO head's Host-only blocks into spare Device cache while it waits: the
-    // blocks started (nullopt while a transaction or an earlier prefetch is in flight).
-    [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan& base);
+    // Copies a queued request's Host-only blocks into spare Device cache while it waits: the
+    // blocks started (nullopt while a transaction or an earlier prefetch is in flight). With `spare_only` (a
+    // request that is not the next to bind) room is made only from free pages and cached blocks no queue hold
+    // names.
+    [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan& base,
+                                                               bool spare_only = false);
     // The Device pages a prefetch could fill now (free plus Host-backed cached).
     [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept;
     // Holds the snapshot each queued request would resume from now, in admission order
@@ -660,6 +672,7 @@ public:
     [[nodiscard]] bool hybrid_source_pending() const noexcept;
     // Whether the SSD tier would start a write-back now: the idle Engine runs maintain() for it.
     [[nodiscard]] bool hybrid_storage_due() const noexcept;
+    [[nodiscard]] std::optional<std::chrono::steady_clock::time_point> hybrid_storage_retry_at() const noexcept;
     // The positions a request can resume from: every position with free-cache-resume, else the
     // 16-token grid (the reproducible route).
     [[nodiscard]] std::uint32_t hybrid_resume_grid() const noexcept;
@@ -667,7 +680,7 @@ public:
 
     // ---- execution units (design §19.3.13): a binding reserves the KV pages of its prompt (or
     // replay) plus one round; a decode or control unit grows the lane's pages to its next round, and
-    // a shortage the Engine cannot reclaim pauses the youngest resident ----
+    // a shortage the Engine cannot reclaim pauses a resident (Scheduler::preemption_victim) ----
     [[nodiscard]] runtime::ResourceReservation reserve_units(std::span<const ExecutionUnit> units);
     void release_units(std::span<const SequenceHandle>) noexcept {}
     [[nodiscard]] bool recovery_pending(SequenceHandle) const noexcept { return false; }
@@ -677,6 +690,10 @@ public:
     // Pause transaction that returns the ResumeState (a lane inside a layer walk's span publishes
     // nothing past the span's start). False while another transaction or a round is open.
     [[nodiscard]] bool start_pause(SequenceHandle sequence, runtime::ExecutionTiming* = nullptr);
+    // The tokens a pause of `sequence` now would recompute on its resume: none where the pause
+    // captures the lane's endpoint, else the frontier past the lineage's deepest snapshot (inside a
+    // layer walk's span). A prediction for choosing a pressure victim.
+    [[nodiscard]] std::uint32_t pause_replay_tokens(SequenceHandle sequence) const noexcept;
     // One prefill call of a resumed lane's ledger, without sampling, toward its paused frontier.
     [[nodiscard]] ReplayProgress advance_replay(SequenceHandle sequence, runtime::ExecutionTiming* = nullptr);
 
@@ -697,6 +714,13 @@ public:
                                       runtime::ExecutionTiming* failed_timing = nullptr);
     [[nodiscard]] DiscardResult abort_pending(PendingBatch&& pending) noexcept;
     [[nodiscard]] FinishResult finish(SequenceHandle sequence) noexcept;
+    // A terminal sequence finished while a context transaction is open (a vision binding encodes over several
+    // Engine cycles): finish_held reports and publishes as finish() does but keeps the lane until
+    // release_finished, which the Engine calls once the transaction has ended. can_finish_held is false when the
+    // transaction holds the sequence back; the Engine then waits for it, as for every finish before.
+    [[nodiscard]] bool can_finish_held(SequenceHandle sequence) const noexcept;
+    [[nodiscard]] FinishResult finish_held(SequenceHandle sequence) noexcept;
+    void release_finished(SequenceHandle sequence) noexcept;
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
 
     void fail_all_cleanup() noexcept;

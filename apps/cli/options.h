@@ -15,6 +15,8 @@ struct Options {
     bool help_requested = false;
 
     std::filesystem::path artifact_path;
+    std::filesystem::path lora_path; // --lora: EngineOptions::lora_path
+    std::filesystem::path ablate_sidecar_path; // --ablate: EngineOptions::ablate_sidecar_path
     std::filesystem::path chat_template_path;
     std::filesystem::path ngram_volume_path;
     NgramResidency ngram_residency = NgramResidency::Auto;
@@ -38,7 +40,7 @@ struct Options {
     std::uint32_t max_new        = 128;
     float rope_yarn_factor       = 1.0F;
     std::uint32_t max_context    = 2048;
-    bool max_context_auto = false; // Gemma4 only; max_context is the upper ceiling
+    bool max_context_auto = false; // Engine sizes the context at startup; Gemma4 caps at 131072/native
     bool gemma4_key_only_kv = false;
     KvCacheStorage gemma4_sliding_kv = KvCacheStorage::BFloat16; // Gemma4 only: the sliding rings' format
     Gemma4Q5Prefill gemma4_q5_prefill = Gemma4Q5Prefill::A16; // Gemma4 native Q5: artifact policy or FP8/INT8 prefill

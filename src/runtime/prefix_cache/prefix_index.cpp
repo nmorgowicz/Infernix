@@ -1,19 +1,12 @@
 #include "runtime/prefix_cache/prefix_index.h"
 
+#include "runtime/prefix_cache/prefix_index_internal.h"
+
 #include <algorithm>
-#include <functional>
+#include <exception>
 #include <stdexcept>
 
 namespace infernix::runtime::prefix_cache {
-namespace {
-
-constexpr std::uint8_t kBacked   = 0;
-constexpr std::uint8_t kUnbacked = 1;
-constexpr std::uint8_t kNoList   = 0xff;
-
-[[noreturn]] void invariant(const char* message) { throw std::logic_error(message); }
-
-} // namespace
 
 PrefixCacheIndex::PrefixCacheIndex(const PrefixIndexConfig& config, PrefixIndexBackend& backend)
     : config_(config), backend_(&backend) {
@@ -55,6 +48,7 @@ PrefixCacheIndex::PrefixCacheIndex(const PrefixIndexConfig& config, PrefixIndexB
     ceiling_    = config.host_slabs;
     slab_reserved_.assign(config.host_slabs, false);
     slab_moving_.assign(config.host_slabs, false);
+    node_of_slab_.assign(config.host_slabs, kNoId);
     // Ascending ids already form a min-heap.
     free_ssd_slabs_.resize(config.ssd_slabs);
     for (std::uint32_t i = 0; i < config.ssd_slabs; ++i) { free_ssd_slabs_[i] = i; }
@@ -69,52 +63,6 @@ void PrefixCacheIndex::set_cost(const CacheCostModel& cost) {
     for (std::uint32_t index = 0; index < snapshots_.size(); ++index) {
         if (snapshots_[index].occupied) { update_priority(index); }
     }
-}
-
-// ---- handles -----------------------------------------------------------------------------------
-
-bool PrefixCacheIndex::valid(NodeRef node) const noexcept {
-    return node.index < nodes_.size() && nodes_[node.index].occupied &&
-           nodes_[node.index].generation == node.generation;
-}
-
-bool PrefixCacheIndex::valid(SnapshotRef snapshot) const noexcept {
-    return snapshot.index < snapshots_.size() && snapshots_[snapshot.index].occupied &&
-           snapshots_[snapshot.index].generation == snapshot.generation;
-}
-
-PrefixCacheIndex::Node& PrefixCacheIndex::require(NodeRef node) {
-    if (!valid(node)) { invariant("stale prefix cache node reference"); }
-    return nodes_[node.index];
-}
-
-const PrefixCacheIndex::Node& PrefixCacheIndex::require(NodeRef node) const {
-    if (!valid(node)) { invariant("stale prefix cache node reference"); }
-    return nodes_[node.index];
-}
-
-PrefixCacheIndex::Snapshot& PrefixCacheIndex::require(SnapshotRef snapshot) {
-    if (!valid(snapshot)) { invariant("stale prefix cache snapshot reference"); }
-    return snapshots_[snapshot.index];
-}
-
-const PrefixCacheIndex::Snapshot& PrefixCacheIndex::require(SnapshotRef snapshot) const {
-    if (!valid(snapshot)) { invariant("stale prefix cache snapshot reference"); }
-    return snapshots_[snapshot.index];
-}
-
-NodeRef PrefixCacheIndex::ref_of_node(std::uint32_t index) const noexcept {
-    if (index == kNoId) { return {}; }
-    return NodeRef{index, nodes_[index].generation};
-}
-
-SnapshotRef PrefixCacheIndex::ref_of_snapshot(std::uint32_t index) const noexcept {
-    return SnapshotRef{index, snapshots_[index].generation};
-}
-
-std::uint64_t PrefixCacheIndex::child_key(std::uint32_t parent,
-                                          std::uint64_t lookup_hash) noexcept {
-    return lookup_hash ^ ((static_cast<std::uint64_t>(parent) + 1ULL) * 0x9e3779b97f4a7c15ULL);
 }
 
 // ---- lookup ------------------------------------------------------------------------------------
@@ -136,43 +84,6 @@ std::optional<NodeRef> PrefixCacheIndex::find_child(NodeRef parent, std::uint64_
         }
     }
     return std::nullopt;
-}
-
-bool PrefixCacheIndex::snapshot_valid(const Snapshot& snapshot) const noexcept {
-    const bool image = snapshot.device_slot != kNoId || image_backed(snapshot);
-    const bool tail  = snapshot.tail_len == 0 || snapshot.tail_device_copy == CopyState::Resident ||
-                       tail_backed(snapshot);
-    return image && tail;
-}
-
-bool PrefixCacheIndex::node_backed(const Node& node) noexcept {
-    return node.host == CopyState::Resident || node.ssd == CopyState::Resident;
-}
-
-bool PrefixCacheIndex::image_backed(const Snapshot& snapshot) noexcept {
-    return snapshot.host == CopyState::Resident || snapshot.ssd == CopyState::Resident;
-}
-
-bool PrefixCacheIndex::tail_backed(const Snapshot& snapshot) const noexcept {
-    return config_.host_blocks && image_backed(snapshot);
-}
-
-std::uint32_t PrefixCacheIndex::snapshot_slab_count(const Snapshot& snapshot) const noexcept {
-    return config_.image_slabs + (config_.host_blocks && snapshot.tail_len != 0 ? 1U : 0U);
-}
-
-std::uint32_t PrefixCacheIndex::ssd_image_slab_count() const noexcept {
-    return config_.ssd_image_slabs == 0 ? config_.image_slabs : std::min(config_.ssd_image_slabs, config_.image_slabs);
-}
-
-std::uint32_t PrefixCacheIndex::ssd_snapshot_slab_count(const Snapshot& snapshot) const noexcept {
-    return ssd_image_slab_count() + (config_.host_blocks && snapshot.tail_len != 0 ? 1U : 0U);
-}
-
-std::size_t PrefixCacheIndex::ssd_to_host_position(std::size_t k) const noexcept {
-    // The SSD copy holds the kept image slabs, then the tail slab; the Host layout, every image slab first.
-    const std::uint32_t kept = ssd_image_slab_count();
-    return k < kept ? k : config_.image_slabs + (k - kept);
 }
 
 bool PrefixCacheIndex::tail_matches(const Snapshot& snapshot,
@@ -198,6 +109,8 @@ MatchResult PrefixCacheIndex::match(std::span<const TokenId> tokens,
     std::vector<std::uint32_t> host_only;
     std::vector<std::uint32_t> filling;
     std::vector<std::uint32_t> ssd_only;
+    // Of ssd_only, the blocks no promotion is reading yet: only these still cost an SSD read.
+    std::vector<std::uint32_t> ssd_unread;
     NodeRef parent;
     for (std::uint32_t block = 0; block < max_blocks && block < block_hashes.size(); ++block) {
         const std::uint64_t extra = block_extras.empty() ? 0ULL : block_extras[block];
@@ -214,6 +127,8 @@ MatchResult PrefixCacheIndex::match(std::span<const TokenId> tokens,
         // Neither a Device nor a Host copy: on the SSD tier, or being promoted from it.
         ssd_only.push_back(prior_ssd_only +
                            (node.device == CopyState::Absent && node.host != CopyState::Resident ? 1U : 0U));
+        ssd_unread.push_back((ssd_unread.empty() ? 0U : ssd_unread.back()) +
+                             (node.device == CopyState::Absent && node.host == CopyState::Absent ? 1U : 0U));
         result.path.push_back(*child);
         parent = *child;
     }
@@ -241,13 +156,21 @@ MatchResult PrefixCacheIndex::match(std::span<const TokenId> tokens,
         candidate.image_on_ssd_only = !candidate.image_on_device && snapshot.host != CopyState::Resident;
         candidate.tail_on_ssd_only =
             candidate.tail && !candidate.tail_on_device && snapshot.host != CopyState::Resident;
+        const std::uint64_t image_ssd_bytes =
+            snapshot.ssd_packed
+                ? static_cast<std::uint64_t>(snapshot.ssd_slabs.size() - (candidate.tail ? 1U : 0U)) * config_.block_bytes
+                : config_.image_bytes * ssd_image_slab_count() / config_.image_slabs;
         candidate.ssd_bytes =
             static_cast<std::uint64_t>(candidate.ssd_only_blocks) * config_.block_bytes +
-            (!candidate.image_on_ssd_only ? 0ULL
-             : snapshot.ssd_packed
-                 ? static_cast<std::uint64_t>(snapshot.ssd_slabs.size() - (candidate.tail ? 1U : 0U)) * config_.block_bytes
-                 : config_.image_bytes * ssd_image_slab_count() / config_.image_slabs) +
+            (candidate.image_on_ssd_only ? image_ssd_bytes : 0ULL) +
             (candidate.tail_on_ssd_only ? config_.block_bytes : 0ULL);
+        // What a promotion is reading already (a Filling Host copy) is not read again: charging it in
+        // full made a source whose read was nearly done look as far away as an unread one.
+        const bool image_unread = snapshot.host == CopyState::Absent;
+        candidate.ssd_unread_bytes =
+            static_cast<std::uint64_t>(path_blocks == 0 ? 0U : ssd_unread[path_blocks - 1U]) * config_.block_bytes +
+            (candidate.image_on_ssd_only && image_unread ? image_ssd_bytes : 0ULL) +
+            (candidate.tail_on_ssd_only && image_unread ? config_.block_bytes : 0ULL);
         result.candidates.push_back(candidate);
     };
     for (const std::uint32_t snapshot : root_snapshots_) { consider(snapshot, 0); }
@@ -272,7 +195,7 @@ AdmissionChoice PrefixCacheIndex::choose(const MatchResult& match,
         const MatchCandidate& candidate = match.candidates[i];
         // A candidate on the SSD tier is read into the Host tier first (§5.7).
         const double seconds =
-            config_.cost.ssd_seconds(candidate.ssd_bytes) +
+            config_.cost.ssd_seconds(candidate.ssd_unread_bytes) +
             config_.cost.restore_seconds(candidate.restore_bytes) +
             config_.cost.prefill_seconds(candidate.frontier, prompt_tokens - candidate.frontier);
         const bool better = seconds < best.predicted_seconds ||
@@ -300,12 +223,51 @@ void PrefixCacheIndex::note_hit(SnapshotRef snapshot, bool counted) {
         return;
     }
     // Resumed from again (a retry, or a second branch): retained until this lineage moves on.
+    retain_again(snapshot.index);
+}
+
+void PrefixCacheIndex::retain_again(std::uint32_t index) {
+    Snapshot& entry = snapshots_[index];
+    // Collected first: an allocation that fails leaves the snapshot superseded and consistent.
+    std::vector<std::uint32_t> dependents;
+    collect_retained_dependents(index, dependents);
     entry.superseded      = false;
     entry.superseded_tick = 0;
     adjust_retained(entry.anchor, +1);
-    std::vector<std::uint32_t> dependents;
-    collect_retained_dependents(snapshot.index, dependents);
-    revalue_around(snapshot.index, dependents);
+    revalue_around(index, dependents);
+    revalue_sibling(entry.anchor, index, 1);
+}
+
+void PrefixCacheIndex::revalue_sibling(std::uint32_t anchor, std::uint32_t skip, std::uint32_t own) {
+    // Up to the first block another retained snapshot shares: below it the count is this snapshot's own.
+    std::uint32_t from = kNoId;
+    std::uint32_t node = anchor;
+    while (node != kNoId && nodes_[node].retained_below == own) {
+        from = node;
+        node = nodes_[node].parent;
+    }
+    // Two or more others: none of them had these blocks to itself, before or after.
+    if (node == kNoId || nodes_[node].retained_below != own + 1U) { return; }
+    // Down to that one snapshot: every block on the way has it alone below (besides `skip`'s branch,
+    // `from`, at the fork).
+    for (std::uint32_t exclude = from;;) {
+        for (const std::uint32_t snapshot : nodes_[node].snapshots) {
+            if (snapshot != skip && !snapshots_[snapshot].superseded) {
+                update_priority(snapshot);
+                return;
+            }
+        }
+        std::uint32_t next = kNoId;
+        for (const std::uint32_t child : nodes_[node].children) {
+            if (child != exclude && nodes_[child].retained_below != 0) {
+                next = child;
+                break;
+            }
+        }
+        if (next == kNoId) { return; }
+        exclude = kNoId;
+        node    = next;
+    }
 }
 
 bool PrefixCacheIndex::shared_below(const Snapshot& snapshot) const noexcept {
@@ -417,18 +379,13 @@ bool PrefixCacheIndex::supersede(SnapshotRef snapshot, std::span<const TokenId> 
     adjust_retained(entry.anchor, -1);
     // Its retained dependents now value what lies between them and the retained ancestor above.
     revalue_around(snapshot.index, dependents);
+    revalue_sibling(entry.anchor, snapshot.index, 0);
     return true;
 }
 
 void PrefixCacheIndex::unsupersede(SnapshotRef snapshot) {
-    Snapshot& entry = require(snapshot);
-    if (!entry.superseded) { return; }
-    entry.superseded      = false;
-    entry.superseded_tick = 0;
-    adjust_retained(entry.anchor, +1);
-    std::vector<std::uint32_t> dependents;
-    collect_retained_dependents(snapshot.index, dependents);
-    revalue_around(snapshot.index, dependents);
+    if (!require(snapshot).superseded) { return; }
+    retain_again(snapshot.index);
 }
 
 // ---- pins --------------------------------------------------------------------------------------
@@ -442,6 +399,7 @@ void PrefixCacheIndex::acquire_path(std::span<const NodeRef> path) {
     }
     for (const NodeRef ref : path) {
         ++nodes_[ref.index].pins;
+        ++nodes_[ref.index].device_pins;
         refresh_node(ref.index);
     }
 }
@@ -451,11 +409,14 @@ void PrefixCacheIndex::release_path(std::span<const NodeRef> path) {
     for (const NodeRef ref : path) {
         const Node& node = require(ref);
         if (node.parent != expected_parent) { invariant("prefix cache path is not a root path"); }
-        if (node.pins == 0) { invariant("prefix cache path released without a pin"); }
+        if (node.pins == 0 || node.device_pins <= node.transfer_pins) {
+            invariant("prefix cache path released without a pin");
+        }
         expected_parent = ref.index;
     }
     for (auto it = path.rbegin(); it != path.rend(); ++it) {
         --nodes_[it->index].pins;
+        --nodes_[it->index].device_pins;
         refresh_node(it->index);
     }
 }
@@ -476,11 +437,28 @@ void PrefixCacheIndex::unpin_path_from(std::uint32_t node, bool) {
 }
 
 void PrefixCacheIndex::pin_node(NodeRef node) {
-    (void)require(node);
+    Node& entry = require(node);
+    ++entry.device_pins;
+    ++entry.transfer_pins;
     pin_path_from(node.index);
 }
 
 void PrefixCacheIndex::unpin_node(NodeRef node) {
+    Node& entry = require(node);
+    if (entry.transfer_pins == 0 || entry.device_pins == 0) {
+        invariant("prefix cache node transfer unpinned without a pin");
+    }
+    --entry.transfer_pins;
+    --entry.device_pins;
+    unpin_path_from(node.index, true);
+}
+
+void PrefixCacheIndex::retain_node(NodeRef node) {
+    (void)require(node);
+    pin_path_from(node.index);
+}
+
+void PrefixCacheIndex::unretain_node(NodeRef node) {
     (void)require(node);
     unpin_path_from(node.index, true);
 }
@@ -531,14 +509,22 @@ std::uint8_t PrefixCacheIndex::lru_list(bool backed, std::uint8_t hold) noexcept
 }
 
 void PrefixCacheIndex::refresh_node(std::uint32_t index) {
-    Node& node     = nodes_[index];
-    // An SSD transfer leaves the Device copy evictable unless it is the only copy (§5.7).
-    const bool lru = node.occupied && node.device == CopyState::Resident && node.pins == 0 &&
-                     (node.io_pins == 0 || node_backed(node));
-    const std::uint8_t list = lru ? lru_list(node_backed(node), node.hold) : kNoList;
+    Node& node              = nodes_[index];
+    const std::uint8_t list = node_lru_list(node);
     if (lru_links_[index].list != list) {
         if (lru_links_[index].list != kNoList) { lru_remove(index); }
         if (list != kNoList) { lru_append(index, list); }
+    }
+    const bool transfer_held = node.occupied &&
+                               (node.device == CopyState::Resident || node.device == CopyState::Filling) &&
+                               node.transfer_pins != 0 && node.device_pins == node.transfer_pins;
+    if (transfer_held != node.transfer_counted) {
+        node.transfer_counted = transfer_held;
+        if (transfer_held) {
+            ++transfer_releasable_;
+        } else {
+            --transfer_releasable_;
+        }
     }
     const bool dead =
         node.occupied && node.host == CopyState::Resident && node.live_below == 0 && !held(node);
@@ -664,13 +650,24 @@ std::uint32_t PrefixCacheIndex::lru_pop(std::uint8_t list_id) {
     return entry;
 }
 
-std::uint32_t PrefixCacheIndex::lru_pop_victim(bool unbacked) {
+std::uint32_t PrefixCacheIndex::lru_pop_victim(bool unbacked, bool unheld_only) {
+    // Dead blocks first: no request can resume through them, so their pages are free room, while every
+    // other copy is one a waiting or later request restores or recomputes.
+    ++operations_.device_list_probes;
+    if (lru_[kLruDeadBacked].count != 0) { return lru_pop(kLruDeadBacked); }
+    if (unbacked) {
+        ++operations_.device_list_probes;
+        if (lru_[kLruDeadUnbacked].count != 0) { return lru_pop(kLruDeadUnbacked); }
+    }
     for (const bool backed : {true, false}) {
         if (!backed && !unbacked) { break; }
         const std::uint8_t unheld = lru_list(backed, kNoHold);
+        ++operations_.device_list_probes;
         if (lru_[unheld].count != 0) { return lru_pop(unheld); }
+        if (unheld_only) { continue; }
         for (std::uint32_t rank = kMaxQueueHolds; rank-- > 0;) {
             const std::uint8_t list = lru_list(backed, static_cast<std::uint8_t>(rank));
+            ++operations_.device_list_probes;
             if (lru_[list].count != 0) {
                 ++counters_.held_device_evictions;
                 return lru_pop(list);
@@ -680,35 +677,48 @@ std::uint32_t PrefixCacheIndex::lru_pop_victim(bool unbacked) {
     return kNoId;
 }
 
+template <std::uint32_t PrefixCacheIndex::Node::*Prev, std::uint32_t PrefixCacheIndex::Node::*Next>
+void PrefixCacheIndex::list_unlink(std::uint32_t index, std::uint32_t& head, std::uint32_t& tail) noexcept {
+    Node& node = nodes_[index];
+    if (node.*Prev != kNoId) {
+        nodes_[node.*Prev].*Next = node.*Next;
+    } else {
+        head = node.*Next;
+    }
+    if (node.*Next != kNoId) {
+        nodes_[node.*Next].*Prev = node.*Prev;
+    } else {
+        tail = node.*Prev;
+    }
+    node.*Prev = kNoId;
+    node.*Next = kNoId;
+}
+
+template <std::uint32_t PrefixCacheIndex::Node::*Prev, std::uint32_t PrefixCacheIndex::Node::*Next>
+void PrefixCacheIndex::list_append(std::uint32_t index, std::uint32_t& head, std::uint32_t& tail) noexcept {
+    Node& node = nodes_[index];
+    node.*Prev = tail;
+    node.*Next = kNoId;
+    if (tail != kNoId) {
+        nodes_[tail].*Next = index;
+    } else {
+        head = index;
+    }
+    tail = index;
+}
+
 void PrefixCacheIndex::dead_remove(std::uint32_t index) {
     Node& node = nodes_[index];
     if (!node.in_dead) { return; }
-    if (node.dead_prev != kNoId) {
-        nodes_[node.dead_prev].dead_next = node.dead_next;
-    } else {
-        dead_head_ = node.dead_next;
-    }
-    if (node.dead_next != kNoId) {
-        nodes_[node.dead_next].dead_prev = node.dead_prev;
-    } else {
-        dead_tail_ = node.dead_prev;
-    }
-    node.dead_prev = kNoId;
-    node.dead_next = kNoId;
-    node.in_dead   = false;
+    list_unlink<&Node::dead_prev, &Node::dead_next>(index, dead_head_, dead_tail_);
+    node.in_dead = false;
     --dead_count_;
 }
 
+// Each append binds the node first: re-indexing nodes_ after the head and tail stores would reload its storage.
 void PrefixCacheIndex::dead_append(std::uint32_t index) {
-    Node& node     = nodes_[index];
-    node.dead_prev = dead_tail_;
-    node.dead_next = kNoId;
-    if (dead_tail_ != kNoId) {
-        nodes_[dead_tail_].dead_next = index;
-    } else {
-        dead_head_ = index;
-    }
-    dead_tail_   = index;
+    Node& node = nodes_[index];
+    list_append<&Node::dead_prev, &Node::dead_next>(index, dead_head_, dead_tail_);
     node.in_dead = true;
     ++dead_count_;
 }
@@ -716,32 +726,14 @@ void PrefixCacheIndex::dead_append(std::uint32_t index) {
 void PrefixCacheIndex::ssd_dead_remove(std::uint32_t index) {
     Node& node = nodes_[index];
     if (!node.in_ssd_dead) { return; }
-    if (node.ssd_dead_prev != kNoId) {
-        nodes_[node.ssd_dead_prev].ssd_dead_next = node.ssd_dead_next;
-    } else {
-        ssd_dead_head_ = node.ssd_dead_next;
-    }
-    if (node.ssd_dead_next != kNoId) {
-        nodes_[node.ssd_dead_next].ssd_dead_prev = node.ssd_dead_prev;
-    } else {
-        ssd_dead_tail_ = node.ssd_dead_prev;
-    }
-    node.ssd_dead_prev = kNoId;
-    node.ssd_dead_next = kNoId;
-    node.in_ssd_dead   = false;
+    list_unlink<&Node::ssd_dead_prev, &Node::ssd_dead_next>(index, ssd_dead_head_, ssd_dead_tail_);
+    node.in_ssd_dead = false;
     --ssd_dead_count_;
 }
 
 void PrefixCacheIndex::ssd_dead_append(std::uint32_t index) {
-    Node& node         = nodes_[index];
-    node.ssd_dead_prev = ssd_dead_tail_;
-    node.ssd_dead_next = kNoId;
-    if (ssd_dead_tail_ != kNoId) {
-        nodes_[ssd_dead_tail_].ssd_dead_next = index;
-    } else {
-        ssd_dead_head_ = index;
-    }
-    ssd_dead_tail_   = index;
+    Node& node = nodes_[index];
+    list_append<&Node::ssd_dead_prev, &Node::ssd_dead_next>(index, ssd_dead_head_, ssd_dead_tail_);
     node.in_ssd_dead = true;
     ++ssd_dead_count_;
 }
@@ -750,32 +742,16 @@ void PrefixCacheIndex::clean_remove(std::uint32_t index) {
     Node& node = nodes_[index];
     if (node.clean_list == kNoList) { return; }
     const std::uint8_t list = node.clean_list;
-    if (node.clean_prev != kNoId) {
-        nodes_[node.clean_prev].clean_next = node.clean_next;
-    } else {
-        clean_head_[list] = node.clean_next;
-    }
-    if (node.clean_next != kNoId) {
-        nodes_[node.clean_next].clean_prev = node.clean_prev;
-    } else {
-        clean_tail_[list] = node.clean_prev;
-    }
-    node.clean_prev = kNoId;
-    node.clean_next = kNoId;
+    list_unlink<&Node::clean_prev, &Node::clean_next>(index, clean_head_[list], clean_tail_[list]);
     node.clean_list = kNoList;
+    --host_clean_listed_;
 }
 
 void PrefixCacheIndex::clean_append(std::uint32_t index, std::uint8_t list) {
-    Node& node      = nodes_[index];
-    node.clean_prev = clean_tail_[list];
-    node.clean_next = kNoId;
-    if (clean_tail_[list] != kNoId) {
-        nodes_[clean_tail_[list]].clean_next = index;
-    } else {
-        clean_head_[list] = index;
-    }
-    clean_tail_[list] = index;
-    node.clean_list   = list;
+    Node& node = nodes_[index];
+    list_append<&Node::clean_prev, &Node::clean_next>(index, clean_head_[list], clean_tail_[list]);
+    node.clean_list = list;
+    ++host_clean_listed_;
 }
 
 void PrefixCacheIndex::adjust_live(std::uint32_t anchor, int delta) {
@@ -843,6 +819,7 @@ InsertResult PrefixCacheIndex::insert_block(NodeRef parent, std::uint64_t lookup
             drop_node_ssd_copy(existing->index);
         }
         ++node.pins;
+        ++node.device_pins; // the sequence maps it
         refresh_node(existing->index);
         return result;
     }
@@ -866,6 +843,8 @@ InsertResult PrefixCacheIndex::insert_block(NodeRef parent, std::uint64_t lookup
     node.ssd_slab       = kNoId;
     node.ssd            = CopyState::Absent;
     node.pins           = 1;
+    node.device_pins    = 1; // the inserting sequence maps it
+    node.transfer_pins  = 0;
     node.io_pins        = 0;
     node.live_below     = 0;
     node.retained_below = 0;
@@ -918,6 +897,11 @@ std::uint32_t PrefixCacheIndex::device_backed_evictable_blocks() const noexcept 
     return lru_backed_;
 }
 
+std::uint32_t PrefixCacheIndex::device_pinned_nodes() const noexcept {
+    return static_cast<std::uint32_t>(std::count_if(
+        nodes_.begin(), nodes_.end(), [](const Node& node) { return node.occupied && node.device_pins != 0; }));
+}
+
 void PrefixCacheIndex::drop_node_device_copy(std::uint32_t index) {
     Node& node = nodes_[index];
     if (node.device != CopyState::Resident) { invariant("prefix cache drops a non-resident page"); }
@@ -933,7 +917,7 @@ void PrefixCacheIndex::drop_node_host_copy(std::uint32_t index) {
     if (node.host != CopyState::Resident) { invariant("prefix cache drops a non-resident slab"); }
     const std::uint32_t slab = node.host_slab;
     node.host                = CopyState::Absent;
-    node.host_slab           = kNoId;
+    set_node_slab(index, kNoId);
     free_slab(slab);
     refresh_node(index);
 }
@@ -946,10 +930,18 @@ std::uint32_t PrefixCacheIndex::evict_backed_device_blocks(std::uint32_t blocks)
     return evict_device_entries(blocks, false);
 }
 
-std::uint32_t PrefixCacheIndex::evict_device_entries(std::uint32_t blocks, bool unbacked) {
+std::uint32_t PrefixCacheIndex::evict_unheld_backed_device_blocks(std::uint32_t blocks) {
+    return evict_device_entries(blocks, false, true);
+}
+
+std::uint32_t PrefixCacheIndex::device_unheld_backed_evictable_blocks() const noexcept {
+    return lru_[kLruDeadBacked].count + lru_[lru_list(true, kNoHold)].count;
+}
+
+std::uint32_t PrefixCacheIndex::evict_device_entries(std::uint32_t blocks, bool unbacked, bool unheld_only) {
     std::uint32_t released = 0;
     while (released < blocks) {
-        const std::uint32_t entry = lru_pop_victim(unbacked);
+        const std::uint32_t entry = lru_pop_victim(unbacked, unheld_only);
         if (entry == kNoId) { break; }
         if (entry < config_.max_nodes) {
             Node& node = nodes_[entry];
@@ -998,718 +990,7 @@ std::uint32_t PrefixCacheIndex::evict_device_entries(std::uint32_t blocks, bool 
     return released;
 }
 
-// ---- host residency ---------------------------------------------------------------------------
-
-void PrefixCacheIndex::free_slab(std::uint32_t slab) {
-    if (slab >= ceiling_) { // retired by the shrink under way
-        --past_in_use_;
-        return;
-    }
-    free_slabs_.push_back(slab);
-    std::push_heap(free_slabs_.begin(), free_slabs_.end(), std::greater<>{});
-}
-
-bool PrefixCacheIndex::evict_for_slabs(std::uint32_t protect_snapshot, double claim) {
-    if (dead_head_ != kNoId) {
-        const std::uint32_t victim = dead_head_;
-        ++counters_.host_dead_reclaims;
-        if (nodes_[victim].device == CopyState::Absent) {
-            // The dead node has no other copy worth keeping; its subtree is dead and unpinned too.
-            remove_subtree(victim);
-        } else {
-            drop_node_host_copy(victim);
-            if (nodes_[victim].ssd == CopyState::Resident) { drop_node_ssd_copy(victim); }
-        }
-        return true;
-    }
-    // With an SSD tier (§5.7) Host copies the SSD also holds go first, where nothing above the SSD
-    // still needs them: blocks under no Host- or Device-resident snapshot image.
-    if (clean_head_[kCold] != kNoId) {
-        drop_node_host_copy(clean_head_[kCold]);
-        ++counters_.host_block_demotions;
-        return true;
-    }
-    const HostVictims victims = pick_host_victims(protect_snapshot);
-    if (victims.superseded != kNoId) {
-        // Only requests diverging before its lineage's newer snapshot could use it: with an SSD
-        // copy it moves there, otherwise both copies go, and GDSF time does not advance.
-        if (snapshots_[victims.superseded].ssd == CopyState::Resident) {
-            demote_snapshot(victims.superseded);
-        } else {
-            remove_snapshot(victims.superseded);
-            ++counters_.superseded_evictions;
-            ++counters_.host_snapshot_evictions;
-        }
-        return true;
-    }
-    if (victims.clean != kNoId) {
-        // Restorable from the SSD: its Host copy yields without loss, and its blocks no other Host or
-        // Device image needs follow as cold blocks.
-        demote_snapshot(victims.clean);
-        return true;
-    }
-    if (clean_head_[kCleanWarm] != kNoId) {
-        drop_node_host_copy(clean_head_[kCleanWarm]);
-        ++counters_.host_block_demotions;
-        return true;
-    }
-    const std::uint32_t victim = victims.unclean;
-    if (victim == kNoId) {
-        // A held snapshot's slabs serve a queued request sooner than anything new would.
-        if (std::any_of(holds_.begin(), holds_.end(), [&](std::uint32_t held) {
-                return held != kNoId && snapshots_[held].host == CopyState::Resident;
-            })) {
-            ++counters_.held_host_refusals;
-        }
-        return false;
-    }
-    Snapshot& chosen = snapshots_[victim];
-    // A retained snapshot only yields its slabs to something worth at least as much: GDSF
-    // never inserts what it would evict next.
-    if (chosen.priority > claim) { return false; }
-    inflation_ = std::max(inflation_, chosen.priority);
-    if (chosen.device_slot != kNoId &&
-        (chosen.tail_len == 0 || chosen.tail_device_copy == CopyState::Resident)) {
-        // Still complete on the Device: only its host copy yields its slabs.
-        for (const std::uint32_t slab : chosen.host_slabs) { free_slab(slab); }
-        chosen.host_slabs.clear();
-        chosen.host = CopyState::Absent;
-        refresh_tail(victim);
-    } else {
-        ++kind_stats(chosen).host_losses;
-        remove_snapshot(victim);
-    }
-    ++counters_.host_snapshot_evictions;
-    return true;
-}
-
-bool PrefixCacheIndex::allocate_slabs(std::uint32_t count, std::vector<std::uint32_t>& out,
-                                      std::uint32_t protect_snapshot, double claim) {
-    out.clear();
-    if (count > ceiling_) { return false; }
-    while (free_slabs_.size() < count) {
-        if (!evict_for_slabs(protect_snapshot, claim)) { return false; }
-    }
-    for (std::uint32_t taken = 0; taken < count; ++taken) {
-        std::pop_heap(free_slabs_.begin(), free_slabs_.end(), std::greater<>{});
-        out.push_back(free_slabs_.back());
-        free_slabs_.pop_back();
-    }
-    return true;
-}
-
-std::uint32_t PrefixCacheIndex::begin_host_shrink(std::uint32_t limit, std::uint32_t granule) {
-    if (host_shrinking()) { throw std::logic_error("prefix cache host shrink is already under way"); }
-    granule          = std::max(granule, 1U);
-    limit            = std::min(limit, host_limit_);
-    const auto round = [&](std::uint64_t slabs) {
-        return static_cast<std::uint32_t>(std::min<std::uint64_t>(host_limit_, (slabs + granule - 1U) / granule * granule));
-    };
-    // One pass (this may run between rounds): what no eviction frees (reservations, copies being filled, held entries:
-    // pinned, I/O-pinned or queue-held), the slabs a transfer reads or writes now (reservations, filling copies,
-    // I/O-pinned entries: the ceiling stays above them, so the shrink never waits for one), so nothing is evicted for a
-    // shrink that cannot happen, and the nodes holding a slab at or past `limit` (the ceiling never lies below it).
-    std::uint64_t kept    = 0;
-    std::uint32_t blocked = 0;
-    for (std::uint32_t slab = 0; slab < host_limit_; ++slab) {
-        if (slab_reserved_[slab]) {
-            ++kept;
-            blocked = slab + 1U;
-        }
-    }
-    std::vector<std::uint32_t> past;
-    for (std::uint32_t index = 0; index < nodes_.size(); ++index) {
-        const Node& node = nodes_[index];
-        if (!node.occupied || node.host == CopyState::Absent) { continue; }
-        kept += node.host == CopyState::Filling || held(node) ? 1U : 0U;
-        if (node.host == CopyState::Filling || node.io_pins != 0) { blocked = std::max(blocked, node.host_slab + 1U); }
-        if (node.host_slab >= limit) { past.push_back(index); }
-    }
-    for (const Snapshot& snapshot : snapshots_) {
-        if (!snapshot.occupied || snapshot.host == CopyState::Absent) { continue; }
-        if (snapshot.host == CopyState::Filling || held(snapshot) || snapshot.hold != kNoHold) {
-            kept += snapshot.host_slabs.size();
-        }
-        if (snapshot.host == CopyState::Filling || snapshot.io_pins != 0) {
-            for (const std::uint32_t slab : snapshot.host_slabs) { blocked = std::max(blocked, slab + 1U); }
-        }
-    }
-    const std::uint32_t target = round(std::max<std::uint64_t>({limit, kept, blocked}));
-    if (target >= host_limit_) { return host_limit_; }
-    const auto in_use = [this] { return host_limit_ - static_cast<std::uint32_t>(free_slabs_.size()); };
-    while (in_use() > target) {
-        if (!evict_for_slabs(kNoId, std::numeric_limits<double>::infinity())) { break; }
-    }
-    const std::uint32_t ceiling = round(std::max(target, in_use()));
-    if (ceiling >= host_limit_) { return host_limit_; }
-    ceiling_                  = ceiling;
-    const std::size_t free_before = free_slabs_.size();
-    std::erase_if(free_slabs_, [this](std::uint32_t slab) { return slab >= ceiling_; });
-    std::make_heap(free_slabs_.begin(), free_slabs_.end(), std::greater<>{});
-    past_in_use_  = (host_limit_ - ceiling_) - static_cast<std::uint32_t>(free_before - free_slabs_.size());
-    shrink_nodes_ = std::move(past);
-    return ceiling_;
-}
-
-std::vector<PrefixCacheIndex::HostMove> PrefixCacheIndex::plan_host_moves() {
-    std::vector<HostMove> out;
-    if (!host_shrinking()) { return out; }
-    // Dead KV past the ceiling (no snapshot resumes through it) goes rather than moves: allocation evicts it first.
-    for (const std::uint32_t index : shrink_nodes_) {
-        const Node& node = nodes_[index];
-        if (!node.occupied || !node.in_dead || node.host != CopyState::Resident || node.host_slab < ceiling_ ||
-            held(node)) {
-            continue;
-        }
-        ++counters_.host_dead_reclaims;
-        if (node.device == CopyState::Absent) {
-            remove_subtree(index); // its subtree is dead and unpinned too
-        } else {
-            drop_node_host_copy(index);
-            if (nodes_[index].ssd == CopyState::Resident) { drop_node_ssd_copy(index); }
-        }
-    }
-    std::erase_if(shrink_nodes_, [this](std::uint32_t index) {
-        const Node& node = nodes_[index];
-        return !node.occupied || node.host == CopyState::Absent || node.host_slab < ceiling_;
-    });
-    std::vector<PendingHostMove> wanted;
-    const auto collect = [&] {
-        wanted.clear();
-        for (const std::uint32_t index : shrink_nodes_) {
-            const Node& node = nodes_[index];
-            if (node.occupied && node.host == CopyState::Resident && node.io_pins == 0 && node.host_slab >= ceiling_ &&
-                !slab_moving_[node.host_slab]) {
-                wanted.push_back({.snapshot = false, .entry = index, .position = 0, .from = node.host_slab});
-            }
-        }
-        for (std::uint32_t index = 0; index < snapshots_.size(); ++index) {
-            const Snapshot& snapshot = snapshots_[index];
-            if (!snapshot.occupied || snapshot.host != CopyState::Resident || snapshot.io_pins != 0) { continue; }
-            for (std::uint32_t k = 0; k < snapshot.host_slabs.size(); ++k) {
-                const std::uint32_t slab = snapshot.host_slabs[k];
-                if (slab >= ceiling_ && !slab_moving_[slab]) {
-                    wanted.push_back({.snapshot = true, .entry = index, .position = k, .from = slab});
-                }
-            }
-        }
-    };
-    collect();
-    // Allocations since begin_host_shrink may have taken the room below the ceiling: they evict as theirs would.
-    while (free_slabs_.size() < wanted.size()) {
-        if (!evict_for_slabs(kNoId, std::numeric_limits<double>::infinity())) { break; }
-        collect();
-    }
-    std::vector<std::uint32_t> to;
-    for (PendingHostMove move : wanted) {
-        if (!take_free_slabs(1, to)) { break; } // the rest at a later call
-        move.to                 = to.front();
-        slab_moving_[move.from] = true;
-        host_moves_.push_back(move);
-        out.push_back({move.from, move.to});
-    }
-    return out;
-}
-
-std::uint32_t* PrefixCacheIndex::host_move_holder(const PendingHostMove& move) noexcept {
-    if (move.snapshot) {
-        Snapshot& snapshot = snapshots_[move.entry];
-        return snapshot.occupied && snapshot.host == CopyState::Resident && move.position < snapshot.host_slabs.size() &&
-                       snapshot.host_slabs[move.position] == move.from
-                   ? &snapshot.host_slabs[move.position]
-                   : nullptr;
-    }
-    Node& node = nodes_[move.entry];
-    return node.occupied && node.host == CopyState::Resident && node.host_slab == move.from ? &node.host_slab : nullptr;
-}
-
-bool PrefixCacheIndex::commit_host_moves() {
-    std::erase_if(host_moves_, [this](const PendingHostMove& move) {
-        if (std::uint32_t* holder = host_move_holder(move)) {
-            const std::uint32_t io_pins = move.snapshot ? snapshots_[move.entry].io_pins : nodes_[move.entry].io_pins;
-            if (io_pins != 0) { return false; } // an SSD job reads it now: a later call
-            *holder = move.to;                  // `from`, past the ceiling, is retired
-            --past_in_use_;
-        } else {
-            free_slab(move.to); // evicted or dropped meanwhile; its `from` retired then
-        }
-        slab_moving_[move.from] = false;
-        return true;
-    });
-    return host_moves_.empty();
-}
-
-bool PrefixCacheIndex::finish_host_shrink() {
-    if (!host_shrinking()) { return true; }
-    if (!host_moves_.empty() || past_in_use_ != 0) { return false; }
-    host_limit_ = ceiling_;
-    std::vector<std::uint32_t>().swap(shrink_nodes_);
-    return true;
-}
-
-void PrefixCacheIndex::grow_host(std::uint32_t limit) {
-    if (host_shrinking()) { throw std::logic_error("prefix cache host growth during a shrink"); }
-    limit                     = std::min(limit, config_.host_slabs);
-    const std::uint32_t first = host_limit_;
-    host_limit_               = std::max(host_limit_, limit);
-    ceiling_                  = host_limit_;
-    for (std::uint32_t slab = first; slab < limit; ++slab) { free_slab(slab); }
-}
-
-// ---- SSD tier ----------------------------------------------------------------------------------
-
-PrefixCacheIndex::HostVictims PrefixCacheIndex::pick_host_victims(std::uint32_t protect) const {
-    HostVictims victims;
-    const auto lower = [&](std::uint32_t candidate, std::uint32_t best) {
-        const Snapshot& a = snapshots_[candidate];
-        const Snapshot& b = snapshots_[best];
-        return a.priority < b.priority || (a.priority == b.priority && a.last_hit_tick < b.last_hit_tick);
-    };
-    for (std::uint32_t i = 0; i < snapshots_.size(); ++i) {
-        const Snapshot& snapshot = snapshots_[i];
-        if (!snapshot.occupied || i == protect || held(snapshot) || snapshot.hold != kNoHold ||
-            snapshot.host != CopyState::Resident) {
-            continue;
-        }
-        if (snapshot.superseded) {
-            if (victims.superseded == kNoId ||
-                snapshot.superseded_tick < snapshots_[victims.superseded].superseded_tick) {
-                victims.superseded = i;
-            }
-        } else if (snapshot.ssd == CopyState::Resident) {
-            if (victims.clean == kNoId || lower(i, victims.clean)) { victims.clean = i; }
-        } else if (victims.unclean == kNoId || lower(i, victims.unclean)) {
-            victims.unclean = i;
-        }
-    }
-    return victims;
-}
-
-void PrefixCacheIndex::demote_snapshot(std::uint32_t index) {
-    Snapshot& snapshot = snapshots_[index];
-    if (snapshot.host != CopyState::Resident || snapshot.ssd != CopyState::Resident || held(snapshot)) {
-        invariant("prefix cache demotes a snapshot the SSD tier does not hold");
-    }
-    for (const std::uint32_t slab : snapshot.host_slabs) { free_slab(slab); }
-    snapshot.host_slabs.clear();
-    snapshot.host = CopyState::Absent;
-    // The tail stays backed (its SSD slab), and the anchor path's blocks lose a warm image above
-    // them: those no other image needs become cold.
-    refresh_tail(index);
-    ++counters_.host_image_demotions;
-}
-
-void PrefixCacheIndex::free_ssd_slab(std::uint32_t slab) {
-    free_ssd_slabs_.push_back(slab);
-    std::push_heap(free_ssd_slabs_.begin(), free_ssd_slabs_.end(), std::greater<>{});
-}
-
-void PrefixCacheIndex::drop_node_ssd_copy(std::uint32_t index) {
-    Node& node = nodes_[index];
-    if (node.ssd != CopyState::Resident) { invariant("prefix cache drops a non-resident SSD slab"); }
-    const std::uint32_t slab = node.ssd_slab;
-    node.ssd                 = CopyState::Absent;
-    node.ssd_slab            = kNoId;
-    free_ssd_slab(slab);
-    refresh_node(index);
-}
-
-void PrefixCacheIndex::drop_snapshot_ssd_copy(std::uint32_t index) {
-    Snapshot& snapshot = snapshots_[index];
-    if (snapshot.ssd != CopyState::Resident) { invariant("prefix cache drops a non-resident SSD image"); }
-    if (!snapshot.ssd_read && !snapshot.superseded) { ++kind_stats(snapshot).dropped_unread; }
-    for (const std::uint32_t slab : snapshot.ssd_slabs) { free_ssd_slab(slab); }
-    snapshot.ssd_slabs.clear();
-    snapshot.ssd        = CopyState::Absent;
-    snapshot.ssd_read   = false;
-    snapshot.ssd_packed = false;
-    refresh_tail(index);
-}
-
-bool PrefixCacheIndex::evict_for_ssd(std::uint32_t protect, double claim) {
-    // 1. SSD copies of dead blocks: nothing can resume through them.
-    if (ssd_dead_head_ != kNoId) {
-        const std::uint32_t victim = ssd_dead_head_;
-        ++counters_.ssd_dead_reclaims;
-        const Node& node = nodes_[victim];
-        if (node.device == CopyState::Absent && node.host != CopyState::Resident) {
-            remove_subtree(victim); // its only copy; its subtree is dead and unpinned too
-        } else {
-            drop_node_ssd_copy(victim);
-        }
-        return true;
-    }
-    // 2. Superseded SSD-only snapshots, oldest first; 3. backups of images still on the Host or the
-    // Device worth more than the claim, most valuable first (the last the Host would give up); 4.
-    // retained SSD-only snapshots worth at most the claim, lowest first. Held ones stay (§9.6).
-    std::uint32_t backup = kNoId, superseded = kNoId, retained = kNoId;
-    for (std::uint32_t i = 0; i < snapshots_.size(); ++i) {
-        const Snapshot& snapshot = snapshots_[i];
-        if (!snapshot.occupied || i == protect || snapshot.ssd != CopyState::Resident || held(snapshot)) {
-            continue;
-        }
-        if (snapshot.warm_counted) {
-            if (snapshot.host != CopyState::Filling && snapshot.priority > claim &&
-                (backup == kNoId || snapshot.priority > snapshots_[backup].priority)) {
-                backup = i;
-            }
-            continue;
-        }
-        if (snapshot.hold != kNoHold) { continue; }
-        if (snapshot.superseded) {
-            if (superseded == kNoId || snapshot.superseded_tick < snapshots_[superseded].superseded_tick) {
-                superseded = i;
-            }
-        } else if (snapshot.priority <= claim &&
-                   (retained == kNoId || snapshot.priority < snapshots_[retained].priority ||
-                    (snapshot.priority == snapshots_[retained].priority &&
-                     snapshot.last_hit_tick < snapshots_[retained].last_hit_tick))) {
-            retained = i;
-        }
-    }
-    if (superseded != kNoId) {
-        remove_snapshot(superseded);
-        ++counters_.ssd_snapshot_evictions;
-        return true;
-    }
-    if (backup != kNoId) {
-        drop_snapshot_ssd_copy(backup);
-        ++counters_.ssd_backup_drops;
-        return true;
-    }
-    if (retained == kNoId) { return false; }
-    inflation_ = std::max(inflation_, snapshots_[retained].priority);
-    remove_snapshot(retained);
-    ++counters_.ssd_snapshot_evictions;
-    return true;
-}
-
-std::uint64_t PrefixCacheIndex::ssd_room_for(std::uint32_t protect, double claim) const {
-    std::uint64_t room = free_ssd_slabs_.size() + ssd_dead_count_;
-    for (std::uint32_t i = 0; i < snapshots_.size(); ++i) {
-        const Snapshot& snapshot = snapshots_[i];
-        if (!snapshot.occupied || i == protect || snapshot.ssd != CopyState::Resident || held(snapshot)) {
-            continue;
-        }
-        const bool yields = snapshot.warm_counted
-                                ? snapshot.host != CopyState::Filling && snapshot.priority > claim
-                                : snapshot.hold == kNoHold && (snapshot.superseded || snapshot.priority <= claim);
-        if (yields) { room += snapshot.ssd_slabs.size(); }
-    }
-    return room;
-}
-
-bool PrefixCacheIndex::allocate_ssd_slabs(std::uint32_t count, std::vector<std::uint32_t>& out,
-                                          std::uint32_t protect, double claim) {
-    out.clear();
-    if (count > config_.ssd_slabs) { return false; }
-    while (free_ssd_slabs_.size() < count) {
-        if (!evict_for_ssd(protect, claim)) { return false; }
-    }
-    for (std::uint32_t taken = 0; taken < count; ++taken) {
-        std::pop_heap(free_ssd_slabs_.begin(), free_ssd_slabs_.end(), std::greater<>{});
-        out.push_back(free_ssd_slabs_.back());
-        free_ssd_slabs_.pop_back();
-    }
-    return true;
-}
-
-std::uint64_t PrefixCacheIndex::host_lossless_slabs() const noexcept {
-    return free_slabs_.size() + dead_count_ + host_clean_nodes_ + host_clean_image_slabs_;
-}
-
-void PrefixCacheIndex::set_ssd_rate(double bytes_per_second) noexcept {
-    if (bytes_per_second > 0.0) { config_.cost.ssd_bytes_per_second = bytes_per_second; }
-}
-
-std::optional<SsdJob> PrefixCacheIndex::begin_ssd_write(const std::function<bool(const SsdWriteCandidate&)>& admit) {
-    if (config_.ssd_slabs == 0) { return std::nullopt; }
-    // Candidates in the order the Host tier would lose them: the lowest priority first.
-    std::vector<std::uint32_t> order;
-    for (std::uint32_t i = 0; i < snapshots_.size(); ++i) {
-        const Snapshot& snapshot = snapshots_[i];
-        if (snapshot.occupied && !snapshot.superseded && !held(snapshot) && snapshot.hold == kNoHold &&
-            snapshot.host == CopyState::Resident && snapshot.ssd == CopyState::Absent) {
-            order.push_back(i);
-        }
-    }
-    std::sort(order.begin(), order.end(), [&](std::uint32_t left, std::uint32_t right) {
-        const Snapshot& a = snapshots_[left];
-        const Snapshot& b = snapshots_[right];
-        return a.priority < b.priority || (a.priority == b.priority && a.last_hit_tick < b.last_hit_tick);
-    });
-    std::vector<std::uint32_t> nodes;
-    // A full SSD tier refuses write-backs worth less than what they would displace; a few later
-    // candidates (worth more) may still fit.
-    constexpr std::size_t kCandidates = 8;
-    std::size_t tried                 = 0;
-    for (const std::uint32_t index : order) {
-        if (tried == kCandidates) { break; }
-        // Every block of its path must have a copy the write can read or already the SSD's, and none
-        // may be under another write-back.
-        nodes.clear();
-        bool writable = true;
-        for (std::uint32_t current = snapshots_[index].anchor; current != kNoId && writable;
-             current               = nodes_[current].parent) {
-            const Node& node = nodes_[current];
-            if (node.ssd == CopyState::Resident) { continue; }
-            writable = node.ssd == CopyState::Absent && node.host == CopyState::Resident;
-            nodes.push_back(current);
-        }
-        if (!writable) { continue; }
-        std::reverse(nodes.begin(), nodes.end()); // path order
-        Snapshot& snapshot       = snapshots_[index];
-        const std::uint32_t need = static_cast<std::uint32_t>(nodes.size()) + ssd_snapshot_slab_count(snapshot);
-        if (admit) {
-            const SsdWriteCandidate candidate{.kind        = snapshot.kind,
-                                              .hits        = snapshot.hits,
-                                              .slabs       = need,
-                                              .value       = snapshot.priority - snapshot.priority_base,
-                                              .first_offer = !snapshot.ssd_offered};
-            snapshot.ssd_offered = true;
-            if (!admit(candidate)) {
-                if (!snapshot.ssd_declined) {
-                    snapshot.ssd_declined = true;
-                    ++counters_.ssd_declined_snapshots;
-                }
-                continue;
-            }
-        }
-        ++tried;
-        // Checked before anything is evicted: a write that cannot fit displaces nothing.
-        if (ssd_room_for(index, snapshot.priority) < need) { continue; }
-        std::vector<std::uint32_t> slabs;
-        // The room check can pass and the allocation still fail: each SSD eviction re-values the victim's retained
-        // dependents, which may rise above this claim. What it freed stays free for the next candidate.
-        if (!allocate_ssd_slabs(need, slabs, index, snapshot.priority)) { continue; }
-        // The SSD eviction above removes only other snapshots, which never take a block of this path
-        // with them (the path stays live), so the candidate and its blocks are as checked.
-        SsdJob job;
-        job.snapshot = ref_of_snapshot(index);
-        job.image    = true;
-        std::size_t next = 0;
-        for (const std::uint32_t node : nodes) {
-            Node& entry    = nodes_[node];
-            entry.ssd_slab = slabs[next];
-            entry.ssd      = CopyState::Filling;
-            job.nodes.push_back(ref_of_node(node));
-            job.transfers.push_back(SsdTransfer{.host_slab = entry.host_slab, .ssd_slab = slabs[next]});
-            ++next;
-        }
-        Snapshot& written = snapshots_[index];
-        written.ssd_slabs.assign(slabs.begin() + static_cast<std::ptrdiff_t>(next), slabs.end());
-        written.ssd = CopyState::Filling;
-        for (std::size_t k = 0; k < written.ssd_slabs.size(); ++k) {
-            job.transfers.push_back(
-                SsdTransfer{.host_slab = written.host_slabs[ssd_to_host_position(k)], .ssd_slab = written.ssd_slabs[k]});
-        }
-        io_pin_snapshot(job.snapshot.index);
-        for (const std::uint32_t node : nodes) { refresh_node(node); }
-        return job;
-    }
-    return std::nullopt;
-}
-
-void PrefixCacheIndex::complete_ssd_write(SsdJob& job) {
-    for (const NodeRef ref : job.nodes) {
-        Node& node = require(ref);
-        if (node.ssd != CopyState::Filling) { invariant("prefix cache SSD write not open"); }
-        node.ssd = CopyState::Resident;
-        refresh_node(ref.index);
-    }
-    if (job.image) {
-        Snapshot& snapshot = require(job.snapshot);
-        if (snapshot.ssd != CopyState::Filling) { invariant("prefix cache SSD image write not open"); }
-        snapshot.ssd      = CopyState::Resident;
-        snapshot.ssd_read = false;
-        SsdKindStats& kind = kind_stats(snapshot);
-        ++kind.writes;
-        kind.written_slabs += job.transfers.size() + job.image_ssd_slabs.size();
-        // Superseded while it was written (begin_ssd_write takes only retained ones).
-        if (snapshot.superseded) { ++kind.superseded_unread; }
-    }
-    io_unpin_snapshot(job.snapshot.index);
-    job = SsdJob{};
-}
-
-void PrefixCacheIndex::pack_ssd_write(SsdJob& job, std::uint32_t stream_slabs) {
-    Snapshot& snapshot       = require(job.snapshot);
-    const std::uint32_t kept = ssd_image_slab_count();
-    if (!job.image || job.packed || snapshot.ssd != CopyState::Filling || stream_slabs == 0 || stream_slabs >= kept) {
-        invariant("prefix cache packs an SSD write it cannot");
-    }
-    // The job's transfers are its blocks', its kept image slabs', then its tail's.
-    const auto image_begin = static_cast<std::ptrdiff_t>(job.nodes.size());
-    job.image_host_slabs.assign(snapshot.host_slabs.begin(), snapshot.host_slabs.begin() + kept);
-    job.image_ssd_slabs.assign(snapshot.ssd_slabs.begin(), snapshot.ssd_slabs.begin() + stream_slabs);
-    for (std::uint32_t k = stream_slabs; k < kept; ++k) { free_ssd_slab(snapshot.ssd_slabs[k]); }
-    std::vector<std::uint32_t> slabs(snapshot.ssd_slabs.begin(), snapshot.ssd_slabs.begin() + stream_slabs);
-    slabs.insert(slabs.end(), snapshot.ssd_slabs.begin() + kept, snapshot.ssd_slabs.end());
-    snapshot.ssd_slabs  = std::move(slabs);
-    snapshot.ssd_packed = true;
-    job.transfers.erase(job.transfers.begin() + image_begin, job.transfers.begin() + image_begin + kept);
-    job.packed = true;
-}
-
-void PrefixCacheIndex::abort_ssd_write(SsdJob& job) {
-    for (const NodeRef ref : job.nodes) {
-        Node& node = require(ref);
-        if (node.ssd != CopyState::Filling) { invariant("prefix cache SSD write not open"); }
-        free_ssd_slab(node.ssd_slab);
-        node.ssd_slab = kNoId;
-        node.ssd      = CopyState::Absent;
-        refresh_node(ref.index);
-    }
-    if (job.image) {
-        Snapshot& snapshot = require(job.snapshot);
-        if (snapshot.ssd != CopyState::Filling) { invariant("prefix cache SSD image write not open"); }
-        for (const std::uint32_t slab : snapshot.ssd_slabs) { free_ssd_slab(slab); }
-        snapshot.ssd_slabs.clear();
-        snapshot.ssd        = CopyState::Absent;
-        snapshot.ssd_packed = false;
-    }
-    io_unpin_snapshot(job.snapshot.index);
-    job = SsdJob{};
-}
-
-SsdPromotionStart PrefixCacheIndex::begin_ssd_promotion(SnapshotRef ref) {
-    const Snapshot& snapshot = require(ref);
-    // What the source lacks above the SSD: path blocks with neither a Device nor a Host copy, and an
-    // image (with its tail) that is not on the Device or the Host.
-    std::vector<std::uint32_t> nodes;
-    bool waiting = false;
-    for (std::uint32_t current = snapshot.anchor; current != kNoId; current = nodes_[current].parent) {
-        const Node& node = nodes_[current];
-        if (node.device != CopyState::Absent || node.host == CopyState::Resident) { continue; }
-        if (node.host == CopyState::Filling) {
-            waiting = true;
-        } else if (node.ssd == CopyState::Resident) {
-            nodes.push_back(current);
-        } else {
-            invariant("prefix cache path block has no copy");
-        }
-    }
-    const bool tail_needed = snapshot.tail_len != 0 && snapshot.tail_device_copy != CopyState::Resident;
-    bool image             = false;
-    if (snapshot.host == CopyState::Filling && (snapshot.device_slot == kNoId || tail_needed)) {
-        waiting = true;
-    } else if (snapshot.host == CopyState::Absent && (snapshot.device_slot == kNoId || tail_needed)) {
-        if (snapshot.ssd != CopyState::Resident) { invariant("prefix cache snapshot has no image copy"); }
-        image = true;
-    }
-    if (nodes.empty() && !image) {
-        return SsdPromotionStart{.status = waiting ? SsdPromotionStatus::Waiting : SsdPromotionStatus::Resident,
-                                 .job    = std::nullopt};
-    }
-    std::reverse(nodes.begin(), nodes.end()); // path order
-    // Pinned first, so making room never takes a Host copy of the source's own path.
-    io_pin_snapshot(ref.index);
-    const std::uint32_t image_slabs = image ? snapshot_slab_count(snapshot) : 0U;
-    std::vector<std::uint32_t> slabs;
-    if (!allocate_slabs(static_cast<std::uint32_t>(nodes.size()) + image_slabs, slabs, ref.index)) {
-        io_unpin_snapshot(ref.index);
-        return SsdPromotionStart{.status = SsdPromotionStatus::NoRoom, .job = std::nullopt};
-    }
-    SsdJob job;
-    job.snapshot     = ref;
-    job.image        = image;
-    std::size_t next = 0;
-    for (const std::uint32_t node : nodes) {
-        Node& entry     = nodes_[node];
-        entry.host_slab = slabs[next];
-        entry.host      = CopyState::Filling;
-        job.nodes.push_back(ref_of_node(node));
-        job.transfers.push_back(SsdTransfer{.host_slab = slabs[next], .ssd_slab = entry.ssd_slab});
-        refresh_node(node);
-        ++next;
-    }
-    if (image) {
-        Snapshot& promoted = snapshots_[ref.index];
-        promoted.host_slabs.assign(slabs.begin() + static_cast<std::ptrdiff_t>(next), slabs.end());
-        promoted.host = CopyState::Filling;
-        if (promoted.ssd_packed) {
-            // The stream decodes into the kept image slabs; the tail is a slab copy.
-            const bool tail           = config_.host_blocks && promoted.tail_len != 0;
-            const std::size_t stream  = promoted.ssd_slabs.size() - (tail ? 1U : 0U);
-            job.packed                = true;
-            job.image_ssd_slabs.assign(promoted.ssd_slabs.begin(), promoted.ssd_slabs.begin() + static_cast<std::ptrdiff_t>(stream));
-            job.image_host_slabs.assign(promoted.host_slabs.begin(), promoted.host_slabs.begin() + ssd_image_slab_count());
-            if (tail) {
-                job.transfers.push_back(SsdTransfer{.host_slab = promoted.host_slabs[config_.image_slabs],
-                                                    .ssd_slab  = promoted.ssd_slabs.back()});
-            }
-        } else {
-            for (std::size_t k = 0; k < promoted.ssd_slabs.size(); ++k) {
-                job.transfers.push_back(SsdTransfer{.host_slab = promoted.host_slabs[ssd_to_host_position(k)],
-                                                    .ssd_slab  = promoted.ssd_slabs[k]});
-            }
-        }
-        for (std::uint32_t k = ssd_image_slab_count(); k < config_.image_slabs; ++k) {
-            job.zero_host_slabs.push_back(promoted.host_slabs[k]);
-        }
-        refresh_tail(ref.index);
-    }
-    return SsdPromotionStart{.status = waiting ? SsdPromotionStatus::Waiting : SsdPromotionStatus::Started,
-                             .job    = std::move(job)};
-}
-
-void PrefixCacheIndex::complete_ssd_promotion(SsdJob& job) {
-    for (const NodeRef ref : job.nodes) {
-        Node& node = require(ref);
-        if (node.host != CopyState::Filling) { invariant("prefix cache SSD promotion not open"); }
-        node.host = CopyState::Resident;
-        refresh_node(ref.index);
-    }
-    if (job.image) {
-        Snapshot& snapshot = require(job.snapshot);
-        if (snapshot.host != CopyState::Filling) { invariant("prefix cache SSD image promotion not open"); }
-        snapshot.host = CopyState::Resident;
-        refresh_tail(job.snapshot.index);
-        SsdKindStats& kind = kind_stats(snapshot);
-        ++kind.reads;
-        if (!snapshot.ssd_read) { ++kind.first_reads; }
-        snapshot.ssd_read = true;
-    }
-    io_unpin_snapshot(job.snapshot.index);
-    job = SsdJob{};
-}
-
-void PrefixCacheIndex::abort_ssd_promotion(SsdJob& job) {
-    for (const NodeRef ref : job.nodes) {
-        Node& node = require(ref);
-        if (node.host != CopyState::Filling) { invariant("prefix cache SSD promotion not open"); }
-        free_slab(node.host_slab);
-        node.host_slab = kNoId;
-        node.host      = CopyState::Absent;
-        refresh_node(ref.index);
-    }
-    if (job.image) {
-        Snapshot& snapshot = require(job.snapshot);
-        if (snapshot.host != CopyState::Filling) { invariant("prefix cache SSD image promotion not open"); }
-        for (const std::uint32_t slab : snapshot.host_slabs) { free_slab(slab); }
-        snapshot.host_slabs.clear();
-        snapshot.host = CopyState::Absent;
-        refresh_tail(job.snapshot.index);
-    }
-    io_unpin_snapshot(job.snapshot.index);
-    // The SSD copies read may be damaged: they go, and an entry left with no copy goes with its
-    // subtree (§9.4). The snapshot first, then the blocks deepest first. An entry another transfer
-    // pins keeps its copy (its loss would leave that transfer's source without one).
-    if (job.image && valid(job.snapshot)) {
-        Snapshot& snapshot = snapshots_[job.snapshot.index];
-        if (snapshot.ssd == CopyState::Resident && !held(snapshot)) {
-            drop_snapshot_ssd_copy(job.snapshot.index);
-            if (!snapshot_valid(snapshot)) { remove_snapshot(job.snapshot.index); }
-        }
-    }
-    for (auto it = job.nodes.rbegin(); it != job.nodes.rend(); ++it) {
-        if (!valid(*it) || held(nodes_[it->index]) || nodes_[it->index].ssd != CopyState::Resident) { continue; }
-        drop_node_ssd_copy(it->index);
-        const Node& node = nodes_[it->index];
-        if (node.device == CopyState::Absent && node.host == CopyState::Absent) { remove_subtree(it->index); }
-    }
-    job = SsdJob{};
-}
+// ---- fills: Host copies of blocks and snapshots, a snapshot tail's Device copy -----------------
 
 std::optional<std::uint32_t> PrefixCacheIndex::begin_host_fill(NodeRef ref) {
     Node& node = require(ref);
@@ -1718,10 +999,17 @@ std::optional<std::uint32_t> PrefixCacheIndex::begin_host_fill(NodeRef ref) {
     }
     if (!config_.host_blocks) { return std::nullopt; }
     std::vector<std::uint32_t> slab;
-    if (!allocate_slabs(1, slab, kNoId)) { return std::nullopt; }
-    Node& filled     = nodes_[ref.index];
-    filled.host      = CopyState::Filling;
-    filled.host_slab = slab.front();
+    // A claim below every value: dead blocks, lossless copies and superseded snapshots yield, no retained one.
+    // Issue #77: at an infinite claim, a tier smaller than one conversation's blocks and image gave up that
+    // conversation's only snapshot for a second copy of a block the Device held, and its next turn re-prefilled.
+    // Without an SSD tier one image and its tail stay free for the lineage's next capture; with one, a capture
+    // makes its room losslessly (§5.7), and a reserve would only demote more than the write needs.
+    const std::uint32_t wanted = config_.ssd_slabs != 0 ? 1U : config_.image_slabs + 2U;
+    if (!make_slabs_free(wanted, kNoId, -std::numeric_limits<double>::infinity()) || !take_free_slabs(1, slab)) {
+        return std::nullopt;
+    }
+    nodes_[ref.index].host = CopyState::Filling;
+    set_node_slab(ref.index, slab.front());
     refresh_node(ref.index);
     return slab.front();
 }
@@ -1737,8 +1025,8 @@ void PrefixCacheIndex::abort_host_fill(NodeRef ref) {
     Node& node = require(ref);
     if (node.host != CopyState::Filling) { invariant("prefix cache host fill not open"); }
     free_slab(node.host_slab);
-    node.host      = CopyState::Absent;
-    node.host_slab = kNoId;
+    node.host = CopyState::Absent;
+    set_node_slab(ref.index, kNoId);
     refresh_node(ref.index);
 }
 
@@ -1888,7 +1176,12 @@ std::optional<std::uint32_t> PrefixCacheIndex::acquire_device_slot(double claim)
         }
     }
     if (unbacked != kNoId && (snapshots_[slot_owner_[unbacked]].priority <= claim || rotate)) {
-        inflation_ = std::max(inflation_, snapshots_[slot_owner_[unbacked]].priority);
+        // GDSF time rises to the value a claim displaced. A rotation takes an owner worth more than the
+        // claim, which says nothing about the cache's least valuable snapshot: time then rises no further
+        // than that one's value, or every rotation would lift it by a hot owner's value and age the
+        // Host tier's snapshots as fast as slots turn over.
+        const double lost = snapshots_[slot_owner_[unbacked]].priority;
+        inflation_        = std::max(inflation_, lost <= claim ? lost : std::min(lost, lowest_retained_priority()));
         remove_snapshot(slot_owner_[unbacked]);
         return take(unbacked);
     }
@@ -1923,15 +1216,19 @@ void PrefixCacheIndex::release_device_slot(std::uint32_t slot) {
 PublishResult PrefixCacheIndex::publish_snapshot(NodeRef anchor, std::uint32_t frontier,
                                                  std::span<const TokenId> tail,
                                                  std::optional<std::uint32_t> tail_device_id,
-                                                 std::uint32_t device_slot, SnapshotKind kind) {
+                                                 std::uint32_t device_slot, SnapshotKind kind,
+                                                 std::optional<double> claim, bool adopt) {
+    // A refused call consumes what it was given, as every other outcome does (publish_image).
     if (device_slot >= slot_state_.size() || slot_state_[device_slot] != SlotState::Staging) {
+        if (tail_device_id && *tail_device_id != kNoId) { backend_->release_device_block(*tail_device_id); }
         invariant("prefix cache snapshot image is not in a staging slot");
     }
     // A Device image's tail lives on the Device until a Host fill backs the whole snapshot.
     if (!tail.empty() && !tail_device_id) {
+        set_slot(device_slot, SlotState::Free);
         throw std::invalid_argument("prefix cache snapshot tail is inconsistent");
     }
-    return publish_image(anchor, frontier, tail, tail_device_id, device_slot, {}, kind);
+    return publish_image(anchor, frontier, tail, tail_device_id, device_slot, {}, kind, claim, adopt);
 }
 
 std::optional<HostImageReservation> PrefixCacheIndex::reserve_host_image(bool tail, double claim) {
@@ -1965,8 +1262,15 @@ PublishResult PrefixCacheIndex::publish_host_snapshot(NodeRef anchor, std::uint3
                                                       std::span<const TokenId> tail,
                                                       std::optional<std::uint32_t> tail_device_id,
                                                       HostImageReservation&& image,
-                                                      SnapshotKind kind) {
+                                                      SnapshotKind kind, std::optional<double> claim) {
+    // A refused call consumes what it was given, as every other outcome does (publish_image); release_host_image
+    // frees only slabs still reserved.
+    const auto refuse = [&]() noexcept {
+        release_host_image(std::move(image));
+        if (tail_device_id && *tail_device_id != kNoId) { backend_->release_device_block(*tail_device_id); }
+    };
     if (image.tail != !tail.empty()) {
+        refuse();
         throw std::invalid_argument(
             "prefix cache Host-born snapshot tail does not match its reservation");
     }
@@ -1974,10 +1278,11 @@ PublishResult PrefixCacheIndex::publish_host_snapshot(NodeRef anchor, std::uint3
         !std::all_of(image.slabs.begin(), image.slabs.end(), [&](std::uint32_t slab) {
             return slab < slab_reserved_.size() && slab_reserved_[slab];
         })) {
+        refuse();
         invariant("prefix cache Host-born snapshot image is not a reservation");
     }
     const PublishResult result =
-        publish_image(anchor, frontier, tail, tail_device_id, kNoId, std::move(image.slabs), kind);
+        publish_image(anchor, frontier, tail, tail_device_id, kNoId, std::move(image.slabs), kind, claim, false);
     image.slabs.clear();
     image.tail = false;
     return result;
@@ -1988,14 +1293,32 @@ PublishResult PrefixCacheIndex::publish_image(NodeRef anchor, std::uint32_t fron
                                               std::optional<std::uint32_t> tail_device_id,
                                               std::uint32_t device_slot,
                                               std::vector<std::uint32_t>&& host_slabs,
-                                              SnapshotKind kind) {
+                                              SnapshotKind kind, std::optional<double> claim, bool adopt) {
+    // Every outcome consumes the image (its staging slot or its reserved slabs) and the tail id, a refusal here
+    // included: the caller cannot tell a refusal from a throw past the first change below (an allocation, after
+    // which the snapshot owns them), so it never gives them back itself.
+    const auto refuse = [&]() noexcept {
+        if (device_slot != kNoId) { set_slot(device_slot, SlotState::Free); }
+        for (const std::uint32_t slab : host_slabs) {
+            slab_reserved_[slab] = false;
+            free_slab(slab);
+        }
+        host_slabs.clear();
+        if (tail_device_id && *tail_device_id != kNoId) { backend_->release_device_block(*tail_device_id); }
+    };
     if (tail.size() >= kBlockTokens || (tail.empty() && tail_device_id) ||
         (tail_device_id && *tail_device_id == kNoId)) {
+        refuse();
         throw std::invalid_argument("prefix cache snapshot tail is inconsistent");
     }
+    if (anchor.valid() && !valid(anchor)) {
+        refuse();
+        invariant("stale prefix cache node reference");
+    }
     const std::uint32_t anchor_index = anchor.valid() ? anchor.index : kNoId;
-    const std::uint32_t base = anchor.valid() ? (require(anchor).depth + 1U) * kBlockTokens : 0U;
+    const std::uint32_t base = anchor.valid() ? (nodes_[anchor_index].depth + 1U) * kBlockTokens : 0U;
     if (frontier == 0 || frontier != base + static_cast<std::uint32_t>(tail.size())) {
+        refuse();
         throw std::invalid_argument("prefix cache snapshot frontier does not match its anchor");
     }
     // Validated: the reserved slabs now belong to this publication.
@@ -2009,24 +1332,49 @@ PublishResult PrefixCacheIndex::publish_image(NodeRef anchor, std::uint32_t fron
     std::vector<std::uint32_t>& anchored =
         anchor.valid() ? nodes_[anchor_index].snapshots : root_snapshots_;
     for (const std::uint32_t existing : anchored) {
-        const Snapshot& snapshot = snapshots_[existing];
-        if (snapshot.tail_len == tail.size() &&
-            std::equal(tail.begin(), tail.end(), snapshot.tail.begin())) {
-            release_image();
-            return PublishResult{ref_of_snapshot(existing), false};
+        Snapshot& snapshot = snapshots_[existing];
+        if (snapshot.tail_len != tail.size() || !std::equal(tail.begin(), tail.end(), snapshot.tail.begin())) {
+            continue;
         }
+        // The same state published again: the lineage that published it resumes from this snapshot next,
+        // so it is recent and, if another lineage had moved past it, its lineage's resume point again
+        // (left superseded it was the first victim, with the snapshot the lineage came from superseded
+        // behind it). It takes the copies it lacks: a tail's Device copy, and the Device slot when the
+        // caller attaches the image.
+        PublishResult result{ref_of_snapshot(existing), false};
+        if (tail_device_id && snapshot.tail_device_copy == CopyState::Absent) {
+            snapshot.tail_device      = *tail_device_id;
+            snapshot.tail_device_copy = CopyState::Resident;
+            tail_device_id.reset();
+            result.tail_adopted = true;
+        }
+        if (adopt && device_slot != kNoId && snapshot.device_slot == kNoId) {
+            snapshot.device_slot = device_slot;
+            set_slot(device_slot, SlotState::Owned);
+            slot_owner_[device_slot] = existing;
+            device_slot              = kNoId;
+            result.device_adopted    = true;
+        }
+        release_image();
+        snapshot.last_hit_tick = ++tick_;
+        if (snapshot.superseded) { retain_again(existing); }
+        refresh_tail(existing);
+        return result;
     }
     if (free_snapshots_.empty()) {
-        // Make room by evicting a superseded snapshot, otherwise the GDSF minimum.
+        // Make room by evicting a superseded snapshot, otherwise the GDSF minimum, and that one only for a
+        // snapshot worth at least as much (GDSF never inserts what it would evict next).
         const std::uint32_t victim = pick_victim(false, kNoId);
-        if (victim == kNoId) {
+        const double worth         = claim.value_or(estimate_priority(
+            retained_frontier_above(anchor_index, frontier, tail), frontier, !tail.empty()));
+        if (victim == kNoId || (!snapshots_[victim].superseded && snapshots_[victim].priority > worth)) {
             release_image();
             return PublishResult{};
         }
         if (snapshots_[victim].superseded) {
             ++counters_.superseded_evictions;
         } else {
-            inflation_ = std::max(inflation_, snapshots_[victim].priority);
+            inflation_ = std::max(inflation_, std::min(snapshots_[victim].priority, worth));
         }
         remove_snapshot(victim);
         ++counters_.host_snapshot_evictions;
@@ -2076,6 +1424,8 @@ PublishResult PrefixCacheIndex::publish_image(NodeRef anchor, std::uint32_t fron
     std::vector<std::uint32_t> dependents;
     collect_retained_dependents(index, dependents);
     revalue_around(index, dependents);
+    // A retained snapshot on another branch shares its path's upper blocks with this one from now on.
+    revalue_sibling(anchor_index, index, 1);
     refresh_tail(index);
     return PublishResult{ref_of_snapshot(index), true};
 }
@@ -2182,6 +1532,9 @@ void PrefixCacheIndex::link_snapshot(std::uint32_t index) {
 void PrefixCacheIndex::unlink_snapshot(std::uint32_t index) {
     Snapshot& snapshot                   = snapshots_[index];
     std::vector<std::uint32_t>& siblings = dependents_of(snapshot.ancestor);
+    // Room first (remove_snapshot has made it already): past this point nothing allocates, so a failed
+    // allocation cannot leave the dependents half handed over.
+    siblings.reserve(siblings.size() + snapshot.dependents.size());
     siblings.erase(std::find(siblings.begin(), siblings.end(), index));
     for (const std::uint32_t other : snapshot.dependents) {
         snapshots_[other].ancestor = snapshot.ancestor;
@@ -2266,8 +1619,16 @@ void PrefixCacheIndex::remove_snapshot(std::uint32_t index) {
     }
     std::vector<std::uint32_t> dependents;
     std::uint32_t retained_above = kNoId;
-    if (!snapshot.superseded) {
-        collect_retained_dependents(index, dependents);
+    const bool retained          = !snapshot.superseded;
+    // Everything that allocates comes before the first change (the retained dependents here, the room
+    // unlink_snapshot hands the dependents over into): an allocation failing under the memory pressure a
+    // Host shrink answers leaves the snapshot whole.
+    if (retained) { collect_retained_dependents(index, dependents); }
+    {
+        std::vector<std::uint32_t>& siblings = dependents_of(snapshot.ancestor);
+        siblings.reserve(siblings.size() + snapshot.dependents.size());
+    }
+    if (retained) {
         retained_above = retained_ancestor(index);
         adjust_retained(snapshot.anchor, -1);
     }
@@ -2326,7 +1687,41 @@ void PrefixCacheIndex::remove_snapshot(std::uint32_t index) {
     if (release_tail) { backend_->release_device_block(tail_device); }
     for (const std::uint32_t other : dependents) { update_priority(other); }
     if (retained_above != kNoId) { update_priority(retained_above); }
+    // A retained snapshot on another branch that shared path blocks with this one has them to itself again.
+    if (retained) { revalue_sibling(anchor, kNoId, 0); }
     if (held) { refresh_holds(); }
+}
+
+std::uint32_t PrefixCacheIndex::retained_frontier_above(std::uint32_t anchor, std::uint32_t frontier,
+                                                        std::span<const TokenId> tail) const noexcept {
+    // As find_ancestor, for a snapshot not yet in the index and past superseded ones.
+    std::uint32_t previous = kNoId;
+    std::uint32_t current  = anchor;
+    for (;;) {
+        const std::vector<std::uint32_t>& anchored = current != kNoId ? nodes_[current].snapshots : root_snapshots_;
+        // Tokens right after this node on the path: the new snapshot's own tail at its anchor.
+        const TokenId* next = previous == kNoId ? tail.data() : nodes_[previous].tokens.data();
+        std::uint32_t best  = 0;
+        for (const std::uint32_t other : anchored) {
+            const Snapshot& candidate = snapshots_[other];
+            if (candidate.superseded || candidate.frontier >= frontier || candidate.frontier <= best ||
+                !std::equal(candidate.tail.begin(), candidate.tail.begin() + candidate.tail_len, next)) {
+                continue;
+            }
+            best = candidate.frontier;
+        }
+        if (best != 0 || current == kNoId) { return best; }
+        previous = current;
+        current  = nodes_[current].parent;
+    }
+}
+
+double PrefixCacheIndex::lowest_retained_priority() const noexcept {
+    double lowest = std::numeric_limits<double>::infinity();
+    for (const Snapshot& snapshot : snapshots_) {
+        if (snapshot.occupied && !snapshot.superseded) { lowest = std::min(lowest, snapshot.priority); }
+    }
+    return lowest;
 }
 
 void PrefixCacheIndex::release_node_storage(std::uint32_t index) {
@@ -2336,8 +1731,8 @@ void PrefixCacheIndex::release_node_storage(std::uint32_t index) {
         invariant("prefix cache removes a pinned or transferring node");
     }
     if (node.host == CopyState::Resident) { free_slab(node.host_slab); }
-    node.host      = CopyState::Absent;
-    node.host_slab = kNoId;
+    node.host = CopyState::Absent;
+    set_node_slab(index, kNoId);
     if (node.ssd == CopyState::Resident) { free_ssd_slab(node.ssd_slab); }
     node.ssd      = CopyState::Absent;
     node.ssd_slab = kNoId;
@@ -2445,6 +1840,9 @@ NodeView PrefixCacheIndex::node(NodeRef ref) const {
     view.ssd_slab             = node.ssd_slab;
     view.ssd                  = node.ssd;
     view.pins                 = node.pins;
+    view.device_pins          = node.device_pins;
+    view.evictable            = lru_links_[ref.index].list != kNoList;
+    view.transfer_held        = node.transfer_counted;
     view.live_snapshots_below = node.live_below;
     return view;
 }
@@ -2467,7 +1865,8 @@ SnapshotView PrefixCacheIndex::snapshot(SnapshotRef ref) const {
     view.kind             = snapshot.kind;
     view.hits             = snapshot.hits;
     view.superseded       = snapshot.superseded;
-    view.tail             = std::span<const TokenId>(snapshot.tail.data(), snapshot.tail_len);
+    view.priority         = snapshot.priority;
+    view.tail             =std::span<const TokenId>(snapshot.tail.data(), snapshot.tail_len);
     return view;
 }
 
@@ -2479,304 +1878,6 @@ BlockIdentity PrefixCacheIndex::block_identity(NodeRef ref) const {
         .extra       = node.extra,
         .tokens      = std::span<const TokenId>(node.tokens.data(), node.tokens.size()),
     };
-}
-
-// ---- persistence -------------------------------------------------------------------------------
-
-void PrefixCacheIndex::collect_persistable(std::vector<NodeRef>& nodes, std::vector<SnapshotRef>& snapshots,
-                                           bool ssd) const {
-    nodes.clear();
-    snapshots.clear();
-    std::vector<bool> keep(nodes_.size(), false);
-    // With `ssd` (a kept SSD tier) an SSD copy counts as a Host copy does.
-    const auto saved = [ssd](CopyState host, CopyState on_ssd) {
-        return host == CopyState::Resident || (ssd && on_ssd == CopyState::Resident);
-    };
-    for (std::uint32_t index = 0; index < snapshots_.size(); ++index) {
-        const Snapshot& snapshot = snapshots_[index];
-        // Superseded snapshots are saved too: a retry, a regenerate or a re-sent prompt resumes
-        // from the tap it resumed from before, which its own endpoint superseded (issue #59).
-        if (!snapshot.occupied || !saved(snapshot.host, snapshot.ssd)) { continue; }
-        bool backed = true;
-        for (std::uint32_t current = snapshot.anchor; current != kNoId && backed;
-             current               = nodes_[current].parent) {
-            backed = saved(nodes_[current].host, nodes_[current].ssd);
-        }
-        if (!backed) { continue; }
-        for (std::uint32_t current = snapshot.anchor; current != kNoId && !keep[current];
-             current               = nodes_[current].parent) {
-            keep[current] = true;
-        }
-        snapshots.push_back(ref_of_snapshot(index));
-    }
-    // Retained first, then superseded oldest supersession first: a restore in file order gives
-    // the superseded ones increasing ticks, so they are evicted in the order they were saved.
-    std::stable_sort(snapshots.begin(), snapshots.end(), [&](SnapshotRef left, SnapshotRef right) {
-        const Snapshot& a = snapshots_[left.index];
-        const Snapshot& b = snapshots_[right.index];
-        if (a.superseded != b.superseded) { return !a.superseded; }
-        return a.superseded && a.superseded_tick < b.superseded_tick;
-    });
-    for (std::uint32_t index = 0; index < nodes_.size(); ++index) {
-        if (keep[index]) { nodes.push_back(ref_of_node(index)); }
-    }
-    std::stable_sort(nodes.begin(), nodes.end(), [&](NodeRef left, NodeRef right) {
-        return nodes_[left.index].depth < nodes_[right.index].depth;
-    });
-}
-
-bool PrefixCacheIndex::take_free_slabs(std::uint32_t count, std::vector<std::uint32_t>& out) {
-    out.clear();
-    if (free_slabs_.size() < count) { return false; }
-    for (std::uint32_t taken = 0; taken < count; ++taken) {
-        std::pop_heap(free_slabs_.begin(), free_slabs_.end(), std::greater<>{});
-        out.push_back(free_slabs_.back());
-        free_slabs_.pop_back();
-    }
-    return true;
-}
-
-bool PrefixCacheIndex::claim_ssd_slabs(std::span<const std::uint32_t> slabs) {
-    if (ssd_claimed_.size() != config_.ssd_slabs) { ssd_claimed_.assign(config_.ssd_slabs, false); }
-    for (std::size_t k = 0; k < slabs.size(); ++k) {
-        const std::uint32_t slab = slabs[k];
-        if (slab >= config_.ssd_slabs || ssd_claimed_[slab] ||
-            std::find(slabs.begin(), slabs.begin() + static_cast<std::ptrdiff_t>(k), slab) !=
-                slabs.begin() + static_cast<std::ptrdiff_t>(k)) {
-            return false;
-        }
-    }
-    for (const std::uint32_t slab : slabs) { ssd_claimed_[slab] = true; }
-    return true;
-}
-
-void PrefixCacheIndex::finish_ssd_restore() {
-    if (ssd_claimed_.empty()) { return; }
-    // The free list is every SSD slab no restored copy holds, lowest first.
-    free_ssd_slabs_.clear();
-    for (std::uint32_t slab = 0; slab < config_.ssd_slabs; ++slab) {
-        if (!ssd_claimed_[slab]) { free_ssd_slabs_.push_back(slab); }
-    }
-    std::make_heap(free_ssd_slabs_.begin(), free_ssd_slabs_.end(), std::greater<>{});
-    ssd_claimed_.clear();
-}
-
-std::optional<RestoredBlock> PrefixCacheIndex::restore_block(NodeRef parent, std::uint64_t lookup_hash,
-                                                             std::span<const TokenId> tokens, std::uint64_t extra,
-                                                             bool host, std::uint32_t ssd_slab) {
-    if (!config_.host_blocks || tokens.size() != kBlockTokens || (!host && ssd_slab == kNoId) ||
-        (ssd_slab != kNoId && config_.ssd_slabs == 0)) {
-        throw std::invalid_argument("prefix cache restore requires a Host tier, a full block and a copy");
-    }
-    const std::uint32_t parent_index = parent.valid() ? parent.index : kNoId;
-    if (parent.valid() && require(parent).host != CopyState::Resident && nodes_[parent_index].ssd != CopyState::Resident) {
-        invariant("prefix cache restored block has no restored parent");
-    }
-    if (find_child(parent, lookup_hash, tokens, extra)) { return std::nullopt; }
-    std::vector<std::uint32_t> slab;
-    if (free_nodes_.empty() || (host && !take_free_slabs(1, slab))) { return std::nullopt; }
-    if (ssd_slab != kNoId && !claim_ssd_slabs(std::span<const std::uint32_t>(&ssd_slab, 1))) {
-        for (const std::uint32_t taken : slab) { free_slab(taken); }
-        return std::nullopt;
-    }
-    const std::uint32_t index = free_nodes_.back();
-    free_nodes_.pop_back();
-    Node& node    = nodes_[index];
-    node.occupied = true;
-    node.parent   = parent_index;
-    node.depth    = parent.valid() ? nodes_[parent_index].depth + 1U : 0U;
-    node.hash     = lookup_hash;
-    node.extra    = extra;
-    std::copy(tokens.begin(), tokens.end(), node.tokens.begin());
-    node.children.clear();
-    node.snapshots.clear();
-    node.device_id      = kNoId;
-    node.host_slab      = host ? slab.front() : kNoId;
-    node.host           = host ? CopyState::Resident : CopyState::Absent;
-    node.ssd_slab       = ssd_slab;
-    node.ssd            = ssd_slab != kNoId ? CopyState::Resident : CopyState::Absent;
-    node.pins           = 0;
-    node.io_pins        = 0;
-    node.live_below     = 0;
-    node.retained_below = 0;
-    node.warm_below     = 0;
-    node.hold           = kNoHold;
-    if (parent.valid()) {
-        nodes_[parent_index].children.push_back(index);
-    } else {
-        root_children_.push_back(index);
-    }
-    children_.emplace(child_key(parent_index, lookup_hash), index);
-    ++node_count_;
-    refresh_node(index);
-    return RestoredBlock{ref_of_node(index), host ? slab.front() : kNoId};
-}
-
-std::optional<SnapshotRef> PrefixCacheIndex::restore_snapshot(NodeRef anchor, std::uint32_t frontier,
-                                                              std::span<const TokenId> tail, SnapshotKind kind,
-                                                              std::uint32_t hits, bool superseded, bool host,
-                                                              std::span<const std::uint32_t> ssd_slabs,
-                                                              bool ssd_packed) {
-    if (!config_.host_blocks || tail.size() >= kBlockTokens || (!host && ssd_slabs.empty()) ||
-        (!ssd_slabs.empty() && config_.ssd_slabs == 0)) {
-        throw std::invalid_argument("prefix cache restored snapshot is inconsistent");
-    }
-    const std::uint32_t anchor_index = anchor.valid() ? anchor.index : kNoId;
-    const std::uint32_t base = anchor.valid() ? (require(anchor).depth + 1U) * kBlockTokens : 0U;
-    if (frontier == 0 || frontier != base + static_cast<std::uint32_t>(tail.size()) ||
-        (anchor.valid() && nodes_[anchor_index].host != CopyState::Resident &&
-         nodes_[anchor_index].ssd != CopyState::Resident)) {
-        throw std::invalid_argument("prefix cache restored snapshot does not match its anchor");
-    }
-    // An SSD copy holds the kept image slabs raw (or fewer, packed) and then the tail's slab.
-    const std::uint32_t ssd_expected = ssd_image_slab_count() + (tail.empty() ? 0U : 1U);
-    if (!ssd_slabs.empty() && (ssd_packed ? ssd_slabs.size() >= ssd_expected : ssd_slabs.size() != ssd_expected)) {
-        return std::nullopt;
-    }
-    std::vector<std::uint32_t>& anchored =
-        anchor.valid() ? nodes_[anchor_index].snapshots : root_snapshots_;
-    for (const std::uint32_t existing : anchored) {
-        const Snapshot& other = snapshots_[existing];
-        if (other.tail_len == tail.size() &&
-            std::equal(tail.begin(), tail.end(), other.tail.begin())) {
-            return std::nullopt;
-        }
-    }
-    std::vector<std::uint32_t> slabs;
-    const std::uint32_t count = config_.image_slabs + (tail.empty() ? 0U : 1U);
-    if (free_snapshots_.empty() || (host && !take_free_slabs(count, slabs))) {
-        for (const std::uint32_t slab : slabs) { free_slab(slab); }
-        return std::nullopt;
-    }
-    if (!ssd_slabs.empty() && !claim_ssd_slabs(ssd_slabs)) {
-        for (const std::uint32_t slab : slabs) { free_slab(slab); }
-        return std::nullopt;
-    }
-    const std::uint32_t index = free_snapshots_.back();
-    free_snapshots_.pop_back();
-    Snapshot& snapshot = snapshots_[index];
-    snapshot.occupied  = true;
-    snapshot.anchor    = anchor_index;
-    snapshot.frontier  = frontier;
-    snapshot.tail_len  = static_cast<std::uint32_t>(tail.size());
-    std::copy(tail.begin(), tail.end(), snapshot.tail.begin());
-    snapshot.tail_device      = kNoId;
-    snapshot.tail_device_copy = CopyState::Absent;
-    snapshot.device_slot      = kNoId;
-    snapshot.host_slabs       = std::move(slabs);
-    snapshot.host             = host ? CopyState::Resident : CopyState::Absent;
-    snapshot.ssd_slabs.assign(ssd_slabs.begin(), ssd_slabs.end());
-    snapshot.ssd              = ssd_slabs.empty() ? CopyState::Absent : CopyState::Resident;
-    snapshot.ssd_read         = false;
-    snapshot.ssd_packed       = !ssd_slabs.empty() && ssd_packed;
-    snapshot.ssd_offered      = false;
-    snapshot.ssd_declined     = false;
-    snapshot.warm_counted     = false;
-    snapshot.clean_counted    = false;
-    snapshot.pins             = 0;
-    snapshot.io_pins          = 0;
-    snapshot.kind             = kind;
-    snapshot.hits             = hits;
-    snapshot.last_hit_tick    = ++tick_;
-    snapshot.priority_base    = inflation_;
-    snapshot.superseded       = superseded;
-    snapshot.superseded_tick  = superseded ? ++tick_ : 0;
-    snapshot.hold             = kNoHold;
-    ++snapshot_epoch_;
-    anchored.push_back(index);
-    ++snapshot_count_;
-    if (anchor.valid()) {
-        adjust_live(anchor_index, +1);
-        if (!superseded) { adjust_retained(anchor_index, +1); }
-    }
-    link_snapshot(index);
-    std::vector<std::uint32_t> dependents;
-    collect_retained_dependents(index, dependents);
-    revalue_around(index, dependents);
-    refresh_tail(index);
-    return ref_of_snapshot(index);
-}
-
-HostRestorePlan plan_host_restore(std::span<const std::int32_t> block_parents,
-                                  std::span<const SavedSnapshotShape> snapshots,
-                                  std::uint64_t host_slabs, const PrefixIndexConfig& config,
-                                  std::span<const bool> block_host) {
-    const std::size_t block_count = block_parents.size();
-    if (!block_host.empty() && block_host.size() != block_count) {
-        throw std::invalid_argument("saved prefix cache block tiers do not match its blocks");
-    }
-    // A block or snapshot the file holds no Host bytes of (only an SSD copy) takes no Host slab.
-    const auto has_host = [&](std::size_t block) { return block_host.empty() || block_host[block]; };
-    HostRestorePlan plan{.blocks    = std::vector<bool>(block_count, false),
-                         .snapshots = std::vector<bool>(snapshots.size(), false)};
-    // Host-carrying blocks on each block's path, itself included.
-    std::vector<std::uint32_t> path_blocks(block_count);
-    std::uint64_t total = 0;
-    for (std::size_t index = 0; index < block_count; ++index) {
-        const std::int32_t parent = block_parents[index];
-        if (parent >= static_cast<std::int32_t>(index) || parent < -1) {
-            throw std::invalid_argument("saved prefix cache blocks are not parents first");
-        }
-        const std::uint32_t own = has_host(index) ? 1U : 0U;
-        path_blocks[index]      = parent < 0 ? own : path_blocks[static_cast<std::size_t>(parent)] + own;
-        total += own;
-    }
-    for (const SavedSnapshotShape& snapshot : snapshots) {
-        if (snapshot.anchor >= static_cast<std::int32_t>(block_count) || snapshot.anchor < -1 ||
-            (snapshot.host && snapshot.slabs < config.image_slabs)) {
-            throw std::invalid_argument("saved prefix cache snapshot is inconsistent");
-        }
-        if (snapshot.host) { total += snapshot.slabs; }
-    }
-    if (total <= host_slabs) {
-        for (std::size_t index = 0; index < block_count; ++index) { plan.blocks[index] = has_host(index); }
-        for (std::size_t index = 0; index < snapshots.size(); ++index) { plan.snapshots[index] = snapshots[index].host; }
-        plan.slabs = total;
-        return plan;
-    }
-
-    std::vector<double> density(snapshots.size());
-    for (std::size_t index = 0; index < snapshots.size(); ++index) {
-        const SavedSnapshotShape& snapshot = snapshots[index];
-        const std::uint64_t path =
-            snapshot.anchor < 0 ? 0U : path_blocks[static_cast<std::size_t>(snapshot.anchor)];
-        const double saved = config.cost.prefill_seconds(0, snapshot.frontier) -
-                             config.cost.restore_seconds(config.image_bytes);
-        const double size =
-            static_cast<double>(config.image_bytes) +
-            static_cast<double>(snapshot.slabs > config.image_slabs ? config.block_bytes : 0U) +
-            static_cast<double>(path) * static_cast<double>(config.block_bytes);
-        density[index] =
-            (1.0 + static_cast<double>(snapshot.hits)) * std::max(0.0, saved) / std::max(size, 1.0);
-    }
-    std::vector<std::uint32_t> order(snapshots.size());
-    for (std::uint32_t index = 0; index < order.size(); ++index) { order[index] = index; }
-    std::stable_sort(order.begin(), order.end(), [&](std::uint32_t left, std::uint32_t right) {
-        // A running cache evicts superseded snapshots first: they are restored last.
-        if (snapshots[left].superseded != snapshots[right].superseded) {
-            return !snapshots[left].superseded;
-        }
-        if (density[left] != density[right]) { return density[left] > density[right]; }
-        return snapshots[left].frontier > snapshots[right].frontier;
-    });
-
-    std::uint64_t left = host_slabs;
-    for (const std::uint32_t index : order) {
-        const SavedSnapshotShape& snapshot = snapshots[index];
-        if (!snapshot.host) { continue; }
-        std::uint64_t need = snapshot.slabs;
-        for (std::int32_t block = snapshot.anchor; block >= 0; block = block_parents[static_cast<std::size_t>(block)]) {
-            if (!plan.blocks[static_cast<std::size_t>(block)] && has_host(static_cast<std::size_t>(block))) { ++need; }
-        }
-        if (need > left) { continue; }
-        for (std::int32_t block = snapshot.anchor; block >= 0; block = block_parents[static_cast<std::size_t>(block)]) {
-            if (has_host(static_cast<std::size_t>(block))) { plan.blocks[static_cast<std::size_t>(block)] = true; }
-        }
-        plan.snapshots[index] = true;
-        left -= need;
-    }
-    plan.slabs = host_slabs - left;
-    return plan;
 }
 
 std::optional<SnapshotRef> PrefixCacheIndex::slot_owner(std::uint32_t slot) const {
@@ -2806,237 +1907,6 @@ PrefixIndexStats PrefixCacheIndex::stats() const noexcept {
             }));
     }
     return stats;
-}
-
-void PrefixCacheIndex::check_invariants() const {
-    std::vector<std::uint32_t> live(nodes_.size(), 0);
-    std::vector<std::uint32_t> warm(nodes_.size(), 0);
-    std::vector<std::uint32_t> slab_uses(config_.host_slabs, 0);
-    std::vector<std::uint32_t> ssd_uses(config_.ssd_slabs, 0);
-    std::uint64_t clean_nodes = 0, clean_image_slabs = 0;
-    std::uint32_t dead_nodes     = 0;
-    std::uint32_t ssd_dead_nodes = 0;
-    std::uint32_t occupied_nodes = 0;
-    for (std::uint32_t i = 0; i < nodes_.size(); ++i) {
-        const Node& node = nodes_[i];
-        if (!node.occupied) {
-            if (lru_links_[i].list != kNoList || node.in_dead || node.in_ssd_dead || node.clean_list != kNoList ||
-                node.clean_counted) {
-                invariant("free node is linked");
-            }
-            continue;
-        }
-        ++occupied_nodes;
-        if (node.parent != kNoId) {
-            const Node& parent = nodes_[node.parent];
-            if (!parent.occupied || parent.depth + 1U != node.depth) {
-                invariant("node parent is inconsistent");
-            }
-            if (parent.pins < node.pins || parent.io_pins < node.io_pins) { invariant("pinned node has a less pinned parent"); }
-        } else if (node.depth != 0) {
-            invariant("root child has nonzero depth");
-        }
-        if (node.device == CopyState::Absent && node.host == CopyState::Absent && node.ssd == CopyState::Absent) {
-            invariant("node has no copy");
-        }
-        if (node.ssd == CopyState::Filling && node.host != CopyState::Resident) {
-            invariant("node SSD write has no Host source");
-        }
-        if (node.host != CopyState::Absent) {
-            if (node.host_slab >= config_.host_slabs) { invariant("node slab out of range"); }
-            ++slab_uses[node.host_slab];
-        }
-        if (node.ssd != CopyState::Absent) {
-            if (node.ssd_slab >= config_.ssd_slabs) { invariant("node SSD slab out of range"); }
-            ++ssd_uses[node.ssd_slab];
-        }
-        const bool lru = node.device == CopyState::Resident && node.pins == 0 && (node.io_pins == 0 || node_backed(node));
-        const std::uint8_t list = lru ? lru_list(node_backed(node), node.hold) : kNoList;
-        if (lru_links_[i].list != list) { invariant("node LRU membership is inconsistent"); }
-        const bool dead =
-            node.host == CopyState::Resident && node.live_below == 0 && !held(node);
-        if (dead != node.in_dead) { invariant("node dead membership is inconsistent"); }
-        const bool ssd_dead = node.ssd == CopyState::Resident && node.live_below == 0 && !held(node);
-        if (ssd_dead != node.in_ssd_dead) { invariant("node SSD dead membership is inconsistent"); }
-        const bool clean = node.host == CopyState::Resident && node.ssd == CopyState::Resident;
-        if (clean != node.clean_counted) { invariant("node clean count is inconsistent"); }
-        if (clean) { ++clean_nodes; }
-        const std::uint8_t clean_list = clean && !held(node) && node.hold == kNoHold && node.live_below != 0
-                                            ? (node.warm_below == 0 ? kCold : kCleanWarm)
-                                            : kNoList;
-        if (clean_list != node.clean_list) { invariant("node clean list membership is inconsistent"); }
-        if (node.in_dead) { ++dead_nodes; }
-        if (node.in_ssd_dead) { ++ssd_dead_nodes; }
-    }
-    if (ssd_dead_nodes != ssd_dead_count_) { invariant("SSD dead node count mismatch"); }
-    if (clean_nodes != host_clean_nodes_) { invariant("clean node count mismatch"); }
-    if (dead_nodes != dead_count_) { invariant("dead node count mismatch"); }
-    if (occupied_nodes != node_count_) { invariant("node count mismatch"); }
-    std::uint32_t resident = 0;
-    for (const Node& node : nodes_) {
-        if (node.occupied && node.device == CopyState::Resident) { ++resident; }
-    }
-    if (resident != device_resident_) { invariant("device resident count mismatch"); }
-    if (static_cast<std::uint32_t>(
-            std::count(slot_state_.begin(), slot_state_.end(), SlotState::Free)) != free_slots_) {
-        invariant("free device slot count mismatch");
-    }
-    std::uint32_t occupied_snapshots = 0;
-    std::vector<std::uint32_t> retained(nodes_.size(), 0);
-    std::uint32_t top_level = 0;
-    for (std::uint32_t i = 0; i < snapshots_.size(); ++i) {
-        const Snapshot& snapshot = snapshots_[i];
-        if (!snapshot.occupied) { continue; }
-        ++occupied_snapshots;
-        if (!snapshot_valid(snapshot)) { invariant("indexed snapshot is not valid"); }
-        const bool is_warm = snapshot.device_slot != kNoId || snapshot.host != CopyState::Absent;
-        if (is_warm != snapshot.warm_counted) { invariant("snapshot warmth is inconsistent"); }
-        const bool is_clean = snapshot.host == CopyState::Resident && snapshot.ssd == CopyState::Resident;
-        if (is_clean != snapshot.clean_counted) { invariant("snapshot clean count is inconsistent"); }
-        if (is_clean) { clean_image_slabs += snapshot_slab_count(snapshot); }
-        if (snapshot.ssd == CopyState::Filling && snapshot.host != CopyState::Resident) {
-            invariant("snapshot SSD write has no Host source");
-        }
-        if (snapshot.ssd != CopyState::Absent) {
-            if (snapshot.ssd_packed ? snapshot.ssd_slabs.size() >= ssd_snapshot_slab_count(snapshot) ||
-                                          snapshot.ssd_slabs.size() < 1U + (ssd_snapshot_slab_count(snapshot) - ssd_image_slab_count())
-                                    : snapshot.ssd_slabs.size() != ssd_snapshot_slab_count(snapshot)) {
-                invariant("snapshot SSD slab count is inconsistent");
-            }
-            for (const std::uint32_t slab : snapshot.ssd_slabs) {
-                if (slab >= config_.ssd_slabs) { invariant("snapshot SSD slab out of range"); }
-                ++ssd_uses[slab];
-            }
-        } else if (!snapshot.ssd_slabs.empty()) {
-            invariant("snapshot without an SSD copy holds SSD slabs");
-        }
-        for (std::uint32_t current = snapshot.anchor; current != kNoId;
-             current               = nodes_[current].parent) {
-            ++live[current];
-            if (!snapshot.superseded) { ++retained[current]; }
-            if (is_warm) { ++warm[current]; }
-        }
-        if (snapshot.ancestor != find_ancestor(i)) {
-            invariant("snapshot ancestor is not the nearest snapshot above it");
-        }
-        const std::vector<std::uint32_t>& siblings =
-            snapshot.ancestor == kNoId ? top_snapshots_ : snapshots_[snapshot.ancestor].dependents;
-        if (std::count(siblings.begin(), siblings.end(), i) != 1) {
-            invariant("snapshot is not listed once under its ancestor");
-        }
-        if (snapshot.ancestor == kNoId) { ++top_level; }
-        for (const std::uint32_t other : snapshot.dependents) {
-            if (!snapshots_[other].occupied || snapshots_[other].ancestor != i) {
-                invariant("snapshot dependent does not name it as its ancestor");
-            }
-        }
-        for (const std::uint32_t slab : snapshot.host_slabs) {
-            if (slab >= config_.host_slabs) { invariant("snapshot slab out of range"); }
-            ++slab_uses[slab];
-        }
-        if (snapshot.device_slot != kNoId &&
-            (slot_state_[snapshot.device_slot] != SlotState::Owned ||
-             slot_owner_[snapshot.device_slot] != i)) {
-            invariant("snapshot slot ownership is inconsistent");
-        }
-    }
-    if (occupied_snapshots != snapshot_count_) { invariant("snapshot count mismatch"); }
-    if (top_level != top_snapshots_.size()) {
-        invariant("top-level snapshot list is inconsistent");
-    }
-    for (std::uint32_t i = 0; i < nodes_.size(); ++i) {
-        if (nodes_[i].occupied && nodes_[i].live_below != live[i]) {
-            invariant("live snapshot count is inconsistent");
-        }
-        if (nodes_[i].occupied && nodes_[i].retained_below != retained[i]) {
-            invariant("retained snapshot count is inconsistent");
-        }
-        if (nodes_[i].occupied && nodes_[i].warm_below != warm[i]) {
-            invariant("warm snapshot count is inconsistent");
-        }
-    }
-    if (clean_image_slabs != host_clean_image_slabs_) { invariant("clean image slab count mismatch"); }
-    for (const std::uint32_t slab : free_ssd_slabs_) {
-        if (slab >= config_.ssd_slabs) { invariant("free SSD slab out of range"); }
-        ++ssd_uses[slab];
-    }
-    for (std::uint32_t slab = 0; slab < ssd_uses.size(); ++slab) {
-        if (ssd_uses[slab] != 1U) { invariant("SSD slab is leaked or shared"); }
-    }
-    for (const std::uint32_t slab : free_slabs_) {
-        if (slab >= ceiling_) { invariant("free host slab past the shrink ceiling"); }
-        ++slab_uses[slab];
-    }
-    // Free + owned + reserved + planned move destinations = every slab in service below the shrink ceiling, each
-    // exactly once; past the ceiling a slab is in use at most once (until it moves or is freed, it retires); a retired
-    // slab holds nothing.
-    for (std::uint32_t slab = 0; slab < slab_reserved_.size(); ++slab) {
-        if (slab_reserved_[slab]) { ++slab_uses[slab]; }
-    }
-    std::uint32_t moving = 0;
-    for (const PendingHostMove& move : host_moves_) {
-        if (move.to >= ceiling_ || move.from < ceiling_ || !slab_moving_[move.from]) {
-            invariant("planned host move is inconsistent");
-        }
-        ++slab_uses[move.to];
-    }
-    for (std::uint32_t slab = 0; slab < slab_moving_.size(); ++slab) { moving += slab_moving_[slab] ? 1U : 0U; }
-    if (moving != host_moves_.size()) { invariant("planned host moves and moving slabs differ"); }
-    if (ceiling_ > host_limit_) { invariant("host shrink ceiling past the limit"); }
-    std::uint32_t past_in_use = 0;
-    for (std::uint32_t slab = 0; slab < slab_uses.size(); ++slab) {
-        const bool ok = slab < ceiling_ ? slab_uses[slab] == 1U : slab < host_limit_ ? slab_uses[slab] <= 1U : slab_uses[slab] == 0U;
-        if (!ok) { invariant("host slab is leaked or shared"); }
-        past_in_use += slab >= ceiling_ && slab < host_limit_ && slab_uses[slab] == 1U ? 1U : 0U;
-    }
-    if (host_shrinking() && past_in_use != past_in_use_) { invariant("host slabs in use past the shrink ceiling miscounted"); }
-    std::array<std::uint32_t, 2> kinds{};
-    for (std::size_t list = 0; list < kLruLists; ++list) {
-        std::uint32_t counted = 0;
-        for (std::uint32_t entry = lru_[list].head; entry != kNoId;
-             entry               = lru_links_[entry].next) {
-            ++counted;
-        }
-        if (counted != lru_[list].count) { invariant("LRU count mismatch"); }
-        kinds[list % 2] += counted;
-    }
-    if (kinds[kBacked] != lru_backed_ || kinds[kUnbacked] != lru_unbacked_) {
-        invariant("LRU totals mismatch");
-    }
-    // Queue holds: each held snapshot names its rank, and each node carries the lowest rank of a
-    // held snapshot on whose anchor path it lies.
-    std::vector<std::uint8_t> holds(nodes_.size(), kNoHold);
-    for (std::uint32_t rank = 0; rank < holds_.size(); ++rank) {
-        const std::uint32_t held = holds_[rank];
-        if (held == kNoId) { continue; }
-        if (!snapshots_[held].occupied || snapshots_[held].hold != rank) {
-            invariant("held snapshot does not carry its rank");
-        }
-        for (std::uint32_t current = snapshots_[held].anchor; current != kNoId;
-             current               = nodes_[current].parent) {
-            holds[current] = std::min(holds[current], static_cast<std::uint8_t>(rank));
-        }
-    }
-    for (std::uint32_t i = 0; i < snapshots_.size(); ++i) {
-        const Snapshot& snapshot = snapshots_[i];
-        if (snapshot.hold != kNoHold &&
-            (!snapshot.occupied || snapshot.hold >= holds_.size() || holds_[snapshot.hold] != i)) {
-            invariant("snapshot hold is not in the queue holds");
-        }
-        const std::uint32_t entry = config_.max_nodes + i;
-        const bool lru            = snapshot.occupied && snapshot.tail_len != 0 &&
-                         snapshot.tail_device_copy == CopyState::Resident && snapshot.pins == 0 &&
-                         (snapshot.io_pins == 0 || tail_backed(snapshot));
-        const bool backed = tail_backed(snapshot);
-        if (lru_links_[entry].list != (lru ? lru_list(backed, snapshot.hold) : kNoList)) {
-            invariant("snapshot tail LRU membership is inconsistent");
-        }
-    }
-    for (std::uint32_t i = 0; i < nodes_.size(); ++i) {
-        if (nodes_[i].occupied && nodes_[i].hold != holds[i]) {
-            invariant("node hold is inconsistent");
-        }
-    }
 }
 
 } // namespace infernix::runtime::prefix_cache

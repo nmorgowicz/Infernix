@@ -1,5 +1,6 @@
 #include "serve/anthropic_messages.h"
 
+#include "serve/documents.h"
 #include "serve/generation_service.h"
 #include "serve/server_tools.h"
 #include "serve/translate.h"
@@ -414,6 +415,15 @@ int test_claude_code_prompt() {
                                                      "D:\\x\n\n# Plan mode\nPlan before you edit.") &&
                           interactive_text.find("Claude") == std::string::npos,
                       "the interactive Claude Code prompt was not rewritten section by section");
+
+    // A heading quoted in a code fence is text: an Environment heading there, with another heading after it inside the
+    // fence, is not an empty Environment section.
+    const std::string fenced = "\n\n# Plan mode\nAn example:\n```markdown\n# Environment\n\n# Example\n```\n"
+                               "Plan before you edit.";
+    const std::string quoted =
+        system_text(parse_with(claude_code_request({identity + fenced}), ClaudeCodePrompt::Local).generation);
+    failures += check(quoted.starts_with(opening) && quoted.ends_with(fenced),
+                      "the local rewrite removed an Environment heading quoted in a code fence");
 
     // Anything without both the attribution block and the identity line stays as sent.
     const auto unchanged = [&](const Json& request_body, const std::string& message) {
@@ -884,8 +894,71 @@ int test_content_and_cache_hints() {
                       "Files image source was flattened or ignored");
     body["messages"][0]["content"] =
         Json::array({Json{{"type", "document"}, {"source", Json::object()}}});
+    failures += check(api_param([&] { (void)parse(body); }) == "messages",
+                      "a document without a source type was accepted");
+
+    // Documents and search results stay whole through parsing; resolve_documents renders them as framed text
+    // (documents.h), the same for every turn that sends them again.
+    const auto resolved = [](const GenerationRequest& request) {
+        DocumentResolution resolution = resolve_documents(request, {});
+        return resolution.request ? std::move(*resolution.request) : request;
+    };
+    body["messages"][0]["content"] = Json::array(
+        {Json{{"type", "document"},
+              {"source", Json{{"type", "text"}, {"media_type", "text/plain"}, {"data", "Line one."}}},
+              {"title", "Notes"}},
+         Json{{"type", "text"}, {"text", "Summarize it."}}});
+    GenerationRequest lowered = parse(body).generation;
+    failures += check(lowered.messages[0].content[0].kind == ContentKind::Document,
+                      "a document was rendered while parsing instead of resolved");
+    lowered = resolved(lowered);
+    failures += check(lowered.messages.size() == 1 && lowered.messages[0].content.size() == 2 &&
+                          lowered.messages[0].content[0].text ==
+                              "<document>\n<title>Notes</title>\nLine one.\n</document>\n",
+                      "a text document was not rendered as framed text");
+    body["messages"][0]["content"][0]["source"] =
+        Json{{"type", "content"}, {"content", Json::array({Json{{"type", "text"}, {"text", "A"}},
+                                                           Json{{"type", "text"}, {"text", "B"}}})}};
+    lowered = resolved(parse(body).generation);
+    failures += check(lowered.messages[0].content[0].text == "<document>\n<title>Notes</title>\nA\n\nB\n</document>\n",
+                      "a content-source document was not rendered");
+    body["messages"][0]["content"][0]["source"] =
+        Json{{"type", "base64"}, {"media_type", "application/pdf"}, {"data", "JVBERi0="}};
+    lowered = parse(body).generation;
+    failures += check(lowered.messages[0].content[0].kind == ContentKind::Document &&
+                          lowered.messages[0].content[0].document->format == DocumentSource::Format::Pdf &&
+                          lowered.messages[0].content[0].document->pdf.value == "data:application/pdf;base64,JVBERi0=",
+                      "a base64 PDF document was not kept for the PDF reader");
+    body["messages"][0]["content"][0]["source"] =
+        Json{{"type", "base64"}, {"media_type", "text/plain"}, {"data", "SGk="}};
     failures += check(api_code([&] { (void)parse(body); }) == "documents_not_supported",
-                      "document citation semantics were silently discarded");
+                      "a base64 document that is not a PDF was accepted");
+    body["messages"][0]["content"][0]["source"] = Json{{"type", "file"}, {"file_id", "file_1"}};
+    failures += check(api_code([&] { (void)parse(body); }) == "files_not_supported",
+                      "a Files API document was accepted");
+    body             = base_request();
+    body["messages"] = Json::array(
+        {Json{{"role", "user"}, {"content", "Search."}},
+         Json{{"role", "assistant"},
+              {"content", Json::array({Json{{"type", "tool_use"}, {"id", "toolu_s"}, {"name", "search"},
+                                            {"input", Json::object()}}})}},
+         Json{{"role", "user"},
+              {"content", Json::array({Json{
+                              {"type", "tool_result"},
+                              {"tool_use_id", "toolu_s"},
+                              {"content", Json::array({Json{{"type", "search_result"},
+                                                            {"source", "https://example.com/a"},
+                                                            {"title", "A"},
+                                                            {"content", Json::array({Json{{"type", "text"},
+                                                                                          {"text", "Body."}}})}}})}}})}}});
+    body["tools"] = Json::array({Json{{"name", "search"}, {"input_schema", Json{{"type", "object"}}}}});
+    lowered       = resolved(parse(body).generation);
+    failures += check(lowered.messages.size() == 3 && lowered.messages[2].role == infernix::ChatRole::Tool &&
+                          lowered.messages[2].content.size() == 1 &&
+                          lowered.messages[2].content[0].text ==
+                              "<search_result>\n<source>https://example.com/a</source>\n<title>A</title>\nBody.\n"
+                              "</search_result>\n",
+                      "a search_result inside a tool_result was not rendered as framed text");
     return failures;
 }
 
@@ -900,6 +973,28 @@ GenerationOutcome sample_outcome() {
     outcome.matched_stop_string             = "STOP";
     outcome.reused_prompt_tokens            = 60;
     return outcome;
+}
+
+// A role or content-block type that is not a string is the client's error, a 400 (audit 2026-11-18 F-18): the
+// mid-conversation tool scan ran first and threw json's type_error, which the server answered with a 500.
+int test_non_string_role_and_type() {
+    Json role                         = base_request();
+    role["messages"]                  = Json::array({{{"role", 5}, {"content", "x"}}});
+    Json type                         = base_request();
+    type["messages"]                  = Json::array({{{"role", "system"}, {"content", Json::array({{{"type", 5}}})}},
+                                                     {{"role", "user"}, {"content", "x"}}});
+    // A request error (HTTP 400; its code may be empty), not another exception (a 500).
+    const auto request_error = [](const std::function<void()>& action) {
+        try {
+            action();
+        } catch (const ApiException& error) { return error.error().status == 400; } catch (...) {
+            return false;
+        }
+        return false;
+    };
+    int failures = check(request_error([&] { (void)parse(role); }), "a non-string role was not a request error");
+    failures += check(request_error([&] { (void)parse(type); }), "a non-string content block type was not a request error");
+    return failures;
 }
 
 int test_aggregate_and_errors() {
@@ -1472,7 +1567,9 @@ int test_hidden_reasoning_signature() {
               "a foreign signature was interpreted as hidden reasoning");
     for (const char* malformed :
          {"ninfer-reasoning.v1:Zm9", "ninfer-reasoning.v1:Zm9v!mFy", "ninfer-reasoning.v1:Zg=A",
-          "ninfer-reasoning.v1:=m9v", "ninfer-reasoning.v1:Zm9vYg==Zm9v"}) {
+          "ninfer-reasoning.v1:=m9v", "ninfer-reasoning.v1:Zm9vYg==Zm9v",
+          // Bytes FF FE FD: Base64 that is well formed, carrying reasoning that is not UTF-8 (audit 2026-11-17 SV-10).
+          "ninfer-reasoning.v1://79"}) {
         bool threw = false;
         try {
             (void)decode_thinking_signature(malformed);
@@ -1733,6 +1830,182 @@ int test_client_tool_references() {
                      Json{{"type", "tool_reference"}, {"tool_name", "get_forecast"}}});
     failures += check(api_code([&] { (void)parse(body); }) == "content_block_not_supported",
                       "a tool_reference outside a tool_result was accepted");
+    return failures;
+}
+
+// Anthropic mid-conversation system messages that change tools (tool_addition / tool_removal): the shape Claude Code
+// 2.1.325 sends for claude.ai connector tools (Strata #5952: an inline tool_definition of a name not in `tools`,
+// cache_control on the block), references, removals, redefinitions, and their effect on the output contract.
+int test_mid_conversation_tool_changes() {
+    int failures         = 0;
+    const Json docs_tool = Json{{"name", "mcp__claude_ai_Docs__batch"},
+                                {"description", "Batch edits"},
+                                {"input_schema", Json{{"type", "object"}, {"properties", Json::object()}}}};
+    const auto conversation = [](Json system_content) {
+        return Json::array({Json{{"role", "user"}, {"content", "hi"}},
+                            Json{{"role", "system"}, {"content", std::move(system_content)}},
+                            Json{{"role", "assistant"}, {"content", "Ready."}},
+                            Json{{"role", "user"}, {"content", "use the batch tool"}}});
+    };
+    const auto inline_addition = [&](Json definition) {
+        return Json{{"type", "tool_addition"},
+                    {"tool", Json{{"type", "tool_definition"}, {"definition", std::move(definition)}}},
+                    {"cache_control", Json{{"type", "ephemeral"}, {"ttl", "1h"}}}};
+    };
+    const auto reference = [](const char* type, std::string name) {
+        return Json{{"type", type}, {"tool", Json{{"type", "tool_reference"}, {"name", std::move(name)}}}};
+    };
+
+    // 1. An inline definition of a new name: shown where the message stands, contract-only, cached after it.
+    Json body        = base_request();
+    body["tools"]    = Json::array({ordinary_tool()});
+    body["messages"] = conversation(Json::array({inline_addition(docs_tool)}));
+    const std::string docs_name = "mcp__claude_ai_Docs__batch";
+    GenerationRequest request   = parse(body).generation;
+    const auto added = std::find_if(request.tools.begin(), request.tools.end(),
+                                    [&](const ToolDefinition& tool) { return tool.name == docs_name; });
+    failures += check(added != request.tools.end() && added->deferred && added->shown_in_messages &&
+                          request.tool_contract_changes.empty(),
+                      "an inline tool_addition was not declared as a contract-only tool");
+    failures += check(request.messages.size() == 4 && request.messages[1].role == infernix::ChatRole::System &&
+                          request.messages[1].loaded_tools.size() == 1 &&
+                          request.messages[1].loaded_tools[0].name == docs_name &&
+                          request.messages[1].cache_boundary_after.has_value(),
+                      "an inline tool_addition was not shown where its system message stands");
+    infernix::PromptInput translated = prompt(request);
+    failures += check(translated.options.tool_jsons.size() == 1 && translated.options.deferred_tool_jsons.size() == 1 &&
+                          translated.options.deferred_tool_jsons[0].find("mcp__claude_ai_Docs__batch") !=
+                              std::string::npos &&
+                          translated.options.withdrawn_tool_names.empty(),
+                      "an inline tool changed the tool section or missed the output contract");
+    const auto counted = parse_anthropic_count_tokens_request(body, limits()).generation;
+    failures += check(counted.messages.size() == request.messages.size() && counted.tools.size() == request.tools.size(),
+                      "count_tokens lowered a tool_addition differently");
+    // Every top-level tool may be deferred when the messages add tools. The templates give the call format only in
+    // the tool section, so with no tool listed the shown tools are listed there instead of in their message.
+    Json all_deferred     = body;
+    all_deferred["tools"] = Json::array({deferred_tool("get_forecast", "Weather forecast")});
+    const GenerationRequest promoted = parse(all_deferred).generation;
+    const infernix::PromptInput promoted_prompt = prompt(promoted);
+    failures += check(promoted_prompt.options.tool_jsons.size() == 1 &&
+                          promoted_prompt.options.tool_jsons[0].find(docs_name) != std::string::npos &&
+                          promoted_prompt.options.deferred_tool_jsons.size() == 1 && promoted.messages.size() == 3 &&
+                          std::none_of(promoted.messages.begin(), promoted.messages.end(),
+                                       [](const ChatTurn& turn) { return !turn.loaded_tools.empty(); }),
+                      "with no listed tool, an added tool was not listed in the tool section");
+    // ... and a declared deferred tool the history redefines is listed as its newer definition.
+    Json redefined_deferred = all_deferred;
+    Json newer              = deferred_tool("get_forecast", "Weather forecast");
+    newer.erase("defer_loading");
+    newer["input_schema"]["properties"]["units"] = Json{{"type", "string"}};
+    redefined_deferred["messages"] = conversation(Json::array({inline_addition(newer)}));
+    const GenerationRequest redefined_request    = parse(redefined_deferred).generation;
+    const infernix::PromptInput redefined_prompt = prompt(redefined_request);
+    failures += check(redefined_prompt.options.tool_jsons.size() == 1 &&
+                          redefined_prompt.options.tool_jsons[0].find("units") != std::string::npos &&
+                          redefined_prompt.options.deferred_tool_jsons.empty() &&
+                          redefined_prompt.options.withdrawn_tool_names.empty() &&
+                          redefined_request.tool_contract_changes.empty(),
+                      "a promoted redefinition listed the older definition");
+    Json no_tools = body;
+    no_tools.erase("tools");
+    failures += check(prompt(parse(no_tools).generation).options.tool_jsons.size() == 1,
+                      "a request whose only tool is added in the messages has no tool section");
+    // The added tool called later in the history, and the conversation going on.
+    Json called        = body;
+    called["messages"] = Json::array(
+        {Json{{"role", "user"}, {"content", "hi"}},
+         Json{{"role", "system"}, {"content", Json::array({inline_addition(docs_tool)})}},
+         Json{{"role", "assistant"},
+              {"content", Json::array({Json{{"type", "tool_use"}, {"id", "toolu_docs"}, {"name", docs_name},
+                                            {"input", Json::object()}}})}},
+         Json{{"role", "user"},
+              {"content", Json::array({Json{{"type", "tool_result"}, {"tool_use_id", "toolu_docs"}, {"content", "done"}}})}}});
+    called["tool_choice"] = Json{{"type", "tool"}, {"name", docs_name}};
+    const GenerationRequest called_request = parse(called).generation;
+    failures += check(called_request.messages.size() == 4 && called_request.has_tool_history() &&
+                          prompt(called_request).options.deferred_tool_jsons.size() == 1,
+                      "a call to an added tool in the history, or tool_choice naming it, was refused");
+
+    // 2. Errors: an unresolved reference, an MCP reference, cache_control on the block and its definition.
+    body["messages"] = conversation(Json::array({reference("tool_addition", "missing")}));
+    failures += check(api_code([&] { (void)parse(body); }) == "tool_reference_unresolved",
+                      "a tool_addition reference to an undeclared tool was accepted");
+    body["messages"] = conversation(
+        Json::array({Json{{"type", "tool_addition"},
+                          {"tool", Json{{"type", "mcp_tool_reference"}, {"server_name", "s"}, {"name", "t"}}}}}));
+    failures += check(api_code([&] { (void)parse(body); }) == "mcp_servers_not_supported",
+                      "an MCP tool reference was accepted without an MCP client");
+    Json cached_definition           = docs_tool;
+    cached_definition["cache_control"] = Json{{"type", "ephemeral"}};
+    body["messages"]                 = conversation(Json::array({inline_addition(cached_definition)}));
+    failures += check(api_code([&] { (void)parse(body); }) == "invalid_cache_control",
+                      "cache_control on both a tool_addition block and its definition was accepted");
+
+    // 3. Removing a listed tool: the prompt keeps listing it, the contract drops it, a line says so; tool_choice may
+    //    no longer force it.
+    body["messages"] = conversation(Json::array({reference("tool_removal", "weather")}));
+    request          = parse(body).generation;
+    translated       = prompt(request);
+    failures += check(request.tool_contract_changes.size() == 1 && request.tool_contract_changes[0].name == "weather" &&
+                          !request.tool_contract_changes[0].definition && translated.options.tool_jsons.size() == 1 &&
+                          translated.options.withdrawn_tool_names == std::vector<std::string>{"weather"} &&
+                          request.messages[1].content.size() == 1 &&
+                          request.messages[1].content[0].text ==
+                              "The following functions are no longer available: weather.",
+                      "a tool_removal of a listed tool was not withdrawn from the contract only");
+    Json forced           = body;
+    forced["tool_choice"] = Json{{"type", "tool"}, {"name", "weather"}};
+    failures += check(api_param([&] { (void)parse(forced); }) == "tool_choice",
+                      "tool_choice could force a tool the conversation removed");
+    forced["tool_choice"] = Json{{"type", "any"}};
+    failures += check(api_param([&] { (void)parse(forced); }) == "tool_choice",
+                      "tool_choice any was accepted with every tool removed");
+
+    // 4. Removed, then offered again by reference: no change at the end; a removal and re-addition in one message
+    //    cancel out and render nothing.
+    body["messages"] = Json::array({Json{{"role", "user"}, {"content", "hi"}},
+                                    Json{{"role", "system"}, {"content", Json::array({reference("tool_removal", "weather")})}},
+                                    Json{{"role", "assistant"}, {"content", "Ok."}},
+                                    Json{{"role", "user"}, {"content", "and now?"}},
+                                    Json{{"role", "system"}, {"content", Json::array({reference("tool_addition", "weather")})}}});
+    request = parse(body).generation;
+    failures += check(request.tool_contract_changes.empty() && request.messages.back().role == infernix::ChatRole::System &&
+                          request.messages.back().loaded_tools.size() == 1,
+                      "a removed tool offered again was not restored");
+    body["messages"] = conversation(
+        Json::array({reference("tool_removal", "weather"), reference("tool_addition", "weather")}));
+    request = parse(body).generation;
+    failures += check(request.messages.size() == 3 && request.tool_contract_changes.empty(),
+                      "a system message whose tool changes cancel out rendered a turn");
+
+    // 5. Another definition under a listed tool's name: shown, and the contract takes it in the listed one's place.
+    Json redefined                  = ordinary_tool();
+    redefined["input_schema"]["properties"]["units"] = Json{{"type", "string"}};
+    redefined.erase("strict");
+    body["messages"] = conversation(Json::array(
+        {Json{{"type", "tool_addition"}, {"tool", Json{{"type", "tool_definition"}, {"definition", redefined}}}}}));
+    request    = parse(body).generation;
+    translated = prompt(request);
+    failures += check(request.tool_contract_changes.size() == 1 && request.tool_contract_changes[0].definition &&
+                          translated.options.withdrawn_tool_names == std::vector<std::string>{"weather"} &&
+                          translated.options.deferred_tool_jsons.size() == 1 &&
+                          translated.options.deferred_tool_jsons[0].find("units") != std::string::npos &&
+                          request.messages[1].loaded_tools.size() == 1,
+                      "a redefined listed tool did not replace its declaration in the output contract");
+
+    // 6. An effort-only system message may follow an assistant turn; it sets the reply's effort and renders nothing.
+    body             = base_request();
+    body["messages"] = Json::array({Json{{"role", "user"}, {"content", "hi"}},
+                                    Json{{"role", "assistant"}, {"content", "Hello."}},
+                                    Json{{"role", "user"}, {"content", "think harder"}},
+                                    Json{{"role", "system"}, {"content", ""}, {"output_config", Json{{"effort", "low"}}}}});
+    request = parse(body).generation;
+    failures += check(request.messages.size() == 3 && request.reasoning_effort == RequestedReasoningEffort::Low,
+                      "an effort-only system message was refused, rendered or ignored");
+    body["messages"][3]["content"] = "an instruction";
+    failures += check(api_param([&] { (void)parse(body); }) == "messages",
+                      "output_config on a system message with content was accepted");
     return failures;
 }
 
@@ -2082,6 +2355,32 @@ int test_multi_round_cache_creation() {
     failures +=
         check(totals.reused_prompt_tokens == 52 + 90 && totals.cached_block_tokens == 64 + 90,
               "three generations did not sum their cached block tokens");
+
+    // The per-request counters every round reports: n-gram archive drafts, tree rounds, the per-position and
+    // per-round records, and the expert cache's lookups (audit 2026-11-18 F-14: the archive and expert-cache
+    // counters were the last generation's alone).
+    GenerationOutcome a, b, c;
+    a.speculative.ngram_archive_drafted_tokens  = 5;
+    a.speculative.ngram_archive_accepted_tokens = 3;
+    a.speculative.tree_rounds                   = 2;
+    a.speculative.accepted_per_position         = {4, 2};
+    a.speculative.round_steps                   = {{.drafted = 3, .accepted = 2, .ngram = false}};
+    a.expert_cache = infernix::ExpertCacheStats{.routed = 100, .hits = 60, .decode_routed = 40, .decode_hits = 20};
+    c.speculative.ngram_archive_drafted_tokens  = 7;
+    c.speculative.ngram_archive_accepted_tokens = 1;
+    c.speculative.accepted_per_position         = {1, 1, 1};
+    c.speculative.round_steps                   = {{.drafted = 4, .accepted = 1, .ngram = true}};
+    c.expert_cache = infernix::ExpertCacheStats{.routed = 10, .hits = 5, .decode_routed = 4, .decode_hits = 2};
+    const std::vector<ServerToolRound> counted{ServerToolRound{.outcome = a}, ServerToolRound{.outcome = b}};
+    const GenerationOutcome sum = combine_round_outcomes(counted, c);
+    failures += check(sum.speculative.ngram_archive_drafted_tokens == 12 &&
+                          sum.speculative.ngram_archive_accepted_tokens == 4 && sum.speculative.tree_rounds == 2 &&
+                          sum.speculative.accepted_per_position == std::vector<std::uint64_t>{5, 3, 1} &&
+                          sum.speculative.round_steps.size() == 2 && sum.speculative.round_steps[0].drafted == 3 &&
+                          sum.speculative.round_steps[1].ngram && sum.expert_cache && sum.expert_cache->routed == 110 &&
+                          sum.expert_cache->hits == 65 && sum.expert_cache->decode_routed == 44 &&
+                          sum.expert_cache->decode_hits == 22,
+                      "server tool rounds did not sum their speculative and expert-cache counters");
     return failures;
 }
 
@@ -2285,6 +2584,7 @@ int main() {
     failures += test_thinking_history_transport_metadata();
     failures += test_content_and_cache_hints();
     failures += test_aggregate_and_errors();
+    failures += test_non_string_role_and_type();
     failures += test_timings();
     failures += test_tool_call_presentation();
     failures += test_streamed_tool_calls();
@@ -2296,6 +2596,7 @@ int main() {
     failures += test_auto_mode_server_review_safeguards_body();
     failures += test_deferred_tool_declarations();
     failures += test_client_tool_references();
+    failures += test_mid_conversation_tool_changes();
     failures += test_tool_search_execution();
     failures += test_tool_search_round_trip();
     failures += test_multi_round_cache_creation();

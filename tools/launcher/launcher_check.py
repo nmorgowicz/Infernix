@@ -1,7 +1,7 @@
 """The launcher against the stand-in server (no GPU): its features and its watchdog.
 
 python -I tools/launcher/launcher_check.py --launcher <infernix-launcher> --fake <infernix_launcher_fake_serve>
-    --models <dir> [--groups features,watchdog,windowless]
+    --models <dir> [--groups features,watchdog,windowless,autoload,cutoff,ablation]
 Runs on Windows and Linux. <dir> holds at least one supported artifact (only its header is read;
 nothing in it is changed). Each group starts its own launcher with its memory and logs in a fresh
 temporary folder (printed; removed afterwards unless --keep).
@@ -10,11 +10,17 @@ features: model ids, named configurations, environment, the memory breakdown, sc
           import, the fit plan, keep-alive streams while a model loads (OpenAI and Anthropic, a
           failed load, and the server's error answer after the load), model
           routes and the pin, prompt progress, request labels, usage, API keys and sign-in, chats,
-          and a configuration's idle unload (about four minutes).
+          a configuration's idle unload and LoRA adapter folders (about four minutes).
 watchdog: crash, lock-up, stall, the restart limit, idle servers, loads that do not fit, the RAM
           floor (about 6 GiB of RAM for a few seconds; --skip-ram leaves it out), the event log and
           the request-content log (about three minutes).
 windowless: (Windows) a launcher started on a console without a window stops its server in order.
+autoload: the default model loads by itself after a slow first scan (about 20 s).
+cutoff: a server that crashes in the middle of a stream: the client's stream ends with an error event
+          (about 10 s).
+ablation: the Ablation page's runs with ablate_stub.py in place of tools/ablate (pip installs a local wheel,
+          no network): the GPU taken and given back, stop, resume, End now, a restart, a killed launcher
+          (about two minutes).
 """
 
 from __future__ import annotations
@@ -100,9 +106,11 @@ def wait_for(predicate, timeout: float, step: float = 0.5):
 
 
 class Launcher:
-    def __init__(self, exe: Path, fake: Path, data: Path, port: int, windowless: bool = False) -> None:
+    def __init__(self, exe: Path, fake: Path, data: Path, port: int, windowless: bool = False,
+                 extra: tuple[str, ...] = ()) -> None:
         self.exe, self.fake, self.data, self.port = exe, fake, data, port
         self.windowless = windowless  # Windows: a console without a window, as some programs start it
+        self.extra = list(extra)
         self.proc: subprocess.Popen | None = None
         self.out = None
 
@@ -118,7 +126,7 @@ class Launcher:
                       "creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NEW_CONSOLE}
         self.out = open(self.data / "launcher-console.log", "ab")
         self.proc = subprocess.Popen([str(self.exe), "--port", str(self.port), "--data-dir", str(self.data),
-                                      "--serve", str(self.fake), "--no-browser"],
+                                      "--serve", str(self.fake), "--no-browser", *self.extra],
                                      stdout=self.out, stderr=subprocess.STDOUT, **kwargs)
         if not wait_for(lambda: self._healthy(), 20, 0.1):
             raise RuntimeError("the launcher did not start")
@@ -181,13 +189,13 @@ def first_model(port: int) -> dict:
     return next(m for m in library["models"] if m["family"] != "unknown")
 
 
-def run_group(name: str, options, settings: dict, body, windowless: bool = False) -> None:
+def run_group(name: str, options, settings: dict, body, windowless: bool = False, extra: tuple[str, ...] = ()) -> None:
     """Starts a launcher on a fresh data folder and runs `body(launcher, port)` against it."""
     data = Path(tempfile.mkdtemp(prefix=f"infernix-launcher-{name}-"))
     log(f"== {name}: data folder {data}")
     (data / "infernix-launcher.json").write_text(json.dumps({"schema": 1, "settings": {
         "model_dirs": [options.models], "open_browser": False, **settings}}), encoding="utf-8")
-    launcher = Launcher(Path(options.launcher), Path(options.fake), data, options.port, windowless)
+    launcher = Launcher(Path(options.launcher), Path(options.fake), data, options.port, windowless, extra)
     try:
         launcher.start()
         check(f"{name}: the launcher starts with the stand-in server", True)
@@ -226,6 +234,16 @@ def features(launcher: Launcher, port: int, data: Path) -> None:
         # --port overrides the saved port (1234), and the web UI quotes the address actually in use.
         listen = call(port, "GET", "/launcher/api/state")[1].get("listen", {})
         check("the state names the address in use", listen == {"host": "127.0.0.1", "port": port}, str(listen))
+
+    with section("CORS preflight"):
+        # A page on another origin that sends an API key asks for Authorization in its preflight, and a wildcard
+        # Access-Control-Allow-Headers does not cover Authorization (Fetch), so it is named (audit 2026-11-18 F-2).
+        status, _, response = call(port, "OPTIONS", "/v1/chat/completions", full=True,
+                                   headers={"Origin": "http://example.com", "Access-Control-Request-Method": "POST",
+                                            "Access-Control-Request-Headers": "authorization, content-type"})
+        allowed = [h.strip().lower() for h in (response.getheader("Access-Control-Allow-Headers") or "").split(",")]
+        check("a preflight asking for Authorization and Content-Type is allowed both",
+              status == 204 and "authorization" in allowed and "content-type" in allowed, f"{status} {allowed}")
 
     with section("Model listing for coding tools"):
         # The fields other servers' clients read (llama.cpp, llama-swap, vLLM, LM Studio, OpenRouter).
@@ -267,6 +285,29 @@ def features(launcher: Launcher, port: int, data: Path) -> None:
               and last.get("model_key") == key, f"{status} {last.get('routed_by')} {last.get('model_key')}")
         check("/v1/health answers", call(port, "GET", "/v1/health")[0] == 200)
         # Nothing stays loaded: the next section starts the model with its own configuration.
+        call(port, "POST", "/launcher/api/unload", {})
+        wait_for(lambda: instance(port)["state"] == "idle", 30)
+
+    with section("A route that never streams, asked to stream while its model loads"):
+        # count_tokens answers JSON whatever `stream` says: the launcher used to start an event stream for the load
+        # and relay only stream chunks, so the client got an empty stream (audit 2026-11-18 F-8).
+        status, counted, response = call(port, "POST", "/v1/messages/count_tokens",
+                                         {"model": default_alias, "stream": True,
+                                          "messages": [{"role": "user", "content": "hi"}]},
+                                         headers={"anthropic-version": "2023-06-01"}, full=True)
+        check("count_tokens with stream true during a load answers its JSON",
+              status == 200 and "application/json" in (response.getheader("Content-Type") or "")
+              and isinstance(counted, dict) and counted.get("input_tokens") == 56,
+              f"{status} {response.getheader('Content-Type')} {str(counted)[:120]}")
+        # /v1/score (a --causal-scoring server) is proxied as a JSON-only route too.
+        status, scored, response = call(port, "POST", "/v1/score",
+                                        {"model": default_alias, "stream": True, "apply_chat_template": False,
+                                         "prompt": "The capital of France is", "continuation": " Paris"},
+                                        full=True)
+        check("/v1/score is proxied and answers its JSON",
+              status == 200 and "application/json" in (response.getheader("Content-Type") or "")
+              and isinstance(scored, dict) and scored.get("object") == "score",
+              f"{status} {response.getheader('Content-Type')} {str(scored)[:120]}")
         call(port, "POST", "/launcher/api/unload", {})
         wait_for(lambda: instance(port)["state"] == "idle", 30)
 
@@ -379,7 +420,7 @@ def features(launcher: Launcher, port: int, data: Path) -> None:
         parts = device.get("parts") or []
         keys = [part.get("key") for part in parts]
         check("/launcher/api/metrics carries the server's memory by part",
-              {"weights", "kv_cache", "workspace", "cuda_graphs"} <= set(keys) and device.get("total_bytes", 0) > 0
+              {"weights", "kv_cache", "mtp_kv", "workspace", "cuda_graphs"} <= set(keys) and device.get("total_bytes", 0) > 0
               and (device.get("process_bytes") or 0) >= sum(part.get("bytes", 0) for part in parts)
               and bool((held.get("host") or {}).get("parts")) and "ssd" in held and held["ssd"] is None, str(keys))
 
@@ -403,6 +444,33 @@ def features(launcher: Launcher, port: int, data: Path) -> None:
         status, plan = call(port, "POST", f"{cfg}/plan", {"args": fast + ["--max-context", "65536"]})
         check("a plan that fits", status == 200 and plan.get("fits") is True and plan.get("max_context") and
               plan.get("vram") and plan["vram"]["parts"], str(plan)[:200])
+        # A LoRA adapter's factors are a part of the plan beside the weights, and count in what it plans.
+        adapter_dir = Path(tempfile.mkdtemp(prefix="infernix-launcher-lora-"))
+        status, plain = call(port, "POST", f"{cfg}/plan", {"args": fast + ["--max-context", "65536"]})
+        status_lora, adapted = call(port, "POST", f"{cfg}/plan",
+                                    {"args": fast + ["--max-context", "65536", "--lora", str(adapter_dir)]})
+        labels = [part.get("label") for part in (adapted.get("vram") or {}).get("parts", [])]
+        check("a LoRA adapter's VRAM is a part of the plan and of what it plans",
+              status == 200 and status_lora == 200 and "Adapters" in labels
+              and (adapted.get("vram") or {}).get("planned", 0) - (plain.get("vram") or {}).get("planned", 0)
+              == 318767104, str(labels))
+        # So is an ablation sidecar's direction (a dense 27B's 20 KiB), alone and beside a LoRA adapter's factors.
+        sidecar = Path(tempfile.mkdtemp(prefix="infernix-launcher-ablate-")) / "sidecar.json"
+        sidecar.write_text("{}", encoding="utf-8")
+        status_cut, cut = call(port, "POST", f"{cfg}/plan",
+                               {"args": fast + ["--max-context", "65536", "--ablate", str(sidecar)]})
+        status_both, both = call(port, "POST", f"{cfg}/plan", {"args": fast + [
+            "--max-context", "65536", "--lora", str(adapter_dir), "--ablate", str(sidecar)]})
+
+        def adapters(plan: dict) -> int | None:
+            found = [part for part in (plan.get("vram") or {}).get("parts", []) if part.get("label") == "Adapters"]
+            return found[0].get("bytes") if found else None
+
+        planned = lambda plan: (plan.get("vram") or {}).get("planned", 0)  # noqa: E731
+        check("an ablation sidecar's direction is the plan's Adapters part and counts in what it plans",
+              status_cut == 200 and status_both == 200 and adapters(cut) == 20480 and adapters(both) == 318767104 + 20480
+              and planned(cut) - planned(plain) == 20480 and planned(both) - planned(adapted) == 20480,
+              f"{adapters(cut)} {adapters(both)} {planned(cut) - planned(plain)} {planned(both) - planned(adapted)}")
         status, plan = call(port, "POST", f"{cfg}/plan", {"args": fast + ["--max-context", "250000"]})
         suggestions = plan.get("suggestions", [])
         first = suggestions[0] if suggestions and isinstance(suggestions[0], dict) else {}
@@ -427,6 +495,7 @@ def features(launcher: Launcher, port: int, data: Path) -> None:
             (["--request-log-max-mib", "8"], "--request-log-max-mib needs --request-log-jsonl"),
             (["--request-log-keep", "2"], "--request-log-keep needs --request-log-max-mib"),
             (["--vision-offload", "on"], "--vision-offload on needs --vision"),
+            (["--causal-scoring", "--max-context", "auto"], "--causal-scoring needs --max-context N"),
         ]
         unnamed = [want for extra, want in alone if not any(w.startswith(want) for w in warned(extra))]
         check("the preview names each", not unnamed, "; ".join(unnamed))
@@ -434,11 +503,27 @@ def features(launcher: Launcher, port: int, data: Path) -> None:
                            "--prefix-cache-file", str(data / "prefix.cache"), "--prefix-cache-save-mins", "30",
                            "--ngram-archive-mib", "64", "--ngram-native-sessions",
                            "--request-log-jsonl", str(data / "requests.jsonl"), "--request-log-max-mib", "8",
-                           "--request-log-keep", "2", "--vision", "--vision-offload", "on"])
+                           "--request-log-keep", "2", "--vision", "--vision-offload", "on",
+                           "--causal-scoring", "--max-context", "8192"])
         check("...and none of them when both are given", not any(" needs " in w for w in together), "; ".join(together))
         absent = warned(["--ssd-context-gib", "64", "--ssd-context-dir", str(data / "no-such-folder")])
         check("...and an SSD prefix cache folder that does not exist",
               any(w.startswith("--ssd-context-dir: folder not found") for w in absent), "; ".join(absent))
+
+    with section("A server started above info is taken from /health at once"):
+        # infernix-serve logs its "listening on" line at Info, so one started with --log-level warning never shows
+        # it: the launcher then takes /health at once, not after the 30 s it gives a server without the line.
+        call(port, "POST", "/launcher/api/unload", {})
+        wait_for(lambda: instance(port)["state"] == "idle", 30)
+        call(port, "PUT", f"{cfg}/config", {"args": fast + ["--log-level", "warning"]})
+        started = time.monotonic()
+        status, _ = call(port, "POST", "/v1/chat/completions", chat("fake-main", 8))
+        took = time.monotonic() - started
+        served += status == 200
+        check("a server started with --log-level warning is answered without the 30 s wait for its ready line",
+              status == 200 and took < 15, f"{status} after {took:.1f} s")
+        call(port, "POST", "/launcher/api/unload", {})
+        wait_for(lambda: instance(port)["state"] == "idle", 30)
 
     with section("Keep-alive while a model loads"):
         # Keep-alive while a model loads (the main configuration now takes 12 s to load).
@@ -464,15 +549,24 @@ def features(launcher: Launcher, port: int, data: Path) -> None:
         served += "message_stop" in text
         check("an Anthropic stream gets ping events while it loads", status == 200 and "event: ping" in text and
               text.index("event: ping") < text.find("message_start") and "message_stop" in text, text[:160])
-        # The server answers a stream that waited for the load with a JSON error (it refuses compaction): the
-        # error event carries the server's message, not only its status.
+        # The server answers a stream that waited for the load with a JSON error (it refuses a negative output
+        # limit): the error event carries the server's message, not only its status.
+        call(port, "POST", "/launcher/api/unload", {})
+        wait_for(lambda: instance(port)["state"] == "idle", 30)
+        status, kind, headers_at, pieces = stream(port, "/v1/chat/completions", chat("fake-main", -1, True))
+        text = "".join(piece for _, piece in pieces)
+        check("a server's error answer to a stream that waited for the load keeps its message",
+              status == 200 and '"error"' in text and "max_tokens must be at least 1" in text, text[:200])
+        # Compaction never streams (the server refuses it): asked to stream during a load, it gets the server's
+        # own answer, its status and message, not a stream.
         call(port, "POST", "/launcher/api/unload", {})
         wait_for(lambda: instance(port)["state"] == "idle", 30)
         status, kind, headers_at, pieces = stream(port, "/v1/responses/compact",
                                                   {"model": "fake-main", "input": "hello", "stream": True})
         text = "".join(piece for _, piece in pieces)
-        check("a server's error answer to a stream that waited for the load keeps its message",
-              status == 200 and '"error"' in text and "compaction is not supported" in text, text[:200])
+        check("compaction asked to stream during a load gets the server's own error answer",
+              status == 400 and "text/event-stream" not in kind and "compaction is not supported" in text,
+              f"{status} {kind} {text[:160]}")
         call(port, "PUT", f"{cfg}/config", {"args": base + ["--fake-load-ms", "300", "--fake-fail-load",
                                                                "cudaMalloc failed: out of memory"]})
         call(port, "POST", "/launcher/api/unload", {})
@@ -645,6 +739,43 @@ def features(launcher: Launcher, port: int, data: Path) -> None:
         check("the default configuration cannot be deleted", call(port, "DELETE", f"{cfg}/config")[0] == 400)
         check("a named configuration can", call(port, "DELETE", f"/launcher/api/models/{named_id}/config")[0] == 200 and
               named_alias not in [m["id"] for m in call(port, "GET", "/v1/models")[1]["data"]])
+
+    with section("LoRA adapters in a model folder"):
+        # A folder with adapter_config.json and adapter_model.safetensors joins the library, matched to the dense
+        # models of the base its config names, and its files can be deleted; a folder without the weights is none.
+        folder = data / "adapters"
+        adapter = folder / "Qwen3.8-27B-check-adapted"
+        adapter.mkdir(parents=True)
+        config = {"peft_type": "LORA", "base_model_name_or_path": "Qwen/Qwen3.8-27B", "r": 16, "lora_alpha": 32,
+                  "target_modules": ["q_proj", "v_proj"]}
+        (adapter / "adapter_config.json").write_text(json.dumps(config), encoding="utf-8")
+        (adapter / "adapter_model.safetensors").write_bytes(b"\0" * 4096)
+        (folder / "no-weights").mkdir()
+        (folder / "no-weights" / "adapter_config.json").write_text(json.dumps(config), encoding="utf-8")
+        dirs = call(port, "GET", "/launcher/api/settings")[1]["model_dirs"]
+        call(port, "PUT", "/launcher/api/settings", {"model_dirs": dirs + [str(folder)]})
+
+        def listed():
+            return [a for a in call(port, "GET", "/launcher/api/library")[1].get("adapters", []) if a["name"] == adapter.name]
+
+        found = (wait_for(listed, 30) or [None])[0]
+        check("an adapter folder joins the library with its config",
+              bool(found) and found["bytes"] == 4096 and found["config"]["rank"] == 16 and
+              found["config"]["base_model"] == "Qwen/Qwen3.8-27B" and found["config"]["target_modules"] == ["q_proj", "v_proj"],
+              str(found)[:200])
+        library = call(port, "GET", "/launcher/api/library")[1]
+        dense = sorted(m["key"] for m in library["models"] if m["family"] == "qwen3.8-27b" and not m.get("num_experts"))
+        check("it fits the Qwen3.8-27B models in the folders", bool(found) and sorted(found["compatible_models"]) == dense,
+              f"{found and found['compatible_models']} vs {dense}")
+        check("a folder without the weights is no adapter", all(a["name"] != "no-weights" for a in library["adapters"]))
+        if found:
+            status, _ = call(port, "DELETE", f"/launcher/api/adapters/{found['key']}", {"confirm": "wrong"})
+            check("deleting an adapter needs its folder name", status == 400 and (adapter / "adapter_model.safetensors").exists(),
+                  str(status))
+            status, _ = call(port, "DELETE", f"/launcher/api/adapters/{found['key']}", {"confirm": adapter.name})
+            check("deleting it removes its files and its emptied folder", status == 200 and not adapter.exists(), str(status))
+            check("and the library drops it", wait_for(lambda: not listed(), 30) is True)
+        call(port, "PUT", "/launcher/api/settings", {"model_dirs": dirs})
 
     code = launcher.stop()
     check("features: an orderly stop", code == 0, str(code))
@@ -886,13 +1017,309 @@ def windowless(launcher: Launcher, port: int, data: Path) -> None:
     check("windowless: an orderly stop", code == 0, str(code))
 
 
+def cutoff(launcher: Launcher, port: int, data: Path) -> None:
+    """A server that crashes in the middle of an answer: the client's stream ends with the protocol's error event,
+    not as a complete answer (its own group: the crash counts toward the watchdog's restart limit)."""
+    model = first_model(port)
+    key, alias = model["key"], model["config"]["alias"]
+    call(port, "PUT", f"/launcher/api/models/{key}/config", {"args": list(model["config"]["default_args"]) +
+                                                              ["--fake-load-ms", "500"]})
+    status, _ = call(port, "POST", "/v1/chat/completions", chat(alias, 8))
+    check("cutoff: a request loads the model", status == 200, str(status))
+    before = instance(port)
+    cut: dict = {}
+    reader = threading.Thread(target=lambda: cut.update(
+        result=stream(port, "/v1/chat/completions", chat(alias, 4000, True))), daemon=True)
+    reader.start()
+    time.sleep(2.0)  # the stream is under way (a token every 6.7 ms)
+    try:
+        call(before["port"], "POST", "/fake/crash", {}, timeout=5)
+    except OSError:
+        pass
+    reader.join(60)
+    status, _, _, pieces = cut.get("result", (0, "", 0.0, []))
+    text = "".join(piece for _, piece in pieces)
+    check("cutoff: a stream the server's crash cut off ends with an error event, not [DONE]",
+          status == 200 and '"error"' in text and "ended the stream early" in text and "[DONE]" not in text,
+          f"{status} ...{text[-200:]!r}")
+    code = launcher.stop()
+    check("cutoff: an orderly stop", code == 0, str(code))
+
+
+def autoload(launcher: Launcher, port: int, data: Path) -> None:
+    """With autoload on, the launcher loads the default model by itself once its first scan has found
+    it, however long the server's --help takes before that scan (12 s here: a cold first start)."""
+    model = first_model(port)
+    key = model["key"]
+    code = launcher.stop()
+    launcher.kill()
+    check("autoload: the first launcher stops", code == 0, str(code))
+    memory = json.loads((data / "infernix-launcher.json").read_text(encoding="utf-8"))
+    memory["settings"].update({"autoload": True, "default_model": key})
+    (data / "infernix-launcher.json").write_text(json.dumps(memory), encoding="utf-8")
+    os.environ["INFERNIX_FAKE_HELP_DELAY_MS"] = "12000"
+    try:
+        launcher.start()
+    finally:
+        del os.environ["INFERNIX_FAKE_HELP_DELAY_MS"]
+    ready = wait_for(lambda: (lambda i: i if i["state"] == "ready" else None)(instance(port)), 60)
+    failed = [e["message"] for e in events(port) if e.get("level") == "error"]
+    check("autoload: the default model loads after a slow first scan",
+          bool(ready) and ready["model_key"] == key and not failed,
+          f"instance {ready}, errors {failed}")
+    code = launcher.stop()
+    check("autoload: an orderly stop", code == 0, str(code))
+
+
+# ---------------------------------------------------------------------------------------------
+# Ablation (the Ablation page's runs of tools/ablate, with ablate_stub.py in its place)
+
+
+def make_stub_tool(root: Path) -> Path:
+    """A tool folder: ablate_stub.py as ablate.py, and a requirements.txt naming a local wheel (Set up runs pip on it
+    with no network)."""
+    import zipfile
+    tool = root / "ablate-tool"
+    tool.mkdir(parents=True)
+    shutil.copy(Path(__file__).with_name("ablate_stub.py"), tool / "ablate.py")
+    wheel = root / "stubpkg-1.0-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("stubpkg/__init__.py", "VALUE = 1\n")
+        archive.writestr("stubpkg-1.0.dist-info/METADATA", "Metadata-Version: 2.1\nName: stubpkg\nVersion: 1.0\n")
+        archive.writestr("stubpkg-1.0.dist-info/WHEEL",
+                         "Wheel-Version: 1.0\nGenerator: launcher_check\nRoot-Is-Purelib: true\nTag: py3-none-any\n")
+        archive.writestr("stubpkg-1.0.dist-info/RECORD",
+                         "stubpkg/__init__.py,,\nstubpkg-1.0.dist-info/METADATA,,\nstubpkg-1.0.dist-info/WHEEL,,\n"
+                         "stubpkg-1.0.dist-info/RECORD,,\n")
+    (tool / "requirements.txt").write_text(f"stubpkg @ {wheel.as_uri()}\n", encoding="utf-8")
+    return tool
+
+
+def process_alive(pid: int) -> bool:
+    if WINDOWS:
+        import ctypes
+        kernel = ctypes.WinDLL("kernel32")
+        handle = kernel.OpenProcess(0x1000 | 0x00100000, False, pid)  # QUERY_LIMITED_INFORMATION | SYNCHRONIZE
+        if not handle:
+            return False
+        try:
+            return kernel.WaitForSingleObject(handle, 0) != 0  # WAIT_OBJECT_0: it has ended
+        finally:
+            kernel.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    stat = Path(f"/proc/{pid}/stat")
+    return not (stat.is_file() and stat.read_text().rsplit(")", 1)[-1].split()[0] == "Z")
+
+
+def ablation(launcher: Launcher, port: int, data: Path, tool: Path) -> None:
+    """The Ablation page's backend against a stand-in tool: Python and packages, prompt sets, a run that takes the GPU
+    (the model is unloaded, loads are refused with the reason, the gate opens at the end), a sidecar that reaches the
+    library, a refusal before anything is unloaded, stop and resume, End now with a tool that ignores the stop, the
+    outcomes without a sidecar, the last run after a restart, and a launcher killed during a run (about two
+    minutes)."""
+    api = "/launcher/api/ablation"
+    model = first_model(port)
+    key, alias = model["key"], model["config"]["alias"]
+    base_args = list(model["config"]["default_args"]) + ["--fake-load-ms", "300"]
+
+    def configure(env: dict, extra: tuple[str, ...] = ()) -> None:
+        status, body = call(port, "PUT", f"/launcher/api/models/{key}/config",
+                            {"args": base_args + list(extra), "env": [{"name": k, "value": v} for k, v in env.items()]})
+        if status != 200:
+            raise RuntimeError(f"configure: {status} {body}")
+
+    def state() -> dict:
+        return call(port, "GET", api)[1]
+
+    def job() -> dict | None:
+        return state()["job"]
+
+    def wait_job(states: set[str], timeout: float, trials: int = 0) -> dict | None:
+        def ready():
+            j = job()
+            done = ((j or {}).get("progress") or {}).get("trials", {}).get("done", 0)
+            return j if j and j["state"] in states and done >= trials else None
+        return wait_for(ready, timeout, 0.2)
+
+    def start(name: str, trials: int):
+        return call(port, "POST", f"{api}/runs", {"config": key, "preset": "stub-set", "trials": trials, "name": name})
+
+    def loaded() -> tuple[bool, str]:
+        status, body = call(port, "POST", "/v1/chat/completions", chat(alias, 8))
+        state_now = instance(port)["state"]
+        return status == 200 and state_now == "ready", f"{status} {str(body)[:300]}, instance {state_now}"
+
+    ended = {"done", "no_sidecar", "stopped", "failed"}
+    with section("ablation: setup"):
+        s = state()
+        check("ablation: the launcher uses the tool --ablate-tool names",
+              s["tool"]["found"] and Path(s["tool"]["dir"]) == tool, str(s["tool"]))
+        status, s = call(port, "POST", f"{api}/python", {"path": sys.executable})
+        found = (s or {}).get("python", {}).get("found") or {}
+        check("ablation: the Python chosen on the page is the one used",
+              status == 200 and found.get("version", "").startswith(f"{sys.version_info[0]}.{sys.version_info[1]}."),
+              str(found))
+        status, body = start("early", 10)
+        check("ablation: a run before Set up is refused", status == 400 and "packages" in json.dumps(body), str(body))
+        call(port, "POST", f"{api}/setup", {})
+        s = wait_for(lambda: (lambda v: v if v["task"] and v["task"]["state"] != "running" else None)(state()), 180)
+        check("ablation: Set up installs the requirements (pip) into the launcher's packages folder",
+              bool(s) and s["task"]["state"] == "done" and s["packages"]["ready"] and
+              (data / "ablation" / "packages" / "stubpkg" / "__init__.py").is_file(),
+              str(s and s["task"]))
+    with section("ablation: prompt sets"):
+        s = state()
+        listed = {p["name"]: p for p in s["catalogue"] or []}
+        check("ablation: the tool's prompt sets are listed with their licences",
+              "stub-set" in listed and listed["stub-set"]["sources"][1]["licence"] == "CC BY-NC 4.0", str(s["catalogue"]))
+        status, body = call(port, "POST", f"{api}/prompts/no-such-set", {})
+        check("ablation: an unknown prompt set is refused", status == 400, str(body))
+        call(port, "POST", f"{api}/prompts/stub-set", {})
+        s = wait_for(lambda: (lambda v: v if v["task"]["state"] != "running" else None)(state()), 60)
+        check("ablation: a prompt set downloads into the prompts folder",
+              bool(s) and s["task"]["state"] == "done" and s["prompts"].get("stub-set", {}).get("counts", {}).get(
+                  "harmful") == 12, str(s and s["prompts"]))
+    with section("ablation: a configuration the tool refuses"):
+        configure({"STUB_REFUSE": "1"})
+        check("ablation: the model loads", *loaded())
+        status, body = start("refused", 10)
+        check("ablation: init's refusal comes back before anything is unloaded",
+              status == 400 and "the stub refuses it" in json.dumps(body) and instance(port)["state"] == "ready",
+              f"{status} {body}")
+    with section("ablation: a run makes a sidecar"):
+        configure({"STUB_AUTO": "done", "STUB_TRIAL_S": "0.5"}, ("--ablate", str(data / "old" / "sidecar.json")))
+        status, body = start("stub-cut", 20)
+        check("ablation: the run starts", status == 200, f"{status} {body}")
+        running = wait_job({"running"}, 30, trials=2)
+        inst = instance(port)
+        check("ablation: the run unloads the model and holds the GPU",
+              bool(running) and inst["state"] in ("idle", "failed") and inst["ablation_holds_gpu"], str(inst))
+        status, body = call(port, "POST", "/v1/chat/completions", chat(alias, 8))
+        check("ablation: a request meanwhile is refused with the reason", status == 503 and "ablation run" in
+              json.dumps(body), f"{status} {body}")
+        status, body = call(port, "POST", f"/launcher/api/models/{key}/load", {})
+        check("ablation: Load meanwhile is refused", status == 400 and "ablation run" in json.dumps(body), str(body))
+        status, body = start("second", 10)
+        check("ablation: a second run meanwhile is refused", status == 400 and "in progress" in json.dumps(body))
+        run_dir = Path(running["run_dir"])
+        setup = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        words = setup["argv"]
+        check("ablation: init gets the configuration's command line without --ablate or the managed flags",
+              Path(words[1]) == Path(model["path"]).resolve() and "--ablate" not in words and "--port" not in words
+              and "--model-id" not in words and "--fake-load-ms" in words, str(words))
+        check("ablation: the tool's version is the launcher's",
+              setup["tool_version"].startswith("infernix-launcher "), setup["tool_version"])
+        done = wait_job(ended, 60)
+        exported = Path((done or {}).get("exported") or "")
+        check("ablation: the run ends with the exported sidecar", bool(done) and done["state"] == "done" and
+              exported.is_file(), str(done and {k: done[k] for k in ("state", "message", "exported")}))
+        check("ablation: the tool's engines are gone", not list((run_dir / "engines").glob("*.json")))
+        check("ablation: the GPU is free again", not instance(port)["ablation_holds_gpu"])
+        sidecar = json.loads(exported.read_text(encoding="utf-8"))
+        check("ablation: the prompt set's licences reach the sidecar's source",
+              sidecar["generation"]["source"] == "stub prompts (MIT; CC BY-NC 4.0)", str(sidecar["generation"]))
+        library = wait_for(lambda: (lambda l: l if any(c["name"] == "stub-cut" for c in l.get("sidecars", [])) else None)(
+            call(port, "GET", "/launcher/api/library")[1]), 30)
+        settings = call(port, "GET", "/launcher/api/settings")[1]
+        check("ablation: the library lists the sidecar, its folder added to the model folders",
+              bool(library) and any(Path(d) == data / "ablation" / "sidecars" for d in settings["model_dirs"]),
+              str(settings["model_dirs"]))
+        configure({"STUB_AUTO": "done"})
+        check("ablation: the model loads again after the run", *loaded())
+        status, body = start("stub-cut", 10)
+        check("ablation: a run is refused a name a sidecar has", status == 400 and "exists" in json.dumps(body))
+    with section("ablation: stop and resume"):
+        configure({"STUB_AUTO": "done", "STUB_TRIAL_S": "0.4"})
+        status, body = start("resumed", 15)
+        running = wait_job({"running"}, 30, trials=3)
+        call(port, "POST", f"{api}/stop", {})
+        stopped = wait_job(ended, 60)
+        run_dir = Path(running["run_dir"]) if running else data
+        first = int((run_dir / "trials-done.txt").read_text()) if (run_dir / "trials-done.txt").is_file() else -1
+        check("ablation: Stop ends the run in order, its engine stopped, the GPU let go",
+              bool(stopped) and stopped["state"] == "stopped" and 3 <= first < 15 and
+              not list((run_dir / "engines").glob("*.json")) and not instance(port)["ablation_holds_gpu"],
+              f"{stopped and stopped['state']}, {first} trials")
+        status, body = start("resumed", 15)
+        done = wait_job(ended, 60)
+        invocations = (run_dir / "invocations.txt").read_text(encoding="utf-8").splitlines()
+        check("ablation: the same request continues the same run folder",
+              bool(done) and done["state"] == "done" and Path(done["run_dir"]) == run_dir and len(invocations) == 2
+              and int((run_dir / "trials-done.txt").read_text()) == 15, f"{done and done['state']}, {invocations}")
+    with section("ablation: End now"):
+        configure({"STUB_AUTO": "stubborn"})
+        status, body = start("stubborn", 10)
+        running = wait_job({"running"}, 30)
+        run_dir = Path(running["run_dir"]) if running else data
+        engines = wait_for(lambda: list((run_dir / "engines").glob("*.json")), 10, 0.2) or []
+        pids = [json.loads(p.read_text(encoding="utf-8"))["pid"] for p in engines]
+        call(port, "POST", f"{api}/stop", {})
+        time.sleep(3)
+        still = job()
+        check("ablation: a tool that ignores the stop keeps stopping", still["state"] == "stopping", still["state"])
+        call(port, "POST", f"{api}/stop", {"now": True})
+        stopped = wait_job(ended, 60)
+        check("ablation: End now ends it and its engine at once",
+              bool(stopped) and stopped["state"] == "stopped" and pids and not any(process_alive(p) for p in pids)
+              and not instance(port)["ablation_holds_gpu"], f"{stopped and stopped['state']}, engines {pids}")
+        warned = [e["message"] for e in events(port) if "did not end" in e.get("message", "")]
+        check("ablation: the ended engine's record is cleared, with no false warning",
+              not list((run_dir / "engines").glob("*.json")) and not warned, str(warned))
+    with section("ablation: runs without a sidecar"):
+        configure({"STUB_AUTO": "no_sidecar", "STUB_TRIAL_S": "0.05"})
+        start("none", 10)
+        none = wait_job(ended, 60)
+        check("ablation: a run whose pick finds no cut says why", bool(none) and none["state"] == "no_sidecar" and
+              "KL" in none["message"], str(none and none["message"]))
+        configure({"STUB_AUTO": "fail"})
+        start("broken", 10)
+        failed = wait_job(ended, 60)
+        check("ablation: a failed run says why", bool(failed) and failed["state"] == "failed" and
+              "on purpose" in failed["message"], str(failed and failed["message"]))
+    with section("ablation: a restart"):
+        configure({"STUB_AUTO": "done", "STUB_TRIAL_S": "1"})
+        start("restart", 100)
+        running = wait_job({"running"}, 30, trials=1)
+        run_dir = Path(running["run_dir"]) if running else data
+        code = launcher.stop()
+        launcher.kill()
+        check("ablation: the launcher stops in order during a run", code == 0, str(code))
+        launcher.start()
+        last = job()
+        check("ablation: the last run is shown after a restart, stopped, its engine gone",
+              bool(last) and last["run"]["name"] == "restart" and last["state"] == "stopped" and not last["active"] and
+              not list((run_dir / "engines").glob("*.json")), str(last and {k: last[k] for k in ("state", "message")}))
+    with section("ablation: a launcher killed during a run"):
+        first_model(port)   # the restarted launcher's first scan (slow on a network or WSL drive)
+        configure({"STUB_AUTO": "done", "STUB_TRIAL_S": "1"})
+        start("killed", 100)
+        running = wait_job({"running"}, 30, trials=1)
+        run_dir = Path(running["run_dir"]) if running else data
+        engines = wait_for(lambda: list((run_dir / "engines").glob("*.json")), 10, 0.2) or []
+        pids = [json.loads(p.read_text(encoding="utf-8"))["pid"] for p in engines]
+        launcher.kill()
+        if WINDOWS:   # its job object ends everything the launcher started, the tool's engines among them
+            gone = wait_for(lambda: not any(process_alive(p) for p in pids), 15, 0.2)
+            check("ablation: the tool's engine ends with a killed launcher", bool(pids) and bool(gone), str(pids))
+        launcher.start()
+        last = job()
+        check("ablation: the next launcher shows the run stopped and leaves no engine of it",
+              bool(last) and last["run"]["name"] == "killed" and last["state"] == "stopped" and bool(pids) and
+              not any(process_alive(p) for p in pids), str(last and {k: last[k] for k in ("state", "message")}))
+        code = launcher.stop()
+        check("ablation: an orderly stop", code == 0, str(code))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--launcher", required=True)
     parser.add_argument("--fake", required=True)
     parser.add_argument("--models", required=True)
     parser.add_argument("--port", type=int, default=1238)
-    parser.add_argument("--groups", default="features,watchdog,windowless")
+    parser.add_argument("--groups", default="features,watchdog,windowless,autoload,cutoff,ablation")
     parser.add_argument("--skip-ram", action="store_true")
     parser.add_argument("--keep", action="store_true", help="keep the temporary folders")
     options = parser.parse_args()
@@ -905,6 +1332,20 @@ def main() -> int:
                   lambda launcher, port, data: watchdog(launcher, port, data, options.skip_ram))
     if "windowless" in groups and WINDOWS:
         run_group("windowless", options, {"load_timeout_s": 60, "stop_timeout_s": 10}, windowless, windowless=True)
+    if "autoload" in groups:
+        run_group("autoload", options, {"load_timeout_s": 60, "stop_timeout_s": 10}, autoload)
+    if "cutoff" in groups:
+        run_group("cutoff", options, {"load_timeout_s": 60, "stop_timeout_s": 10}, cutoff)
+    if "ablation" in groups:
+        tool_root = Path(tempfile.mkdtemp(prefix="infernix-launcher-ablate-tool-"))
+        try:
+            tool = make_stub_tool(tool_root)
+            run_group("ablation", options, {"load_timeout_s": 60, "stop_timeout_s": 10},
+                      lambda launcher, port, data: ablation(launcher, port, data, tool),
+                      extra=("--ablate-tool", str(tool)))
+        finally:
+            if not options.keep:
+                shutil.rmtree(tool_root, ignore_errors=True)
     failed = [r for r in results if not r[1]]
     log(f"SUMMARY: {len(results) - len(failed)} passed, {len(failed)} failed")
     for name, _, detail in failed:

@@ -44,9 +44,15 @@ struct RowsShape {
     static constexpr int kDownCtas  = G::kDownRowGroups / kRowsDownGroups;
 };
 
-// Whether a call's W4A16 jobs take these kernels (moe_experts' prepare and launch_pass decide it identically).
+// Whether a call's W4A16 jobs take these kernels (moe_experts' prepare and launch_pass decide it identically). Their x
+// rows are the workspace's x limb rows as A16Act blocks, so a call with jobs on the exact wide route (a trimmed call on
+// a wider call's routes, moe::route_width), which reads those rows as its limbs, keeps the tensor-core kernels: their
+// prepare writes the wide route's limbs, and their outputs are these kernels' bits. The product never builds that
+// call (Qwen4Exp sets a reference width only where ops::moe_routes_by_width holds, never on a bank whose narrow and
+// wide routes are both exact; only the op tests set one there): the check keeps the Op correct for any reference width.
 inline bool a16_rows_call(const MoeExpertSource& source, int columns, const moe::wide::ExpertsWorkspace& layout) {
-    return columns <= kA16RowsMaxColumns && a16_nmma_call(source, columns, layout);
+    return columns <= kA16RowsMaxColumns && a16_nmma_call(source, columns, layout) &&
+           !(source.wide_a16 == moe::WideA16::kExact && moe::route_width(source, columns) > moe::kMaxColumns);
 }
 
 // A lane's code words (q, i) of one unit, q = 0..3, and its two rows' scale words (byte 0: row i, byte 1: row i + 8).
@@ -173,7 +179,7 @@ __global__ void __launch_bounds__(kThreads, kRowsMinCtas) gate_up_rows_kernel(Ro
     if (record == nullptr) { return; }
     const moe::ExpertScales scales = a.source.scales[expert];
     const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
-    if (moe::wide_route(count, scales)) { return; }
+    if (moe::wide_route(moe::route_count(dispatch, expert), scales)) { return; }
     const int g    = static_cast<int>(blockIdx.x);
     const int lane = static_cast<int>(threadIdx.x) % 32, warp = static_cast<int>(threadIdx.x) / 32;
     UnitRows w[kRowsWarpSteps];
@@ -301,7 +307,7 @@ __global__ void __launch_bounds__(kThreads, kRowsMinCtas) down_rows_kernel(RowsA
         scales = a.source.scales[expert];
         first  = dispatch.offsets[expert];
         count  = dispatch.offsets[expert + 1] - first;
-        if (moe::wide_route(count, scales)) { record = nullptr; }
+        if (moe::wide_route(moe::route_count(dispatch, expert), scales)) { record = nullptr; }
     }
     const int group = kRowsDownGroups * tile + warp / 2, base = (warp % 2) * kRowsWarpUnits;
     UnitRows w[kRowsWarpSteps];

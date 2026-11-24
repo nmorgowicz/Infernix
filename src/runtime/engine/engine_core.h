@@ -5,6 +5,7 @@
 #include "core/device.h"
 #include "core/nvtx.h"
 #include "core/temporary_switches.h"
+#include "core/timer_resolution.h"
 #include "infernix/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/program.h"
@@ -14,12 +15,14 @@
 #include "runtime/engine/diagnostics.h"
 #include "runtime/engine/scheduler.h"
 #include "runtime/engine/generation_budget.h"
+#include "runtime/engine/kv_capacity.h"
 #include "runtime/expert_offload/placement.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <concepts>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -146,34 +149,46 @@ public:
             if (worker_.joinable()) { worker_.join(); }
             throw;
         }
-        instance_.program->set_maintenance_waker([this] { request_maintenance(); });
-        // Finished turns are rendered and tokenized off the worker (hybrid-prefix-cache-spec §7.9).
-        // Without the thread the Engine simply never prefills them.
-        if (next_turn_quiet_.count() > 0) {
-            try {
-                next_turn_thread_ = std::thread([this] { next_turn_prepare_loop(); });
-            } catch (...) {
-                next_turn_disabled_.store(true, std::memory_order_release);
+        // With the worker running, a step below that throws (a thread that cannot start, an allocation) stops and
+        // joins what started, as the destructor does: no destructor runs for a constructor that throws, and a
+        // joinable std::thread member would end the process.
+        try {
+            instance_.program->set_maintenance_waker([this] { request_maintenance(); });
+            // Finished turns are rendered and tokenized off the worker (hybrid-prefix-cache-spec §7.9).
+            // Without the thread the Engine simply never prefills them.
+            if (next_turn_quiet_.count() > 0) {
+                try {
+                    next_turn_thread_ = std::thread([this] { next_turn_prepare_loop(); });
+                } catch (...) {
+                    next_turn_disabled_.store(true, std::memory_order_release);
+                }
             }
+            // The first constrained request would build the constraint compiler's vocabulary index
+            // before its prefill starts (measured 0.85 s of `prepare` with a 337-token prefill), so
+            // it is built beside startup instead.
+            constraint_warm_ = std::thread([this, frontend = instance_.frontend] {
+                const auto started = Clock::now();
+                try {
+                    frontend.warm_constraints();
+                    publish_diagnostic(diagnostics_, DiagnosticLevel::Debug,
+                                       "constraint vocabulary index built in %.3f s",
+                                       std::chrono::duration<double>(Clock::now() - started).count());
+                } catch (const std::exception& error) {
+                    publish_diagnostic(diagnostics_, DiagnosticLevel::Warning,
+                                       "constraint vocabulary index not built ahead: %s", error.what());
+                } catch (...) {}
+            });
+        } catch (...) {
+            shut_down();
+            throw;
         }
-        // The first constrained request would build the constraint compiler's vocabulary index
-        // before its prefill starts (measured 0.85 s of `prepare` with a 337-token prefill), so
-        // it is built beside startup instead. Last, so nothing after it can throw past the thread.
-        constraint_warm_ = std::thread([this, frontend = instance_.frontend] {
-            const auto started = Clock::now();
-            try {
-                frontend.warm_constraints();
-                publish_diagnostic(diagnostics_, DiagnosticLevel::Debug,
-                                   "constraint vocabulary index built in %.3f s",
-                                   std::chrono::duration<double>(Clock::now() - started).count());
-            } catch (const std::exception& error) {
-                publish_diagnostic(diagnostics_, DiagnosticLevel::Warning,
-                                   "constraint vocabulary index not built ahead: %s", error.what());
-            } catch (...) {}
-        });
     }
 
-    ~EngineCore() noexcept {
+    ~EngineCore() noexcept { shut_down(); }
+
+    // Stops the worker and joins every thread this Engine started (the destructor's, and a constructor's that
+    // throws after the worker started).
+    void shut_down() noexcept {
         // The Program's monitor thread must not wake an engine that is going away.
         try { instance_.program->set_maintenance_waker({}); } catch (...) {}
         stop();
@@ -218,31 +233,7 @@ public:
     // quiet period, the worker prefills it as an internal request. A newer conversation replaces it,
     // a request submitted first drops it, and a request arriving during the pass makes it yield at
     // its next unit boundary.
-    void prefill_next_turn(PromptInput conversation) noexcept {
-        if (next_turn_quiet_.count() == 0 || next_turn_disabled_.load(std::memory_order_acquire)) {
-            return;
-        }
-        try {
-            conversation.options.continuation = PromptContinuationMode::NextTurnHistory;
-            const Clock::time_point registered = Clock::now();
-            std::uint64_t epoch                = 0;
-            {
-                std::lock_guard lock(queue_mutex_);
-                if (stopping_ || failed_) { return; }
-                epoch = submission_epoch_;
-            }
-            bool replaced = false;
-            {
-                std::lock_guard lock(next_turn_mutex_);
-                if (next_turn_stop_) { return; }
-                replaced = next_turn_input_.has_value();
-                next_turn_input_.emplace(
-                    NextTurnInput{.input = std::move(conversation), .epoch = epoch, .registered = registered});
-            }
-            if (replaced) { next_turn_dropped_.fetch_add(1, std::memory_order_relaxed); }
-            next_turn_cv_.notify_one();
-        } catch (...) {}
-    }
+    void prefill_next_turn(PromptInput conversation) noexcept;
 
     class Submission {
     public:
@@ -319,8 +310,6 @@ public:
                                "inference request expired before submission");
         }
 
-        std::uint64_t request_id        = 0;
-        std::uint64_t publication_order = 0;
         {
             std::lock_guard lock(queue_mutex_);
             if (stopping_ || failed_) {
@@ -330,12 +319,7 @@ public:
             if (outstanding_ >= max_outstanding_) {
                 throw RequestError(RequestErrorKind::Overloaded, "inference request queue is full");
             }
-            if (next_request_id_ == 0 || next_publication_order_ == 0) {
-                throw std::overflow_error("request identity space exhausted");
-            }
             ++outstanding_;
-            request_id        = next_request_id_++;
-            publication_order = next_publication_order_++;
             // A request came first: a finished turn not yet being prefilled is dropped (the request
             // is often that conversation's next turn), and a running pass yields to it.
             ++submission_epoch_;
@@ -374,23 +358,28 @@ public:
                 observation.phase_timings,
                 std::chrono::duration<double>(ready - constraint_started).count());
             prepare_seconds += std::chrono::duration<double>(ready - submitted).count();
-            request = std::make_shared<Request>(request_id, publication_order, std::move(prompt),
-                                                std::move(output), prompt_summary, prepare_seconds,
-                                                std::move(options), consumer_mode,
-                                                std::move(observation), pending_deadline, ready);
-        } catch (...) {
-            release_reserved_capacity();
-            throw;
-        }
-
-        {
+            // The identity and the publication order are taken with the queue position, in one hold of the queue
+            // lock: ids then follow the queue's order (which the preemption victim choice, the candidate order and
+            // the paused order assume) whatever the grammar compile above took. A throw releases the lock, then the
+            // reserved capacity below.
             std::lock_guard lock(queue_mutex_);
             if (stopping_ || failed_) {
-                --outstanding_;
                 throw RequestError(RequestErrorKind::Unavailable,
                                    "inference engine is unavailable");
             }
+            if (next_request_id_ == 0 || next_publication_order_ == 0) {
+                throw std::overflow_error("request identity space exhausted");
+            }
+            request = std::make_shared<Request>(next_request_id_, next_publication_order_, std::move(prompt),
+                                                std::move(output), prompt_summary, prepare_seconds,
+                                                std::move(options), consumer_mode,
+                                                std::move(observation), pending_deadline, ready);
+            ++next_request_id_;
+            ++next_publication_order_;
             pending_.push_back(request);
+        } catch (...) {
+            release_reserved_capacity();
+            throw;
         }
         request_admission_check();
         queue_cv_.notify_one();
@@ -399,26 +388,17 @@ public:
 
     [[nodiscard]] MemorySummary memory_summary() const {
         std::scoped_lock lock(execution_mutex_);
-        MemorySummary out                      = instance_.program->memory_summary();
-        const KvCapacityResolution& resolution = instance_.kv_capacity_resolution;
-        out.kv_capacity_mode                   = resolution.mode;
-        out.kv_capacity_page_groups            = resolution.main_page_groups;
-        out.kv_capacity_max_page_groups        = resolution.maximum_main_page_groups;
-        out.minimum_runtime_reservation_bytes  = resolution.minimum_runtime_reservation_bytes;
-        out.kv_capacity_increment_bytes        = resolution.bytes_per_additional_main_page_group;
-        out.runtime_reservation_bytes          = resolution.runtime_reservation_bytes;
-        out.available_after_weights_bytes      = resolution.available_after_weights_bytes;
-        out.available_after_startup_bytes      = resolution.available_after_startup_bytes;
-        out.shared_memory_weights_bytes        = resolution.shared_memory_weights_bytes;
-        out.shared_memory_runtime_bytes        = resolution.shared_memory_runtime_bytes;
-        out.vram_headroom_bytes                = resolution.automatic_headroom_bytes;
-        out.planned_slack_bytes                = resolution.planned_slack_bytes;
-        return out;
+        return with_kv_capacity(instance_.program->memory_summary(), instance_.kv_capacity_resolution);
     }
 
     [[nodiscard]] RuntimeStats runtime_stats() const {
         std::lock_guard lock(stats_mutex_);
         return published_stats_;
+    }
+
+    [[nodiscard]] RequestMonitor request_monitor() const {
+        std::lock_guard lock(stats_mutex_);
+        return published_monitor_;
     }
 
     [[nodiscard]] bool is_available() const {
@@ -725,7 +705,9 @@ private:
     }
 
     // Coalesces admission-visible queue/resource changes. Ordinary prefill/decode progress does not
-    // re-arm a temporarily blocked inspection.
+    // re-arm a temporarily blocked inspection; a prefill unit that published a snapshot or returned
+    // capacity does, and so does every prefill unit while a queued request waits for a sibling's
+    // snapshot (resolve_prefill_progress).
     void request_admission_check() noexcept {
         admission_check_pending_.store(true, std::memory_order_release);
     }
@@ -876,6 +858,7 @@ private:
         if (!request->observation.progress || !request->admitted_begin) { return; }
         const BeginSummary& begin = *request->admitted_begin;
         const GenerationProgressObservation observation{
+            .engine_request_id       = request->id,
             .prompt_tokens           = begin.prompt_tokens,
             .reused_prompt_tokens    = begin.reused_prompt_tokens,
             .processed_prompt_tokens = begin.reused_prompt_tokens + request->computed_prompt_tokens,
@@ -1142,6 +1125,26 @@ private:
     // (a tool call the parameter decoder refuses, a value past its nesting bound) fails this
     // request only: its lane is released unless the Program already released it, and the Engine
     // keeps serving. Returns nothing once the request has been failed.
+    // A Program released a finished or aborted lane in place after a device failure (FinishResult and
+    // AbortResult::device_error): its request is answered as usual, and the error is raised at the cycle's next safe
+    // point (raise_device_error_after_release, inside the worker's try), so the worker's out-of-memory recovery fails
+    // only the other residents and counts toward the failures in a row.
+    void note_device_error_after_release(const std::exception_ptr& error) noexcept {
+        if (error && !device_error_after_release_) { device_error_after_release_ = error; }
+    }
+    void raise_device_error_after_release() {
+        if (auto error = std::exchange(device_error_after_release_, nullptr)) { std::rethrow_exception(error); }
+    }
+    // A test's device failure inside the next finish or abort call (testing::request_finish_fault, request_abort_fault).
+    template <class Call>
+    auto with_release_fault(std::atomic<std::uint64_t>& request, Call&& call) {
+        const std::uint64_t armed = request.exchange(0, std::memory_order_relaxed);
+        if (armed != 0) [[unlikely]] { ::infernix::testing::arm_memory_exhausted_here(armed); }
+        auto result = call();
+        if (armed != 0) [[unlikely]] { ::infernix::testing::arm_memory_exhausted_here(0); }
+        return result;
+    }
+
     std::optional<PublishedOutput> commit_output(std::uint32_t lane,
                                                  const std::shared_ptr<Request>& request,
                                                  bool released) {
@@ -1152,10 +1155,13 @@ private:
                                "%s: failed 1 request; the Engine keeps serving", error.what());
             const std::exception_ptr failure = std::current_exception();
             if (!released) {
-                auto aborted = instance_.program->abort(*request->sequence);
+                auto aborted = with_release_fault(testing::abort_fault_request(),
+                                                  [&] { return instance_.program->abort(*request->sequence); });
                 if (aborted.status != ConsumeStatus::Consumed) {
+                    if (aborted.device_error) { std::rethrow_exception(aborted.device_error); }
                     throw std::logic_error("a request whose output failed could not be released");
                 }
+                note_device_error_after_release(aborted.device_error);
                 request->generation_timings = aborted.timings;
                 request->speculative_stats  = std::move(aborted.speculative);
             }
@@ -1175,10 +1181,35 @@ private:
         return cancelled;
     }
 
+    // Completes the terminal requests in publication order: the Program finishes each sequence (its usage
+    // fields: timings, speculative and expert-cache counts, the prompt tokens its snapshots made reusable) and
+    // releases its lane. No lane is released while a context transaction is open. One that spans Engine cycles
+    // (a Flash-Next vision binding's encode) would otherwise hold a finished request's final event (a
+    // non-streaming client's whole response) for the encode, so a Program with finish_held completes the request
+    // now and keeps the lane, and the Engine releases it here once the transaction has ended (QN-04). A sequence
+    // the transaction holds back (can_finish_held false) waits, and so do the requests after it.
     bool settle_terminal_requests(HostPhaseMeasurement& boundary) {
-        if (instance_.program->has_context_transaction()) { return false; }
+        constexpr bool kFinishHeld = requires(typename ModelContract::Program& program, const SequenceHandle& s) {
+            { program.can_finish_held(s) } -> std::same_as<bool>;
+            program.finish_held(s);
+            program.release_finished(s);
+        };
+        const bool transaction = instance_.program->has_context_transaction();
+        if (transaction && !kFinishHeld) { return false; }
 
         bool changed = false;
+        if constexpr (kFinishHeld) {
+            if (!transaction) {
+                for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                    const auto& request = slots_[lane];
+                    if (request == nullptr || !request->held_sequence) { continue; }
+                    instance_.program->release_finished(*request->held_sequence);
+                    request->held_sequence.reset();
+                    remove_completed_slot(lane);
+                    changed = true;
+                }
+            }
+        }
         for (;;) {
             std::optional<std::uint32_t> selected;
             for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
@@ -1198,10 +1229,26 @@ private:
                 throw std::logic_error("terminal-pending request has invalid ownership");
             }
             const FinishReason reason = *request->terminal_reason;
-            auto finished             = instance_.program->finish(*request->sequence);
+            typename ModelContract::FinishResult finished;
+            if constexpr (kFinishHeld) {
+                if (transaction) {
+                    if (!instance_.program->can_finish_held(*request->sequence)) { break; }
+                    finished = with_release_fault(testing::finish_fault_request(),
+                                                  [&] { return instance_.program->finish_held(*request->sequence); });
+                } else {
+                    finished = with_release_fault(testing::finish_fault_request(),
+                                                  [&] { return instance_.program->finish(*request->sequence); });
+                }
+            } else {
+                finished = with_release_fault(testing::finish_fault_request(),
+                                              [&] { return instance_.program->finish(*request->sequence); });
+            }
             if (finished.status != ConsumeStatus::Consumed) {
+                if (finished.device_error) { std::rethrow_exception(finished.device_error); }
                 throw std::logic_error("terminal native sequence could not finish");
             }
+            // Released in place after a device failure: the request completes, then the device recovers.
+            note_device_error_after_release(finished.device_error);
             request->generation_timings = finished.timings;
             request->speculative_stats  = std::move(finished.speculative);
             request->constrained_draws  = std::move(finished.constrained_draws);
@@ -1220,8 +1267,15 @@ private:
             }
 
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
+            // Completion clears the request's sequence: a held lane's is kept for its release.
+            std::optional<SequenceHandle> held;
+            if (transaction) { held = request->sequence; }
             complete_success(request, reason);
-            remove_completed_slot(lane);
+            if (transaction) {
+                request->held_sequence = held; // the slot and lane follow once the transaction ends
+            } else {
+                remove_completed_slot(lane);
+            }
             boundary = begin_host_phase();
             changed  = true;
         }
@@ -1235,15 +1289,19 @@ private:
         bool changed = false;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             const auto& request = slots_[lane];
-            if (request == nullptr || !cancelled_at_boundary[lane]) { continue; }
+            // A held finished request is complete: settle_terminal_requests releases it.
+            if (request == nullptr || request->held_sequence || !cancelled_at_boundary[lane]) { continue; }
             if (!request->sequence || !request->lane || request->lane->value != lane) {
                 throw std::logic_error("active cancellation has no sequence binding");
             }
             (void)request->output.preview_terminal(FinishReason::Cancelled);
-            auto aborted = instance_.program->abort(*request->sequence);
+            auto aborted = with_release_fault(testing::abort_fault_request(),
+                                              [&] { return instance_.program->abort(*request->sequence); });
             if (aborted.status != ConsumeStatus::Consumed) {
+                if (aborted.device_error) { std::rethrow_exception(aborted.device_error); }
                 throw std::logic_error("a cancelled request could not be released");
             }
+            note_device_error_after_release(aborted.device_error);
             request->generation_timings = aborted.timings;
             request->speculative_stats  = std::move(aborted.speculative);
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
@@ -1425,7 +1483,11 @@ private:
             rollback_generated();
             const auto discarded = instance_.program->abort_pending(std::move(pending));
             if (discarded.status != ConsumeStatus::Consumed) {
-                throw std::logic_error("failed pending batch could not be discarded");
+                std::string cause = "unknown error";
+                try {
+                    std::rethrow_exception(error);
+                } catch (const std::exception& e) { cause = e.what(); } catch (...) {}
+                throw std::logic_error("failed pending batch could not be discarded (after: " + cause + ")");
             }
             std::rethrow_exception(error);
         }
@@ -1484,11 +1546,15 @@ private:
         if (decode_round) {
             ++cumulative_stats_.decode_rounds;
             cumulative_stats_.decode_row_rounds += row_count;
+            const auto committed_at = Clock::now();
             for (std::size_t row = 0; row < row_count; ++row) {
                 if (!cancelled[row]) {
                     cumulative_stats_.committed_decode_tokens += decisions[row].accepted_tokens;
                     slots_[lane_indices[row]]->committed_decode_tokens +=
                         decisions[row].accepted_tokens;
+                    if (decisions[row].accepted_tokens != 0) {
+                        slots_[lane_indices[row]]->last_progress = committed_at;
+                    }
                 }
             }
         }
@@ -1608,13 +1674,19 @@ private:
             throw std::logic_error("completed prefill did not reach the admitted prompt frontier");
         }
         if (progress.processed_prompt_tokens != 0) {
+            request->last_progress = Clock::now();
             publish_prompt_progress(request);
             publish_progress_observation(request);
         }
         // Between a long prompt's calls (Qwen4Exp: after each layer-walk span) the frames it borrows
         // can be returned, so a request waiting for KV growth need not wait for the whole prompt
         // (GitHub #24: admitted after the first 65,536-token span instead of expiring in the queue).
-        if (progress.capacity_released) { request_admission_check(); }
+        // A snapshot this unit published may be the one a queued request waits for (a sibling's tap where
+        // their prompts diverge, hybrid-prefix-cache-spec §12.2): it is quoted again now, not when this
+        // prompt completes. While a request waits for a sibling every prefill boundary re-arms admission,
+        // so one whose sibling passed the target without publishing (a tap skipped for lack of room)
+        // stops waiting there too.
+        if (progress.capacity_released || progress.snapshot_published || sibling_wait_) { request_admission_check(); }
         if (!progress.complete) { return; }
         if (!request->lane || !progress.pending) {
             throw std::logic_error("completed prefill has no lane or pending token");
@@ -1813,10 +1885,19 @@ private:
         return allow_pause && pause_reclaim_victim();
     }
 
+    // The tokens a pause of the resident on `lane` would recompute on its resume (the Program's
+    // prediction), so a pressure turn pauses the resident whose resume restores its own state.
+    [[nodiscard]] auto pause_cost() const noexcept {
+        return [this](std::uint32_t lane) noexcept -> std::uint32_t {
+            const auto& request = slots_[lane];
+            return request && request->sequence ? instance_.program->pause_replay_tokens(*request->sequence) : 0U;
+        };
+    }
+
     // Pauses the progress owner's victim, the next one when a resident cannot pause now.
     bool pause_reclaim_victim() {
         std::vector<std::uint32_t> skipped;
-        while (const auto victim = scheduler_.preemption_victim(slots_, max_concurrency_, skipped)) {
+        while (const auto victim = scheduler_.preemption_victim(slots_, max_concurrency_, skipped, pause_cost())) {
             if (pause_resident(*victim)) { return true; }
             if (instance_.program->has_context_transaction()) { return false; }
             skipped.push_back(*victim);
@@ -1865,17 +1946,31 @@ private:
         }
     }
 
-    // Hybrid prefix cache: copies the waiting FIFO head's Host-only blocks into spare Device cache
-    // (hybrid-prefix-cache-spec §6.6).
-    void prefetch_blocked_head() {
-        std::shared_ptr<Request> head;
+    // Hybrid prefix cache: copies the queued requests' Host-only blocks into spare Device cache
+    // (hybrid-prefix-cache-spec §6.6): the FIFO head's, then the request's behind it. Paused requests are not
+    // targets: a paused request's history copied back while the lanes that paused it still run took the pages
+    // they grow into, and two such requests then paused each other in turn (§16.14). A target is prefetched for
+    // once an admission scan has planned it.
+    void prefetch_waiting() {
+        if (instance_.program->has_context_transaction()) { return; }
+        std::array<std::shared_ptr<Request>, kPrefetchTargets> waiting;
+        std::size_t count = 0;
         {
             std::lock_guard lock(queue_mutex_);
-            if (!pending_.empty()) { head = pending_.front(); }
+            for (const auto& request : pending_) {
+                if (count == kPrefetchTargets) { break; }
+                if (request->cancelled.load(std::memory_order_acquire)) { continue; }
+                waiting[count++] = request;
+            }
         }
-        if (!head || !head->base_plan) { return; }
-        resources_.prefetch_blocked_head(*instance_.program, *head->base_plan,
-                                         head->publication_order);
+        std::array<typename ResourceManagement::PrefetchTarget, kPrefetchTargets> targets;
+        std::size_t planned = 0;
+        for (std::size_t index = 0; index < count; ++index) {
+            const auto& request = waiting[index];
+            if (!request->base_plan) { continue; }
+            targets[planned++] = {.id = request->id, .base = &*request->base_plan};
+        }
+        resources_.prefetch_waiting(*instance_.program, std::span(targets.data(), planned));
     }
 
     // Hybrid prefix cache: the sources of the requests waiting for admission are evicted last, the
@@ -1948,6 +2043,55 @@ private:
         }
     }
 
+    // The admission trace (Debug): the sources the Program offered the request, in its order with the
+    // one tried marked `*`, and what became of it. A line repeats only when it changes, so a request
+    // waiting across scans logs its wait once.
+    void trace_admission(Request& request, const AdmissionDecision& decision, const std::string& outcome) {
+        const auto path_name = [](PrefixReusePath path) {
+            switch (path) {
+            case PrefixReusePath::HybridEndpoint: return "endpoint";
+            case PrefixReusePath::HybridSnapshot: return "snapshot";
+            case PrefixReusePath::Root: break;
+            }
+            return "root";
+        };
+        std::string line = "admission req " + std::to_string(request.id) +
+                           (decision.restoring ? " resume" : " fresh") + ", prompt " +
+                           std::to_string(request.base_plan ? request.base_plan->summary().prompt_tokens : 0U) +
+                           ": sources";
+        for (std::size_t index = 0; index < decision.sources.size(); ++index) {
+            const SourceCandidate& source = decision.sources[index];
+            line += index == 0 ? " " : ", ";
+            if (index == decision.current) { line += '*'; }
+            line += std::to_string(source.reused_tokens);
+            line += ' ';
+            line += path_name(source.reused_tokens != 0 ? source.reuse_path : PrefixReusePath::Root);
+        }
+        if (!decision.sources.empty() && decision.sources.front().cached_block_tokens != 0) {
+            line += " (cached blocks " + std::to_string(decision.sources.front().cached_block_tokens) + ')';
+        }
+        line += "; " + outcome;
+        if (line == request.admission_trace) { return; }
+        request.admission_trace = line;
+        publish_diagnostic(diagnostics_, DiagnosticLevel::Debug, "%s", line.c_str());
+    }
+
+    // The trace of a request that was not quoted (every lane is taken), logged once as trace_admission's lines.
+    void trace_waiting(Request& request, const char* outcome) {
+        std::string line = "admission req " + std::to_string(request.id) + " fresh, prompt " +
+                           std::to_string(request.base_plan ? request.base_plan->summary().prompt_tokens : 0U) + ": " +
+                           outcome;
+        if (line == request.admission_trace) { return; }
+        request.admission_trace = line;
+        publish_diagnostic(diagnostics_, DiagnosticLevel::Debug, "%s", line.c_str());
+    }
+
+    [[nodiscard]] static std::string shortage_text(const ContextResourceUsage& shortage) {
+        return "short state " + std::to_string(shortage.state_slots) + ", main KV " +
+               std::to_string(shortage.main_kv_pages) + ", backend KV " + std::to_string(shortage.backend_kv_pages) +
+               " pages";
+    }
+
     // `restoring`: restores the paused progress owner (Scheduler::progress_owner), pausing a
     // resident for its lane or capacity; otherwise admits a fresh request.
     bool try_admit_one(bool restoring) {
@@ -1959,17 +2103,16 @@ private:
                                      [&](const auto& request) { return request->id == owner; })
                       : paused_.end();
         if (restoring && suspended == paused_.end()) { return false; }
-        if (!lane && !restoring) { prefetch_blocked_head(); }
-        if (!lane && restoring) {
-            if (const auto victim = scheduler_.preemption_victim(slots_, max_concurrency_)) {
-                return pause_resident(*victim);
-            }
-            return false;
-        }
+        // The owner needs a lane: the resident whose pause recomputes least, the next one when it cannot
+        // pause now (while the owner is paused no resident reserves a unit, so a victim that refused would
+        // never reach a boundary where it can).
+        if (!lane && restoring) { return pause_reclaim_victim(); }
         if (admission_decision_ && (admission_decision_->restoring != restoring ||
                                     (restoring && *suspended != admission_decision_->request))) {
             admission_decision_.reset();
         }
+        // A decision is only ever kept across a pause it started, which frees a lane.
+        if (!lane) { admission_decision_.reset(); }
         std::vector<std::shared_ptr<Request>> candidates;
         if (admission_decision_) {
             candidates.push_back(admission_decision_->request);
@@ -1987,6 +2130,15 @@ private:
                     request->admission_generation = admission_generation_;
                 }
                 if (!plan_or_fail(request, restoring)) { return true; }
+                if (!lane) {
+                    // Every lane is taken, so no source can bind: the request is planned (its queue hold
+                    // and the head's prefetch read the plan) and not quoted. A quote walks the prompt's
+                    // path and waits for a prefetch landing on it (the head's own, started for this very
+                    // wait), which held the residents' decode for a request that could not start. It is
+                    // quoted when a lane frees (remove_completed_slot starts a new scan).
+                    trace_waiting(*request, "waits for a lane");
+                    continue;
+                }
                 std::vector<SourceCandidate> sources = resources_.candidates(
                     *instance_.program, *request->base_plan, restoring ? &*request->suspended : nullptr);
                 if (sources.empty() && source_pending()) {
@@ -1995,6 +2147,9 @@ private:
                     if (restoring) { return false; }
                     continue;
                 }
+                // No source and no read: it waits for a prefilling sibling's snapshot (§12.2). Each of the
+                // sibling's prefill boundaries quotes it again (resolve_prefill_progress).
+                if (sources.empty() && !restoring) { sibling_wait_ = true; }
                 // An idle-time pass whose history the cache already holds ends before any binding
                 // (an agent turn that echoed the reply resumes from its endpoint anyway, §7.9).
                 if (request->background && !restoring && next_turn_covered(*request, sources)) {
@@ -2020,12 +2175,7 @@ private:
             bool deferred = false;
             while (decision.current < decision.sources.size()) {
                 const SourceCandidate& source = decision.sources[decision.current];
-                if (!lane) {
-                    note_source_wait(request, source, restoring);
-                    deferred = true;
-                    break;
-                }
-                const auto binding_started = Clock::now();
+                const auto binding_started    = Clock::now();
                 auto reservation           = instance_.program->start_binding(
                     *request->base_plan, LaneId{*lane}, source,
                     restoring ? &*request->suspended : nullptr,
@@ -2039,6 +2189,7 @@ private:
                                     request->output.pending_control_tokens().size())
                                   : 1U);
                 if (!reservation && !reservation.source_valid) {
+                    trace_admission(*request, decision, "source no longer valid, next");
                     if (!restoring) {
                         request->admission.fallback_reason = AdmissionFallbackReason::SourceInvalid;
                     }
@@ -2049,6 +2200,7 @@ private:
                     // A request no state of the Engine admits, with the Program's own error (Qwen4Exp:
                     // a Vision window its expert cache cannot lend): it fails alone, now.
                     if (reservation.refusal) {
+                        trace_admission(*request, decision, "refused by the Program");
                         fail_unadmittable(request, restoring, reservation.refusal);
                         return true;
                     }
@@ -2057,8 +2209,13 @@ private:
                     // A shortage the cache cannot cover (the other residents hold the pages) evicts nothing
                     // from it: that would take the request's own cached history, to restore it again. A
                     // resumed request pauses a resident for its turn; a fresh one waits for their release.
+                    const std::string short_by = shortage_text(shortage);
                     if (reservation.reclaim_cache ? reclaim(shortage, restoring)
                                                   : restoring && pause_reclaim_victim()) {
+                        trace_admission(*request, decision,
+                                        short_by + (reservation.reclaim_cache
+                                                        ? ", reclaimed from the cache or a pause"
+                                                        : ", the cache cannot cover it: paused a resident"));
                         if (instance_.program->has_context_transaction()) { return true; }
                         continue;
                     }
@@ -2066,9 +2223,14 @@ private:
                     // initial allocation is not a reason to discard this source.
                     if (reservation.capacity_possible &&
                         (!resident_empty() || (!restoring && !paused_.empty()))) {
+                        trace_admission(*request, decision, short_by + ", waits for the residents' release");
                         deferred = true;
                         break;
                     }
+                    trace_admission(*request, decision,
+                                    short_by + (reservation.capacity_possible
+                                                    ? ", nothing resident to release it: next source"
+                                                    : ", beyond the pool: next source"));
                     if (!restoring) {
                         request->admission.fallback_reason =
                             reservation.capacity_possible ? AdmissionFallbackReason::IsolatedCapacity
@@ -2077,6 +2239,7 @@ private:
                     ++decision.current;
                     continue;
                 }
+                trace_admission(*request, decision, "bound");
                 const BeginSummary begin{
                     .prompt_tokens        = request->base_plan->summary().prompt_tokens,
                     .reused_prompt_tokens = source.reused_tokens,
@@ -2131,7 +2294,7 @@ private:
             }
             if (restoring) { return false; }
         }
-        if (!restoring) { prefetch_blocked_head(); }
+        if (!restoring) { prefetch_waiting(); }
         return false;
     }
 
@@ -2261,10 +2424,9 @@ private:
                 }
             }
         }
-        const auto prefill = priority && (slots_[*priority]->is_prefilling() ||
-                                          slots_[*priority]->is_replaying())
-                                 ? priority
-                                 : scheduler_.next_prefill(prefill_view, max_concurrency_);
+        // The owner's (or the recovering lane's) while it can run; a blocked one leaves the permit to the
+        // lane it waits behind (Scheduler::prefill_turn).
+        const auto prefill = scheduler_.prefill_turn(prefill_view, max_concurrency_, priority);
         std::vector<std::uint32_t> candidates;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             const auto& request = slots_[lane];
@@ -2325,6 +2487,11 @@ private:
                     handed_over = priority == lane;
                     break;
                 }
+                // A resident that finished in this cycle returns its lane and pages at the next boundary
+                // (settle_terminal_requests): the unit waits for that release rather than pausing another
+                // resident for it, or failing every resident with a capacity error one cycle before the
+                // pages come back.
+                if (scheduler_.release_pending(slots_, max_concurrency_)) { break; }
                 // The cache cannot cover the unit. During a turn only its owner may take
                 // capacity from a resident; another row records contention and waits.
                 if (const auto turn = scheduler_.progress_owner(); turn && *turn != request->id) {
@@ -2464,9 +2631,11 @@ private:
         generated_staged = false;
 
         ++cumulative_stats_.host_work.control_units;
+        const auto committed_at = Clock::now();
         for (const std::uint32_t lane : membership.lane_span()) {
             ++slots_[lane]->host_timing.control_units;
             slots_[lane]->committed_decode_tokens += membership.row_stride;
+            slots_[lane]->last_progress = committed_at;
         }
         cumulative_stats_.committed_decode_tokens += membership.size * membership.row_stride;
 
@@ -2492,6 +2661,7 @@ private:
     // then, or when the Program's cleanup failed; the caller then fails everything, as for any
     // other worker error.
     bool recover_locked(const std::exception_ptr& error, bool with_binding = false) noexcept {
+        device_error_after_release_ = nullptr; // this recovery covers a failure a release reported too
         try {
             if ((materializing_ || context_owner_) && !with_binding) { return false; }
             // A paused request releases its suspended state as a cancelled one does, while the
@@ -2516,6 +2686,10 @@ private:
             context_owner_.reset(); // a pausing owner holds its lane: it fails with the others below
             for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
                 if (slots_[lane] == nullptr) { continue; }
+                if (slots_[lane]->held_sequence) { // already answered; the Program released its lane above
+                    remove_completed_slot(lane);
+                    continue;
+                }
                 complete_error(slots_[lane], error);
                 remove_completed_slot(lane);
                 ++failed;
@@ -2550,6 +2724,7 @@ private:
     // The worker holds execution_mutex_ across the failing operation and this cleanup, so no
     // Program introspection can observe a partially cleared physical state.
     void fail_all_locked(std::exception_ptr error, bool shutdown = false) noexcept {
+        device_error_after_release_ = nullptr;
         if (!shutdown) {
             std::string what = "unknown error";
             try {
@@ -2574,6 +2749,14 @@ private:
         scheduler_ = Scheduling{};
         const std::shared_ptr<Request> materializing_request =
             materializing_ ? materializing_->request : nullptr;
+        // Every client is answered whatever throws on the way (an allocation, or the Program's queries in
+        // publish_runtime_stats after a device failure): this function is noexcept, so a throw would end the
+        // process instead. A completion that throws still answers its client.
+        const auto complete = [&](const std::shared_ptr<Request>& request) noexcept {
+            try {
+                complete_error(request, error);
+            } catch (...) { answer_error(request, error); }
+        };
         // An orderly stop saves the prefix cache during the Program cleanup, which takes seconds
         // for a large Host tier: answer every request first rather than after the save.
         if (shutdown) {
@@ -2581,11 +2764,14 @@ private:
                 if (slots_[lane] != nullptr) { answer_error(slots_[lane], error); }
             }
             if (materializing_request != nullptr) { answer_error(materializing_request, error); }
-            for (const auto& request : pending) { complete_error(request, error); }
+            // A paused request's client waits too; its suspended state is released after the cleanup, below.
+            for (const auto& request : paused_) { answer_error(request, error); }
+            for (const auto& request : pending) { complete(request); }
             pending.clear();
         }
         // An orderly stop also saves an attached prefix cache file.
         if (shutdown) {
+            if (const auto hook = testing::shutdown_cleanup_hook().load()) { hook(); }
             instance_.program->shutdown_cleanup();
         } else {
             instance_.program->fail_all_cleanup();
@@ -2595,18 +2781,20 @@ private:
         context_owner_.reset();
         for (auto& request : paused_) {
             request->suspended.reset();
-            complete_error(request, error);
+            complete(request);
         }
         paused_.clear();
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) {
-                complete_error(slots_[lane], error);
+                complete(slots_[lane]);
                 slots_[lane].reset();
             }
         }
-        if (materializing_request != nullptr) { complete_error(materializing_request, error); }
-        for (const auto& request : pending) { complete_error(request, error); }
-        publish_runtime_stats();
+        if (materializing_request != nullptr) { complete(materializing_request); }
+        for (const auto& request : pending) { complete(request); }
+        try {
+            publish_runtime_stats();
+        } catch (...) {} // the statistics stay as last published
     }
 
     // The periodic Host-tier save (HybridPrefixCacheOptions::persistent_save_interval): at the first
@@ -2639,7 +2827,7 @@ private:
         }
     }
 
-    // ---- idle-time prefill of finished turns (hybrid-prefix-cache-spec §7.9) ----------------------
+    // ---- idle-time prefill of finished turns (hybrid-prefix-cache-spec §7.9; next_turn_prefill.inl) ------
 
     // A pass that would leave its deepest snapshot within one block of what the cache already
     // holds adds nothing the next request would not compute in a few tokens: it is skipped.
@@ -2648,159 +2836,30 @@ private:
     // The pass's request: its prompt ends one token past the history it caches (its <|im_start|>),
     // so one output token, sampled at the prompt's end and discarded, ends it there. No constraint,
     // no tool grammar unless a declared tool is strict, nothing published to a consumer.
-    [[nodiscard]] static ResolvedRequestOptions next_turn_options() {
-        ResolvedRequestOptions options;
-        options.execution.requested_output_tokens = 1;
-        options.execution.allow_prefix_reuse      = true;
-        options.tool_choice.constraints           = ToolConstraintMode::Automatic;
-        return options;
-    }
+    [[nodiscard]] static ResolvedRequestOptions next_turn_options();
 
     // Renders and tokenizes the latest finished turn off the worker, with its output session, and
     // hands it to the worker unless a request came first.
-    void next_turn_prepare_loop() noexcept {
-        for (;;) {
-            std::optional<NextTurnInput> turn;
-            {
-                std::unique_lock lock(next_turn_mutex_);
-                next_turn_cv_.wait(lock, [&] { return next_turn_stop_ || next_turn_input_.has_value(); });
-                if (next_turn_stop_) { return; }
-                turn.swap(next_turn_input_);
-            }
-            const std::uint64_t epoch = turn->epoch;
-            const auto current        = [this, epoch] {
-                std::lock_guard lock(queue_mutex_);
-                return !stopping_ && !failed_ && submission_epoch_ == epoch;
-            };
-            bool accepted = false;
-            try {
-                if (current()) {
-                    const PreparationControl control{
-                        .deadline     = {},
-                        .cancellation = CancellationView([this, &current] {
-                            {
-                                std::lock_guard lock(next_turn_mutex_);
-                                if (next_turn_stop_ || next_turn_input_.has_value()) { return true; }
-                            }
-                            return !current();
-                        })};
-                    const Clock::time_point started = Clock::now();
-                    PreparedPrompt prompt = instance_.frontend.prepare(std::move(turn->input), control);
-                    const ResolvedRequestOptions options = next_turn_options();
-                    auto output = instance_.frontend.make_output_session(
-                        prompt, options.stop, options.output, options.execution.thinking,
-                        options.constraint, options.tool_choice);
-                    const PromptSummary summary = prompt.summary();
-                    const double seconds =
-                        std::chrono::duration<double>(Clock::now() - started).count();
-                    bool replaced = false;
-                    {
-                        std::lock_guard lock(queue_mutex_);
-                        if (!stopping_ && !failed_ && submission_epoch_ == epoch &&
-                            summary.prompt_tokens <= max_context_) {
-                            replaced = next_turn_candidate_.has_value();
-                            next_turn_candidate_.emplace(NextTurnCandidate{.prompt          = std::move(prompt),
-                                                                  .output          = std::move(output),
-                                                                  .summary         = summary,
-                                                                  .prepare_seconds = seconds,
-                                                                  .registered      = turn->registered});
-                            ++next_turn_serial_;
-                            accepted = true;
-                        }
-                    }
-                    if (replaced) { next_turn_dropped_.fetch_add(1, std::memory_order_relaxed); }
-                }
-            } catch (...) {
-                // A history the template or the context cannot take is simply not prefilled.
-            }
-            if (accepted) {
-                queue_cv_.notify_all();
-            } else {
-                next_turn_dropped_.fetch_add(1, std::memory_order_relaxed);
-            }
-        }
-    }
+    void next_turn_prepare_loop() noexcept;
 
     // When the prepared turn's pass may start: the quiet period after the later of its turn's end
     // and the worker's last work. queue_mutex_ held.
-    [[nodiscard]] std::optional<Clock::time_point> next_turn_due() const {
-        if (!next_turn_candidate_) { return std::nullopt; }
-        return std::max(next_turn_candidate_->registered, worker_busy_at_) + next_turn_quiet_;
-    }
+    [[nodiscard]] std::optional<Clock::time_point> next_turn_due() const;
 
     // Starts the prepared turn's pass once due, as an internal request at the queue's head (the
     // queue is empty: the Engine is idle). queue_mutex_ held. Returns whether it started.
-    bool start_next_turn_locked() {
-        const auto due = next_turn_due();
-        if (!due || Clock::now() < *due) { return false; }
-        NextTurnCandidate candidate = std::move(*next_turn_candidate_);
-        next_turn_candidate_.reset();
-        if (next_request_id_ == 0 || next_publication_order_ == 0) { return false; }
-        auto request = std::make_shared<Request>(
-            next_request_id_++, next_publication_order_++, std::move(candidate.prompt),
-            std::move(candidate.output), candidate.summary, candidate.prepare_seconds,
-            next_turn_options(), OutputConsumerMode::Aggregate, GenerationObservationOptions{},
-            Clock::time_point::max(), Clock::now());
-        request->background        = true;
-        request->consumer_released = true;
-        request->capacity_released = true;
-        pending_.push_back(request);
-        next_turn_request_ = request;
-        ++next_turn_counters_.started;
-        request_admission_check();
-        return true;
-    }
+    bool start_next_turn_locked();
 
     // At each worker boundary: a pass that has ended is forgotten, and a running one yields to any
     // real request (waiting, paused, binding or resident). It is cancelled, so it ends at the next
     // unit boundary as a client's cancellation would, keeping the blocks and snapshots it published
     // (the endpoint at its frontier, or a tap there on the reproducible route's grid).
-    void yield_next_turn() {
-        if (!next_turn_request_) { return; }
-        {
-            std::lock_guard lock(next_turn_request_->mutex);
-            if (next_turn_request_->response_done) {
-                next_turn_request_.reset();
-                return;
-            }
-        }
-        // A pass that has already reached its end settles at this boundary anyway.
-        if (next_turn_request_->cancelled.load(std::memory_order_acquire) ||
-            next_turn_request_->is_model_finished()) {
-            return;
-        }
-        bool real = !paused_.empty() || (materializing_ && materializing_->request != next_turn_request_);
-        for (std::uint32_t lane = 0; lane < max_concurrency_ && !real; ++lane) {
-            real = slots_[lane] != nullptr && slots_[lane] != next_turn_request_;
-        }
-        if (!real) {
-            std::lock_guard lock(queue_mutex_);
-            real = stopping_ || std::any_of(pending_.begin(), pending_.end(),
-                                            [&](const auto& request) { return request != next_turn_request_; });
-        }
-        if (!real) { return; }
-        next_turn_request_->cancelled.store(true, std::memory_order_release);
-        if (next_turn_request_->admitted_at) {
-            ++next_turn_counters_.yielded;
-        } else {
-            next_turn_dropped_.fetch_add(1, std::memory_order_relaxed);
-        }
-        request_admission_check();
-    }
+    void yield_next_turn();
 
     // Whether the cache already holds the pass's history: its deepest snapshot could not land a
     // block past the best source (the reproducible route resumes only on its grid).
     [[nodiscard]] bool next_turn_covered(const Request& request,
-                                            std::span<const SourceCandidate> sources) const {
-        const std::uint32_t prompt = request.base_plan->summary().prompt_tokens;
-        std::uint32_t best         = 0;
-        for (const SourceCandidate& source : sources) { best = std::max(best, source.reused_tokens); }
-        const std::uint32_t grid = std::max<std::uint32_t>(instance_.program->hybrid_resume_grid(), 1U);
-        // The pass's last snapshot sits at its history's end (one token before its prompt's end), on
-        // the grid at or before it.
-        const std::uint32_t deepest = prompt == 0 ? 0U : (prompt - 1U) / grid * grid;
-        return deepest < best + kNextTurnMinimumTokens;
-    }
+                                            std::span<const SourceCandidate> sources) const;
 
     // What every request the Engine holds is doing, for the no-progress Warning.
     [[nodiscard]] std::string describe_progress_state() const {
@@ -2895,8 +2954,13 @@ private:
                 no_progress_reported_  = false;
                 no_progress_recovered_ = false;
             } else {
+                // Not recovered now (a bind or restore holds the Program, or the Program refused): another interval
+                // tries again rather than none, while the requests are still held.
                 publish_diagnostic(diagnostics_, DiagnosticLevel::Error,
-                                   "%s, and its state cannot be recovered (%s): it stays as it is", what, state.c_str());
+                                   "%s, and its state cannot be recovered now (%s): tried again in %.0f s", what,
+                                   state.c_str(), std::chrono::duration<double>(recovery_bound).count());
+                no_progress_since_     = now;
+                no_progress_recovered_ = false;
             }
         } catch (...) {} // the watch never fails the Engine
     }
@@ -2921,9 +2985,16 @@ private:
                         return stopping_ || !pending_.empty() || maintenance_requested_ ||
                                next_turn_serial_ != seen;
                     };
+                    // The idle wait's deadline: the earliest of the timed events below.
                     std::optional<Clock::time_point> wake;
                     if (prefix_save_interval_.count() != 0) { wake = next_prefix_save_; }
                     if (const auto due = next_turn_due()) { wake = wake ? std::min(*wake, *due) : *due; }
+                    // A refused SSD write-back is tried again at a set time (a capture still landing when the last
+                    // request ended): nothing else wakes an idle Engine for it. The timeout branch's `continue`
+                    // returns to the loop top, where hybrid_storage_due() is then true.
+                    if (const auto retry = instance_.program->hybrid_storage_retry_at()) {
+                        wake = wake ? std::min(*wake, *retry) : *retry;
+                    }
                     if (!wake) {
                         queue_cv_.wait(lock, woken);
                     } else if (!queue_cv_.wait_until(lock, *wake, woken)) {
@@ -2988,9 +3059,18 @@ private:
             worker_busy_at_ = Clock::now();
             if (const std::uint64_t fault = testing::memory_fault_request().load(std::memory_order_relaxed);
                 fault != 0) [[unlikely]] {
-                // A test's out-of-memory injection (testing::request_memory_fault): armed on this thread.
-                testing::memory_fault_request().store(0, std::memory_order_relaxed);
-                ::infernix::testing::arm_memory_exhausted_here(fault == testing::kMemoryFaultDisarm ? 0 : fault);
+                // A test's out-of-memory injection (testing::request_memory_fault): armed on this thread once the request
+                // it is for has arrived (queued or resident), so the idle cycles before it (1 ms apart since the timer
+                // resolution is held) do not count down its checks.
+                bool work = fault == testing::kMemoryFaultDisarm || !resident_empty();
+                if (!work) {
+                    std::lock_guard lock(queue_mutex_);
+                    work = !pending_.empty();
+                }
+                if (work) {
+                    testing::memory_fault_request().store(0, std::memory_order_relaxed);
+                    ::infernix::testing::arm_memory_exhausted_here(fault == testing::kMemoryFaultDisarm ? 0 : fault);
+                }
             }
             try {
                 save_prefix_cache_if_due();
@@ -3003,6 +3083,7 @@ private:
                 poll_storage();
                 (void)settle_terminal_requests(boundary);
                 cancel_active_requests(snapshot_cancellations(), boundary);
+                raise_device_error_after_release();
                 for (auto it = paused_.begin();
                      !instance_.program->has_context_transaction() && it != paused_.end();) {
                     const auto request = *it;
@@ -3036,21 +3117,40 @@ private:
                     executed |= progress_context_transaction(boundary);
                 }
                 reserve_resident_units();
+                bool admitted = false;
                 // Fresh requests wait while admitted ones contend (they keep their queue deadline);
                 // they enter once no turn is held, nothing is paused and no recovery is pending.
                 if (!scheduler_.progress_owner() && paused_.empty() && !context_owner_ && !recovering) {
                     if (!admission_decision_ && consume_admission_check()) {
                         ++admission_generation_;
                         scheduler_.begin_admission_scan();
+                        sibling_wait_ = false; // set again by a request this scan finds still waiting
                     }
-                    if (admission_decision_ || scheduler_.admission_scan_pending()) {
-                        (void)try_admit_one(false);
+                    // Every request the scan can bind is bound in this cycle, before its units are chosen:
+                    // requests that arrive together then share the cycle's prefill turn by its order (the
+                    // shortest prompt first) instead of each waiting out a unit of the one bound before it,
+                    // and a later one's Host restore runs under that unit. A binding the Program completes
+                    // over several cycles (a media prompt's encode on Qwen3.8-Flash-Next) ends the pass: the
+                    // Program holds one context transaction at a time.
+                    while ((admission_decision_ || scheduler_.admission_scan_pending()) && try_admit_one(false) &&
+                           materializing_) {
+                        executed |= progress_context_transaction(boundary);
+                        if (instance_.program->has_context_transaction()) { break; }
+                        admitted = true;
                     }
+                }
+                // The queued requests' Host-only paths go on being copied while they wait (§6.6), each cycle
+                // while the last pass left more to copy.
+                if (resources_.prefetch_continues() && !instance_.program->has_context_transaction()) {
+                    prefetch_waiting();
                 }
                 hold_queued_sources();
                 if (instance_.program->has_context_transaction()) {
                     executed |= progress_context_transaction(boundary);
                     if (!instance_.program->has_context_transaction()) { reserve_resident_units(); }
+                } else if (admitted) {
+                    // The lanes bound above reserve their first units.
+                    reserve_resident_units();
                 }
                 if (testing::units_held().load(std::memory_order_relaxed)) {
                     // A test's stall (testing::hold_units): requests are admitted and bound, no unit runs.
@@ -3154,6 +3254,7 @@ private:
                         }
                         request->replayed_tokens += progress.processed_tokens;
                         cumulative_stats_.replayed_tokens += progress.processed_tokens;
+                        if (progress.processed_tokens != 0) { request->last_progress = Clock::now(); }
                         if (progress.complete) {
                             // Qwen3.5 binds every resume as a replay from the reused prefix: one that recomputed
                             // nothing resumed from a snapshot at the paused frontier, or was paused before its
@@ -3187,6 +3288,7 @@ private:
                 }
                 watch_progress(executed);
                 publish_runtime_stats();
+                raise_device_error_after_release(); // before a successful unit resets the failure count
                 if (executed) { unit_recoveries_in_a_row_ = 0; }
             } catch (const RecoverableExecutionError&) {
                 if (!recover_unit_failure_locked(std::current_exception())) { return; }
@@ -3209,6 +3311,7 @@ private:
             }
             execution_lock.unlock();
             if (!executed) {
+                // About 1 ms with timer_resolution_ held (15.7 ms at Windows' default tick, candidates QN-27).
                 std::unique_lock lock(queue_mutex_);
                 queue_cv_.wait_for(lock, std::chrono::milliseconds(1));
             }
@@ -3249,12 +3352,18 @@ private:
     Scheduling scheduler_;
     std::array<bool, kMaximumConcurrency> runnable_units_{};
     std::atomic<bool> admission_check_pending_{false};
+    // worker: a queued request's last quote had no source because it waits for a prefilling sibling's
+    // snapshot; every prefill boundary then re-arms admission (hybrid-prefix-cache-spec §12.2).
+    bool sibling_wait_ = false;
+    // The requests prefetch_waiting copies for: the FIFO head and the request behind it.
+    static constexpr std::size_t kPrefetchTargets = 2;
     std::uint64_t worker_accounted_elapsed_ns_ = 0;
     HostWorkClass current_host_work_class_     = HostWorkClass::Control;
     std::array<std::uint32_t, kMaximumConcurrency> current_decode_lanes_{};
     std::size_t current_decode_lane_count_ = 0;
     RuntimeStats cumulative_stats_;
     RuntimeStats published_stats_;
+    RequestMonitor published_monitor_;
     bool stopping_ = false;
     bool maintenance_requested_ = false; // guarded by queue_mutex_
     bool failed_   = false;
@@ -3300,6 +3409,8 @@ private:
     // (cumulative, RuntimeStats::device_memory_recoveries).
     static constexpr std::uint32_t kMaximumUnitRecoveries = 8;
     std::uint32_t unit_recoveries_in_a_row_     = 0;
+    // A device failure a Program reported after releasing a lane in place (note_device_error_after_release).
+    std::exception_ptr device_error_after_release_;
     std::uint64_t memory_exhausted_recoveries_ = 0;
     std::shared_ptr<Request> next_turn_request_;           // worker: the pass queued, binding or resident
     NextTurnCounters next_turn_counters_;                  // worker
@@ -3311,6 +3422,9 @@ private:
     bool next_turn_stop_ = false;                          // next_turn_mutex_
     std::thread next_turn_thread_;
 
+    // The worker's 1 ms wait between cycles that ran nothing is about a millisecond while the Engine exists, not a
+    // 15.6 ms Windows timer tick (core/timer_resolution.h). Destroyed after the threads are joined.
+    TimerResolution timer_resolution_;
     std::thread worker_;
     std::thread constraint_warm_;
 };
@@ -3318,3 +3432,4 @@ private:
 } // namespace infernix::runtime
 
 #include "runtime/engine/engine_metrics.inl"
+#include "runtime/engine/next_turn_prefill.inl"

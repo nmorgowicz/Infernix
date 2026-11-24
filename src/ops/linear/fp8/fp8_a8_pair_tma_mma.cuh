@@ -148,7 +148,7 @@ fp8_a8_pair_tma_mma_kernel(
     const int token_begin = token_offset + token_tile * BT;
 
     // Every stage base is a multiple of 1,024 bytes, as the 128-byte TMA swizzle requires.
-    extern __shared__ __align__(128) unsigned char fp8_pair_shared[];
+    extern __shared__ __align__(1024) unsigned char fp8_pair_shared[];
     auto* activation_hi = fp8_pair_shared;
     auto* activation_lo = activation_hi + plane_bytes;
     auto* weight        = activation_lo + plane_bytes;
@@ -258,7 +258,7 @@ void launch_fp8_a8_pair_tma_mma(const Fp8A8Operands& p, const std::uint8_t* x_lo
                 constexpr auto kernel = fp8_a8_pair_tma_mma_kernel<Schedule, Full, InPlace>;
                 constexpr int bytes =
                     fp8_tma_scratch_bytes<Schedule, LinearIdentityEpilogue> + Schedule::kBarrierBytes;
-                const int dynamic = fp8_prepare_shared<bytes, kernel, true>();
+                const int dynamic = prepare_dynamic_shared<bytes, kernel, true>();
                 kernel<<<blocks, Schedule::kThreads, dynamic, stream>>>(parameter, p, scales_lo, output,
                                                                         offset, count);
                 CUDA_CHECK(cudaGetLastError());
@@ -511,7 +511,7 @@ fp8_a8_pair_block32_tma_mma_kernel(
 
     // Every code stage base is a multiple of 1,024 bytes, as the 128-byte TMA swizzle requires; the
     // scale words follow the code planes.
-    extern __shared__ __align__(128) unsigned char fp8_pair_block32_shared[];
+    extern __shared__ __align__(1024) unsigned char fp8_pair_block32_shared[];
     auto* activation_hi = fp8_pair_block32_shared;
     auto* activation_lo = activation_hi + plane_bytes;
     auto* weight        = activation_lo + plane_bytes;
@@ -657,7 +657,7 @@ void launch_fp8_a8_pair_block32_tma_mma(const Fp8A8PairBlock32Operands& p, Outpu
                     fp8_a8_pair_block32_tma_mma_kernel<Schedule, Full, BlockScaledWeights, Output, InPlace>;
                 constexpr int bytes =
                     fp8_tma_scratch_bytes<Schedule, LinearIdentityEpilogue> + Schedule::kBarrierBytes;
-                const int dynamic = fp8_prepare_shared<bytes, kernel, true>();
+                const int dynamic = prepare_dynamic_shared<bytes, kernel, true>();
                 kernel<<<blocks, Schedule::kThreads, dynamic, stream>>>(parameter, p, output, offset,
                                                                         count);
                 CUDA_CHECK(cudaGetLastError());

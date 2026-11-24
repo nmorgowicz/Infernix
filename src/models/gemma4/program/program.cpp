@@ -382,6 +382,7 @@ struct ProgramImpl {
         std::uint32_t ring_low = 0, ring_end = 0;
     } resident;
     std::uint32_t ring_low = 0; // the live sequence's lowest ring position holding its own state
+    std::uint64_t prefix_publications_seen = 0;
     // Last: destroyed first, waiting for its copies before the Device buffers it reads are freed.
     std::unique_ptr<prefix::PrefixCache> prefix_cache;
 
@@ -545,10 +546,10 @@ struct ProgramImpl {
     void require(SequenceHandle sequence) const {
         if (!owns(sequence) || !state_valid) { throw std::logic_error("Gemma4 stale or invalid sequence"); }
     }
-    void clear() noexcept {
+    std::exception_ptr clear() noexcept {
         // A sequence that ends with its state unknown (an exception left it invalid) takes back
         // what it published; every pin it holds goes back before the request itself is dropped.
-        release_prefix(!state_valid);
+        auto release_error = release_prefix(!state_valid);
         binding = occupied = prefilled = replaying = finishable = pending = false;
         state_valid = true;
         fed = physical_written = replay_target = 0;
@@ -557,6 +558,7 @@ struct ProgramImpl {
         timings = {};
         carry_column.reset(); pending_round = false; speculative = {};
         ++epoch; ++transaction;
+        return release_error;
     }
     Tensor hidden_columns(int first, int n) const { return hidden.slice(1, first, n); }
     Tensor logits(int n) const { return head.slice(1, 0, n); }
@@ -1071,12 +1073,21 @@ struct ProgramImpl {
         }
     }
 
+    // Host captures land after the call that took them; only notify admission after publication.
+    bool prefix_publications_observed() {
+        if (!prefix_cache) { return false; }
+        prefix_cache->poll();
+        const auto& count = prefix_cache->counters();
+        const auto now = count.taps_created + count.endpoints_created;
+        return std::exchange(prefix_publications_seen, now) != now;
+    }
+
     // The end of a consistent sequence (finish, abort, pause): its remaining blocks and an endpoint
     // snapshot at the committed frontier when publishable() reaches it (always with free-cache-resume; on
     // the reproducible route a pausing sequence past the exact prefix resumes from its last grid snapshot
     // and replays the rest on the chunk grid).
-    void prefix_finish(bool pausing) noexcept {
-        if (!prefix_cache || !pl.active || !state_valid) { return; }
+    std::exception_ptr prefix_finish(bool pausing) noexcept {
+        if (!prefix_cache || !pl.active || !state_valid) { return {}; }
         try {
             publish_blocks(fed);
             const std::uint32_t F = fed;
@@ -1095,10 +1106,13 @@ struct ProgramImpl {
                        DiagnosticLevel::Warning);
             pl.withdraw = true;
             clear_prefix_after_release = true;
+            return std::current_exception();
         } catch (...) {
             pl.withdraw = true;
             clear_prefix_after_release = true;
+            return std::current_exception();
         }
+        return {};
     }
 
     // The prompt tokens past the reused prefix that this request's accepted captures made
@@ -1114,7 +1128,7 @@ struct ProgramImpl {
     // (hybrid-prefix-cache-spec §7.8): the sequence's captures land, then its blocks (with what
     // later requests built on them) and its snapshots leave the cache, so a resend resumes from
     // what was cached before it. What another pin still holds waits in prefix_withdrawal.
-    void prefix_withdraw() noexcept {
+    std::exception_ptr prefix_withdraw() noexcept {
         try {
             prefix_cache->drain(); // each capture pins its anchor until it has landed and published
             for (const std::uint64_t id : pl.captures) {
@@ -1138,24 +1152,30 @@ struct ProgramImpl {
         } catch (...) {
             // What it published cannot be told apart now: the cache is emptied.
             clear_prefix_after_release = true;
+            return std::current_exception();
         }
+        return {};
     }
 
     // Gives back everything the sequence holds in the cache: the selection's pins, the mapped
     // path, its Device copies (the pages go with the sequence; their bytes are on the Host) and,
     // for a failed sequence, what it published.
-    void release_prefix(bool invalid) noexcept {
-        if (!prefix_cache) { return; }
+    std::exception_ptr release_prefix(bool invalid) noexcept {
+        if (!prefix_cache) { return {}; }
         if (invalid && pl.active) { pl.withdraw = true; }
         if (invalid || pl.withdraw) { resident = {}; } // the Device state is not vouched for
         pc::PrefixCacheIndex& index = prefix_cache->index();
+        std::exception_ptr failure;
         try {
             if (pl.pinned_snapshot) { index.unpin_snapshot(*pl.pinned_snapshot); }
             if (!pl.path.empty()) { index.release_path(pl.path); }
-        } catch (...) { clear_prefix_after_release = true; }
+        } catch (...) {
+            clear_prefix_after_release = true;
+            failure = std::current_exception();
+        }
         try {
             if (pl.withdraw) {
-                prefix_withdraw();
+                if (auto error = prefix_withdraw(); !failure) { failure = std::move(error); }
             } else {
                 for (const std::uint64_t id : pl.captures) { prefix_cache->forget_capture(id); }
                 // Entries an earlier withdrawal found pinned go once nothing pins them.
@@ -1163,9 +1183,13 @@ struct ProgramImpl {
             }
             prefix_cache->poll();
             prefix_cache->sweep_device_copies();
-        } catch (...) { clear_prefix_after_release = true; }
+        } catch (...) {
+            clear_prefix_after_release = true;
+            if (!failure) { failure = std::current_exception(); }
+        }
         pl = PrefixLane{};
         if (clear_prefix_after_release) { reset_prefix_cache(); }
+        return failure;
     }
 
     // The cache is emptied: after a failure it may hold state no one can vouch for.
@@ -1618,6 +1642,16 @@ runtime::ResourceReservation Program::reserve_units(std::span<const ExecutionUni
     }
     return {.reserved = true};
 }
+std::uint32_t Program::pause_replay_tokens(SequenceHandle sequence) const noexcept {
+    const auto& p = *impl_;
+    if (!p.owns(sequence)) { return 0; }
+    const std::uint32_t target = p.fed;
+    if (!p.prefix_cache || !p.pl.active) { return target; }
+    const bool captures = p.state_valid && !p.pending && !p.binding && !p.replaying &&
+                          target != 0 && target == p.publishable() && target <= p.ledger.size();
+    const std::uint32_t cached = captures ? target : std::min(p.pl.deepest, target);
+    return target - cached;
+}
 bool Program::start_pause(SequenceHandle sequence, runtime::ExecutionTiming* observed_timing) {
     auto& p = *impl_; p.require(sequence);
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Post, observed_timing);
@@ -1691,6 +1725,7 @@ PrefillProgress Program::advance_prefill(SequenceHandle sequence, runtime::Execu
             progress.timing = p.charge(timing.finish(), false);
             progress.pending.emplace(p.stage(token, failure, progress.timing));
         } else { progress.timing = p.charge(timing.finish(), false); }
+        progress.snapshot_published = p.prefix_publications_observed();
         return progress;
     } catch (...) {
         p.state_valid = false;
@@ -1873,9 +1908,11 @@ FinishResult Program::finish(SequenceHandle sequence) noexcept {
     if (!p.owns(sequence) || p.pending || !p.finishable || !p.state_valid) { return {}; }
     FinishResult result; result.status = runtime::ConsumeStatus::Consumed; result.timings = p.timings;
     result.speculative = std::move(p.speculative);
-    p.prefix_finish(false);
+    result.device_error = p.prefix_finish(false);
     result.cache_created_prompt_tokens = p.prefix_created_tokens();
-    p.clear(); return result;
+    auto release_error = p.clear();
+    if (!result.device_error) { result.device_error = std::move(release_error); }
+    return result;
 }
 AbortResult Program::abort(SequenceHandle sequence) noexcept {
     auto& p = *impl_;
@@ -1883,8 +1920,10 @@ AbortResult Program::abort(SequenceHandle sequence) noexcept {
     AbortResult result; result.status = runtime::ConsumeStatus::Consumed; result.timings = p.timings;
     result.speculative = std::move(p.speculative);
     // A consistent abort (no unit in flight) leaves an endpoint a resend resumes from.
-    if (!p.pending) { p.prefix_finish(false); }
-    p.clear(); return result;
+    if (!p.pending) { result.device_error = p.prefix_finish(false); }
+    auto release_error = p.clear();
+    if (!result.device_error) { result.device_error = std::move(release_error); }
+    return result;
 }
 void Program::fail_all_cleanup() noexcept {
     (void)settle_after_memory_exhausted();

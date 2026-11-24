@@ -1,4 +1,5 @@
 #include "runtime/engine/model_instance.h"
+#include "artifact/ablate_sidecar.h"
 #include "artifact/reader.h"
 #include "artifact/formats.h"
 #include "artifact/materializer.h"
@@ -6,6 +7,7 @@
 #include "core/evictable_weight_pool.h"
 #include "core/host_memory.h"
 #include "core/startup.h"
+#include "core/temporary_switches.h"
 #include "core/vmm_arena.h"
 #include "core/vram_budget.h"
 #include "models/qwen3_5/load.h"
@@ -21,6 +23,7 @@
 #include "runtime/expert_offload/memory_plan.h"
 #include "runtime/expert_offload/route_trace.h"
 #include "runtime/expert_offload/vram_monitor.h"
+#include "runtime/prefix_cache/persist_file.h"
 
 #include <algorithm>
 #include <system_error>
@@ -59,9 +62,6 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
         throw std::invalid_argument("Engine max_context must be nonzero");
     }
     if (architecture != models::Architecture::Gemma4) {
-        if (options.max_context_auto) {
-            throw std::invalid_argument("--max-context auto is supported only for Gemma4");
-        }
         if (options.gemma4_key_only_kv) {
             throw std::invalid_argument("--gemma4-key-only-kv is supported only for Gemma4");
         }
@@ -73,6 +73,38 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
         }
         if (options.allow_shared_memory) {
             throw std::invalid_argument("--allow-shared-memory is supported only for Gemma4");
+        }
+    }
+    if (!options.lora_path.empty()) {
+        if (architecture != models::Architecture::Qwen3_5) {
+            throw std::invalid_argument("LoRA adapter " + options.lora_path.string() +
+                                        " is refused: Qwen3.8-Flash-Next is a mixture-of-experts model, and Infernix "
+                                        "applies LoRA adapters to the dense Qwen3.5-family models (the 27B) only");
+        }
+        if (offloaded_experts) {
+            throw std::invalid_argument("LoRA adapter " + options.lora_path.string() +
+                                        " is refused: this artifact is a mixture-of-experts model (its experts are "
+                                        "offloaded), and Infernix applies LoRA adapters to the dense Qwen3.5-family "
+                                        "models (the 27B) only");
+        }
+    }
+    // The lossless route computes the model's own forward correctly rounded; a cut is not part of it. Refused here,
+    // before anything loads.
+    if (!options.ablate_sidecar_path.empty() && options.lossless) {
+        throw std::invalid_argument("--ablate does not combine with --lossless (docs/ablate.md)");
+    }
+    // An automatic context takes all the VRAM the KV pool may have: offloaded experts size their cache from what
+    // the fixed allocations leave, so it would starve the expert cache.
+    if (options.max_context_auto) {
+        if (architecture != models::Architecture::Gemma4 &&
+            (architecture != models::Architecture::Qwen3_5 || offloaded_experts)) {
+            throw std::invalid_argument(
+                "--max-context auto sizes one request to the whole KV cache, which offloaded experts share the VRAM "
+                "with (their expert cache would shrink to nothing): give --max-context N (infernix-serve --plan "
+                "reports the largest that fits)");
+        }
+        if (options.purpose != EnginePurpose::Generation) {
+            throw std::invalid_argument("--max-context auto sizes a generation server: causal scoring takes N");
         }
     }
     switch (options.kv_capacity.mode) {
@@ -105,7 +137,10 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
         throw std::invalid_argument("Engine pending request capacity and timeout must be nonzero");
     }
     if (const auto interval = options.context_cache.hybrid.persistent_save_interval; interval.count() != 0) {
-        if (interval.count() < 0) { throw std::invalid_argument("prefix cache save interval must not be negative"); }
+        // Added to a steady_clock time at every save (int64 nanoseconds): past a year it would overflow there.
+        if (interval.count() < 0 || interval > std::chrono::hours(24 * 366)) {
+            throw std::invalid_argument("prefix cache save interval must be in [0, one year]");
+        }
         if (options.context_cache.hybrid.persistent_file.empty()) {
             throw std::invalid_argument("a periodic prefix cache save needs a prefix cache file");
         }
@@ -152,6 +187,35 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
 }
 
 namespace {
+
+// NVIDIA's dense NVFP4 Qwen3.5 exports (the 27B's W4A4 and FP8 layers): no MoE layer, at least one NVFP4 text
+// projection permitted 4-bit activations, and every text projection permitted 4- or 8-bit ones (the head aside)
+// bound to NVFP4 or row-scaled FP8 parents. `--a8-activations` then binds those Uses A8Only
+// (LoadOptions::a8_dense), 8-bit activations at every width; a MoE artifact keeps the flag's expert routes.
+bool dense_a8_artifact(const artifact::Directory& directory) {
+    for (const auto& [name, binding] : directory.bindings) {
+        if (name.starts_with("text/") && name.find("/moe/") != std::string::npos) { return false; }
+    }
+    bool w4a4 = false;
+    for (const auto& [key, use] : directory.uses) {
+        if (!use.parameter.starts_with("text/") || use.parameter == "text/output_head" || !use.activation_policy ||
+            *use.activation_policy == artifact::ActivationPolicy::A16Only) {
+            continue;
+        }
+        const auto binding = directory.bindings.find(use.parameter);
+        if (binding == directory.bindings.end() || binding->second.parts.empty()) { return false; }
+        for (const auto& part : binding->second.parts) {
+            const auto* tensor = std::get_if<artifact::TensorObject>(&directory.objects.at(part.object.index));
+            const bool nvfp4 = tensor != nullptr && (tensor->format == "nvfp4" || tensor->format == "nvfp4_mul");
+            if (!nvfp4 && (tensor == nullptr || (tensor->format != "fp8_e4m3fn_row_bf16" &&
+                                                 tensor->format != "fp8_e4m3fn_row_f32"))) {
+                return false;
+            }
+            w4a4 = w4a4 || (nvfp4 && *use.activation_policy == artifact::ActivationPolicy::AllowA4);
+        }
+    }
+    return w4a4;
+}
 
 // The hybrid index ranks admission sources and values snapshots with the same calibrated
 // prefill and Host-to-Device coefficients as the original cache's ResourceManager.
@@ -210,6 +274,28 @@ std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::st
     out += ";lossless=" + std::to_string(options.lossless ? 1 : 0);
     // The 8-bit activation routes change the KV and state their calls write (decode, short and prefill calls).
     if (options.a8_activations) { out += ";a8"; }
+    const auto stamp = [](const std::filesystem::path& file) {
+        std::error_code e;
+        const auto bytes = std::filesystem::file_size(file, e);
+        const auto when  = std::filesystem::last_write_time(file, e);
+        return std::filesystem::absolute(file).string() + ":" + std::to_string(e ? 0U : bytes) + ":" +
+               std::to_string(e ? 0 : when.time_since_epoch().count());
+    };
+    // A LoRA adapter changes every adapted projection: its weights file and configuration name it as the artifact's
+    // path, size and time do.
+    if (!options.lora_path.empty()) {
+        const std::filesystem::path weights = std::filesystem::is_directory(options.lora_path, error)
+                                                  ? options.lora_path / "adapter_model.safetensors"
+                                                  : options.lora_path;
+        const std::filesystem::path config = weights.parent_path() / "adapter_config.json";
+        out += ";lora=" + stamp(weights) + "|" + stamp(config);
+    }
+    // An ablation sidecar changes the residual writes of every layer it cuts: the sidecar and its direction file name
+    // it the same way.
+    if (!options.ablate_sidecar_path.empty()) {
+        out += ";ablate=" + stamp(options.ablate_sidecar_path) + "|" +
+               stamp(artifact::AblateSidecar::direction_path(options.ablate_sidecar_path));
+    }
     // Tail skip leaves experts out of decode and verification rounds, so the KV and state those rounds wrote
     // (endpoints, continued turns) differ from what a run without it computes, and the reverse.
     if (options.expert_tail_skip != 0) { out += ";tail_skip=" + std::to_string(options.expert_tail_skip); }
@@ -234,8 +320,69 @@ std::size_t free_device_bytes(const VramSnapshot& s) {
     return static_cast<std::size_t>(std::min<std::uint64_t>(s.device_free, left));
 }
 
+// What a start resolves its KV capacity in (kv_available_bytes): an automatic capacity leaves `headroom` of
+// free device memory and, of the OS budget, the expert frames' margin (size_expert_frames) with the retry's
+// extra headroom, so a budget below free memory is not stacked on the display headroom (it cost up to 960 MiB
+// of KV with a display: 24.10 GiB free against 21.88 the budget left planned 20.88, now 21.82). Past the
+// budget (--vram-past-budget) the source's free memory is already the widened budget less usage, whose
+// allowance kept its own margin (kPastBudgetMargin): the headroom alone comes off it, as before.
+std::size_t kv_sizing_bytes(const VramSnapshot& s, bool automatic, std::size_t headroom, std::size_t retry_headroom) {
+    std::optional<std::uint64_t> budget_left;
+    if (s.has_budget && s.budget_allowance == 0) {
+        budget_left = s.local_budget > s.local_usage ? s.local_budget - s.local_usage : 0U;
+    } else if (s.has_budget) {
+        return free_device_bytes(s);
+    }
+    return kv_available_bytes(automatic, s.device_free, budget_left, headroom,
+                              static_cast<std::size_t>(expert_offload::kVramBudgetMarginBytes) + retry_headroom);
+}
+
 std::size_t current_free_device_bytes(int device, bool past_budget) {
     return free_device_bytes(open_vram_budget_source(device, past_budget)->query());
+}
+
+// What stepped growth maps on `device` now, up to `max_bytes`: 64 MiB VMM chunks as the expert frames grow, each
+// mapped only while growth_room covers it and kept only while the spill guard finds it resident (SpillGuard::end),
+// all released after. Under
+// WDDM the OS budget and free memory need not see another process's VRAM, so a resident model's automatic KV sized
+// from them was one allocation that made Windows evict the other process: the 27B NVFP4 at --max-context auto beside
+// a 3 GiB holder resolved 370,304 tokens as on an empty card and the holder's VRAM fell from 3,504 to 416 MiB (RTX
+// 5090, 2026-11-17, issue #68), while the frames' stepped growth stopped where Windows lowered the budget and the
+// holder kept its memory.
+struct GrowthProbe {
+    std::uint64_t bytes = 0;     // what it mapped (max_bytes when nothing stopped it)
+    bool stopped        = false; // growth_room, a refused chunk or a spill stopped it short of max_bytes
+    double milliseconds = 0.0;
+    std::string spill_readings; // a spill stopped it: the readings that found it (SpillGuard::readings)
+};
+
+GrowthProbe probe_growth(int device, VramBudgetSource& source, const expert_offload::GrowthLimit& limit,
+                         std::uint64_t max_bytes) {
+    GrowthProbe out;
+    const auto start        = std::chrono::steady_clock::now();
+    const std::size_t chunk = expert_offload::ExpertResidency::kChunkBytes;
+    const auto chunk_signed = static_cast<std::int64_t>(chunk);
+    VmmArena arena(device, static_cast<std::size_t>(max_bytes), chunk);
+    SpillGuard guard(source);
+    while (arena.mapped_bytes() + chunk <= max_bytes) {
+        guard.begin();
+        if (expert_offload::growth_room(guard.before(), limit) < chunk_signed || !arena.map_chunk()) {
+            out.stopped = true;
+            break;
+        }
+        CUDA_CHECK(cudaMemset(static_cast<std::byte*>(arena.base()) + arena.mapped_bytes() - chunk, 0, chunk));
+        CUDA_CHECK(cudaDeviceSynchronize());
+        if (guard.end(chunk) != 0) {
+            out.spill_readings = guard.readings(chunk);
+            arena.unmap_chunk();
+            out.stopped = true;
+            break;
+        }
+    }
+    out.bytes = out.stopped ? arena.mapped_bytes() : max_bytes;
+    while (arena.mapped_bytes() != 0) { arena.unmap_chunk(); }
+    out.milliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    return out;
 }
 
 // Offloaded experts: an estimate of the expert frames beside `sequence`. A start sizes them from a live
@@ -300,7 +447,7 @@ void plan_qwen3_5_program(EnginePlan& plan, const EngineOptions& options, const 
     vram.workspace_bytes       = sequence.workspace_capacity_bytes();
     vram.graph_allowance_bytes = sequence.graph_allowance_bytes();
     const std::uint64_t reservation = resolution.runtime_reservation_bytes;
-    vram.planned_bytes              = vram.weights_bytes + reservation;
+    vram.planned_bytes              = vram.weights_bytes + planned_beside_weights_bytes(vram) + reservation;
     std::uint64_t used              = reservation + vram.headroom_bytes;
     if (options.context_cache.enabled) {
         plan.ram.host_context_bytes = sequence.host_capacity_bytes();
@@ -309,8 +456,12 @@ void plan_qwen3_5_program(EnginePlan& plan, const EngineOptions& options, const 
         }
     }
     if (offload != nullptr) {
+        // Not yet on the device: the weights and what a start allocates beside them before its frames. On the 122B
+        // that is an --ablate sidecar's direction (12 KiB shared, 576 KiB per layer: under one frame); it takes no
+        // --lora, and its DFlash2 head (hidden size 3072) has no draft screen.
         const OffloadedFrames estimate =
-            estimate_offloaded_frames(*instance.model, sequence, reservation, vram.weights_bytes,
+            estimate_offloaded_frames(*instance.model, sequence, reservation,
+                                      vram.weights_bytes + planned_beside_weights_bytes(vram),
                                       open_vram_budget_source(device.device, options.vram_past_budget)->query(),
                                       *offload, device);
         vram.expert_frames      = estimate.frames;
@@ -362,7 +513,8 @@ void plan_qwen3_5_context(EnginePlan& plan, const EngineOptions& options,
                              std::max(1.0, static_cast<double>(options.rope_yarn_factor));
     const auto upper       = static_cast<std::uint32_t>(
         std::min(positions, static_cast<double>(std::numeric_limits<std::int32_t>::max())));
-    const bool kv_follows = options.kv_capacity.mode == KvCapacityMode::Explicit &&
+    // An automatic context's starting point is no capacity to follow.
+    const bool kv_follows = !options.max_context_auto && options.kv_capacity.mode == KvCapacityMode::Explicit &&
                             options.kv_capacity.explicit_tokens == options.max_context;
     plan.max_context = largest_fitting_context(upper, options.max_context, [&](std::uint32_t context) {
         EngineOptions trial = options;
@@ -476,7 +628,26 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     switch (options.purpose) {
     case EnginePurpose::Generation:
         break;
-    case EnginePurpose::CausalScoring:
+    case EnginePurpose::CausalScoring: {
+        // Scoring runs one teacher-forced call at a time, without speculation, vision, CUDA Graphs or the prefix
+        // cache. A server started for scoring with a generation configuration (the launcher's defaults name lanes
+        // and a drafter) says which of its settings that leaves unused rather than refusing them.
+        std::string ignored;
+        const auto ignore = [&ignored](const std::string& what) { ignored += (ignored.empty() ? "" : ", ") + what; };
+        if (options.max_concurrency > 1) { ignore("--max-concurrency " + std::to_string(options.max_concurrency)); }
+        const SpeculativeOptions& spec = options.speculative;
+        if (spec.backend != SpeculativeBackend::None || spec.backend_auto || !spec.draft_model.empty() ||
+            spec.ngram_draft_tokens != 0 || spec.ngram_draft_tokens_auto) {
+            ignore("speculative decoding (--spec, --draft-model, --ngram-draft-tokens)");
+        }
+        if (options.enable_vision) { ignore("vision"); }
+        if (!options.context_cache.hybrid.persistent_file.empty()) { ignore("--prefix-cache-file"); }
+        if (!ignored.empty()) {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                               "causal scoring runs one request at a time without speculation, vision or the prefix "
+                               "cache: %s unused",
+                               ignored.c_str());
+        }
         options.max_concurrency      = 1;
         options.max_pending_requests = 1;
         options.kv_capacity         = options.max_context_auto ? KvCapacityPolicy::automatic()
@@ -486,6 +657,7 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
         options.use_cuda_graph       = false;
         options.context_cache        = ContextCacheOptions{.enabled = false};
         break;
+    }
     default:
         throw std::invalid_argument("Engine purpose is invalid");
     }
@@ -567,9 +739,8 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
         throw std::invalid_argument("--expert-a4-activations applies to nvidia/Qwen3.8-Flash-Next-FP4-Local only");
     }
     if (options.expert_a16_activations) {
-        if (!qwen4_exp) { throw std::invalid_argument("--a16-activations applies to Qwen3.8-Flash-Next artifacts only"); }
         if (options.expert_a4_activations || options.a8_activations) {
-            throw std::invalid_argument("--a16-activations runs the routed experts with 16-bit activations: it excludes "
+            throw std::invalid_argument("--a16-activations runs with 16-bit activations: it excludes "
                                         "--expert-a4-activations and --a8-activations");
         }
         if (options.lossless) {
@@ -707,10 +878,14 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
         if (!qwen4_exp && !gemma4) {
             // With offloaded experts and a Host tier one slot (candidates §22 VM-03, 2026-10-27): each further slot
             // is 146.5 MiB of the 122B's frames, and the VRAM defaults measured its one-request decode +1.0-1.7 %
-            // with one; its conversations' endpoints restore from the Host tier instead. Resident artifacts keep a
-            // slot per lane (their freed VRAM would be context, not speed, and restores were not measured there).
-            hybrid.device_snapshot_slots = hybrid.device_snapshot_slots.value_or(
-                offloaded_experts && host_tier ? 1U : concurrency + (host_tier ? 1U : 2U));
+            // with one; its conversations' endpoints restore from the Host tier instead. Resident artifacts take one
+            // too since 2026-11-15 (a slot per lane before): the slots' VRAM is KV capacity, and on the 27B at four
+            // lanes one slot against five gave 14,272 more tokens and, where two agent conversations did not fit
+            // the pool together, continuing turns of 1.9 s mean and 9.2 s worst against 2.5-2.6 s and 16.5 s
+            // (hybrid spec §16.13); an image restores from the Host tier in a few milliseconds, pipelined behind
+            // the first pass. Without a Host tier the slots are the only snapshot storage: one per lane and two.
+            hybrid.device_snapshot_slots =
+                hybrid.device_snapshot_slots.value_or(host_tier ? 1U : concurrency + 2U);
         }
         // Taps without a Host tier would evict other conversations' resident snapshots.
         hybrid.max_new_taps = hybrid.max_new_taps.value_or(host_tier ? 8U : 2U);
@@ -780,23 +955,35 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     return options;
 }
 
+namespace {
+
+models::qwen3_5::Frontend instance_frontend(const models::qwen3_5::Model& model, const EngineOptions& options) {
+    return models::qwen3_5::make_frontend(
+        model.resources(),
+        {.chat_template_path       = options.chat_template_path,
+         .grammar_cache_bytes      = options.grammar_cache_bytes,
+         .architecture             = model.config().text.architecture,
+         .vision_enabled           = options.enable_vision,
+         .max_context              = options.max_context,
+         .media_cache_bytes        = options.media_cache_bytes,
+         .media_live_bytes         = options.media_live_bytes,
+         .media_preprocess_threads = options.media_preprocess_threads,
+         .vision_max_merged_tokens = options.vision_max_merged_tokens,
+         .ngram_sources_enabled    = options.speculative.ngram_draft_tokens != 0,
+         .ngram_archive_enabled    = options.speculative.ngram_archive_bytes != 0});
+}
+
+} // namespace
+
 ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
                              const EngineOptions& options)
-    : model(std::move(source)), parameters(*model),
-      frontend(models::qwen3_5::make_frontend(
-          model->resources(),
-          {.chat_template_path       = options.chat_template_path,
-           .grammar_cache_bytes      = options.grammar_cache_bytes,
-           .architecture             = model->config().text.architecture,
-           .vision_enabled           = options.enable_vision,
-           .max_context              = options.max_context,
-           .media_cache_bytes        = options.media_cache_bytes,
-           .media_live_bytes         = options.media_live_bytes,
-           .media_preprocess_threads = options.media_preprocess_threads,
-           .vision_max_merged_tokens = options.vision_max_merged_tokens,
-           .ngram_sources_enabled    = options.speculative.ngram_draft_tokens != 0,
-           .ngram_archive_enabled    = options.speculative.ngram_archive_bytes != 0})),
+    : model(std::move(source)), parameters(*model), frontend(instance_frontend(*model, options)),
       capacity(options.max_context) {}
+
+void ModelInstance::resize_context(const EngineOptions& options) {
+    frontend = instance_frontend(*model, options);
+    capacity = options.max_context;
+}
 
 ModelInstance::~ModelInstance() = default;
 
@@ -814,7 +1001,29 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
     artifact::Reader& reader = *opened;
     inspect.complete();
     StartupPhaseScope binding(options.startup_observer, StartupPhase::TargetPlan);
-    auto plan = models::qwen3_5::plan_load(reader, models::load_options(options, models::Architecture::Qwen3_5));
+    models::LoadOptions load = models::load_options(options, models::Architecture::Qwen3_5);
+    const bool dense_a8      = options.a8_activations && options.fast_paths && !options.lossless &&
+                          dense_a8_artifact(reader.directory());
+    load.a8_dense = dense_a8;
+    auto plan     = models::qwen3_5::plan_load(reader, load);
+    // --a16-activations on an artifact whose text projections permit 4- or 8-bit activations (NVIDIA's NVFP4 and FP8
+    // 27B layers): they run 16-bit instead. The default follows the checkpoint's specification, so the launch says so.
+    if (options.expert_a16_activations) {
+        const auto& uses   = reader.directory().uses;
+        const bool reduced = std::any_of(uses.begin(), uses.end(), [](const auto& entry) {
+            const artifact::Use& use = entry.second;
+            return use.parameter.starts_with("text/") && use.activation_policy &&
+                   *use.activation_policy != artifact::ActivationPolicy::A16Only;
+        });
+        if (reduced) {
+            report_engine(options, DiagnosticLevel::Warning,
+                          "--a16-activations: this artifact's text projections are specified with 4- or 8-bit "
+                          "activations at their calibrated scales (NVIDIA's NVFP4 and FP8 layers, as NVIDIA serves "
+                          "them); they now run with 16-bit activations everywhere, which changes the output and "
+                          "reads prompts more slowly. The default follows the checkpoint's specification and is the "
+                          "recommended configuration");
+        }
+    }
     // Offloaded experts: the VRAM in use before anything is uploaded, for the reproducible route's nominal
     // prefill-chunk fit (offloaded_prefill_lent), as Qwen3.8-Flash-Next takes it.
     std::optional<std::uint64_t> in_use_before_load;
@@ -896,6 +1105,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
         if (expert_ram->tier) {
             auto streamed           = models::load_options(options, models::Architecture::Qwen3_5);
             streamed.stream_experts = true;
+            streamed.a8_dense       = dense_a8;
             plan                    = models::qwen3_5::plan_load(reader, streamed);
         }
         plan.set_host_reserve(options.ram_free_bytes, expert_ram->demand.later_pinned);
@@ -922,6 +1132,10 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
             options.context_cache.host_capacity_bytes =
                 auto_host_context_bytes(expert_offload::plan_host_memory(snapshot, demand));
             set_growth(snapshot, demand);
+            // The tier page-locks RAM down to the reserve, so the process's own pageable memory (its heap, the
+            // driver's pages, the kernel images) is what Windows would trim first under pressure: the growth the
+            // plan counted stays resident, as beside offloaded experts.
+            if (!plan_only) { reserve_expert_working_set(options, demand); }
         }
     }
     // Engine::plan: the pinned block's check (materialize's), the RAM report, and the weights; then the
@@ -956,6 +1170,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
         if (plan.offloaded_experts() && !(expert_ram && expert_ram->tier)) {
             auto streamed           = models::load_options(options, models::Architecture::Qwen3_5);
             streamed.stream_experts = true;
+            streamed.a8_dense       = dense_a8;
             plan                    = models::qwen3_5::plan_load(reader, streamed);
         }
     }
@@ -1034,21 +1249,34 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
             planned->vram.planned_bytes  = dense_bytes;
             return {};
         }
-        if (!plan_only) {
-            spill.emplace(*spill_source);
-            spill->begin();
-        }
+    }
+    // Every start checks that its weights landed in device memory: a resident model's arena is as exposed to
+    // the sysmem fallback as an offloaded one's dense weights, and without the check its spill surfaced only as
+    // a KV sizing failure that did not name the weights. The load page-locks the pinned block and the ladder's
+    // tail mirror meanwhile (its staging slots are released again), which the guard takes off the shared system
+    // memory use it reads.
+    std::uint64_t pinned_in_load = 0;
+    if (!plan_only) {
+        if (!spill_source) { spill_source = open_vram_budget_source(device.device, options.vram_past_budget); }
+        dense_bytes    = plan.materialization().device_capacity_bytes;
+        pinned_in_load = plan.materialization().pinned_capacity_bytes + tail_mirror;
+        spill.emplace(*spill_source);
+        spill->begin();
     }
     if (plan_only && !pinned_refusal.empty()) { plan_refuse(*planned, std::move(pinned_refusal)); }
     auto model = plan_only ? models::qwen3_5::plan_model(std::move(plan))
                           : models::qwen3_5::materialize_model(std::move(plan), device, &options.startup_observer);
     device.synchronize();
     if (spill) {
-        if (const std::uint64_t spilled = spill->end(dense_bytes); spilled != 0) {
-            throw std::runtime_error(std::to_string(spilled >> 20) +
-                                     " MiB of the dense weights were placed in shared system memory by the driver's "
-                                     "sysmem fallback: free VRAM and start again (" + spill->readings(dense_bytes) +
-                                     ")");
+        // The upload's staging slots count as page-locked too: they are released before this reading, but a
+        // release the OS has not yet taken off the process's use must not read as a spill.
+        pinned_in_load += model->storage_stats().peak_staging_bytes;
+        if (const std::uint64_t spilled = spill->end(dense_bytes, pinned_in_load); spilled != 0) {
+            throw std::runtime_error(std::to_string(spilled >> 20) + " MiB of the model's " +
+                                     (expert_ram ? "dense weights" : "weights") + " (" +
+                                     std::to_string(dense_bytes >> 20) +
+                                     " MiB) were placed in shared system memory by the driver's sysmem fallback: free "
+                                     "VRAM and start again (" + spill->readings(dense_bytes) + ")");
         }
     }
     StartupPhaseScope frontend(options.startup_observer, StartupPhase::FrontendInitialize);
@@ -1069,7 +1297,53 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
             }
         }
     }
+    // The native Parameters allocate the DFlash2 full head's screen (models::qwen3_5::execution::Parameters::
+    // draft_screen, 357.6 MB for the 27B's head) outside the weights' arena, after the check above: the same guard
+    // reads its step, so a screen the driver placed in shared system memory fails the start by name instead of
+    // slowing every proposal round.
+    if (spill) { spill->begin(); }
     auto instance = std::make_unique<ModelInstance>(std::move(model), options);
+    // The adapter's VRAM as allocated (or, for Engine::plan, as it would be): the lossless route's layout is larger.
+    if (const auto* lora = instance->model->lora()) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info, "LoRA adapter %s: %s; %llu MiB of VRAM",
+                           lora->adapter->weights_path().parent_path().string().c_str(), lora->describe().c_str(),
+                           static_cast<unsigned long long>((instance->parameters.lora_bytes() + (1U << 20) - 1) >> 20));
+    }
+    // --ablate: the cut applied, and a warning when the sidecar was fitted on another artifact.
+    if (const auto* ablate = instance->model->ablate()) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info, "ablation sidecar %s: %s",
+                           ablate->path.string().c_str(), ablate->describe().c_str());
+        if (const std::string warning = ablate->artifact_mismatch(instance->model->info().artifact_id); !warning.empty()) {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning, "%s", warning.c_str());
+        }
+    }
+    if (spill) {
+        const std::uint64_t screen = instance->parameters.draft_screen.bytes;
+        const std::uint64_t lora   = instance->parameters.allocated_adapter_bytes();
+        const std::uint64_t beside = screen + lora;
+        if (const std::uint64_t spilled = beside != 0 ? spill->end(beside, 0) : 0; spilled != 0) {
+            // --ablate's direction counts beside a LoRA adapter's factors (Parameters::allocated_adapter_bytes).
+            const char* adapter = instance->parameters.lora_factors.bytes != 0 ? "the LoRA adapter's factors"
+                                                                               : "the ablation sidecar's direction";
+            const std::string named = screen != 0 && lora != 0 ? std::string("the DFlash2 draft screen and ") + adapter
+                                      : screen != 0            ? std::string("the DFlash2 draft screen")
+                                                               : std::string(adapter);
+            const char* what = named.c_str();
+            throw std::runtime_error(std::to_string(spilled >> 20) + " MiB of " + what + " (" +
+                                     std::to_string(beside >> 20) +
+                                     " MiB) were placed in shared system memory by the driver's sysmem fallback: free "
+                                     "VRAM and start again (" + spill->readings(beside) + ")");
+        }
+    }
+    // Engine::plan: the device memory beside the weights' arena the Parameters plan (planned_bytes counts it).
+    if (planned != nullptr) {
+        if (const std::uint64_t screen = instance->parameters.draft_screen_bytes(); screen != 0) {
+            planned->vram.draft_screen_bytes = screen;
+        }
+        if (const std::uint64_t adapter = instance->parameters.adapter_bytes(); adapter != 0) {
+            planned->vram.adapter_bytes = adapter;
+        }
+    }
     frontend.complete();
     // --a8-activations (LOSSY, opt-in; design §19.3.31): the 8-bit activation routes of this artifact
     // (models::qwen3_5::A8Routes, which the Program's ExecutionSchedule takes too), in decode and verification calls
@@ -1077,27 +1351,41 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
     if (options.a8_activations) {
         const models::qwen3_5::A8Routes a8 =
             models::qwen3_5::a8_activation_routes(models::qwen3_5::fast_path_configuration(*instance->model, options));
-        if (!a8.any()) {
+        if (!a8.any() && !dense_a8) {
             throw std::invalid_argument(
                 "--a8-activations: no 8-bit activation route applies to this artifact (it covers offloaded experts in "
-                "decode and prefill and a groupwise Q4 MLP gate/up in prefill; the NVFP4 27B's FP8 and NVFP4 "
-                "projections already take the 8- and 4-bit activations their artifact permits)");
+                "decode and prefill, a groupwise Q4 MLP gate/up in prefill, and every NVFP4 and FP8 text projection "
+                "of a dense NVFP4 27B artifact whose NVFP4 projections permit 4-bit activations)");
+        }
+        if (dense_a8) {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                               "--a8-activations (approximate): every NVFP4 and FP8 text projection at every width "
+                               "(NVFP4: int8 codes per 32 values with an FP32 scale; FP8: one E4M3 term); the head "
+                               "and the drafters keep their routes");
         }
         // The CPU-served misses compute the GPU's 8-bit route (offloaded experts: the offload options exist).
         if (a8.experts) { offload_options.value().engine.narrow_a16 = ops::offloaded_moe::NarrowA16::kA8; }
-        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                           "--a8-activations (approximate): %s; every other call keeps its route", a8.describe().c_str());
+        if (a8.any()) {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                               "--a8-activations (approximate): %s; every other call keeps its route",
+                               a8.describe().c_str());
+        }
     }
     std::optional<StartupPhaseScope> planning;
     planning.emplace(options.startup_observer, StartupPhase::TargetFinalize);
     // --draft-tokens auto where its policy does not run: the configuration's fastest fixed length.
+    const FastPath length_policy =
+        options.speculative.backend == SpeculativeBackend::Mtp ? FastPath::AdaptiveMtp : FastPath::AdaptiveDFlash;
+    const bool policy_excluded = std::find(options.fast_path_exclusions.begin(), options.fast_path_exclusions.end(),
+                                           length_policy) != options.fast_path_exclusions.end();
     if (const std::uint32_t fixed = models::qwen3_5::resolve_auto_draft_length(instance->parameters, options)) {
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                            "--draft-tokens auto: each round drafts %u tokens, the fastest fixed length here (%s, "
                            "which adapts the length, %s)",
-                           fixed,
-                           options.speculative.backend == SpeculativeBackend::Mtp ? "adaptive-mtp" : "adaptive-dflash",
-                           options.fast_paths ? "is not qualified for this artifact" : "is off with the fast paths");
+                           fixed, fast_path_name(length_policy),
+                           !options.fast_paths ? "is off with the fast paths"
+                           : policy_excluded   ? "is off (--no-fast-path)"
+                                               : "is not qualified for this artifact");
     }
     // TEMPORARY (MTP drafting package A/B): what the switches resolved to (their values are in the
     // startup log's temporary switches line).
@@ -1125,25 +1413,82 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
         // parameters' derived buffers it did not allocate (the DFlash2 drafter's head screen).
         const VramSnapshot vram_now  = open_vram_budget_source(device.device, options.vram_past_budget)->query();
         const std::size_t free_now   = free_device_bytes(vram_now);
-        const std::size_t free_bytes =
-            plan_only ? planned_free_after_weights(free_now, planned_weights,
-                                                   planned_beside_weights + instance->parameters.planned_device_bytes)
-                      : free_now;
+        // What the capacity resolves in: with a resident model's automatic capacity the display headroom comes
+        // off free device memory and the margin off the OS budget (kv_sizing_bytes); otherwise free_now.
+        const std::size_t sizing_headroom =
+            static_cast<std::size_t>(runtime::expert_offload::display_headroom(vram_now.display, false,
+                                                                              options.vram_headroom_bytes)) +
+            retry_headroom;
+        const std::size_t sizing_now = kv_sizing_bytes(
+            vram_now, !expert_ram && kv_policy.mode == KvCapacityMode::Automatic, sizing_headroom, retry_headroom);
+        std::size_t free_bytes =
+            plan_only ? planned_free_after_weights(sizing_now, planned_weights,
+                                                   planned_beside_weights + instance->parameters.draft_screen_bytes() +
+                                                       instance->parameters.adapter_bytes())
+                      : sizing_now;
+        // Other processes' VRAM by NVML, which counts every process (the OS budget does not): its device-wide use
+        // less this process's; 0 without NVML. On the RTX 5090 it read ~200 MiB on a quiet card (the desktop
+        // window manager's) and ~3,700 MiB beside a 3 GiB holder (2026-11-17).
+        const std::uint64_t others_bytes =
+            vram_now.physical_used > vram_now.local_usage ? vram_now.physical_used - vram_now.local_usage : 0U;
         if (vram_now.has_budget) {
             publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Debug,
-                               "KV sizing: %zu MiB free (cudaMemGetInfo %zu MiB; OS budget %llu MiB, %llu used)",
+                               "KV sizing: %zu MiB free (cudaMemGetInfo %zu MiB; OS budget %llu MiB, %llu used; NVML: "
+                               "every process uses %llu MiB, other processes %llu)",
                                free_now >> 20, vram_now.device_free >> 20,
                                static_cast<unsigned long long>(vram_now.local_budget >> 20),
-                               static_cast<unsigned long long>(vram_now.local_usage >> 20));
+                               static_cast<unsigned long long>(vram_now.local_usage >> 20),
+                               static_cast<unsigned long long>(vram_now.physical_used >> 20),
+                               static_cast<unsigned long long>(others_bytes >> 20));
         }
         // An automatic KV capacity leaves the offloaded models' display headroom (256 MiB with no display on
         // the GPU, 1 GiB with one or when unknown). Measured headless on the 27B and 35B at 4 x 65,536 (RTX
         // 5090, 2026-11-03): the earlier fixed 1 GiB stayed free, and long prefills, decode at four lanes
         // and a constrained tool call took 2 MiB more after startup.
-        const std::size_t headroom =
-            static_cast<std::size_t>(runtime::expert_offload::display_headroom(vram_now.display, false,
-                                                                              options.vram_headroom_bytes)) +
-            retry_headroom;
+        const std::size_t headroom = sizing_headroom;
+        // A resident model's automatic capacity under an OS budget (Windows), while other processes hold more VRAM
+        // than the headroom leaves them, takes only what stepped growth maps at startup (probe_growth), so the
+        // memory they hold stays theirs. The capacity is fixed from then on: it never shrinks after startup.
+        //  - The probe costs ~270 ms (11.8 GiB in 64 MiB steps), so it runs only past the headroom by
+        //    kOthersSlackBytes, which covers NVML's and the budget's differing accounts: a quiet card or the
+        //    desktop alone pay nothing and size as before.
+        //  - An explicit --max-context keeps one request's whole context: below it the probe gives way and Windows
+        //    pages the other program out, as before. --max-context auto takes what fits.
+        //  - Engine::plan cannot allocate, so it keeps the budget's figure: the two differ while the probe acts.
+        constexpr std::uint64_t kOthersSlackBytes = 256ULL << 20;
+        if (!plan_only && !expert_ram && kv_policy.mode == KvCapacityMode::Automatic && vram_now.has_budget &&
+            vram_now.physical_used != 0 && others_bytes > headroom + kOthersSlackBytes && free_bytes > headroom &&
+            VmmArena::supported(device.device)) {
+            const auto source       = open_vram_budget_source(device.device, options.vram_past_budget);
+            const GrowthProbe probe = probe_growth(device.device, *source, expert_offload::GrowthLimit{headroom, 0},
+                                                   free_bytes - headroom);
+            std::size_t probed = static_cast<std::size_t>(probe.bytes) + headroom;
+            if (probe.stopped && !options.max_context_auto) {
+                const auto curve =
+                    models::qwen3_5::make_sequence_planner(instance->parameters, device, options, offload).capacity_curve();
+                const std::uint64_t pages = std::clamp<std::uint64_t>(
+                    (static_cast<std::uint64_t>(options.max_context) + curve.main_page_tokens - 1U) / curve.main_page_tokens,
+                    curve.minimum_main_page_groups, curve.maximum_main_page_groups);
+                probed = std::max(probed, curve.reservation_bytes(static_cast<std::uint32_t>(pages)) + headroom);
+            }
+            if (probe.stopped && probed < free_bytes) {
+                publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                                   "other programs hold %llu MiB of VRAM the OS budget does not show: the automatic KV "
+                                   "capacity takes %zu MiB instead of %zu, so they keep it",
+                                   static_cast<unsigned long long>(others_bytes >> 20), (probed - headroom) >> 20,
+                                   (free_bytes - headroom) >> 20);
+                free_bytes = probed;
+            }
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Debug,
+                               "KV room probe: %zu MiB mapped in 64 MiB steps in %.0f ms%s",
+                               static_cast<std::size_t>(probe.bytes >> 20), probe.milliseconds,
+                               probe.stopped ? ", stopped short" : "");
+            if (!probe.spill_readings.empty()) {
+                publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Debug,
+                                   "KV room probe: a chunk read as placed in system memory stopped it: %s",
+                                   probe.spill_readings.c_str());
+            }
+        }
         // The sequence plan of `trial` (these options at another prefill chunk, for the fit below) with its
         // KV capacity resolved; none when Engine::plan finds no capacity that fits.
         const auto plan_sequence = [&](const EngineOptions& trial)
@@ -1172,9 +1517,17 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
             // whole, an automatic one down to every lane's full context. None fitting keeps chunk-wide steps.
             {
                 const std::uint64_t page_tokens = planner.capacity_curve().main_page_tokens;
-                const std::uint64_t lane_page_groups =
+                std::uint64_t lane_page_groups =
                     static_cast<std::uint64_t>(trial.max_concurrency) *
                     ((static_cast<std::uint64_t>(trial.max_context) + page_tokens - 1U) / page_tokens);
+                // INFERNIX_TMP_IDLE_WIDE_KV_PERCENT: the idle width may also cost that share of the pages.
+                if (const std::int64_t percent =
+                        temporary_switches::integer("INFERNIX_TMP_IDLE_WIDE_KV_PERCENT", 0, 0, 20);
+                    percent != 0) {
+                    lane_page_groups = std::min<std::uint64_t>(
+                        lane_page_groups,
+                        resolution.main_page_groups * static_cast<std::uint64_t>(100 - percent) / 100U);
+                }
                 for (const std::uint32_t width : models::qwen3_5::idle_prefill_widths(instance->parameters, trial)) {
                     auto wide = models::qwen3_5::make_sequence_planner(instance->parameters, device, trial, width, offload);
                     if (const auto fitted = resolve_kv_capacity_beside(kv_policy, wide.capacity_curve(), free_bytes,
@@ -1192,6 +1545,23 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
             }
             return std::pair{std::move(sequence), resolution};
         };
+        // --max-context auto: the largest context whose smallest reservation resolves here (Engine::plan's
+        // answer), so one request may fill the KV pool; every attempt resolves it again, as a retry's larger
+        // headroom leaves fewer pages. The frontend and the Engine's capacity take it.
+        if (options.max_context_auto) {
+            EnginePlan probe;
+            plan_qwen3_5_context(probe, options, instance->parameters, device, offload, free_bytes, headroom);
+            if (!probe.max_context) {
+                throw std::runtime_error("--max-context auto: no context fits beside the weights in the free VRAM");
+            }
+            if (*probe.max_context != options.max_context) {
+                options.max_context = *probe.max_context;
+                instance->resize_context(options);
+            }
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                               "--max-context auto: %u tokens, the largest context the KV cache holds here",
+                               options.max_context);
+        }
         auto planned_sequence = plan_sequence(options);
         if (!planned_sequence) {
             plan_qwen3_5_context(*planned, options, instance->parameters, device, offload, free_bytes, headroom);
@@ -1310,6 +1680,17 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
         instance->program->set_hybrid_coalesce_wait_limit(
             static_cast<double>(options.pending_timeout_ms) / 1000.0 / 2.0);
         const std::filesystem::path& file = options.context_cache.hybrid.persistent_file;
+        // A prefix cache file no longer used leaves its kept SSD file behind, which nothing removes: the start names
+        // each (another running server's is among them, so none is deleted).
+        if (!file.empty() && options.context_cache.ssd_capacity_bytes != 0) {
+            for (const runtime::prefix_cache::KeptSsdFile& other : runtime::prefix_cache::other_kept_ssd_files(
+                     options.context_cache.ssd_directory,
+                     runtime::prefix_cache::kept_ssd_file(options.context_cache.ssd_directory, file))) {
+                publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                                   "SSD prefix cache: %s (%llu MiB) is not used by this server",
+                                   other.path.string().c_str(), static_cast<unsigned long long>(other.bytes >> 20));
+            }
+        }
         if (!file.empty()) {
             const runtime::prefix_cache::PersistResult loaded =
                 instance->program->attach_hybrid_cache_file(
@@ -1341,6 +1722,12 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
     LoadSummary summary;
     summary.architecture = models::architecture_name(instance->model->config().text.architecture);
     summary.model_name   = instance->model->info().name;
+    if (const auto* lora = instance->model->lora()) {
+        summary.lora_adapter = lora->adapter->weights_path().parent_path().string() + ": " + lora->describe();
+    }
+    if (const auto* ablate = instance->model->ablate()) {
+        summary.ablate_sidecar = ablate->path.string() + ": " + ablate->describe();
+    }
     summary.prefill_signature = signature;
     std::set<std::string> formats;
     for (const auto& weight : instance->model->weight_data()) {

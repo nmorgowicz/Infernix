@@ -147,6 +147,36 @@ public:
         return best;
     }
 
+    // The lane this cycle's prefill permit goes to. `runnable` is the residents less the lanes that cannot
+    // run a prefill unit now (the Program blocks their context, or they wait for their grammar while
+    // another lane has work). `priority`, the service turn's owner or a protected recovery, takes the
+    // permit while it prefills or replays and can run; otherwise next_prefill chooses among the lanes that
+    // can. A priority lane that cannot run must not keep the permit: the lane it waits behind (another
+    // lane's layer walk on Qwen3.8-Flash-Next) would never advance, and neither would it. Its turn is not
+    // charged meanwhile (served counts only its own committed progress), so it still gets its whole slice
+    // once it can run.
+    template <class Slots>
+    [[nodiscard]] std::optional<std::uint32_t>
+    prefill_turn(const Slots& runnable, std::uint32_t concurrency,
+                 std::optional<std::uint32_t> priority) const noexcept {
+        if (priority && *priority < concurrency && runnable[*priority] &&
+            (runnable[*priority]->is_prefilling() || runnable[*priority]->is_replaying())) {
+            return priority;
+        }
+        return next_prefill(runnable, concurrency);
+    }
+
+    // Whether a resident has finished and gives its lane and pages back at the next cycle boundary (the
+    // Engine settles terminal requests there). A unit short of capacity waits for that release instead of
+    // pausing a resident for it or reporting a capacity contract error: the releaser exists.
+    template <class Slots>
+    [[nodiscard]] bool release_pending(const Slots& slots, std::uint32_t concurrency) const noexcept {
+        for (std::uint32_t lane = 0; lane < concurrency; ++lane) {
+            if (slots[lane] && slots[lane]->is_model_finished()) { return true; }
+        }
+        return false;
+    }
+
     // After lane `lane`'s unit prefilled or replayed `tokens`: every other lane still prefilling or
     // replaying waited that long.
     template <class Slots>
@@ -273,14 +303,14 @@ public:
     void served(std::uint64_t request, std::uint64_t elapsed_ns) noexcept {
         if (progress_owner() != request) { return; }
         served_ = true;
-        service_ns_ += std::min(elapsed_ns, maximum_service_ns - service_ns_);
+        service_ns_ += std::min(elapsed_ns, service_quantum() - std::min(service_ns_, service_quantum()));
     }
 
     // Replay toward the owner's paused frontier: lengthens its turn (up to maximum_service_ns),
     // never counts as service.
     void recovery_work(std::uint64_t request, std::uint64_t elapsed_ns) noexcept {
         if (progress_owner() == request) {
-            recovery_ns_ += std::min(elapsed_ns, maximum_service_ns - recovery_ns_);
+            recovery_ns_ += std::min(elapsed_ns, service_quantum() - std::min(recovery_ns_, service_quantum()));
         }
     }
 
@@ -290,7 +320,7 @@ public:
     // next admitted request takes the turn. Returns whether the turn ended.
     bool advance_service(bool have_paused, bool recovering) noexcept {
         if (!pressure_ || recovering || !served_) { return false; }
-        if (service_ns_ < std::max(service_quantum_ns, recovery_ns_) && service_order_.size() > 1) {
+        if (service_ns_ < std::max(service_quantum(), recovery_ns_) && service_order_.size() > 1) {
             return false;
         }
         if (!have_paused && (!contended_ || service_order_.size() <= 1)) {
@@ -313,16 +343,26 @@ public:
         begin_admission_scan();
     }
 
-    // The resident a pressure turn pauses for its owner: the youngest one that is not the owner,
-    // not binding, not finished and not protecting a Native recovery, outside `excluded` (lanes
-    // that could not pause). None without a turn.
-    template <class Slots>
+    // Every pause costs the same (tests and callers without a Program).
+    struct UniformPauseCost {
+        [[nodiscard]] constexpr std::uint32_t operator()(std::uint32_t) const noexcept { return 0; }
+    };
+
+    // The resident a pressure turn pauses for its owner, among those that are not the owner, not
+    // binding, not finished and not protecting a Native recovery, outside `excluded` (lanes that
+    // could not pause): the one whose pause costs the fewest tokens to recompute on resume
+    // (`replay(lane)`, the Program's pause_replay_tokens: none where the pause publishes the lane's
+    // state at its frontier, from the deepest snapshot where it cannot, as a Qwen3.5 prefill whose
+    // DFlash2 ring is not whole), the youngest among equals. None without a turn.
+    template <class Slots, class Replay = UniformPauseCost>
     [[nodiscard]] std::optional<std::uint32_t>
     preemption_victim(const Slots& slots, std::uint32_t concurrency,
-                      std::span<const std::uint32_t> excluded = {}) const noexcept {
+                      std::span<const std::uint32_t> excluded = {},
+                      const Replay& replay = {}) const noexcept {
         const auto owner = progress_owner();
         if (!owner) { return std::nullopt; }
-        std::optional<std::uint32_t> youngest;
+        std::optional<std::uint32_t> chosen;
+        std::uint32_t chosen_cost = 0;
         for (std::uint32_t lane = 0; lane < concurrency; ++lane) {
             const auto& request = slots[lane];
             if (!request || request->id == *owner || request->is_materializing() ||
@@ -330,15 +370,27 @@ public:
                 std::find(excluded.begin(), excluded.end(), lane) != excluded.end()) {
                 continue;
             }
-            if (!youngest || request->id > slots[*youngest]->id) { youngest = lane; }
+            const std::uint32_t cost = replay(lane);
+            if (!chosen || cost < chosen_cost ||
+                (cost == chosen_cost && request->id > slots[*chosen]->id)) {
+                chosen      = lane;
+                chosen_cost = cost;
+            }
         }
-        return youngest;
+        return chosen;
     }
 
-    // A turn grants at least one second of useful execution; an expensive restore earns up to
-    // four seconds to amortize its Replay or transfer, a finite bound either way.
-    static constexpr std::uint64_t service_quantum_ns = 1'000'000'000;
-    static constexpr std::uint64_t maximum_service_ns = 4 * service_quantum_ns;
+    // A turn grants 30 seconds of useful execution before it passes (the owner's choice, 2026-11-16, candidates
+    // QN-01): every switch costs a pause and a resume, and with one-second turns (up to four after an expensive
+    // restore) two long requests that could not both fit paused each other in turn, 4 + 4 to 9 + 9 pauses a
+    // replay run. A restore's Replay no longer lengthens a turn past it.
+    static constexpr std::uint64_t service_quantum_ns = 30'000'000'000;
+    static constexpr std::uint64_t maximum_service_ns = service_quantum_ns;
+    // The turn in force: service_quantum_ns, or an engine-level test's (testing::service_quantum_ns).
+    [[nodiscard]] static std::uint64_t service_quantum() noexcept {
+        const std::uint64_t test = testing::service_quantum_ns().load(std::memory_order_relaxed);
+        return test != 0 ? test : service_quantum_ns;
+    }
 
 private:
     template <class R>

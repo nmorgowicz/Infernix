@@ -10,10 +10,17 @@
 //   exact    Both requests publish to the prefix cache: the pause publishes the younger one's
 //            state at its frontier and the resume restores it, so both outputs equal their solo
 //            runs (greedy) and the younger request reports a snapshot restore.
-//   replay   The younger request does not publish (allow_prefix_reuse = false): its resume replays
-//            the ledger from the root without sampling. Its output keeps every token committed
-//            before the pause, completes at full length and reports a replay restore; the tokens
-//            after the pause may differ from the solo run (prefill arithmetic), which is reported.
+//   replay   Neither request publishes (allow_prefix_reuse = false), so the paused one resumes by
+//            replaying its ledger from the root without sampling. Which one is paused is the turn's:
+//            the request first refused a unit owns it and pauses the other, the one whose pause
+//            recomputes the fewest tokens (both replay here; resource-scheduling, "Service turns"),
+//            and which lane is refused first depends on how its prefill and the other's rounds
+//            interleave in time. (With the older request publishing, the younger one was expected
+//            to be paused; when the younger one owned the turn the older one, whose pause recomputes
+//            nothing, was paused instead, and the replay went unexercised: 2026-11-17, 5 of 5 MTP runs.)
+//            The paused request's output keeps every token committed before the pause, completes at
+//            full length and reports a replay restore; the tokens after the pause may differ from the
+//            solo run (prefill arithmetic), which is reported. The other one equals its solo run.
 //
 // The DFlash2 mode (INFERNIX_QWEN4_DFLASH2 names the drafter companion) adds dflash2-pairs: the two
 // residents decode in two-row DFlash2 rounds until the pause, so the exact scenario also checks that
@@ -29,8 +36,12 @@
 // that reads them without waiting for that restore would read them before they land every time, not only when the
 // copy happens to lose the race (an exact resume decodes at once, with no prefill call to wait per layer).
 //
-//   infernix_qwen4_exp_preemption_real_test [--mtp] [--plain] [--dflash2]
-//   (default: plain and MTP, and DFlash2 when INFERNIX_QWEN4_DFLASH2 is set)
+//   penalties (plain mode) Chat turns thinking under a 16-token budget, greedy with presence and frequency penalties:
+//            the forced thinking-close tokens count toward the penalties alike live and in a resume's rebuilt counts,
+//            so the paused B equals its solo run.
+//
+//   infernix_qwen4_exp_preemption_real_test [--mtp] [--plain] [--dflash2] [--penalties]
+//   (default: plain, penalties and MTP, and DFlash2 when INFERNIX_QWEN4_DFLASH2 is set)
 
 #include "kv_cache_storage.h"
 #include "models/qwen4_exp/program/prefix/test_taps.h"
@@ -44,6 +55,7 @@
 #include <exception>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -168,27 +180,37 @@ int run_mode(const char* artifact, const char* ngram, Mode mode, const char* dra
         failures += check(rb.scheduling.preemptions == 0 || rb.scheduling.snapshot_restores >= 1,
                           "a paused publishing request resumes from its published state");
     }
-    // replay: B publishes nothing, so its resume replays the ledger from the root.
+    // replay: neither publishes, so the paused one's resume replays its ledger from the root.
     {
-        auto a = engine.submit(engine.prepare_tokens(prompt_a), greedy(true));
+        auto a = engine.submit(engine.prepare_tokens(prompt_a), greedy(false));
         auto b = engine.submit(engine.prepare_tokens(prompt_b), greedy(false));
         const infernix::GenerationResult ra = a.wait();
         const infernix::GenerationResult rb = b.wait();
-        const std::size_t kept = common_prefix(rb.generated_token_ids, solo_b);
-        std::printf("  replay: A preemptions %llu (snapshot restores %llu, replay restores %llu); B preemptions %llu, "
-                    "replay restores %llu, replayed tokens %llu, tokens equal to solo %zu of %zu\n",
+        std::printf("  replay: A preemptions %llu (replay restores %llu, replayed tokens %llu, tokens equal to solo %zu); "
+                    "B preemptions %llu (replay restores %llu, replayed tokens %llu, tokens equal to solo %zu)\n",
                     static_cast<unsigned long long>(ra.scheduling.preemptions),
-                    static_cast<unsigned long long>(ra.scheduling.snapshot_restores),
                     static_cast<unsigned long long>(ra.scheduling.replay_restores),
+                    static_cast<unsigned long long>(ra.scheduling.replayed_tokens),
+                    common_prefix(ra.generated_token_ids, solo_a),
                     static_cast<unsigned long long>(rb.scheduling.preemptions),
                     static_cast<unsigned long long>(rb.scheduling.replay_restores),
-                    static_cast<unsigned long long>(rb.scheduling.replayed_tokens), kept, rb.generated_token_ids.size());
-        failures += check(ra.generated_token_ids == solo_a, "A equals its solo run (first difference at " +
-                                                                std::to_string(common_prefix(ra.generated_token_ids, solo_a)) + ")");
-        failures += check(rb.scheduling.preemptions >= 1, "B is paused");
-        failures += check(rb.scheduling.replay_restores >= 1 && rb.scheduling.replayed_tokens >= kPrompt,
-                          "B resumes by replaying its ledger");
-        failures += check(rb.generated_token_ids.size() == kOutputs, "B completes every token");
+                    static_cast<unsigned long long>(rb.scheduling.replayed_tokens),
+                    common_prefix(rb.generated_token_ids, solo_b));
+        failures += check(ra.scheduling.preemptions + rb.scheduling.preemptions >= 1, "the shared pool forces a pause");
+        for (const auto& [label, result, solo] :
+             {std::tuple<const char*, const infernix::GenerationResult&, const std::vector<infernix::TokenId>&>{"A", ra, solo_a},
+              std::tuple<const char*, const infernix::GenerationResult&, const std::vector<infernix::TokenId>&>{"B", rb, solo_b}}) {
+            if (result.scheduling.preemptions >= 1) {
+                failures += check(result.scheduling.replay_restores >= 1 && result.scheduling.replayed_tokens >= kPrompt,
+                                  std::string(label) + ", paused, resumes by replaying its ledger");
+                failures += check(result.generated_token_ids.size() == kOutputs,
+                                  std::string(label) + ", paused, completes every token");
+            } else {
+                failures += check(result.generated_token_ids == solo,
+                                  std::string(label) + ", never paused, equals its solo run (first difference at " +
+                                      std::to_string(common_prefix(result.generated_token_ids, solo)) + ")");
+            }
+        }
     }
     return failures;
 }
@@ -257,6 +279,95 @@ int run_prompt_pause(const char* artifact, const char* ngram) {
     return failures;
 }
 
+// A chat turn of about kPrompt tokens that opens in thinking (a user message of synthetic words).
+infernix::PreparedPrompt thinking_turn(const infernix::Engine& engine, std::uint32_t seed) {
+    std::uint32_t state = seed * 2654435761U + 7U;
+    std::string text    = "Summarize these words:";
+    for (;;) {
+        for (int i = 0; i < 40; ++i) {
+            state = state * 1664525U + 1013904223U;
+            text += " w" + std::to_string((state >> 8U) % 5000U);
+        }
+        infernix::PromptInput input;
+        infernix::ChatMessage user;
+        user.role = infernix::ChatRole::User;
+        user.parts.push_back(infernix::MessagePart{.kind = infernix::MessagePartKind::Text, .text = text, .media = {}});
+        input.messages.push_back(std::move(user));
+        input.options.enable_thinking = true;
+        infernix::PreparedPrompt prepared = engine.prepare(std::move(input));
+        if (prepared.summary().prompt_tokens >= kPrompt - 64) { return prepared; }
+    }
+}
+
+// penalties  (plain mode) The exact scenario on chat turns that think under a 16-token budget, decoding greedily
+//            with presence and frequency penalties: the Engine forces each turn's thinking close (forced tokens)
+//            early, B is paused after them and resumes from its published state, its penalty counts rebuilt from its
+//            history, and B must equal its solo run, whose counts took the forced tokens as they were appended. A
+//            chat prompt's publication plants taps at its message boundaries, which split its prefill calls, so the
+//            solo references publish as well, on a cold cache of their own (a first Engine; the two prompts share no
+//            cache block): the pair (a second Engine, also cold) then runs the same call grids.
+int run_penalty_pause(const char* artifact, const char* ngram) {
+    std::printf("== plain decode, penalties and forced thinking-close tokens across a pause\n");
+    infernix::EngineOptions options;
+    options.artifact_path = artifact;
+    if (ngram != nullptr) { options.ngram_volume_path = ngram; }
+    options.max_context                       = 4096;
+    options.kv_capacity                       = infernix::KvCapacityPolicy::explicit_capacity(2560);
+    options.prefill_chunk                     = 512;
+    const char* kv                            = std::getenv("INFERNIX_QWEN4_KV");
+    options.kv_cache                          = kv != nullptr ? infernix::test::parse_kv_cache_storage(kv)
+                                                              : infernix::KvCacheStorage::Int8Group64;
+    options.expert_a4_activations             = std::getenv("INFERNIX_QWEN4_EXPERT_A4") != nullptr;
+    options.max_concurrency                   = 2;
+    options.max_pending_requests              = 4;
+    options.context_cache.host_capacity_bytes = 2ULL << 30;
+    options.fast_paths                        = false;
+    options.fast_path_candidates = {infernix::FastPath::Preemption, infernix::FastPath::FreeCacheResume};
+    // The forced text is common words, so whether its tokens count changes what the penalties let greedy decoding
+    // pick after it (the built-in close alone did not: B's tokens were the same either way).
+    options.thinking_budget_message = "The answer is the list, and the words of the list are the answer. So the answer "
+                                      "is: the words, the list, and the answer.";
+    const auto request = [] {
+        infernix::RequestOptions out             = greedy(true);
+        out.execution.sampling.presence_penalty  = 1.0F;
+        out.execution.sampling.frequency_penalty = 0.5F;
+        out.execution.thinking.budget            = 16;
+        return out;
+    };
+    int failures = 0;
+    infernix::GenerationResult solo_a, solo_b;
+    {
+        infernix::Engine engine(options, infernix::test::engine_host());
+        solo_a = engine.generate(thinking_turn(engine, 31U), request());
+        solo_b = engine.generate(thinking_turn(engine, 32U), request());
+    }
+    failures += check(solo_b.thinking.injected_tokens > 0, "the thinking budget forces B's thinking close (" +
+                                                               std::to_string(solo_b.thinking.injected_tokens) + " tokens)");
+    infernix::Engine engine(options, infernix::test::engine_host());
+    const RestoreDelay delay;
+    auto a                              = engine.submit(thinking_turn(engine, 31U), request());
+    auto b                              = engine.submit(thinking_turn(engine, 32U), request());
+    const infernix::GenerationResult ra = a.wait();
+    const infernix::GenerationResult rb = b.wait();
+    std::printf("  penalties: A preemptions %llu; B preemptions %llu (snapshot restores %llu, replay restores %llu), "
+                "B forced tokens %u, B reused %u prompt tokens\n",
+                static_cast<unsigned long long>(ra.scheduling.preemptions),
+                static_cast<unsigned long long>(rb.scheduling.preemptions),
+                static_cast<unsigned long long>(rb.scheduling.snapshot_restores),
+                static_cast<unsigned long long>(rb.scheduling.replay_restores), rb.thinking.injected_tokens,
+                rb.reused_prompt_tokens);
+    failures += check(ra.scheduling.preemptions + rb.scheduling.preemptions >= 1, "the shared pool forces a pause");
+    failures += check(rb.scheduling.preemptions == 0 || rb.scheduling.snapshot_restores >= 1,
+                      "a paused B resumes from its published state");
+    failures += check(ra.generated_token_ids == solo_a.generated_token_ids,
+                      "A equals its solo run (first difference at " +
+                          std::to_string(common_prefix(ra.generated_token_ids, solo_a.generated_token_ids)) + ")");
+    failures += check(rb.generated_token_ids == solo_b.generated_token_ids,
+                      "B equals its solo run across its pause (first difference at " +
+                          std::to_string(common_prefix(rb.generated_token_ids, solo_b.generated_token_ids)) + ")");
+    return failures;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -268,14 +379,15 @@ int main(int argc, char** argv) {
     const char* ngram   = std::getenv("INFERNIX_QWEN4_NGRAM");
     const char* drafter = std::getenv("INFERNIX_QWEN4_DFLASH2");
     const bool has_drafter = drafter != nullptr && *drafter != '\0';
-    bool plain = true, mtp = true, dflash2 = has_drafter;
+    bool plain = true, mtp = true, dflash2 = has_drafter, penalties = true;
     if (argc > 1) {
-        plain = mtp = dflash2 = false;
+        plain = mtp = dflash2 = penalties = false;
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
             if (arg == "--plain") { plain = true; }
             if (arg == "--mtp") { mtp = true; }
             if (arg == "--dflash2") { dflash2 = true; }
+            if (arg == "--penalties") { penalties = true; }
         }
     }
     if (dflash2 && !has_drafter) {
@@ -288,6 +400,7 @@ int main(int argc, char** argv) {
             failures += run_mode(artifact, ngram, Mode::Plain);
             failures += run_prompt_pause(artifact, ngram);
         }
+        if (penalties) { failures += run_penalty_pause(artifact, ngram); }
         if (mtp) { failures += run_mode(artifact, ngram, Mode::Mtp); }
         if (dflash2) { failures += run_mode(artifact, ngram, Mode::DFlash2Pairs, drafter); }
         std::printf(failures == 0 ? "all preemption checks passed\n" : "%d preemption check(s) failed\n", failures);

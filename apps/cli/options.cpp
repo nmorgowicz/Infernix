@@ -83,6 +83,8 @@ constexpr std::array kCliOptions{
     CliOption{"--prompt"},
     CliOption{"--messages"},
     CliOption{"--chat-template"},
+    CliOption{"--lora"},
+    CliOption{"--ablate"},
     CliOption{"--ngram-volume"},
     CliOption{"--ngram-residency"},
     CliOption{"--expert-state"},
@@ -201,7 +203,8 @@ std::string usage_text(const char* argv0) {
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
-           "       [--chat-template FILE] [--ngram-volume FILE] [--ngram-residency auto|ram|volume]\n"
+           "       [--chat-template FILE] [--lora PATH] [--ablate FILE] [--ngram-volume FILE]\n"
+           "       [--ngram-residency auto|ram|volume]\n"
            "       [--expert-state FILE|off] [--expert-stripe FILE] [--expert-a4-activations] [--a16-activations]\n"
            "       [--a8-activations]\n"
            "       [--embedding-host]\n"
@@ -231,8 +234,9 @@ std::string usage_text(const char* argv0) {
            "\n"
            "CONTEXT\n"
            "  --max-context N|auto     max context tokens (default 2048); numeric stays fixed\n"
-           "                           Gemma4 auto fits resident VRAM less headroom, page\n"
-           "                           aligned, 9216..131072/native; needs --kv-capacity auto\n"
+           "                           auto sizes resident Qwen3.5 to its KV cache; Gemma4\n"
+           "                           fits resident VRAM less headroom, page aligned,\n"
+           "                           9216..131072/native and needs --kv-capacity auto\n"
            "  --rope-yarn-factor F     startup-fixed YaRN, finite [1,4] (default 1);\n"
            "                           extends allowed ceiling only, not --max-context\n"
            "  --prefill-chunk N|auto   positive multiple of 128; auto is Gemma4-only\n"
@@ -340,10 +344,11 @@ std::string usage_text(const char* argv0) {
            "                           (qualification runs; repeatable)\n"
            "  --no-fast-path NAME      leave this selected fast path out of the default\n"
            "                           route (leave-one-out measurements; repeatable)\n"
-           "  --a16-activations        Qwen3.8-Flash-Next artifacts whose routed experts are\n"
-           "                           NVIDIA's W4A4 NVFP4 (Dense8, recipe A): run them with\n"
-           "                           16-bit activations instead of the checkpoint's 4-bit\n"
-           "                           ones. Changes the output; the default is recommended\n"
+           "  --a16-activations        16-bit activations where the checkpoint specifies fewer\n"
+           "                           bits: Flash-Next routed experts that are NVIDIA's W4A4\n"
+           "                           NVFP4 (Dense8, recipe A, NVFP4-QAD and its shared\n"
+           "                           experts), and the NVFP4 and FP8 layers of NVIDIA's NVFP4\n"
+           "                           Qwen3.8-27B. Changes the output; the default is recommended\n"
            "  --expert-a4-activations  nvidia/Qwen3.8-Flash-Next-FP4-Local only: run its\n"
            "                           routed experts with 4-bit (NVFP4) activations, using\n"
            "                           the activation scales NVIDIA calibrated for them.\n"
@@ -356,7 +361,9 @@ std::string usage_text(const char* argv0) {
            "                           llama.cpp's Q8_1), and prefill calls of GGUF dense\n"
            "                           projections and those experts (the same codec), a\n"
            "                           groupwise Q4 MLP gate/up (int8 per token) and MXFP8\n"
-           "                           dense projections (two E4M3 terms per 32 values). A\n"
+           "                           dense projections (two E4M3 terms per 32 values).\n"
+           "                           The NVFP4 Qwen3.8-27B artifacts: every NVFP4 and FP8 text\n"
+           "                           projection 8-bit at every width (a precision option). A\n"
            "                           GGUF import's BF16 hyper-connection matrices become\n"
            "                           8-bit at load. Other calls keep their routes.\n"
            "                           Approximate: changes the output; --reproducible and\n"
@@ -390,6 +397,13 @@ std::string usage_text(const char* argv0) {
            "  --draft-model FILE       Qwen3.8-Flash-Next dflash2 (or auto): the DFlash2\n"
            "                           drafter's companion artifact (auto finds one alone\n"
            "                           beside the model; Qwen3.5/3.6 artifacts bundle theirs)\n"
+           "  --lora PATH              apply a LoRA adapter at runtime: a Hugging Face PEFT\n"
+           "                           adapter directory (or its adapter_model.safetensors,\n"
+           "                           adapter_config.json beside it); Qwen3.5 dense models\n"
+           "                           (the 27Bs); --lossless computes it as PEFT does (docs/lora.md)\n"
+           "  --ablate FILE            apply an ablation sidecar at runtime: its sidecar.json,\n"
+           "                           the direction file beside it; Qwen families only\n"
+           "                           (docs/ablate.md)\n"
            "  --lm-head-draft          use the optimized proposal head\n"
            "  --spec-min-p P           mtp (on Qwen3.8-Flash-Next with a fixed --draft-tokens N\n"
            "                           only), Qwen3.8-Flash-Next dflash2: one-request rounds\n"
@@ -483,6 +497,10 @@ Options parse_options(int argc, char** argv) {
             options.prompt = value(arg);
         } else if (arg == "--chat-template") {
             options.chat_template_path = value(arg);
+        } else if (arg == "--lora") {
+            options.lora_path = value(arg);
+        } else if (arg == "--ablate") {
+            options.ablate_sidecar_path = value(arg);
         } else if (arg == "--ngram-volume") {
             options.ngram_volume_path = value(arg);
         } else if (arg == "--ngram-residency") {
@@ -744,8 +762,9 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("select only one of --grammar-file, --json-object, "
                                     "--json-schema-file, --regex or --choice");
     if (!kv_capacity_explicit) {
+        // An automatic context takes the KV pool it sizes.
         options.kv_capacity = options.max_context_auto ? KvCapacityPolicy::automatic()
-                                                      : KvCapacityPolicy::explicit_capacity(options.max_context);
+                                                       : KvCapacityPolicy::explicit_capacity(options.max_context);
     }
 
     const bool has_prompt   = !options.prompt.empty();
@@ -758,9 +777,6 @@ Options parse_options(int argc, char** argv) {
     }
     if (options.prefill_split_workspace_mib > kMaximumPrefillSplitWorkspaceMiB) {
         throw std::invalid_argument("--prefill-split-workspace-mib must be in [0,16384]");
-    }
-    if (options.max_context_auto && options.kv_capacity.mode != KvCapacityMode::Automatic) {
-        throw std::invalid_argument("--max-context auto requires --kv-capacity auto");
     }
     if (!options.max_context_auto && options.kv_capacity.mode == KvCapacityMode::Explicit &&
         options.kv_capacity.explicit_tokens < options.max_context) {

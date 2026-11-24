@@ -144,6 +144,8 @@ int main() {
                    .handoff_active_bytes    = 0,
                    .handoff_peak_bytes      = 150,
     };
+    memory.draft_screen_bytes                = 357;
+    memory.adapter_bytes                     = 304;
     memory.minimum_runtime_reservation_bytes = 1300;
     memory.kv_capacity_increment_bytes       = 100;
     memory.runtime_reservation_bytes         = 1600;
@@ -181,6 +183,8 @@ int main() {
         check(server.at("artifact").at("formats") == Json::array({"q4_g64_fp16", "q8_g32_fp16"}),
               "server weights id missing");
     failures += check(server.at("artifact").at("size_bytes") == 123456, "artifact size missing");
+    failures += check(server.at("artifact").at("ablate_sidecar").is_null(),
+                      "server_start names no ablation sidecar when none was applied");
     failures += check(server.at("engine").at("max_context") == 262144, "max context missing");
     failures += check(server.at("engine").at("kv_capacity") == 524288, "KV capacity missing");
     failures += check(server.at("engine").at("kv_capacity_mode") == "explicit" &&
@@ -281,6 +285,9 @@ int main() {
                           server.at("memory").at("vram_headroom_bytes") == 0 &&
                           server.at("memory").at("planned_slack_bytes") == 100,
                       "adaptive KV memory ledger missing");
+    failures += check(server.at("memory").at("draft_screen_bytes") == 357 &&
+                          server.at("memory").at("adapter_bytes") == 304,
+                      "server_start memory names the draft screen and the LoRA adapter beside the weights");
     failures += check(!server.at("memory").contains("host_context_capacity_bytes"),
                       "the removed Host context ledger is still reported");
     failures += check(server.dump().find("must-not-appear") == std::string::npos,
@@ -609,6 +616,26 @@ int main() {
                       "the log line does not show cached blocks left without a resumable state");
     failures += check(render_request_done(context, outcome).message.find("in cached blocks") == std::string::npos,
                       "a resumed request was reported as missing a resumable state");
+    // A large re-prefill's cause shows in the line: the client changed the history, or the cache lost it.
+    GenerationOutcome diverged = stateless;
+    diverged.prefix_miss       = PrefixMiss{.kind                 = PrefixMiss::Kind::Diverged,
+                                            .common_prefix_tokens = 12345,
+                                            .lost_reuse_tokens    = 9000};
+    failures += check(render_request_done(context, diverged)
+                              .message.find("tok recomputed) | miss diverged at 12,345, 9,000 tok recomputed | TTFT") ==
+                          std::string::npos &&
+                          render_request_done(context, diverged).message.find(
+                              "no state to resume) | miss diverged at 12,345, 9,000 tok recomputed | TTFT") !=
+                              std::string::npos,
+                      "the log line does not name a diverged history");
+    GenerationOutcome evicted = stateless;
+    evicted.prefix_miss       = PrefixMiss{
+              .kind = PrefixMiss::Kind::Evicted, .common_prefix_tokens = 71000, .lost_reuse_tokens = 60000};
+    failures += check(render_request_done(context, evicted).message.find(
+                          " | miss evicted, shared 71,000, 60,000 tok recomputed | ") != std::string::npos,
+                      "the log line does not name an evicted history");
+    failures += check(render_request_done(context, outcome).message.find(" | miss ") == std::string::npos,
+                      "a request without a miss record names one");
     failures += check(done.at("result").at("thinking_budget") == 256 &&
                           done.at("result").at("model_thinking_tokens") == 256 &&
                           done.at("result").at("thinking_control_tokens") == 19 &&
@@ -944,8 +971,9 @@ int main() {
         check(pretty_throughput ==
                   "throughput | 2.0s | prefill 50.0 tok/s (100 tok) | decode 20.0 tok/s (40 tok) | "
                   "running 2 (prefill 1, decode-ready 1) | waiting 3 | paused 2 | replaying 1 | "
-                  "materializing 1 | terminal-pending 1 | batch 1.80 | host 0.8% (15.0 ms)",
-              "pretty throughput record mismatch");
+                  "materializing 1 | terminal-pending 1 | pauses 3, resumes 1 from snapshot, 2 by replay "
+                  "(768 tok replayed, 88.5% of prefill) | batch 1.80 | host 0.8% (15.0 ms)",
+              ("pretty throughput record mismatch: " + pretty_throughput).c_str());
     ThroughputReport single_decode;
     single_decode.interval_seconds                     = 5.000168;
     single_decode.committed_decode_tokens              = 1025;
@@ -960,8 +988,25 @@ int main() {
                 "throughput | 5.0s | decode 205.0 tok/s (1,025 tok) | running 1 (decode-ready 1) | "
                 "batch 1.00 | host 1.4% (69.2 ms)" &&
             single_decode_pretty.find("prefill") == std::string::npos &&
-            single_decode_pretty.find("waiting") == std::string::npos,
+            single_decode_pretty.find("waiting") == std::string::npos &&
+            single_decode_pretty.find("pauses") == std::string::npos,
         "single-request pretty throughput is noisy or incomplete");
+    // Recovery over the interval: pauses, resumes by kind, and Replay's share of all prefill work.
+    ThroughputReport recovery;
+    recovery.interval_seconds           = 2.0;
+    recovery.computed_prefill_tokens    = 3000;
+    recovery.previous.preemptions       = 4;
+    recovery.current.preemptions        = 7;
+    recovery.previous.snapshot_restores = 3;
+    recovery.current.snapshot_restores  = 5;
+    recovery.previous.replay_restores   = 1;
+    recovery.current.replay_restores    = 2;
+    recovery.previous.replayed_tokens   = 500;
+    recovery.current.replayed_tokens    = 1500;
+    const std::string recovery_pretty   = render_throughput(recovery).message;
+    failures += check(recovery_pretty.find(" | pauses 3, resumes 2 from snapshot, 1 by replay (1,000 tok replayed, "
+                                           "25.0% of prefill) | ") != std::string::npos,
+                      ("pretty throughput lacks the interval's recovery: " + recovery_pretty).c_str());
     const Json throughput_json =
         Json::parse(format_throughput_json("serve-test", 5000, throughput));
     failures += check(throughput_json.at("event") == "throughput", "throughput event mismatch");
@@ -1226,6 +1271,38 @@ int main() {
     failures += check(!std::filesystem::exists(rotated(1)) && unkept_records.size() == 1 &&
                           unkept_records[0].at("event") == "server_start",
                       "keep 0 retained a rotated file or lost the server_start record");
+
+#ifdef _WIN32
+    // A rotation that cannot move the full file (another process holds it open without delete sharing, as an MSVC
+    // ifstream does) touches no retained file: PATH.1 survives, and the log keeps appending (audit 2026-11-17
+    // SS-01; with keep 1 every failed attempt used to delete the only retained file).
+    reset_rotation_dir();
+    {
+        JsonlRequestLog held(rotation_log.string(), {}, {},
+                             RequestLogRotation{.max_bytes = server_start_bytes + request_bytes / 2, .keep = 1});
+        write_server_start(held);
+        write_request(held, 1);
+        write_request(held, 2); // rotated: PATH.1 is the first full file
+        std::ifstream holder(rotation_log);
+        write_request(held, 3);
+        write_request(held, 4); // past the limit while held: the rotation fails
+        holder.close();
+    }
+    failures += check(std::filesystem::exists(rotated(1)) && !read_records(rotated(1)).empty() &&
+                          !read_records(rotation_log).empty(),
+                      "a failed rotation removed the retained file");
+#endif
+
+    // A string that is not UTF-8 (a path or an argv in the Windows ANSI code page) is logged with replacement
+    // characters instead of throwing out of the formatter (audit 2026-11-17 SS-02).
+    {
+        const std::string ansi = std::string("cannot open E:\\Mod") + static_cast<char>(0xE8) + "les\\m.infernix";
+        bool parsed = false;
+        try {
+            parsed = Json::parse(format_request_error_json("serve-test", 1, context, ansi)).is_object();
+        } catch (const std::exception&) {}
+        failures += check(parsed, "a non-UTF-8 message did not make a JSON record");
+    }
 
     bool rotated_artifact_rejected = false;
     try {

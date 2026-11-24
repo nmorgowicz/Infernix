@@ -82,6 +82,31 @@ void validate_input(std::span<const std::uint8_t> bytes, const Policy& policy) {
     }
 }
 
+constexpr std::string_view kRawRgbMagic = "IFXRGB24";
+
+bool is_raw_rgb(std::span<const std::uint8_t> bytes) noexcept {
+    return bytes.size() >= kRawRgbHeaderBytes &&
+           std::equal(kRawRgbMagic.begin(), kRawRgbMagic.end(), bytes.begin(),
+                      [](char expected, std::uint8_t actual) { return static_cast<std::uint8_t>(expected) == actual; });
+}
+
+std::uint32_t read_le32(std::span<const std::uint8_t> bytes, std::size_t offset) noexcept {
+    return static_cast<std::uint32_t>(bytes[offset]) | static_cast<std::uint32_t>(bytes[offset + 1]) << 8U |
+           static_cast<std::uint32_t>(bytes[offset + 2]) << 16U | static_cast<std::uint32_t>(bytes[offset + 3]) << 24U;
+}
+
+ImageInfo raw_rgb_info(std::span<const std::uint8_t> bytes, std::uint64_t max_decoded_pixels) {
+    const std::uint32_t width  = read_le32(bytes, 8);
+    const std::uint32_t height = read_le32(bytes, 12);
+    if (width == 0 || height == 0 || width > 65'536 || height > 65'536) {
+        throw_invalid_media("raw RGB image has invalid dimensions");
+    }
+    const std::uint64_t pixels = std::uint64_t{width} * height;
+    if (pixels > max_decoded_pixels) { throw Error(ErrorKind::BudgetExceeded, "raw RGB image exceeds pixel limit"); }
+    if (bytes.size() != kRawRgbHeaderBytes + pixels * 3U) { throw_invalid_media("raw RGB image has the wrong size"); }
+    return ImageInfo{.width = static_cast<int>(width), .height = static_cast<int>(height)};
+}
+
 int exif_orientation(std::span<const std::uint8_t> bytes) {
     constexpr std::size_t limit = 1ULL << 20;
     bytes                       = bytes.first(std::min(limit, bytes.size()));
@@ -334,10 +359,22 @@ public:
             stream_              = format_->streams[stream_index_];
             const AVCodec* codec = avcodec_find_decoder(stream_->codecpar->codec_id);
             if (codec == nullptr) { throw_invalid_media("media codec is not supported"); }
+            // The pixel budget before the decoder allocates a frame: the declared size here, and the decoder's own
+            // limit for a frame larger than declared (a 16383 x 16383 WebP would otherwise be allocated first).
+            if (const AVCodecParameters* parameters = stream_->codecpar;
+                parameters->width > 0 && parameters->height > 0 &&
+                static_cast<std::uint64_t>(parameters->width) * static_cast<std::uint64_t>(parameters->height) >
+                    max_decoded_pixels_) {
+                throw Error(ErrorKind::BudgetExceeded, "decoded media pixels exceed processor limit");
+            }
             codec_ = avcodec_alloc_context3(codec);
             if (codec_ == nullptr) { throw std::bad_alloc(); }
-            if ((rc = avcodec_parameters_to_context(codec_, stream_->codecpar)) < 0 ||
-                (rc = avcodec_open2(codec_, codec, nullptr)) < 0) {
+            if ((rc = avcodec_parameters_to_context(codec_, stream_->codecpar)) < 0) {
+                throw_invalid_media("failed to open media codec: " + av_error(rc));
+            }
+            codec_->max_pixels = static_cast<std::int64_t>(std::min<std::uint64_t>(
+                max_decoded_pixels_, static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())));
+            if ((rc = avcodec_open2(codec_, codec, nullptr)) < 0) {
                 throw_invalid_media("failed to open media codec: " + av_error(rc));
             }
             packet_ = av_packet_alloc();
@@ -586,7 +623,9 @@ std::vector<int> sample_indices(int total, double source_fps, double target_fps,
         max_frames < min_frames) {
         throw std::invalid_argument("invalid video sampling configuration");
     }
-    int count = static_cast<int>(static_cast<double>(total) / source_fps * target_fps);
+    // Clamped before the cast (a tiny source rate makes the quotient exceed int).
+    const double wanted = static_cast<double>(total) / source_fps * target_fps;
+    int count = wanted < static_cast<double>(max_frames) ? static_cast<int>(wanted) : max_frames;
     count     = std::min({std::max(count, min_frames), max_frames, total});
     std::vector<int> indices(static_cast<std::size_t>(count));
     if (count == 1) {
@@ -619,11 +658,15 @@ VideoPlan make_video_plan(std::span<const std::uint8_t> bytes, const Policy& pol
                             ? static_cast<int>(probe.stream()->nb_frames)
                             : 0;
     plan.duration     = probe.duration_seconds();
-    if (plan.total_frames == 0 && plan.duration > 0.0) {
-        plan.total_frames = static_cast<int>(std::nearbyint(plan.duration * plan.fps));
-    }
+    // The duration limit first, and a frame estimate the int holds: a container's huge duration or frame rate made
+    // the cast undefined. An estimate past int's range is past every frame limit too.
     if (plan.duration > policy.max_video_duration_seconds) {
         throw Error(ErrorKind::BudgetExceeded, "video duration exceeds processor limit");
+    }
+    if (plan.total_frames == 0 && plan.duration > 0.0) {
+        const double frames = std::nearbyint(plan.duration * plan.fps);
+        plan.total_frames   = frames < static_cast<double>(std::numeric_limits<int>::max()) ? static_cast<int>(frames)
+                                                                                           : std::numeric_limits<int>::max();
     }
     if (plan.total_frames == 0) { plan.total_frames = count_frames(bytes, policy); }
     if (plan.total_frames == 0) { throw_invalid_media("video contains no decoded frame"); }
@@ -776,6 +819,7 @@ bool animated_webp_supported() noexcept {
 ImageInfo inspect_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
     validate_input(bytes, policy);
     if (policy.checkpoint) { policy.checkpoint(); }
+    if (is_raw_rgb(bytes)) { return raw_rgb_info(bytes, policy.max_decoded_pixels); }
     refuse_unsupported_animated_webp(bytes);
 #ifdef INFERNIX_MEDIA_NATIVE_PNG
     if (is_png(bytes)) {
@@ -825,6 +869,12 @@ VideoInfo inspect_video(std::span<const std::uint8_t> bytes, const Policy& polic
 Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
     validate_input(bytes, policy);
     if (policy.checkpoint) { policy.checkpoint(); }
+    if (is_raw_rgb(bytes)) {
+        const ImageInfo info = raw_rgb_info(bytes, policy.max_decoded_pixels);
+        return Image{.width = info.width,
+                     .height = info.height,
+                     .rgb    = std::vector<std::uint8_t>(bytes.begin() + kRawRgbHeaderBytes, bytes.end())};
+    }
     refuse_unsupported_animated_webp(bytes);
     // Some FFmpeg builds (the Windows vcpkg tree) ship without the png decoder; the
     // native path decodes png directly so those builds accept png images too.
@@ -872,6 +922,21 @@ Video decode_video(std::span<const std::uint8_t> bytes, const Policy& policy, do
     out.height  = scan.first_frame.height;
     out.indices = std::move(plan.indices);
     return out;
+}
+
+std::vector<std::uint8_t> encode_raw_rgb(int width, int height, std::span<const std::uint8_t> rgb) {
+    if (width <= 0 || height <= 0 ||
+        rgb.size() != static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 3U) {
+        throw std::invalid_argument("raw RGB pixels do not match their dimensions");
+    }
+    std::vector<std::uint8_t> bytes(kRawRgbHeaderBytes + rgb.size());
+    std::copy(kRawRgbMagic.begin(), kRawRgbMagic.end(), bytes.begin());
+    for (int i = 0; i < 4; ++i) {
+        bytes[8 + i]  = static_cast<std::uint8_t>(static_cast<std::uint32_t>(width) >> (8 * i));
+        bytes[12 + i] = static_cast<std::uint8_t>(static_cast<std::uint32_t>(height) >> (8 * i));
+    }
+    std::copy(rgb.begin(), rgb.end(), bytes.begin() + kRawRgbHeaderBytes);
+    return bytes;
 }
 
 LibraryLogHandler set_library_log_handler(LibraryLogHandler handler) {

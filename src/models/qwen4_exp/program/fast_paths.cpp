@@ -521,6 +521,10 @@ constexpr std::array kQualified{
     // 117.3 -> 125.0 tok/s (+6.6 %, 2 of 2), the struct fixture 378.3 -> 386.9 (+2.3 %, 3 of 3, the same text and
     // rounds: 20.24 -> 19.79 ms a round); without it the exact BF16 head took 706 us of a 9.5 ms round after a 16K
     // prompt (the screen 135 us). The formats below INT8's precision by the owner's rule above.
+    // NVIDIA's NVFP4-QAD Dense8 has this configuration with an 8-bit head (q8_g32_fp16, whose rescore reads its rows by
+    // warps) and its screen: measured faster there too (RTX 5090, 2026-11-18, INT8 KV, pp2048 + tg128, on-off-off-on x 2,
+    // against --no-fast-path screened-lm-head): plain decode 151.4-152.3 -> 153.5-154.7 tok/s (+1.43 %), DFlash2 with
+    // automatic draft lengths 221.1-222.1 -> 224.4-225.2 (+1.46 %), prefill level (+0.41 % and -0.10 %, overlapping).
     Qualification{FastPath::ScreenedLmHead, {DenseKernels::Mxfp8, true, KvCacheStorage::Int8Group64}},
     Qualification{FastPath::ScreenedLmHead, {DenseKernels::Mxfp8, true, KvCacheStorage::Fp8E4M3Row256}},
     Qualification{FastPath::ScreenedLmHead, {DenseKernels::Mxfp8, true, KvCacheStorage::Nvfp4Group16}},
@@ -685,6 +689,7 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
                options.speculative.backend == SpeculativeBackend::Mtp;
     case FastPath::UniverTrees: return false; // Qwen3.5's tree rounds only
     case FastPath::GdnTreeClosedForm: return false; // Qwen3.5's tree rounds only
+    case FastPath::GumbelSampling: return false;    // Qwen3.5's drafters only (candidates ZH-01)
     case FastPath::QsaPrepareFused:
         // ops::qsa_prepare_supports's KV formats (bf16 and bf16p, int8, fp8, nvfp4, k8v4); VQ2 and K4V2
         // append inside qsa_attention and keep the composed prepare.
@@ -722,6 +727,9 @@ bool FastPathSelection::request_invariant() const noexcept {
         // between requests. ggml-bf16-prefill routes a prompt's GGUF projections by its calls' widths, whose
         // boundaries prefix-cache resumes move; f16-accumulate-prefill likewise its FP8 and MXFP8 projections,
         // and router-mma the router. screened-lm-head screens a round only when every row of it may be screened.
+        // gdn-f16-accumulate couples nothing: without free-cache-resume a prompt's calls start on the prefill chunk
+        // grid, and the chunked GDN gives the same bits for calls cut there (64-token multiples) as for one call, in
+        // either arithmetic (test_gated_delta_net split_bits_case, the Flash-Next and 27B geometries).
         return path == FastPath::AdaptiveSpeculation || path == FastPath::DFlash2Pairs ||
                path == FastPath::FreeCacheResume || path == FastPath::Preemption || path == FastPath::Q8SlicedK ||
                path == FastPath::ExpertA4Residual || path == FastPath::ExpertA4Residual3 ||

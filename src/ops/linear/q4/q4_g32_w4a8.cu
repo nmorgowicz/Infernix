@@ -482,7 +482,7 @@ __global__ void __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm)
     const int row_begin   = row_tile * BR;
     const int token_begin = token_offset + token_tile * BT;
 
-    extern __shared__ __align__(128) unsigned char q4_tma_shared[];
+    extern __shared__ __align__(1024) unsigned char q4_tma_shared[];
     auto* activation = q4_tma_shared;
     auto* weight     = activation + S * BT * BK;
     auto* full       = reinterpret_cast<std::uint64_t*>(q4_tma_shared + fp8_tma_scratch_bytes<Schedule, LinearIdentityEpilogue>);
@@ -600,7 +600,7 @@ void launch_q4_w4a8_tma(const std::uint8_t* activations, const float* activation
                 constexpr int kRaw =
                     fp8_tma_scratch_bytes<Schedule, LinearIdentityEpilogue> + Schedule::kBarrierBytes + kScaleBytes;
                 constexpr int bytes = (kRaw + 127) & ~127;
-                const int dynamic = fp8_prepare_shared<bytes, kernel, true>();
+                const int dynamic = prepare_dynamic_shared<bytes, kernel, true>();
                 const int grid    = Split ? plan.full_tiles + plan.split_ctas : blocks;
                 kernel<<<grid, Schedule::kThreads, dynamic, stream>>>(parameter, operands, group_scales, output,
                                                                       offset, count, plan, partials);

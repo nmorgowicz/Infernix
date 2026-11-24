@@ -10,6 +10,7 @@
 // loan, a sixteenth of the frames and the KV growth, the seeds never take the frames they cover, and RAM holds
 // every other expert.
 
+#include "runtime/engine/expert_memory.h"
 #include "runtime/expert_offload/memory_plan.h"
 #include "runtime/expert_offload/ram_monitor.h"
 
@@ -17,6 +18,7 @@
 #include <chrono>
 #include <cstdio>
 #include <deque>
+#include <functional>
 #include <future>
 #include <stdexcept>
 #include <string>
@@ -154,6 +156,57 @@ void test_expert_cap() {
             "a cap larger than the ledger leaves is flagged");
 }
 
+// The automatic Host tier beside the exclusive layout's own cap (runtime::plan_auto_host_tier). The cap is tested
+// before the tier exists and the tier takes at least 1 GiB: with less than that left beside the cap, the plan with
+// the tier flags the cap (which a start reported as a refused --expert-ram-mib), so the layout must give way there
+// and nowhere else. Free RAM just above the band, inside it and below it (the cap not fitting at all).
+void test_auto_tier_beside_cap() {
+    HostMemoryDemand d        = flash_next();
+    d.expert_cap              = 32 * kGiB;
+    const std::uint64_t fixed = d.reserve + plan_host_memory(snapshot(0, 0), d).planned; // without a tier
+    const auto with_tier      = [&](std::uint64_t available, std::uint64_t tier) {
+        HostMemoryDemand planned = d;
+        planned.prefix_cache     = tier;
+        return plan_host_memory(snapshot(available, 200 * kGiB), planned);
+    };
+
+    // 3 GiB beside the cap: the tier takes them less its lock overhead, in 256 MiB steps, and the cap holds.
+    const std::uint64_t above       = fixed + 32 * kGiB + 3 * kGiB;
+    const runtime::AutoHostTier roomy = runtime::plan_auto_host_tier(snapshot(above, 200 * kGiB), d);
+    require(roomy.keeps_cap && roomy.bytes == 2816 * kMiB,
+            "3 GiB beside the cap give a 2,816 MiB tier and keep the cap");
+    require(!with_tier(above, roomy.bytes).cap_too_large, "the plan with that tier holds the cap");
+
+    // 512 MiB beside the cap: the cap fits alone, the 1 GiB least tier does not fit beside it.
+    const std::uint64_t inside = fixed + 32 * kGiB + 512 * kMiB;
+    require(!with_tier(inside, 0).cap_too_large, "inside the band the cap fits before the tier");
+    require(with_tier(inside, runtime::kMinAutoHostContextBytes).cap_too_large,
+            "inside the band the least tier no longer leaves the cap its room");
+    const runtime::AutoHostTier band = runtime::plan_auto_host_tier(snapshot(inside, 200 * kGiB), d);
+    require(!band.keeps_cap && band.bytes == runtime::kMinAutoHostContextBytes,
+            "inside the band the layout gives way and the tier is the least one");
+    HostMemoryDemand plain = d;
+    plain.expert_cap.reset();
+    plain.prefix_cache = band.bytes;
+    const HostMemoryLedger fallback = plan_host_memory(snapshot(inside, 200 * kGiB), plain);
+    require(!fallback.cap_too_large && fallback.placement == ExpertPlacement::Tier && fallback.expert_ram > 31 * kGiB,
+            "the fallback plan starts: the SSD tier with what the Host tier leaves");
+
+    // Below the band the cap does not fit even alone: the same fallback.
+    const runtime::AutoHostTier below =
+        runtime::plan_auto_host_tier(snapshot(fixed + 32 * kGiB - 512 * kMiB, 200 * kGiB), d);
+    require(!below.keeps_cap && below.bytes == runtime::kMinAutoHostContextBytes,
+            "below the band the layout gives way");
+
+    // The edge: exactly the least tier with its lock overhead beside the cap keeps it.
+    const std::uint64_t edge = fixed + 32 * kGiB + kGiB + 64 * kMiB;
+    require(runtime::plan_auto_host_tier(snapshot(edge, 200 * kGiB), d).keeps_cap, "just above the band the cap stays");
+
+    // Without a cap there is nothing to give way.
+    require(runtime::plan_auto_host_tier(snapshot(inside, 200 * kGiB), plain).keeps_cap,
+            "a plan without a cap keeps none");
+}
+
 // The page-locking limit (Windows: the GPU's shared system memory): the other pins draw on it first,
 // the experts pin what is left, and the rest of their RAM stays unpinned; it never shrinks the RAM
 // the experts get. Without a known limit nothing changes.
@@ -164,6 +217,13 @@ void test_pin_room() {
     const HostMemoryLedger unlimited = plan_host_memory(snapshot(need, 200 * kGiB), d);
     require(unlimited.placement == ExpertPlacement::Full && !unlimited.pin_limited && unlimited.expert_pageable == 0,
             "no pin limit: full mode as before");
+    // Half a GiB short of the full need: the records alone would fit (the margin does not), so the summary names the
+    // full need instead of more of the records fitting than there are ("63.5 of the experts' 63.3 GiB", 2026-11-20).
+    const HostMemoryLedger margin_short = plan_host_memory(snapshot(need - kGiB / 2, 200 * kGiB), d);
+    require(margin_short.placement == ExpertPlacement::Tier && margin_short.expert_ram >= d.expert_banks &&
+                margin_short.summary().find("short of the") != std::string::npos &&
+                margin_short.summary().find("of the experts'") == std::string::npos,
+            "a RAM plan past the records but short of the margin names the full need: " + margin_short.summary());
     // A 96 GB machine whose limit is half of RAM (47.9 GiB, 1 GiB margin): every expert fits in RAM
     // but not in the pin room, so the SSD tier holds all of them, part unpinned.
     const std::uint64_t pins = plan_host_memory(snapshot(need, 200 * kGiB), d).planned; // unchanged by the room
@@ -353,6 +413,117 @@ private:
     std::deque<std::uint64_t> nonlocal_;
 };
 
+// Whole snapshots per query, as a Windows source reads them: free memory is the OS budget less this
+// process's LOCAL use, beside its shared-system (NON_LOCAL) use.
+class SnapshotSource final : public VramBudgetSource {
+public:
+    explicit SnapshotSource(std::deque<VramSnapshot> readings) : readings_(std::move(readings)) {}
+    VramSnapshot query() override {
+        VramSnapshot s = readings_.front();
+        if (readings_.size() > 1) { readings_.pop_front(); }
+        return s;
+    }
+
+private:
+    std::deque<VramSnapshot> readings_;
+};
+
+VramSnapshot windows_reading(std::uint64_t budget, std::uint64_t local, std::uint64_t nonlocal,
+                             std::uint64_t physical_free = 0) {
+    VramSnapshot s;
+    s.has_budget      = true;
+    s.has_local_usage = true;
+    s.local_budget    = budget;
+    s.local_usage     = local;
+    s.device_free     = budget > local ? budget - local : 0;
+    s.shared_system   = 76 * kGiB;
+    s.nonlocal_usage  = nonlocal;
+    s.physical_free   = physical_free;
+    return s;
+}
+
+// SpillGuard::end(bytes), a device-only step (the expert frames' chunks, the KV room probe): where the source reads
+// this process's LOCAL use, a spill is that use's rise short of the step.
+void test_device_step_spill() {
+    const std::uint64_t n = 64 * kMiB, budget = 30 * kGiB, local = 20 * kGiB, nonlocal = 900 * kMiB;
+    {
+        // Issue #68's shape: the OS raised the budget during the step, so free memory did not drop at all, but the
+        // chunk is in device memory (LOCAL use rose by it). The free-memory drop read the whole chunk as spilled.
+        const auto before = windows_reading(budget, local, nonlocal);
+        const auto after  = windows_reading(budget + n, local + n, nonlocal);
+        require(after.device_free == before.device_free, "the scripted budget rise hides the chunk from free memory");
+        require(spill_shortfall(before.device_free, after.device_free, n) == n, "the free drop reads a spill");
+        SnapshotSource source({before, after, after});
+        SpillGuard guard(source);
+        guard.begin();
+        require(guard.end(n) == 0, "a budget the OS raised during the step is not a spill");
+    }
+    {
+        // A real sysmem fallback: LOCAL use flat, NON_LOCAL use up by the chunk.
+        SnapshotSource source({windows_reading(budget, local, nonlocal), windows_reading(budget, local, nonlocal + n),
+                               windows_reading(budget, local, nonlocal + n)});
+        SpillGuard guard(source);
+        guard.begin();
+        require(guard.end(n) == n, "a chunk placed in system memory is a spill");
+        // Half of an earlier allocation of this process evicted to make room for the chunk: also a spill.
+        SnapshotSource evicted({windows_reading(budget, local, nonlocal),
+                                windows_reading(budget, local + n - 48 * kMiB, nonlocal + 48 * kMiB),
+                                windows_reading(budget, local + n - 48 * kMiB, nonlocal + 48 * kMiB)});
+        SpillGuard by_eviction(evicted);
+        by_eviction.begin();
+        require(by_eviction.end(n) == 48 * kMiB, "this process's memory moved to system memory by the step is a spill");
+    }
+    {
+        // Past the OS budget the free figure clamps at 0, so a resident chunk's free drop reads short (RTX 5090,
+        // 2026-11-19: 10 of 494 pieces); LOCAL use rose by it.
+        SnapshotSource clamped({windows_reading(budget, budget + 40 * kMiB, nonlocal),
+                                windows_reading(budget, budget + 40 * kMiB + n, nonlocal)});
+        SpillGuard past(clamped);
+        past.begin();
+        require(past.end(n) == 0, "a resident chunk past the budget is not a spill");
+        // Another thread page-locked 1 GiB during the step while the chunk went to device memory.
+        SnapshotSource pinned({windows_reading(budget, local, nonlocal), windows_reading(budget, local + n, nonlocal + kGiB),
+                               windows_reading(budget, local + n, nonlocal + kGiB)});
+        SpillGuard by_pins(pinned);
+        by_pins.begin();
+        require(by_pins.end(n) == 0, "a page-lock beside a resident step is not a spill");
+    }
+    {
+        // A spill on the first reading only is re-read.
+        SnapshotSource transient({windows_reading(budget, local, nonlocal), windows_reading(budget, local, nonlocal + n),
+                                  windows_reading(budget, local + n, nonlocal)});
+        SpillGuard guard(transient);
+        guard.begin();
+        require(guard.end(n) == 0, "a second reading clears a transient spill");
+    }
+    {
+        // LOCAL use readable without the shared-system reading (a WSL2 adapter without it): the same rule.
+        auto before = windows_reading(budget, local, nonlocal);
+        auto after  = windows_reading(budget + n, local, nonlocal);
+        before.shared_system = after.shared_system = 0;
+        SnapshotSource source({before, after, after});
+        SpillGuard guard(source);
+        guard.begin();
+        require(guard.end(n) == n, "LOCAL use short of the step is a spill without the shared-system reading");
+    }
+    {
+        // The readings name every figure the source has, and where free memory comes from.
+        auto before = windows_reading(budget, local, nonlocal, 2775 * kMiB);
+        auto after  = windows_reading(budget + n, local + n, nonlocal, 2711 * kMiB);
+        before.free_from_budget = after.free_from_budget = true;
+        SnapshotSource source({before, after});
+        SpillGuard guard(source);
+        guard.begin();
+        (void)guard.end(n);
+        require(guard.readings(n) ==
+                    "free device memory 10240 MiB before and 10240 MiB after 64 MiB of allocations (the OS budget less "
+                    "this process's use); OS budget 30720 MiB before and 30784 MiB after; this process's device memory "
+                    "use 20480 MiB before and 20544 MiB after; this process's shared system memory use 900 MiB before "
+                    "and 900 MiB after; free over every process 2775 MiB before and 2711 MiB after (NVML)",
+                "the readings: " + guard.readings(n));
+    }
+}
+
 void test_spill() {
     const std::uint64_t n = 1 * kGiB;
     require(spill_shortfall(10 * kGiB, 9 * kGiB, n) == 0, "a resident step");
@@ -370,7 +541,8 @@ void test_spill() {
     SpillGuard confirm(spilled);
     confirm.begin();
     require(confirm.end(n) == n - 100 * kMiB, "a confirmed shortfall is reported");
-    require(confirm.readings(n) == "free device memory 10240 MiB before and 10140 MiB after 1024 MiB of allocations",
+    require(confirm.readings(n) ==
+                "free device memory 10240 MiB before and 10140 MiB after 1024 MiB of allocations (cudaMemGetInfo)",
             "the failure names the free-memory readings it compared");
     // Where the source reads this process's shared system memory use (Windows, WSL2), the readings
     // carry it: a real sysmem fallback raises it, a misread free-memory figure does not.
@@ -379,9 +551,53 @@ void test_spill() {
     SpillGuard fallback(shared);
     fallback.begin();
     require(fallback.end(n) == n - 100 * kMiB, "a shortfall with shared-memory readings is reported");
-    require(fallback.readings(n) == "free device memory 10240 MiB before and 10140 MiB after 1024 MiB of allocations; "
-                                    "this process's shared system memory use 200 MiB before and 1124 MiB after",
+    require(fallback.readings(n) == "free device memory 10240 MiB before and 10140 MiB after 1024 MiB of allocations "
+                                    "(cudaMemGetInfo); this process's shared system memory use 200 MiB before and "
+                                    "1124 MiB after",
             "the failure names the shared system memory readings where the source has them");
+
+    // A caller that names what it page-locked is judged by this process's shared system memory use where the
+    // source reads it, so other programs' device memory does not decide.
+    require(spill_rise(200 * kMiB, 200 * kMiB, n, 0) == 0, "no rise: resident");
+    require(spill_rise(200 * kMiB, 200 * kMiB + 512 * kMiB, n, 0) == 512 * kMiB, "half the step in shared memory");
+    require(spill_rise(200 * kMiB, 200 * kMiB + 512 * kMiB, n, 500 * kMiB) == 0, "the rise is the step's own pins");
+    require(spill_rise(200 * kMiB, 200 * kMiB + 3 * kGiB, n, 0) == n, "at most the step's bytes");
+    require(spill_rise(900 * kMiB, 200 * kMiB, n, 0) == 0, "pins released during the step");
+    {
+        // Another program freed 1 GiB during the step: free memory did not move, nothing spilled.
+        ScriptedSource freed({10 * kGiB, 10 * kGiB, 10 * kGiB}, {200 * kMiB, 200 * kMiB, 200 * kMiB});
+        SpillGuard by_free(freed);
+        by_free.begin();
+        require(by_free.end(n) == n, "the free-memory form cannot tell a peer's free from a spill");
+        ScriptedSource again({10 * kGiB, 10 * kGiB, 10 * kGiB}, {200 * kMiB, 200 * kMiB, 200 * kMiB});
+        SpillGuard by_use(again);
+        by_use.begin();
+        require(by_use.end(n, 0) == 0, "a peer freeing device memory during the step is not a spill");
+    }
+    {
+        // A real spill of 600 MiB while another program took 600 MiB: the free drop looks whole.
+        ScriptedSource hidden({10 * kGiB, 9 * kGiB, 9 * kGiB}, {200 * kMiB, 800 * kMiB, 800 * kMiB});
+        SpillGuard by_use(hidden);
+        by_use.begin();
+        require(by_use.end(n, 0) == 600 * kMiB, "a spill a peer's allocation hides from free memory is reported");
+        // The same rise with a compensating free elsewhere, and with 590 MiB of it the step's own pins.
+        ScriptedSource compensated({10 * kGiB, 10 * kGiB + 400 * kMiB}, {200 * kMiB, 800 * kMiB});
+        SpillGuard with_free(compensated);
+        with_free.begin();
+        require(with_free.end(n, 0) == 600 * kMiB, "a spill is reported whatever a peer freed meanwhile");
+        ScriptedSource pinned({10 * kGiB, 9 * kGiB}, {200 * kMiB, 800 * kMiB});
+        SpillGuard with_pins(pinned);
+        with_pins.begin();
+        require(with_pins.end(n, 590 * kMiB) == 0, "memory the step page-locked is not a spill");
+    }
+    {
+        // No shared-memory reading (native Linux): the free-memory drop decides, re-read once.
+        ScriptedSource plain({10 * kGiB, 10 * kGiB, 9 * kGiB});
+        SpillGuard by_free(plain);
+        by_free.begin();
+        require(by_free.end(n, 0) == 0, "without the reading a second free-memory reading clears a transient");
+    }
+    test_device_step_spill();
 
     // The test seam replaces the sources opened afterwards.
     infernix::testing::set_vram_budget_source([] { return card(5 * kGiB, DisplayState::Headless); });
@@ -479,6 +695,85 @@ void test_control_law() {
     trimmed.local_budget = pool + other - kGiB;
     trimmed.device_free  = kGiB;
     require(control.decide(trimmed, pool, frames, 200.0, false).shrink, "an exceeded budget shrinks the pool");
+}
+
+// RT7/RT9, issue #68: a grow maps a chunk only while growth_room, the sizing's own room, covers it. Under WDDM the
+// budget and free memory do not see another process's memory: with a 3 GiB holder in another process the sizing
+// planned as on an empty card, Windows lowered the budget as the card filled, and the grow mapped past it until a
+// chunk read as placed in system memory (RTX 5090, 2026-11-17).
+void test_growth_room() {
+    const auto bytes          = [](std::uint64_t v) { return static_cast<std::int64_t>(v); };
+    const std::uint64_t fixed = 3 * kGiB;
+    // growth_room is size_expert_frames' room with nothing left to allocate, under every bound.
+    std::vector<VramSnapshot> cases{card(28 * kGiB, DisplayState::Headless), card(28 * kGiB, DisplayState::Attached)};
+    VramSnapshot budgeted = card(28 * kGiB, DisplayState::Attached);
+    budgeted.has_budget   = true;
+    budgeted.local_budget = 26 * kGiB; // below free memory: the budget's bound
+    cases.push_back(budgeted);
+    budgeted.local_budget = 30 * kGiB; // above it: free memory's bound
+    cases.push_back(budgeted);
+    VramSnapshot past     = wddm(8 * kGiB, 0, DisplayState::Headless, 32'059 * kMiB); // --vram-past-budget's widened budget
+    past.budget_allowance = 640 * kMiB;
+    cases.push_back(past);
+    for (const VramSnapshot& s : cases) {
+        const VramSizing sizing = size_expert_frames(s, demand(fixed, 20));
+        require(growth_room(s, GrowthLimit{sizing.headroom, sizing.reserve}) - bytes(fixed) == sizing.frame_bytes,
+                "growth_room is the sizing's room: " + sizing.describe());
+    }
+
+    // A startup grow on the card the sizing read maps every chunk of the plan.
+    const std::uint64_t other = 6 * kGiB;
+    VramDemand elastic        = demand(0, 20);
+    elastic.elastic           = true;
+    const VramSizing sized    = size_expert_frames(wddm(0, other), elastic);
+    const GrowthLimit limit{sized.headroom, sized.reserve};
+    const std::uint64_t planned = static_cast<std::uint64_t>(sized.frame_bytes) / kChunk * kChunk;
+    const auto grow = [&](const std::function<std::uint64_t(std::uint64_t)>& budget_at) {
+        std::uint64_t pool = 0;
+        while (pool < planned &&
+               growth_room(wddm(pool, other, DisplayState::Headless, budget_at(pool)), limit) >= bytes(kChunk)) {
+            pool += kChunk;
+        }
+        return pool;
+    };
+    require(grow([](std::uint64_t) { return 31'419 * kMiB; }) == planned, "an unchanged card takes the whole plan");
+    // Another process holds 3 GiB the budget does not see; Windows cuts the budget by it once the card fills.
+    const std::uint64_t held = 3 * kGiB;
+    const auto cut_budget    = [&](std::uint64_t pool) {
+        return pool + other + held > 31'419 * kMiB ? 31'419 * kMiB - held : 31'419 * kMiB;
+    };
+    const std::uint64_t stopped = grow(cut_budget);
+    require(stopped < planned && stopped + other <= 31'419 * kMiB - held + kChunk,
+            "the grow stops where the budget fell, within the chunk that crossed it");
+    require(planned + other > 31'419 * kMiB - held + 2 * kGiB,
+            "without the live bound the plan maps over 2 GiB past the cut budget");
+
+    // The elastic controller's target is the same bound: growth_room's room plus the pool, on the chunk grid.
+    VramControl control(elastic, kChunk, other, 0);
+    const std::uint64_t pool   = 10 * kGiB;
+    const VramSnapshot now     = wddm(pool, other);
+    const std::uint64_t target = static_cast<std::uint64_t>(growth_room(now, control.growth_limit(now, pool)) + bytes(pool));
+    require(control.target(now, pool) == static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                                             target / kChunk * kChunk / kRecord, elastic.max_frames)),
+            "the controller's target is growth_room's");
+
+    // NVML's figures are for the lines only: they size nothing, the nominal launch drops them, the line names them.
+    VramSnapshot measured  = card(28 * kGiB, DisplayState::Headless);
+    measured.physical_used = 4'129 * kMiB;
+    measured.physical_free = 28'058 * kMiB;
+    require(size_expert_frames(measured, demand(fixed, 20)).frame_bytes ==
+                size_expert_frames(card(28 * kGiB, DisplayState::Headless), demand(fixed, 20)).frame_bytes,
+            "NVML's figures do not size the frames");
+    const VramSnapshot nominal = nominal_snapshot(measured, 758 * kMiB);
+    require(nominal.physical_used == 0 && !nominal.physical_free, "the nominal launch carries no NVML figures");
+    const std::string line = size_expert_frames(measured, demand(fixed, 20)).describe();
+    require(line.find("every process uses 4129 MiB, 28058 free (NVML)") != std::string::npos,
+            "the sizing line names NVML's figures: " + line);
+    require(size_expert_frames(card(28 * kGiB, DisplayState::Headless), demand(fixed, 20)).describe().find("NVML") ==
+                std::string::npos,
+            "without NVML's figures the line names none");
+    require(short_of_room_line(7'912, 9'108).find("starts with 7912 of 9108 frames") != std::string::npos,
+            "the stop's line names the frames");
 }
 
 void test_exclusive_tier() {
@@ -606,6 +901,42 @@ void test_ram_control() {
     const RamControl large(16 * kGiB);
     require(large.pressure_point() == 8 * kGiB && large.relieve_point() == 16 * kGiB && large.growth_floor() == 17 * kGiB,
             "R = 16 GiB: release below 8 GiB back to 16 GiB, grow above 17 GiB");
+
+    // The law reads the lesser of available physical memory and available commit: a system out of commit (a small
+    // page file) is under pressure while physical memory still looks free, and growth takes no commit it lacks.
+    HostMemorySnapshot reading = snapshot(20 * kGiB, 3 * kGiB);
+    require(resize_available(reading) == 3 * kGiB, "commit below physical: the law reads the commit");
+    control.set_room(10 * kGiB, 6 * kGiB);
+    require(control.decide(resize_available(reading), 200.0).release == 5 * kGiB,
+            "20 GiB physical but 3 GiB of commit: a release back to the reserve");
+    reading = snapshot(6 * kGiB, 40 * kGiB);
+    require(resize_available(reading) == 6 * kGiB && control.decide(resize_available(reading), 200.0).release == 0,
+            "physical below commit: the physical reading, in the band");
+
+    // A growth that was due and took nothing (the OS page-locks no more) doubles the wait before the next attempt, up
+    // to kGrowHoldMaximumSeconds; a growth that takes memory, or a release, returns it to 10 s.
+    RamControl refused(8 * kGiB);
+    refused.set_room(0, 4 * kGiB);
+    (void)refused.observe(12 * kGiB, 0.0);
+    require(refused.observe(12 * kGiB, 10.5), "the first growth is due after 10 s");
+    refused.resized(11.0, true, true);
+    require(refused.grow_hold_seconds() == 20.0 && !refused.observe(12 * kGiB, 22.0) && refused.observe(12 * kGiB, 31.5),
+            "a refused growth is tried again after 20 s, not 10");
+    refused.resized(32.0, true, true);
+    require(refused.grow_hold_seconds() == 40.0 && !refused.observe(12 * kGiB, 62.0) && refused.observe(12 * kGiB, 72.5),
+            "a second refusal: 40 s");
+    for (int i = 0; i < 12; ++i) { refused.resized(100.0, true, true); }
+    require(refused.grow_hold_seconds() == RamControl::kGrowHoldMaximumSeconds, "the wait stops doubling at its maximum");
+    refused.resized(1000.0, false);
+    require(refused.grow_hold_seconds() == RamControl::kGrowHoldSeconds && refused.observe(12 * kGiB, 1000.0),
+            "a growth that took memory: the next piece at once, and 10 s after a later hold");
+    refused.resized(1001.0, true, true);
+    refused.resized(1002.0, true);
+    require(refused.grow_hold_seconds() == RamControl::kGrowHoldSeconds, "a release returns the wait to 10 s");
+
+    // Less than twice the pressure point available: the monitor reads ten times as often.
+    require(control.near_pressure(8 * kGiB - 1) && !control.near_pressure(8 * kGiB),
+            "R = 8 GiB: near the pressure point below 8 GiB available");
 }
 
 // The monitor wakes the engine when a reading finds a resize due, which due() reports until decide() takes it, and
@@ -620,7 +951,22 @@ void test_ram_monitor() {
         return done();
     };
     {
-        RamMonitor monitor(8 * kGiB, -1, [&] { return available.load(); }, std::chrono::milliseconds(2));
+        std::atomic<int> reads{0};
+        RamMonitor monitor(8 * kGiB, -1,
+                           [&] {
+                               const std::uint64_t value = available.load();
+                               ++reads;
+                               return value;
+                           },
+                           std::chrono::milliseconds(2));
+        // Waits until three more readings have begun: a tick reads, observes, then waits before the next read, so by
+        // then the second of them saw the value stored before the call, and every tick that read an older value has
+        // finished observing it (a fixed sleep let a tick that read the old value, then lost the CPU on a loaded
+        // machine, set a resize due after the test's decide).
+        const auto settled = [&] {
+            const int from = reads.load();
+            return wait_for([&] { return reads.load() >= from + 3; });
+        };
         monitor.set_room(10 * kGiB, 0);
         monitor.set_waker([&] { ++wakes; });
         std::this_thread::sleep_for(std::chrono::milliseconds(30));
@@ -630,15 +976,18 @@ void test_ram_monitor() {
         require(monitor.decide(10 * kGiB, 0).release == 5 * kGiB, "monitor: the due release");
         // The band: once no tick still holds the old reading, decide takes what is due and nothing sets it again.
         available = 6 * kGiB;
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        require(settled(), "monitor: it reads the new value");
         require(monitor.decide(10 * kGiB, 0).release == 0, "monitor: nothing due in the band");
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        require(!monitor.due(), "monitor: decide takes the due resize, and the band sets nothing");
+        require(settled() && !monitor.due(), "monitor: decide takes the due resize, and the band sets nothing");
         const int before = wakes.load();
         monitor.set_busy(true);
         require(wait_for([&] { return wakes.load() >= before + 3; }) && !monitor.due(),
                 "monitor: a resize in flight wakes it every period, nothing due");
         monitor.set_busy(false);
+        // The period: the configured one with plenty available, a tenth (at least 1 ms) under twice the pressure point.
+        require(monitor.poll_period(20 * kGiB) == std::chrono::milliseconds(2) &&
+                    monitor.poll_period(7 * kGiB) == std::chrono::milliseconds(1),
+                "monitor: readings come sooner near the pressure point");
 
         std::vector<int> order;
         std::future<void> first  = monitor.worker().post([&] { order.push_back(1); });
@@ -663,6 +1012,33 @@ void test_ram_monitor() {
         }
     }
     require(ran.load() == 16, "worker: the destructor runs the queued jobs (a queued release does not leak)");
+
+    // Clearing the waker ends its use: once set_waker returns, neither the monitor's thread nor its worker is inside
+    // the old waker or calls it again (an Engine clears it before it destroys what the waker locks). The waker here
+    // reads a flag that is lowered right after the reset, as the Engine's members go away right after theirs.
+    for (int round = 0; round < 200; ++round) {
+        std::atomic<bool> alive{true};
+        std::atomic<int> late{0};
+        RamMonitor monitor(8 * kGiB, -1, [] { return 3 * kGiB; }, std::chrono::milliseconds(1));
+        monitor.set_room(10 * kGiB, 0);
+        monitor.set_busy(true); // a wake every reading
+        monitor.set_waker([&] {
+            if (!alive.load()) { ++late; }
+            std::this_thread::yield();
+            if (!alive.load()) { ++late; }
+        });
+        for (int job = 0; job < 4; ++job) { (void)monitor.worker().post([] {}); } // the worker wakes after each
+        std::this_thread::sleep_for(std::chrono::microseconds(300));
+        monitor.set_waker({});
+        alive = false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        require(late.load() == 0, "monitor: the waker ran after it was cleared");
+    }
+
+    // WSL2's kernels name Microsoft: the engine warns there that its RAM readings are the VM's.
+    require(kernel_release_is_wsl("5.15.167.4-microsoft-standard-WSL2") && kernel_release_is_wsl("4.4.0-19041-Microsoft") &&
+                !kernel_release_is_wsl("6.8.0-45-generic") && !kernel_release_is_wsl(""),
+            "the WSL kernel release test");
 }
 
 int main() {
@@ -676,6 +1052,7 @@ int main() {
         test_commit_limit();
         test_starved_and_describe();
         test_expert_cap();
+        test_auto_tier_beside_cap();
         test_pin_room();
         test_graph_bound();
         test_display_headroom();
@@ -683,6 +1060,7 @@ int main() {
         test_sizing();
         test_spill();
         test_control_law();
+        test_growth_room();
         test_exclusive_tier();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());

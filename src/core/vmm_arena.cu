@@ -46,6 +46,9 @@ VmmArena::VmmArena(int device, std::size_t reserve_bytes, std::size_t chunk_byte
 }
 
 VmmArena::~VmmArena() {
+    // Work still queued may read or write the arena (an owner whose constructor failed after it enqueued work, before
+    // its first synchronize): unmapping under it is undefined, so the device drains first. Teardown only.
+    if (!chunks_.empty()) { (void)cudaDeviceSynchronize(); }
     while (!chunks_.empty()) {
         const std::size_t offset = (chunks_.size() - 1) * chunk_;
         (void)cuMemUnmap(base_ + offset, chunk_);
@@ -56,6 +59,12 @@ VmmArena::~VmmArena() {
 }
 
 bool VmmArena::supported(int device) { return vmm::supported(device); }
+
+namespace testing {
+void set_vmm_supported(std::optional<bool> supported) noexcept {
+    vmm::forced_support().store(supported ? (*supported ? 1 : 0) : -1, std::memory_order_relaxed);
+}
+} // namespace testing
 
 bool VmmArena::map_chunk() {
     if (mapped_bytes() + chunk_ > reserved_) { return false; }
@@ -79,6 +88,9 @@ VmmRange::VmmRange(int device, std::size_t reserve_bytes, std::size_t chunk_byte
 }
 
 VmmRange::~VmmRange() {
+    // As ~VmmArena: queued work may still use a chunk (a Program constructor that failed after map_kv enqueued the
+    // chunks' zeroing, before its first synchronize), so the device drains before anything is unmapped.
+    if (mapped_ != 0) { (void)cudaDeviceSynchronize(); }
     for (std::size_t chunk = 0; chunk < handles_.size(); ++chunk) {
         if (handles_[chunk] == 0) { continue; }
         (void)cuMemUnmap(base_ + chunk * chunk_, chunk_);

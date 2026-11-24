@@ -324,6 +324,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     if (plan.persistent.score_hidden) {
         score_hidden = plan.persistent.score_hidden->bind(backing);
     }
+    if (plan.persistent.score_layer_hidden) {
+        score_layer_hidden = plan.persistent.score_layer_hidden->bind(backing);
+    }
     if (plan.persistent.token_counts) {
         token_counts = plan.persistent.token_counts->bind(backing);
     }
@@ -387,7 +390,11 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         // The fixed allocations: the persistent and workspace arenas and the elastic text KV's base pages
         // (the rest of its region is reserved, not backed).
         const std::uint64_t fixed = plan.persistent.bytes + plan.workspace.capacity + (kv_vmm ? kv_vmm->mapped_bytes() : 0U);
-        if (const std::uint64_t spilled = spill_guard->end(fixed); spilled != 0) {
+        // What the constructor page-locked since the guard began (the grammar masks' mirror is the only buffer of
+        // megabytes; the round frames, flags and table shadows are within the guard's tolerance), which the
+        // guard takes off the shared system memory use it reads.
+        const std::uint64_t pinned = grammar_masks_host ? grammar_masks_host->size() : 0U;
+        if (const std::uint64_t spilled = spill_guard->end(fixed, pinned); spilled != 0) {
             throw std::runtime_error(
                 std::to_string(spilled >> 20) +
                 " MiB of the Program's VRAM allocations were placed in shared system memory by the driver's sysmem "
@@ -440,16 +447,54 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         // Past the OS budget (--vram-past-budget) cudaMemGetInfo stops at the budget: the budget source reads both
         // sides of the graphs' allocations.
         const auto graph_vram         = open_vram_budget_source(device.device, plan.vram_past_budget);
-        const std::size_t free_before = graph_vram->query().device_free;
+        const VramSnapshot before     = graph_vram->query();
+        const std::size_t free_before = before.device_free;
         // Offloaded experts: each executable's warm launch runs the MoE (its CPU-served misses and
         // landings included), so a round is open; an expert the warm launches could not serve fails
         // the startup.
         if (offload) { offload->begin_round(device.stream); }
-        prepare_graphs();
-        device.synchronize();
+        try {
+            prepare_graphs();
+            device.synchronize();
+        } catch (const GraphMemoryExhausted&) {
+            throw;
+        } catch (const DeviceMemoryExhausted& error) {
+            // A warm launch (a kernel's first launch loads its module) or the work it enqueued found no device
+            // memory, as an instantiation does: the same answer, so the start's retry with a smaller automatic KV
+            // capacity takes it too. The device is usable once the enqueued work has drained.
+            (void)settle_after_memory_exhausted();
+            throw GraphMemoryExhausted(std::string("CUDA Graph preparation: ") + error.what());
+        }
         if (offload) { offload->engine().check_error(parameters.model.info().name + " (graph preparation)"); }
-        const std::size_t free_after = graph_vram->query().device_free;
-        graph_measured_bytes         = free_before > free_after ? free_before - free_after : 0;
+        const VramSnapshot after     = graph_vram->query();
+        const std::size_t free_after = after.device_free;
+        // This process's own device memory where the OS reports it (DXGI's local usage on Windows, DXCore's under
+        // WSL2), else the drop in free memory. Under WDDM cudaMemGetInfo's free figure is device-wide, so another
+        // program's allocation during the preparation counted as graph memory: 2026-11-18, four consecutive real
+        // tests read 44,810,240 B more than the same configurations ever did again (not a 2 MiB multiple); on a
+        // quiet card the two readings agree to the byte (24 windows, 8-124 MiB). Every allocation of this process
+        // still counts, so an overrun of the graphs' own is never hidden.
+        const bool own_usage = before.has_local_usage && after.has_local_usage;
+        graph_measured_bytes =
+            own_usage ? static_cast<std::size_t>(after.local_usage > before.local_usage ? after.local_usage - before.local_usage : 0)
+                      : (free_before > free_after ? free_before - free_after : 0);
+        // Under the Windows sysmem fallback the driver never reports the shortage: executables past the free
+        // device memory land in shared system memory, where every replay reads them over the link, and the drop
+        // in free memory misses them. This process's shared system memory use shows them (nothing here
+        // page-locks host memory without offloaded experts, whose tiers and promotions do): they fail the attempt
+        // as an exhausted instantiation does, so an automatic KV capacity retries smaller and an explicit one
+        // fails the start by name instead of running slowly.
+        if (!offload && before.shared_system != 0 && after.shared_system != 0) {
+            const std::uint64_t ceiling = std::numeric_limits<std::uint64_t>::max();
+            if (const std::uint64_t spilled = spill_rise(before.nonlocal_usage, after.nonlocal_usage, ceiling, 0);
+                spilled != 0) {
+                throw GraphMemoryExhausted("CUDA Graph preparation: " + std::to_string(spilled >> 20) +
+                                           " MiB of the executables were placed in shared system memory by the "
+                                           "driver's sysmem fallback (free device memory " +
+                                           std::to_string(free_before >> 20) + " MiB before, " +
+                                           std::to_string(free_after >> 20) + " MiB after)");
+            }
+        }
         graph_phase.complete();
     }
     work.reset();
@@ -465,7 +510,7 @@ ProgramImpl::~ProgramImpl() noexcept {
 
 ScoreResult ProgramImpl::causal_score(PreparedPromptData&& prompt, std::uint32_t first_target,
                                       const ScoreOptions& options) {
-    if (!causal_scoring || !score_hidden || !score_logprobs_host ||
+    if (!causal_scoring || !score_hidden || !score_layer_hidden || !score_logprobs_host ||
         workspace_plan.causal_score == 0) {
         throw std::logic_error("Program was not constructed for causal scoring");
     }
@@ -527,6 +572,16 @@ ScoreResult ProgramImpl::causal_score(PreparedPromptData&& prompt, std::uint32_t
     std::vector<TokenId> staged_targets;
     staged_targets.reserve(kCausalScoreTile);
     std::uint32_t staged_columns = 0;
+    // ScoreOptions::prompt_hidden_states: every layer's output at the last prompt position, recorded by the text pass
+    // that holds it.
+    std::vector<std::uint8_t> hidden_rows;
+    std::optional<execution::HiddenStateSink> hidden_sink;
+    if (options.prompt_hidden_states) {
+        hidden_rows.assign(parameters.model.config().text.num_hidden_layers, 0);
+        hidden_sink.emplace(execution::HiddenStateSink{.out      = *score_layer_hidden,
+                                                       .position = static_cast<std::int64_t>(first_target) - 1,
+                                                       .rows     = &hidden_rows});
+    }
 
     try {
         state = state_store->reserve_reset(device.stream);
@@ -663,6 +718,7 @@ ScoreResult ProgramImpl::causal_score(PreparedPromptData&& prompt, std::uint32_t
                 0,
                 0,
                 nullptr};
+            schedule_state.hidden_states = hidden_sink ? &*hidden_sink : nullptr;
             mark_workspace_usage(workspace_plan.text_prefill);
             // Offloaded experts: each scored pass is a prompt pass of lane 0.
             execution::OffloadedCall offload_call;
@@ -717,6 +773,22 @@ ScoreResult ProgramImpl::causal_score(PreparedPromptData&& prompt, std::uint32_t
         if (output.logprobs.size() != scored_positions) {
             throw std::logic_error("causal score produced the wrong number of logprobs");
         }
+        if (hidden_sink) {
+            if (std::any_of(hidden_rows.begin(), hidden_rows.end(), [](std::uint8_t n) { return n != 1; })) {
+                throw std::logic_error("the scored prompt's hidden states were not captured once per layer");
+            }
+            const auto values = static_cast<std::size_t>(score_layer_hidden->numel());
+            std::vector<std::uint16_t> raw(values);
+            CUDA_CHECK(cudaMemcpyAsync(raw.data(), score_layer_hidden->data, 2 * values, cudaMemcpyDeviceToHost,
+                                       device.stream));
+            device.synchronize();
+            output.hidden_states.resize(values);
+            output.hidden_state_layers = parameters.model.config().text.num_hidden_layers;
+            for (std::size_t i = 0; i < values; ++i) {
+                const std::uint32_t bits = std::uint32_t{raw[i]} << 16U;
+                std::memcpy(&output.hidden_states[i], &bits, sizeof(bits));
+            }
+        }
         // flush() synchronized: the appends' flag is final.
         if (unpackable != nullptr && std::exchange(*unpackable, 0) != 0) {
             throw std::runtime_error("a K or V row of the scored text has more values outside its exponent window "
@@ -745,6 +817,8 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
     const auto& weights = parameters.model.storage_stats();
     out.weights = ArenaMemorySummary{weights.device_capacity_bytes, weights.device_capacity_bytes,
                                      weights.device_capacity_bytes};
+    out.draft_screen_bytes = parameters.draft_screen.bytes;
+    out.adapter_bytes      = parameters.allocated_adapter_bytes();
     out.sequence =
         ArenaMemorySummary{persistent.capacity(), persistent.used(), persistent.peak_used()};
     std::size_t active_handoff_bytes = 0;
@@ -801,9 +875,25 @@ MemoryUsage ProgramImpl::memory_usage() const noexcept {
     out.device.weights  = storage.device_capacity_bytes - std::min<std::uint64_t>(storage.device_capacity_bytes, drafter_weight_bytes);
     // With the drafter's proposal-head screen (DFlash2, Parameters::draft_screen: 357.6 MB at 248,320 rows).
     out.device.drafter  = drafter_weight_bytes + persistent_drafter_bytes + parameters.draft_screen.bytes;
+    // --lora: the adapter's factors (Parameters::lora_factors; its per-call U is in the workspace); --ablate: the
+    // sidecar's direction (Parameters::ablate).
+    out.device.adapter  = parameters.allocated_adapter_bytes();
     // The KV: the decoder's pages and tables (and an elastic pool's mapped pages), less the pages only the prefix
     // cache holds (each page's share of the KV), which are its part.
     out.device.kv = persistent_kv_bytes + (kv_vmm ? kv_vmm->mapped_bytes() : 0);
+    // The MTP drafter's page pool is planned with the decoder's KV but is no text page: named on its own, so the
+    // per-page figure below (a text page's share, which sizes the prefix cache's part and the used pages) and the
+    // KV cache's row are the text KV's. The total is unchanged.
+    if (const PagedKVCache* mtp = decoder->mtp_cache(); mtp != nullptr) {
+        const DeviceKVPagePool& mtp_pool = mtp->page_pool();
+        std::uint64_t planes             = 0;
+        for (std::size_t i = 0; i < mtp_pool.plane_count(); ++i) {
+            const Tensor& plane = mtp_pool.plane(i);
+            planes += static_cast<std::uint64_t>(plane.nb[3]) * static_cast<std::uint64_t>(plane.ne[3]);
+        }
+        out.device.mtp_kv = std::min(planes, out.device.kv);
+        out.device.kv    -= out.device.mtp_kv;
+    }
     const DeviceKVPagePool& pool = decoder->text_kv.page_pool();
     if (const std::uint32_t backed = pool.backed_pages(); backed != 0) {
         const std::uint64_t page      = out.device.kv / backed;
@@ -812,6 +902,19 @@ MemoryUsage ProgramImpl::memory_usage() const noexcept {
         out.device.prefix  = page * cached;
         out.device.kv     -= out.device.prefix;
         out.device.kv_used = page * (allocated - cached);
+        // A cached block's bundle holds a page of the DFlash drafter's full-attention pool too: the cache's
+        // part, not the drafter's.
+        if (dflash && dflash->full) {
+            const DeviceKVPagePool& full = dflash->full->page_pool();
+            std::uint64_t planes         = 0;
+            for (std::size_t i = 0; i < full.plane_count(); ++i) {
+                const Tensor& plane = full.plane(i);
+                planes += static_cast<std::uint64_t>(plane.nb[3]) * static_cast<std::uint64_t>(plane.ne[3]);
+            }
+            const std::uint64_t held = planes / full.capacity_pages() * std::min(cached, full.allocated_pages());
+            out.device.prefix  += held;
+            out.device.drafter -= std::min(out.device.drafter, held);
+        }
     }
     // The StateImage pool: a slot per lane (state), then the prefix cache's Device snapshot slots (its part).
     const std::uint64_t snapshot_slots = context_cache.hybrid.device_snapshot_slots.value_or(0);

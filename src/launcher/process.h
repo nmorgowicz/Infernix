@@ -77,8 +77,20 @@ struct CaptureResult {
                                                        const std::vector<std::string>& args,
                                                        std::chrono::milliseconds timeout, const EnvOverlay& env = {});
 
+// Ends process `pid` while it still runs a program of this file name ("infernix-serve.exe"; case-insensitive on
+// Windows): the leftover of a child's own child, in a process group of its own, after the child was ended. True when
+// no such process runs any longer (ended within `wait`, gone, or the id belongs to another program now).
+bool end_leftover_process(std::uint32_t pid, std::string_view file_name, std::chrono::milliseconds wait);
+
+// A program found on PATH ("python3"; ".exe" is added on Windows when the name has no extension).
+[[nodiscard]] std::optional<std::filesystem::path> find_program(std::string_view name);
+
 // Starts a process that outlives the launcher (no pipe, no job object, its own process group).
 bool spawn_detached(const std::filesystem::path& executable, const std::vector<std::string>& args);
+#ifdef _WIN32
+// The same with its command line given whole (cmd_batch_command_line's, which quoting each argument cannot spell).
+bool spawn_detached_command_line(const std::filesystem::path& executable, const std::string& command_line);
+#endif
 
 // Opens a URL in the user's browser.
 void open_in_browser(const std::string& url);

@@ -4,6 +4,7 @@
 #include "test_temp_path.h"
 #include "kv_cache_storage.h"
 #include "runtime/contract/execution.h"
+#include "models/qwen3_5/program/prefix/test_seams.h"
 #include "infernix/engine.h"
 
 #include <algorithm>
@@ -26,6 +27,8 @@
 #include <vector>
 
 namespace {
+
+namespace qwen_testing = infernix::models::qwen3_5::testing;
 
 constexpr std::uint32_t kPrefillChunk = 512;
 // Tokens per cached KV block.
@@ -97,6 +100,34 @@ struct Observed {
     std::uint32_t reused = 0;
     infernix::RuntimeStats stats;
 };
+
+// Restore-exact's two prompts (the SSD tier's too): the second shares the first's first 1400 tokens.
+std::pair<std::vector<infernix::TokenId>, std::vector<infernix::TokenId>> restore_prompts() {
+    std::vector<infernix::TokenId> first = synthetic_tokens(1500, 1);
+    std::vector<infernix::TokenId> second(first.begin(), first.begin() + 1400);
+    const std::vector<infernix::TokenId> suffix = synthetic_tokens(300, 2);
+    second.insert(second.end(), suffix.begin(), suffix.end());
+    return {std::move(first), std::move(second)};
+}
+
+// The Device-resident engine on restore_prompts() (16384 KV tokens, a 1 GiB Host tier, eight Device snapshot slots):
+// the first prompt, then the second, which resumes from its snapshot. Restore-exact compares its Host restore with it
+// and the SSD tier its SSD restore, so one run per drafter serves both, made by whichever runs first (a fresh Engine of
+// the same options gives the same greedy tokens, which restore-exact's own comparison already rests on).
+Observed device_restore_reference(const char* artifact, infernix::SpeculativeBackend backend) {
+    static std::vector<std::pair<infernix::SpeculativeBackend, Observed>> runs;
+    for (const auto& [ran, observed] : runs) {
+        if (ran == backend) { return observed; }
+    }
+    const auto prompts = restore_prompts();
+    const std::vector<infernix::TokenId>& first  = prompts.first;
+    const std::vector<infernix::TokenId>& second = prompts.second;
+    infernix::Engine engine(hybrid_options(artifact, backend, 16384, 1ULL << 30, 8));
+    (void)engine.generate(engine.prepare_tokens(first), greedy(8));
+    const infernix::GenerationResult result = engine.generate(engine.prepare_tokens(second), greedy(24));
+    runs.emplace_back(backend, Observed{result.generated_token_ids, result.reused_prompt_tokens, engine.runtime_stats()});
+    return runs.back().second;
+}
 
 // GitHub #29: after a ladder of long prompts with repeats on a small Host tier, the cache stopped
 // reusing for the rest of the session (identical repeats and continued turns prefilled from zero,
@@ -186,25 +217,21 @@ int exercise_issue29(const char* artifact) {
 // same snapshot comes back through the Host slabs. Both restores carry identical bytes and resume
 // at the same frontier with the same chunking, so greedy generation must match token for token.
 int exercise_restore_exact(const char* artifact, infernix::SpeculativeBackend backend) {
-    const std::vector<infernix::TokenId> first = synthetic_tokens(1500, 1);
-    std::vector<infernix::TokenId> second(first.begin(), first.begin() + 1400);
-    const std::vector<infernix::TokenId> suffix = synthetic_tokens(300, 2);
-    second.insert(second.end(), suffix.begin(), suffix.end());
+    const auto prompts = restore_prompts();
+    const std::vector<infernix::TokenId>& first  = prompts.first;
+    const std::vector<infernix::TokenId>& second = prompts.second;
     // 3900 prompt tokens need 61 of the constrained engine's 64 pages, evicting all but the
     // first few of the first request's cached blocks.
     const std::vector<infernix::TokenId> pressure = synthetic_tokens(3900, 3);
 
-    const auto run = [&](infernix::EngineOptions options, bool apply_pressure) {
-        infernix::Engine engine(std::move(options));
+    const Observed device = device_restore_reference(artifact, backend);
+    const Observed host   = [&] {
+        infernix::Engine engine(hybrid_options(artifact, backend, 4096, 1ULL << 30, 1));
         (void)engine.generate(engine.prepare_tokens(first), greedy(8));
-        if (apply_pressure) { (void)engine.generate(engine.prepare_tokens(pressure), greedy(4)); }
-        const infernix::GenerationResult result =
-            engine.generate(engine.prepare_tokens(second), greedy(24));
-        return Observed{result.generated_token_ids, result.reused_prompt_tokens,
-                        engine.runtime_stats()};
-    };
-    const Observed device = run(hybrid_options(artifact, backend, 16384, 1ULL << 30, 8), false);
-    const Observed host   = run(hybrid_options(artifact, backend, 4096, 1ULL << 30, 1), true);
+        (void)engine.generate(engine.prepare_tokens(pressure), greedy(4));
+        const infernix::GenerationResult result = engine.generate(engine.prepare_tokens(second), greedy(24));
+        return Observed{result.generated_token_ids, result.reused_prompt_tokens, engine.runtime_stats()};
+    }();
 
     // The first prompt's chunks end at 512 and 1024; the final chunk [1024, 1500) holds the
     // flexible prompt-tail tap, realized at its start.
@@ -246,22 +273,25 @@ int exercise_restore_exact(const char* artifact, infernix::SpeculativeBackend ba
 // (1024) and its blocks out of the Host tier. The second prompt reads them back from the SSD tier and
 // generates exactly what the Device-resident engine does (byte copies at every tier).
 int exercise_ssd_restore(const char* artifact, infernix::SpeculativeBackend backend) {
-    const std::vector<infernix::TokenId> first = synthetic_tokens(1500, 1);
-    std::vector<infernix::TokenId> second(first.begin(), first.begin() + 1400);
-    const std::vector<infernix::TokenId> suffix = synthetic_tokens(300, 2);
-    second.insert(second.end(), suffix.begin(), suffix.end());
-    std::vector<infernix::TokenId> device_tokens;
-    {
-        infernix::Engine engine(hybrid_options(artifact, backend, 16384, 1ULL << 30, 8));
-        (void)engine.generate(engine.prepare_tokens(first), greedy(8));
-        device_tokens = engine.generate(engine.prepare_tokens(second), greedy(24)).generated_token_ids;
-    }
+    const auto prompts = restore_prompts();
+    const std::vector<infernix::TokenId>& first  = prompts.first;
+    const std::vector<infernix::TokenId>& second = prompts.second;
+    const std::vector<infernix::TokenId> device_tokens = device_restore_reference(artifact, backend).tokens;
     std::filesystem::path directory;
+    // A directory the scenario made goes when it ends: declared before its Engines, after their stops.
+    struct RemoveOnExit {
+        std::filesystem::path path;
+        ~RemoveOnExit() {
+            std::error_code ignored;
+            if (!path.empty()) { std::filesystem::remove_all(path, ignored); }
+        }
+    } temporary;
     if (const char* dir = std::getenv("INFERNIX_TEST_SSD_DIR"); dir != nullptr && *dir != '\0') {
         directory = dir;
     } else {
         directory = infernix::test::unique_temp_path("hybrid_ssd_tier");
         std::filesystem::create_directories(directory);
+        temporary.path = directory;
     }
     const auto ssd_options = [&](const std::filesystem::path& persistent) {
         infernix::EngineOptions options = hybrid_options(artifact, backend, 4096, 480ULL << 20, 1);
@@ -295,7 +325,9 @@ int exercise_ssd_restore(const char* artifact, infernix::SpeculativeBackend back
         }
         // The restore refills the Host tier with entries the SSD does not hold yet; the promotion waits for their
         // write-back to land (SsdTier::Promotion::Pending) rather than falling back to a cold prefill.
-        infernix::Engine restarted(ssd_options(persistent));
+        std::optional<infernix::Engine> holder;
+        holder.emplace(ssd_options(persistent));
+        infernix::Engine& restarted = *holder;
         const infernix::LoadSummary::PrefixCacheRestore restore = restarted.load_summary().prefix_cache;
         std::cout << "ssd-restore (restart): restored " << restore.blocks << " blocks and " << restore.snapshots
                   << " snapshots, " << restore.ssd_blocks << " and " << restore.ssd_snapshots
@@ -320,7 +352,13 @@ int exercise_ssd_restore(const char* artifact, infernix::SpeculativeBackend back
             std::cerr << "ssd-restore (restart): the kept SSD restore generated other tokens or failed a transfer\n";
             ++failures;
         }
+        // The stop saves the file again, so it goes after the Engine.
+        holder.reset();
         std::filesystem::remove(persistent, ignored);
+        if (std::filesystem::exists(persistent)) {
+            std::cerr << "ssd-restore (restart): the kept SSD file was left in the temp directory\n";
+            ++failures;
+        }
     }
     for (const auto& entry : std::filesystem::directory_iterator(directory)) {
         if (entry.path().filename().string().starts_with("infernix-context-kept-")) {
@@ -423,6 +461,12 @@ int exercise_persist(const char* artifact) {
         if (!fails_unavailable(
                 [&] { (void)saver.submit(saver.prepare_tokens(second), greedy(4)); })) {
             std::cerr << "persist: a stopped Engine accepted a request\n";
+            ++failures;
+        }
+        // A request for no output tokens is answered without the queue, but not by a stopped Engine.
+        if (!fails_unavailable(
+                [&] { (void)saver.submit(saver.prepare_tokens(second), greedy(0)).wait(); })) {
+            std::cerr << "persist: a stopped Engine answered a zero-token request\n";
             ++failures;
         }
     }
@@ -605,11 +649,15 @@ int exercise_persist(const char* artifact) {
 //   token so the follower never shares a decode round: the follower's output must equal an
 //   uncached run's.
 // - Inside a block, the snapshot goes on the block boundary below, where it publishes at once.
-int exercise_coalesce(const char* artifact, std::uint32_t shared_tokens, bool compare_output) {
+// - A leader with a long prompt past the shared prefix (`leader_suffix` of several chunks): the follower is
+//   admitted when the leader's snapshot at the divergence publishes, not when the leader's whole prefill ends
+//   (2026-11-15: admission was re-run only at the end of the leader's prompt, so the follower queued for all of it).
+int exercise_coalesce(const char* artifact, std::uint32_t shared_tokens, bool compare_output,
+                      std::uint32_t leader_suffix = 40) {
     const std::vector<infernix::TokenId> shared        = synthetic_tokens(shared_tokens, 6);
     std::vector<infernix::TokenId> first               = shared;
     std::vector<infernix::TokenId> second              = shared;
-    const std::vector<infernix::TokenId> first_suffix  = synthetic_tokens(40, 7);
+    const std::vector<infernix::TokenId> first_suffix  = synthetic_tokens(leader_suffix, 7);
     const std::vector<infernix::TokenId> second_suffix = synthetic_tokens(40, 8);
     first.insert(first.end(), first_suffix.begin(), first_suffix.end());
     second.insert(second.end(), second_suffix.begin(), second_suffix.end());
@@ -618,6 +666,7 @@ int exercise_coalesce(const char* artifact, std::uint32_t shared_tokens, bool co
     infernix::EngineOptions options =
         hybrid_options(artifact, infernix::SpeculativeBackend::None, 16384, 1ULL << 30, 8);
     options.max_concurrency = 2;
+    if (shared_tokens + leader_suffix + 64U > options.max_context) { options.max_context = 8192; }
     std::vector<infernix::TokenId> reference;
     if (compare_output) {
         infernix::Engine engine(options);
@@ -639,6 +688,19 @@ int exercise_coalesce(const char* artifact, std::uint32_t shared_tokens, bool co
         std::cerr << "coalesce " << shared_tokens
                   << ": the follower generated different tokens than an uncached run\n";
         ++failures;
+    }
+    if (leader_suffix >= kPrefillChunk) {
+        // The follower waits for the leader's prefill of the shared prefix only: under half of the leader's
+        // prompt here, and later chunks cost more. Three quarters of the leader's prefill time bounds it with room.
+        const double waited  = followed.engine_timing.queue_wait_seconds;
+        const double prefill = led.timings.prefill_seconds;
+        std::cout << "coalesce " << shared_tokens << "+" << leader_suffix << ": the follower queued " << waited
+                  << " s of the leader's " << prefill << " s prefill\n";
+        if (!(waited < 0.75 * prefill)) {
+            std::cerr << "coalesce " << shared_tokens << "+" << leader_suffix
+                      << ": the follower was admitted only once the leader's whole prefill had run\n";
+            ++failures;
+        }
     }
     return failures;
 }
@@ -904,6 +966,317 @@ int exercise_turns(const char* artifact, std::size_t host_bytes) {
     return failures;
 }
 
+// QK-02, the pair window: a chat turn whose generation opener tap falls in its prompt's last pass takes the tap
+// inside that pass. With the cut (testing::set_pair_windows(false)) the turn's last pass begins at the opener; with
+// the pair no pass does, the next turn still resumes at the opener, and it generates the tokens it generates
+// resuming from the cut's tap: the tap's state (the GDN convolution and recurrence split at the opener, the
+// continuation hidden, the drafter's ring) is the cut's, where the head's kernels take the same routes at the
+// pair's width as at its own (heads of ~200 columns here; a resumed 77-column head paired to 84 changed its next
+// turn's tokens in a served A/B). Two turns: a cold one, then one resumed from its tap that pairs its own opener.
+// Each arm runs on a fresh Engine. A KV window (vq2, q4k-vq2) keeps the cut: both arms cut.
+// The pair-window exercises' conversation: a cold turn, a short follow-up, and a long resumed turn with its reply.
+struct PairConversation {
+    infernix::ChatMessage system, first_user, reply, second_user, follow_user, follow_reply;
+    std::string question;
+};
+
+PairConversation pair_conversation() {
+    PairConversation p;
+    p.system = text_message(infernix::ChatRole::System, "You are a concise assistant for a hardware shop. Answer in plain words.");
+    // Longer than the 64-token cluster distance, so the opener keeps its own exact tap past the system block's.
+    p.question = "A customer asks which of three drills to buy.";
+    for (int i = 0; i < 6; ++i) {
+        p.question += " Drill " + std::to_string(i) + " has a different battery, chuck size, weight and warranty, and the "
+                      "customer mostly hangs shelves and assembles furniture at home.";
+    }
+    p.first_user = text_message(infernix::ChatRole::User, p.question);
+    p.reply = text_message(infernix::ChatRole::Assistant, "Take the lightest one with a two-year warranty and a spare battery.");
+    p.second_user = text_message(infernix::ChatRole::User, "And which bits should go with it?");
+    // The resumed turn's question: long enough that its opener lies well past where it resumes (its own exact tap,
+    // with a wide head).
+    std::string follow_up = "Thanks. Now the same customer also asks about storage.";
+    for (int i = 0; i < 6; ++i) {
+        follow_up += " Case " + std::to_string(i) + " is a plastic box with foam inserts, a metal clasp, room for twenty "
+                     "bits and a belt clip, sold at a slightly different price.";
+    }
+    p.follow_user  = text_message(infernix::ChatRole::User, follow_up);
+    p.follow_reply = text_message(infernix::ChatRole::Assistant, "The second case: foam inserts keep the bits from rattling.");
+    return p;
+}
+
+int exercise_pair_window(const char* artifact, infernix::SpeculativeBackend backend) {
+    const std::string name = std::string("pair-window") +
+                             (backend == infernix::SpeculativeBackend::DFlash2 ? " (dflash2)"
+                              : backend == infernix::SpeculativeBackend::Mtp   ? " (mtp)"
+                                                                               : "");
+    const PairConversation conv = pair_conversation();
+    const infernix::ChatMessage &system = conv.system, &first_user = conv.first_user, &reply = conv.reply,
+                                &second_user = conv.second_user, &follow_user = conv.follow_user,
+                                &follow_reply = conv.follow_reply;
+    const std::string& question = conv.question;
+    const bool kv_window = kv_storage == infernix::KvCacheStorage::Vq2 || kv_storage == infernix::KvCacheStorage::Q4KeyVq2Value;
+    struct Arm {
+        std::vector<std::uint32_t> bases, follow_bases; // where each text pass of the two turns began
+        std::uint32_t first_tokens = 0, follow_tokens = 0, reused = 0, follow_reused = 0, last_reused = 0;
+        std::uint64_t refusals = 0; // Device snapshot slots refused during the resumed turn
+        std::vector<infernix::TokenId> second, last;
+    };
+    const auto run = [&](bool pair) {
+        qwen_testing::set_pair_windows(pair);
+        infernix::EngineOptions options = hybrid_options(artifact, backend, 8192, 1ULL << 30, 0);
+        options.context_cache.hybrid.device_snapshot_slots.reset();
+        infernix::Engine engine(std::move(options));
+        Arm arm;
+        const auto passes = [] {
+            std::vector<std::uint32_t> bases;
+            for (const qwen_testing::TextPass& pass : qwen_testing::text_passes()) { bases.push_back(pass.base); }
+            qwen_testing::record_text_passes(false);
+            return bases;
+        };
+        qwen_testing::record_text_passes(true);
+        const infernix::GenerationResult first = engine.generate(engine.prepare(conversation({system, first_user})), greedy(8));
+        arm.bases = passes();
+        const infernix::GenerationResult second =
+            engine.generate(engine.prepare(conversation({system, first_user, reply, second_user})), greedy(24));
+        // The resumed turn (from the first turn's opener tap) whose own opener pairs, then the turn after it. A turn
+        // that finds every Device snapshot slot still held (the previous reply's snapshots landing on the Host) is
+        // cut instead (hybrid spec §7.10); the pause, as a client's next turn arrives, makes the pair the usual case
+        // without depending on it: a cut is accepted where a slot refusal explains it.
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        arm.refusals = engine.runtime_stats().hybrid_device_slot_refusals;
+        qwen_testing::record_text_passes(true);
+        const infernix::GenerationResult follow =
+            engine.generate(engine.prepare(conversation({system, first_user, reply, follow_user})), greedy(8));
+        arm.follow_bases = passes();
+        arm.refusals     = engine.runtime_stats().hybrid_device_slot_refusals - arm.refusals;
+        const infernix::GenerationResult last = engine.generate(
+            engine.prepare(conversation({system, first_user, reply, follow_user, follow_reply, second_user})), greedy(24));
+        arm.first_tokens  = first.prompt.prompt_tokens;
+        arm.follow_tokens = follow.prompt.prompt_tokens;
+        arm.reused        = second.reused_prompt_tokens;
+        arm.follow_reused = follow.reused_prompt_tokens;
+        arm.last_reused   = last.reused_prompt_tokens;
+        arm.second        = second.generated_token_ids;
+        arm.last          = last.generated_token_ids;
+        return arm;
+    };
+    Arm cut, pair;
+    try {
+        cut  = run(false);
+        pair = run(true);
+    } catch (...) {
+        qwen_testing::set_pair_windows(true);
+        qwen_testing::record_text_passes(false);
+        throw;
+    }
+    qwen_testing::set_pair_windows(true);
+    int failures = 0;
+    // The cut's last pass begins at the opener, 2-8 tokens before the prompt's end.
+    if (cut.bases.size() < 2 || cut.bases.back() + 8U < cut.first_tokens || cut.bases.back() + 2U > cut.first_tokens) {
+        std::cerr << name << ": the cut's first turn ran " << cut.bases.size() << " passes, the last from "
+                  << (cut.bases.empty() ? 0U : cut.bases.back()) << " of " << cut.first_tokens
+                  << " tokens; expected one from the generation opener\n";
+        return 1;
+    }
+    const std::uint32_t opener = cut.bases.back();
+    // The pair arm's passes: the cut's without the one from the opener (with a KV window, the cut's).
+    const auto paired = [&](const std::vector<std::uint32_t>& bases) {
+        return kv_window ? bases : std::vector<std::uint32_t>(bases.begin(), bases.end() - 1);
+    };
+    if (pair.bases != paired(cut.bases)) {
+        std::cerr << name << ": the pair's first turn ran " << pair.bases.size() << " passes, the cut's "
+                  << cut.bases.size() << (kv_window ? " (a KV window keeps the cut)" : "") << '\n';
+        ++failures;
+    }
+    if (cut.reused != opener || pair.reused != opener) {
+        std::cerr << name << ": the second turn reused " << cut.reused << " (cut) and " << pair.reused
+                  << " (pair) tokens; expected the opener, " << opener << '\n';
+        ++failures;
+    }
+    if (pair.second != cut.second) {
+        std::cerr << name << ": the second turn generated other tokens after the pair's tap than after the cut's\n";
+        ++failures;
+    }
+    // The resumed turn: it resumes at the first turn's opener, its own last pass begins at its opener in the cut
+    // (2-8 tokens before its end) and not in the pair, and the turn after it resumes there with the cut's tokens.
+    const std::uint32_t follow_opener = cut.follow_bases.empty() ? 0U : cut.follow_bases.back();
+    const bool follow_paired = pair.follow_bases == paired(cut.follow_bases);
+    const bool follow_cut_for_room = !follow_paired && pair.follow_bases == cut.follow_bases && pair.refusals > 0;
+    if (cut.follow_reused != opener || pair.follow_reused != opener || follow_opener + 8U < cut.follow_tokens ||
+        follow_opener + 2U > cut.follow_tokens || !(follow_paired || follow_cut_for_room)) {
+        std::cerr << name << ": the resumed turn reused " << cut.follow_reused << " / " << pair.follow_reused << " of "
+                  << cut.follow_tokens << " tokens and ran " << cut.follow_bases.size() << " passes cut, "
+                  << pair.follow_bases.size() << " paired (last cut pass from " << follow_opener << "; "
+                  << pair.refusals << " Device snapshot slots refused during it)\n";
+        ++failures;
+    }
+    if (cut.last_reused != follow_opener || pair.last_reused != follow_opener || pair.last != cut.last) {
+        std::cerr << name << ": the turn after the resumed one reused " << cut.last_reused << " (cut) and "
+                  << pair.last_reused << " (pair), expected " << follow_opener << ", and generated "
+                  << (pair.last == cut.last ? "equal" : "different") << " tokens\n";
+        ++failures;
+    }
+    std::cout << name << ": a " << cut.first_tokens << "-token turn ran " << cut.bases.size() << " passes cut and "
+              << pair.bases.size() << " paired (opener at " << opener << "); the next turn resumed at " << pair.reused
+              << " (cut " << cut.reused << "), tokens " << (pair.second == cut.second ? "equal" : "different")
+              << "; a resumed " << cut.follow_tokens << "-token turn ran " << cut.follow_bases.size() << " passes cut and "
+              << pair.follow_bases.size() << (follow_cut_for_room ? " (cut: no slot)" : " paired") << " (opener at "
+              << follow_opener << "); the turn after it resumed at "
+              << pair.last_reused << ", tokens " << (pair.last == cut.last ? "equal" : "different") << '\n';
+    if (backend != infernix::SpeculativeBackend::None || kv_window) { return failures; }
+
+    // A device failure anywhere in a pair turn's work, its pass among them, gives back the room the pass's tap took
+    // (its Device snapshot slot and state image). On an Engine with two Device snapshot slots each swept turn (a new
+    // question, so each pairs its opener) fails with the out-of-memory error or completes, a clean turn after it
+    // completes, and then a new conversation's next turn still resumes at its opener: two leaked slots would leave
+    // its tap none, paired or cut (a pass without room for its tap is cut, and the capture after its head pass
+    // tries again).
+    const std::uint32_t tail = cut.first_tokens - opener;
+    infernix::EngineOptions faulted = hybrid_options(artifact, backend, 8192, 1ULL << 30, 2);
+    infernix::Engine engine(std::move(faulted));
+    const auto turn = [&](const std::string& text) {
+        return conversation({system, text_message(infernix::ChatRole::User, text)});
+    };
+    const std::vector<std::uint64_t> sweep{1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987, 1597};
+    std::uint32_t failed = 0;
+    for (std::size_t i = 0; i < sweep.size(); ++i) {
+        infernix::runtime::testing::request_memory_fault(sweep[i]);
+        std::string error;
+        try {
+            (void)engine.generate(engine.prepare(turn(question + " Case " + std::to_string(i) + ".")), greedy(4));
+        } catch (const std::exception& e) { error = e.what(); }
+        infernix::runtime::testing::request_memory_fault(0);
+        if (!error.empty()) {
+            ++failed;
+            if (error.find("out of device memory") == std::string::npos) {
+                std::cerr << name << ": a turn faulted at check " << sweep[i] << " failed otherwise: " << error << '\n';
+                ++failures;
+            }
+        }
+        try {
+            (void)engine.generate(engine.prepare(turn("Say yes. Item " + std::to_string(i) + ".")), greedy(2));
+        } catch (const std::exception& e) {
+            std::cerr << name << ": a clean turn after the fault at check " << sweep[i] << " failed: " << e.what() << '\n';
+            return failures + 1;
+        }
+    }
+    const infernix::ChatMessage last_user = text_message(infernix::ChatRole::User, question + " After the faults.");
+    qwen_testing::record_text_passes(true);
+    const infernix::GenerationResult last = engine.generate(engine.prepare(conversation({system, last_user})), greedy(8));
+    std::vector<std::uint32_t> last_bases;
+    for (const qwen_testing::TextPass& pass : qwen_testing::text_passes()) { last_bases.push_back(pass.base); }
+    qwen_testing::record_text_passes(false);
+    const infernix::GenerationResult next =
+        engine.generate(engine.prepare(conversation({system, last_user, reply, second_user})), greedy(4));
+    const std::uint32_t last_opener = last.prompt.prompt_tokens - tail;
+    const bool last_paired = std::find(last_bases.begin(), last_bases.end(), last_opener) == last_bases.end();
+    if (next.reused_prompt_tokens != last_opener) {
+        std::cerr << name << ": after " << failed << " faulted turns a new conversation's opener (" << last_opener
+                  << ", " << (last_paired ? "paired" : "cut") << ") did not serve its next turn, which resumed at "
+                  << next.reused_prompt_tokens << '\n';
+        ++failures;
+    }
+    std::cout << name << ": " << failed << " of " << sweep.size() << " faulted pair turns failed; afterwards a new "
+              << "conversation's opener was " << (last_paired ? "paired" : "cut") << " and its next turn resumed at "
+              << next.reused_prompt_tokens << '\n';
+    return failures;
+}
+
+// QK-02 beside a landing restore: the pair takes its tap's room before its pass, superseding the snapshot its turn
+// resumed from, while that snapshot's Host restore is still landing. With one Device snapshot slot the first turn's
+// opener tap gives its Device copy up to another conversation's snapshot, so the resumed turn restores it from the
+// Host, held back by testing::set_restore_delay so the copies are in flight when the pair asks for room. In both arms
+// the resumed turn restores from the Host and resumes at the first opener, and the turn after it resumes at the
+// resumed turn's opener with the same tokens; the pair arm pairs, or is cut where a slot refusal explains it.
+int exercise_pair_window_restore(const char* artifact) {
+    const std::string name = "pair-window-restore";
+    const PairConversation conv = pair_conversation();
+    const infernix::ChatMessage other_system =
+        text_message(infernix::ChatRole::System, "You answer questions about trains in one short sentence.");
+    std::string other_question = "Which train leaves first?";
+    for (int i = 0; i < 6; ++i) {
+        other_question += " Train " + std::to_string(i) + " leaves platform " + std::to_string(i + 2) +
+                          " a few minutes after the one before it and stops at every station on the coast line.";
+    }
+    const infernix::ChatMessage other_user = text_message(infernix::ChatRole::User, other_question);
+    struct Arm {
+        std::uint32_t first_tokens = 0, follow_reused = 0, last_reused = 0;
+        std::vector<std::uint32_t> follow_bases;
+        std::uint64_t restores = 0, refusals = 0;
+        std::vector<infernix::TokenId> last;
+    };
+    const auto run = [&](bool pair) {
+        qwen_testing::set_pair_windows(pair);
+        infernix::Engine engine(hybrid_options(artifact, infernix::SpeculativeBackend::None, 8192, 1ULL << 30, 1));
+        Arm arm;
+        const infernix::GenerationResult first =
+            engine.generate(engine.prepare(conversation({conv.system, conv.first_user})), greedy(8));
+        std::this_thread::sleep_for(std::chrono::milliseconds(200)); // its snapshots land on the Host
+        (void)engine.generate(engine.prepare(conversation({other_system, other_user})), greedy(8));
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        const infernix::RuntimeStats before = engine.runtime_stats();
+        qwen_testing::set_restore_delay(20000);
+        qwen_testing::record_text_passes(true);
+        infernix::GenerationResult follow;
+        try {
+            follow = engine.generate(
+                engine.prepare(conversation({conv.system, conv.first_user, conv.reply, conv.follow_user})), greedy(8));
+        } catch (...) {
+            qwen_testing::set_restore_delay(0);
+            qwen_testing::record_text_passes(false);
+            throw;
+        }
+        qwen_testing::set_restore_delay(0);
+        for (const qwen_testing::TextPass& pass : qwen_testing::text_passes()) { arm.follow_bases.push_back(pass.base); }
+        qwen_testing::record_text_passes(false);
+        const infernix::RuntimeStats after = engine.runtime_stats();
+        arm.restores = after.hybrid_host_image_restores - before.hybrid_host_image_restores;
+        arm.refusals = after.hybrid_device_slot_refusals - before.hybrid_device_slot_refusals;
+        const infernix::GenerationResult last = engine.generate(
+            engine.prepare(conversation(
+                {conv.system, conv.first_user, conv.reply, conv.follow_user, conv.follow_reply, conv.second_user})),
+            greedy(24));
+        arm.first_tokens  = first.prompt.prompt_tokens;
+        arm.follow_reused = follow.reused_prompt_tokens;
+        arm.last_reused   = last.reused_prompt_tokens;
+        arm.last          = last.generated_token_ids;
+        return arm;
+    };
+    Arm cut, pair;
+    try {
+        cut  = run(false);
+        pair = run(true);
+    } catch (...) {
+        qwen_testing::set_pair_windows(true);
+        throw;
+    }
+    qwen_testing::set_pair_windows(true);
+    int failures = 0;
+    const std::uint32_t follow_opener = cut.follow_bases.empty() ? 0U : cut.follow_bases.back();
+    const bool paired = !cut.follow_bases.empty() &&
+                        pair.follow_bases == std::vector<std::uint32_t>(cut.follow_bases.begin(), cut.follow_bases.end() - 1);
+    const bool cut_for_room = !paired && pair.follow_bases == cut.follow_bases && pair.refusals > 0;
+    if (cut.restores == 0 || pair.restores == 0 || cut.follow_reused != pair.follow_reused ||
+        cut.follow_reused + 16U < cut.first_tokens || cut.follow_reused >= cut.first_tokens || !(paired || cut_for_room)) {
+        std::cerr << name << ": the resumed turn restored " << cut.restores << " / " << pair.restores
+                  << " images from the Host and reused " << cut.follow_reused << " / " << pair.follow_reused << " of "
+                  << cut.first_tokens << " tokens; " << pair.follow_bases.size() << " passes paired against "
+                  << cut.follow_bases.size() << " cut (" << pair.refusals << " slot refusals)\n";
+        ++failures;
+    }
+    if (cut.last_reused != follow_opener || pair.last_reused != follow_opener || pair.last != cut.last) {
+        std::cerr << name << ": the turn after the resumed one reused " << cut.last_reused << " (cut) and "
+                  << pair.last_reused << " (pair), expected " << follow_opener << ", and generated "
+                  << (pair.last == cut.last ? "equal" : "different") << " tokens\n";
+        ++failures;
+    }
+    std::cout << name << ": the resumed turn restored " << pair.restores << " images from the Host (cut " << cut.restores
+              << ") under a held restore and was " << (paired ? "paired" : cut_for_room ? "cut (no slot)" : "?")
+              << "; the turn after it resumed at " << pair.last_reused << ", tokens "
+              << (pair.last == cut.last ? "equal" : "different") << '\n';
+    return failures;
+}
+
 std::vector<std::uint8_t> gradient_ppm(int size, int phase) {
     std::vector<std::uint8_t> ppm;
     const std::string header =
@@ -971,6 +1344,80 @@ int exercise_vision(const char* artifact) {
     }
     if (first.generated_token_ids.size() != 4 || other.generated_token_ids.size() != 4) {
         std::cerr << "vision: generation did not complete\n";
+        ++failures;
+    }
+    return failures;
+}
+
+// A turn resumed past an image against the same prompt run cold, on the reproducible route (bit for bit). A
+// multi-row image advances the rotary position by less than its token count, so every token after it sits at
+// position + rope_delta. Turn 1 leaves a snapshot on the chunk grid past the image; turn 2 resumes there and
+// prefills only text, through the text pass, which must carry the prompt's rope delta (2026-11-15: it ran at delta
+// 0 since the pass's context gained a member, so a resumed image conversation computed its suffix at the wrong
+// positions and published it, while a cold run of the same prompt, a multimodal pass throughout, did not).
+int exercise_vision_resume(const char* artifact) {
+    infernix::EngineOptions options =
+        hybrid_options(artifact, infernix::SpeculativeBackend::None, 8192, 1ULL << 30, 0);
+    options.context_cache.hybrid.device_snapshot_slots.reset();
+    options.enable_vision = true;
+    options.fast_paths    = false;
+    options.fast_path_candidates.clear();
+
+    const std::string system = "You describe images for an accessibility service.";
+    // Long enough that a chunk boundary past the image lies before the generation opener.
+    std::string question = "Describe the image.";
+    for (int sentence = 0; sentence < 150; ++sentence) {
+        question += " Detail " + std::to_string(sentence) + ": name the colours, shapes and layout plainly.";
+    }
+    const std::vector<std::uint8_t> image = gradient_ppm(512, 23);
+    const auto first_turn                 = [&] {
+        infernix::ChatMessage user;
+        user.role = infernix::ChatRole::User;
+        infernix::MessagePart media;
+        media.kind              = infernix::MessagePartKind::Media;
+        media.media.kind        = infernix::MediaKind::Image;
+        media.media.bytes       = image;
+        media.media.media_type  = "image/x-portable-pixmap";
+        media.media.source_name = "image.ppm";
+        user.parts.push_back(std::move(media));
+        user.parts.push_back(
+            infernix::MessagePart{.kind = infernix::MessagePartKind::Text, .text = question, .media = {}});
+        return std::vector<infernix::ChatMessage>{text_message(infernix::ChatRole::System, system), std::move(user)};
+    };
+    const auto second_turn = [&] {
+        std::vector<infernix::ChatMessage> messages = first_turn();
+        messages.push_back(text_message(infernix::ChatRole::Assistant, "A diagonal colour gradient."));
+        messages.push_back(text_message(infernix::ChatRole::User, "Which colour dominates the top left corner?"));
+        return messages;
+    };
+
+    std::vector<infernix::TokenId> cold;
+    std::uint32_t prompt_tokens = 0;
+    {
+        infernix::Engine engine(options);
+        const infernix::GenerationResult result = engine.generate(engine.prepare(conversation(second_turn())), greedy(24));
+        cold          = result.generated_token_ids;
+        prompt_tokens = result.prompt.prompt_tokens;
+        if (result.reused_prompt_tokens != 0) {
+            std::cerr << "vision-resume: the cold run reused " << result.reused_prompt_tokens << " tokens\n";
+            return 1;
+        }
+    }
+    infernix::Engine engine(options);
+    (void)engine.generate(engine.prepare(conversation(first_turn())), greedy(4));
+    const infernix::GenerationResult resumed = engine.generate(engine.prepare(conversation(second_turn())), greedy(24));
+    std::cout << "vision-resume: turn 2 reused " << resumed.reused_prompt_tokens << " of " << prompt_tokens
+              << " prompt tokens\n";
+    int failures = 0;
+    // The system text is under a chunk and a 512x512 image is 256 merged tokens: a resume from the second chunk
+    // boundary on lies past the image.
+    if (resumed.reused_prompt_tokens < 2U * kPrefillChunk || resumed.reused_prompt_tokens % kPrefillChunk != 0) {
+        std::cerr << "vision-resume: turn 2 resumed from " << resumed.reused_prompt_tokens
+                  << ", not from a chunk boundary past the image\n";
+        ++failures;
+    }
+    if (resumed.generated_token_ids != cold) {
+        std::cerr << "vision-resume: the turn resumed past the image differs from the same prompt run cold\n";
         ++failures;
     }
     return failures;
@@ -1419,7 +1866,12 @@ int main() {
     }
     const char* selected            = std::getenv("INFERNIX_HYBRID_REAL_SCENARIO");
     const std::string_view scenario = selected != nullptr && *selected != '\0' ? selected : "all";
-    constexpr std::array<std::string_view, 22> kScenarios{"all",
+    constexpr std::array<std::string_view, 27> kScenarios{"all",
+                                                          "pair-window",
+                                                          "pair-window-restore",
+                                                          "pair-window-dflash2",
+                                                          "pair-window-mtp",
+                                                          "vision-resume",
                                                           "ssd-restore",
                                                           "ssd-restore-mtp",
                                                           "next-turn",
@@ -1464,8 +1916,19 @@ int main() {
             failures += exercise_ssd_restore(artifact, infernix::SpeculativeBackend::Mtp);
         }
         if (all || scenario == "turns") { failures += exercise_turns(artifact, 1ULL << 30); }
+        if (all || scenario == "pair-window") {
+            failures += exercise_pair_window(artifact, infernix::SpeculativeBackend::None);
+        }
+        if (all || scenario == "pair-window-dflash2") {
+            failures += exercise_pair_window(artifact, infernix::SpeculativeBackend::DFlash2);
+        }
+        if (all || scenario == "pair-window-mtp") {
+            failures += exercise_pair_window(artifact, infernix::SpeculativeBackend::Mtp);
+        }
+        if (all || scenario == "pair-window-restore") { failures += exercise_pair_window_restore(artifact); }
         if (all || scenario == "turns-device-only") { failures += exercise_turns(artifact, 0); }
         if (all || scenario == "vision") { failures += exercise_vision(artifact); }
+        if (all || scenario == "vision-resume") { failures += exercise_vision_resume(artifact); }
         if (all || scenario == "persist") { failures += exercise_persist(artifact); }
         if (all || scenario == "interleaved") { failures += exercise_interleaved(artifact); }
         if (all || scenario == "identical-burst") { failures += exercise_identical_burst(artifact); }
@@ -1478,6 +1941,7 @@ int main() {
         if (all || scenario == "coalesce") {
             failures += exercise_coalesce(artifact, 6 * kPrefillChunk, true);
             failures += exercise_coalesce(artifact, 3000, false);
+            failures += exercise_coalesce(artifact, 6 * kPrefillChunk, false, 8 * kPrefillChunk);
         }
         if (all || scenario == "coalesce-vision") {
             failures += exercise_coalesce_vision(artifact);

@@ -118,8 +118,8 @@ to compile instead of silently losing SSD polling, resizes or a periodic save.
 ### 2.3 HybridResourceManager
 
 The `HybridResourceManager` connects the Engine to the Program's prefix index: it asks for an admitted
-request's candidate sources, reclaims by evicting cached Device blocks, prefetches the blocked FIFO
-head's Host-only path, passes the queue for queue holds and publishes the cache statistics. Retention
+request's candidate sources, reclaims by evicting cached Device blocks, prefetches the queued requests'
+Host-only paths (the FIFO head's and the request's behind it), passes the queue for queue holds and publishes the cache statistics. Retention
 policy (the block tree, snapshots, taps and eviction) lives in the Program's index
 ([hybrid prefix cache](hybrid-prefix-cache-spec.md)).
 
@@ -130,6 +130,18 @@ in the Program stores and its index.
 
 The Model owns the config, bindings, Uses, weight backing and read-only resources. A ModelInstance's
 const Parameters borrow these resources, and planning and execution consume the same parameters.
+
+A runtime LoRA adapter (`--lora`, [user guide](../lora.md)) follows the same split. The artifact layer reads its
+Hugging Face files (`artifact/safetensors.h`, `artifact/peft_lora.h`: header validation, the configuration's
+refusals, rank and alpha patterns). The Qwen3.5 Model binds its modules to text layers and projections
+(`models/qwen3_5/load/lora.h`) and keeps the binding; the instance's Parameters own the BF16 factor buffer
+(`execution/lora_parameters.h`: the factors in each adapted parent's physical row order, q_proj split per head into
+query and gate rows) and give each adapted input a site (`ops::LoraSite`: A stacked over the input's adapters, and
+the parent's term). Execution runs `ops::lora_shrink` before a projection and passes the term to the projection Op;
+the Ops own the canonical term arithmetic (`include/infernix/ops/lora.h`) in an adapter instance of each kernel,
+and refuse a parent format without one by name. An adapter instance keeps the kernel's own arithmetic (a zero `B`
+returns the no-adapter kernel's bits) and the no-adapter instance is the kernel as it was, so `--lora` changes no
+route and costs nothing without it. Planning counts each site's `U` in the workspace the call uses.
 
 Each Program exclusively owns:
 
@@ -345,6 +357,14 @@ state. The source remains valid until the required data has been copied and veri
 up reservations and transfers and does not publish an incomplete destination. Evictions that
 completed safely are kept, and the result must match the final actual occupancy.
 
+No lane is released while a transaction is open. Qwen3.5's bindings and pauses complete in their first poll,
+before terminal requests settle, so its finished requests never wait for one. A Flash-Next vision binding encodes
+over several cycles; a request that finishes meanwhile is completed at once (`finish_held`: its usage fields and
+its prefix publication, which are a terminal lane's endpoint capture and block writes, as a prefill tap of another
+lane makes during the transaction) and its lane is released at the first cycle after the transaction
+(`release_finished`). The publication follows the cache's rules at that moment: the binding's pinned source is not
+evictable room, so under Host-tier pressure an endpoint can be refused that a later finish would have kept.
+
 ### 5.2 Model unit transactions
 
 Prefill finalization, decode and control can produce a move-only `PendingBatch` containing the frozen
@@ -446,7 +466,7 @@ fault may have published into. Qwen3.5's execution paths clear a failed unit's l
 others as `abort` does and keeps its cache; it refuses while a pending batch exists. The eighth such
 recovery with no successful unit since the first, or a Program that refuses, fails everything instead.
 The no-progress watch's heal (YJ-02) uses the same recovery without a binding in flight, which it
-leaves as it is. A service or read thread that has itself stopped makes every later unit fail, so the
+leaves as it is and tries again after another interval (it was tried once and never again). A service or read thread that has itself stopped makes every later unit fail, so the
 Program reports that as an ordinary (fatal) error with its cause. Every other CUDA error is never
 recoverable: the context state is unknown, and `CUDA_CHECK` aborts. Startup turns an out-of-memory
 error into a failed start (a CUDA Graph's, `GraphMemoryExhausted`, first retries with a smaller
@@ -519,7 +539,7 @@ no cached prefix that external requests could hit.
 | Responsibility | Main location |
 |---|---|
 | Public Engine facade | `include/infernix/engine.h`, `src/runtime/engine/engine.cpp` |
-| Request lifecycle, scheduling and observation | `src/runtime/engine/engine_core.h`, `request_record.h`, `scheduler.h`, `engine_metrics.inl` |
+| Request lifecycle, scheduling and observation | `src/runtime/engine/engine_core.h`, `request_record.h`, `scheduler.h`, `engine_metrics.inl`, `next_turn_prefill.inl` |
 | Instance construction | `src/runtime/engine/model_instance.*` |
 | Engine connection to the prefix cache | `src/runtime/engine/context_cache/` |
 | Model-agnostic prefix index, tap planner and cost model | `src/runtime/prefix_cache/` |

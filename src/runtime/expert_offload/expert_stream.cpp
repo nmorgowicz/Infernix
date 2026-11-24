@@ -3,6 +3,7 @@
 #include "core/copy_batch.h"
 #include "core/device.h"
 #include "ops/offloaded_sparse_moe/csf_expand.h"
+#include "runtime/contract/execution.h"
 
 #include <algorithm>
 #include <stdexcept>
@@ -35,15 +36,20 @@ ExpertStream::ExpertStream(std::uint32_t layers, std::uint32_t experts, std::uin
         throw std::invalid_argument("expert stream: a bank's record stride exceeds the ring's slots");
     }
     tables_host_ = PinnedHostBuffer(static_cast<std::size_t>(layers_) * experts_ * sizeof(std::int32_t));
-    CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
-    CUDA_CHECK(cudaEventCreateWithFlags(&start_, cudaEventDisableTiming));
-    CUDA_CHECK(cudaEventCreateWithFlags(&uploaded_, cudaEventDisableTiming));
-    CUDA_CHECK(cudaEventCreateWithFlags(&drained_, cudaEventDisableTiming));
-    landed_.resize(layers_);
-    consumed_.resize(layers_);
-    for (std::uint32_t l = 0; l < layers_; ++l) {
-        CUDA_CHECK(cudaEventCreateWithFlags(&landed_[l], cudaEventDisableTiming));
-        CUDA_CHECK(cudaEventCreateWithFlags(&consumed_[l], cudaEventDisableTiming));
+    try {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&start_, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&uploaded_, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&drained_, cudaEventDisableTiming));
+        landed_.resize(layers_);
+        consumed_.resize(layers_);
+        for (std::uint32_t l = 0; l < layers_; ++l) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&landed_[l], cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&consumed_[l], cudaEventDisableTiming));
+        }
+    } catch (...) {
+        release();
+        throw;
     }
     streams_.assign(layers_, 0);
     complete_.assign(layers_, 0);
@@ -51,7 +57,9 @@ ExpertStream::ExpertStream(std::uint32_t layers, std::uint32_t experts, std::uin
     ahead_.assign(layers_, 0);
 }
 
-ExpertStream::~ExpertStream() {
+ExpertStream::~ExpertStream() { release(); }
+
+void ExpertStream::release() noexcept {
     if (stream_ != nullptr) { (void)cudaStreamSynchronize(stream_); }
     if (expand_stream_ != nullptr) {
         (void)cudaStreamSynchronize(expand_stream_);
@@ -63,8 +71,12 @@ ExpertStream::~ExpertStream() {
     for (auto event : bounced_) {
         if (event != nullptr) { (void)cudaEventDestroy(event); }
     }
-    for (auto event : landed_) { (void)cudaEventDestroy(event); }
-    for (auto event : consumed_) { (void)cudaEventDestroy(event); }
+    for (auto event : landed_) {
+        if (event != nullptr) { (void)cudaEventDestroy(event); }
+    }
+    for (auto event : consumed_) {
+        if (event != nullptr) { (void)cudaEventDestroy(event); }
+    }
     if (uploaded_ != nullptr) { (void)cudaEventDestroy(uploaded_); }
     if (start_ != nullptr) { (void)cudaEventDestroy(start_); }
     if (stream_ != nullptr) { (void)cudaStreamDestroy(stream_); }
@@ -198,8 +210,15 @@ void ExpertStream::begin(DeviceSpan ring, const std::int32_t* residency, cudaStr
     CUDA_CHECK(cudaEventRecord(start_, compute));
     CUDA_CHECK(cudaStreamWaitEvent(stream_, start_, 0));
     active_ = true;
-    enqueue(0);
-    if (layers_ > 1) { enqueue(1); }
+    // A failed first enqueue (a read request, a copy) ends the chunk here: the caller's span is not active yet,
+    // so it would not end it, and the next chunk would find the stream still streaming.
+    try {
+        enqueue(0);
+        if (layers_ > 1) { enqueue(1); }
+    } catch (...) {
+        end(compute);
+        throw;
+    }
 }
 
 std::uint32_t ExpertStream::plan_layer(std::uint32_t layer, std::span<const std::int32_t> columns,
@@ -364,7 +383,13 @@ void ExpertStream::enqueue(std::uint32_t layer, std::uint32_t first) {
         if (next_ssd < ssd_planned_[layer].size() && ssd_planned_[layer][next_ssd].first == e) {
             // A stream read: its record once landed (the host waits for the drive here).
             const std::uint8_t* source = ssd_.wait(ssd_slots_[layer][next_ssd]);
-            if (source == nullptr) { throw std::runtime_error("expert stream: an SSD-only expert's record could not be read"); }
+            // As a failed read of a decode round (ExpertOffload::check_error): the unit's requests fail and the Engine
+            // keeps serving. The record is not copied and its layer's experts are not enqueued, so no kernel reads
+            // it; the caller ends the stream (end) on the way out.
+            if (source == nullptr) {
+                throw RecoverableExecutionError("expert stream: layer " + std::to_string(layer) +
+                                                ": an SSD-only expert's record could not be read");
+            }
             const std::size_t bytes = host_strides_.empty() ? stride_ : host_strides_[layer];
             copies.add(records_ + static_cast<std::size_t>(row[e]) * stride_, source, bytes);
             stats_.streamed += 1;

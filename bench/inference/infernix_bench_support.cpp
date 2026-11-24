@@ -470,15 +470,18 @@ std::string usage_text(std::string_view program) {
         << "  --stop-at-eos               the model's stop tokens end a request (it may end early)\n"
         << "  --route-trace <path>        write the expert route trace (offloaded experts)\n"
         << "  --ngram-volume <path>       Qwen3.8-Flash-Next n-gram volume: the artifact's, or any FP8,\n"
-        << "                              IQ4_NL, BF16 or NVFP4 volume of the table (default: <weights>.ngram)\n"
+        << "                              IQ4_NL, Q8_0, NVFP4, BF16 or BF16 P12 volume of the table\n"
+        << "                              (default: <weights>.ngram)\n"
         << "  --ngram-residency <mode>    Qwen3.8-Flash-Next n-gram table: auto, ram (all of it in RAM,\n"
         << "                              locked for the CPU) or volume (rows read on demand) (default: auto)\n"
         << "  --expert-state <path|off>   offloaded experts' cache state: warm-start from and save to this\n"
         << "                              file, as infernix-serve does from <weights>.expert-state; off: an empty\n"
-        << "                              cache (cold); default: seeded from the model's calibrated order, no file\n"
-        << "                              (Qwen3.8-Flash-Next; the Qwen3.5-122B-A10B's once one is generated)\n"
-        << "  --expert-stripe <path>      Qwen3.8-Flash-Next expert stripe: the SSD tier reads each record's\n"
-        << "                              tail from it (a second drive) beside its head in the artifact\n"
+        << "                              cache (cold); default: seeded from the model's built-in calibrated\n"
+        << "                              order, no file (Qwen3.8-Flash-Next; half the frames on the\n"
+        << "                              Qwen3.5-122B-A10B)\n"
+        << "  --expert-stripe <path>      offloaded experts' stripe (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B):\n"
+        << "                              the SSD tier reads each record's tail from it (a second drive)\n"
+        << "                              beside its head in the artifact\n"
         << "  --ram-free-mib <N>          physical Host RAM the weights, experts, n-gram table and caches\n"
         << "                              leave free for other programs (default "
         << (infernix::kDefaultRamFreeBytes >> 20) << ")\n"
@@ -499,9 +502,10 @@ std::string usage_text(std::string_view program) {
         << "  --expert-tail-skip <1..9>   Qwen3.8-Flash-Next: skip a VRAM-missing expert every token of a decode\n"
         << "                              round routes at top-10 rank R or lower (faster, lower quality; changes\n"
         << "                              the output; default off, Strata's default 7)\n"
-        << "  --a16-activations           Qwen3.8-Flash-Next artifacts whose routed experts are NVIDIA's W4A4\n"
-        << "                              NVFP4 (Dense8, recipe A): 16-bit activations instead of the\n"
-        << "                              checkpoint's 4-bit ones (changes the output; default off)\n"
+        << "  --a16-activations           16-bit activations where the checkpoint specifies fewer bits:\n"
+        << "                              Flash-Next's W4A4 NVFP4 experts (Dense8, recipe A, NVFP4-QAD) and the\n"
+        << "                              NVFP4 and FP8 layers of NVIDIA's NVFP4 Qwen3.8-27B (changes the\n"
+        << "                              output; default off)\n"
         << "  --expert-a4-activations     nvidia/Qwen3.8-Flash-Next-FP4-Local only: routed experts with 4-bit\n"
         << "                              (NVFP4) activations, using the activation scales NVIDIA calibrated\n"
         << "                              for them (changes the output; default: 16-bit, as NVIDIA serves it)\n"
@@ -509,7 +513,9 @@ std::string usage_text(std::string_view program) {
         << "                              projections' and GGUF or NVFP4 W4A16 routed experts' decode and\n"
         << "                              verification calls (int8, one scale per 32 values), and the prefill\n"
         << "                              calls of those projections and experts, a groupwise Q4 MLP gate/up and\n"
-        << "                              MXFP8 dense projections (approximate; --reproducible refuses it)\n"
+        << "                              MXFP8 dense projections; on the NVFP4 Qwen3.8-27B artifacts every NVFP4\n"
+        << "                              and FP8 text projection at every width (approximate; --reproducible\n"
+        << "                              refuses it)\n"
         << "  --embedding-host            Qwen3.5-family artifacts: the token embedding in pinned host memory,\n"
         << "                              read zero-copy (its VRAM goes to the KV cache; same output)\n"
         << "  --concurrency <1..8>     simultaneous requests per repetition (default: 1)\n"
@@ -562,6 +568,8 @@ std::string usage_text(std::string_view program) {
         << "                             round's length (0..7; Qwen3.5/3.6 1..5 by adaptive-mtp where\n"
         << "                             qualified, else the model's fastest fixed length)\n"
         << "  --draft-model <path>       Qwen3.8-Flash-Next DFlash2: the drafter's companion artifact\n"
+        << "  --lora <path>              Qwen3.5 dense: a LoRA adapter applied at runtime (PEFT directory)\n"
+        << "  --ablate <path>            an ablation sidecar applied at runtime, every model (sidecar.json)\n"
         << "  --spec-min-p <p>           MTP (Flash-Next: fixed --draft-tokens only), Flash-Next DFlash2\n"
         << "                             draft-confidence gate 0..1 (default 0: every draft)\n"
         << "  --ngram-draft-tokens <n>   copy proposals 1..63; 0 disables (default: 0)\n"
@@ -789,6 +797,10 @@ BenchOptions parse_args(int argc, char** argv) {
             product::apply_draft_tokens(options.speculative, value("--draft-tokens"));
         } else if (arg == "--draft-model") {
             options.speculative.draft_model = std::filesystem::path(std::string(value("--draft-model")));
+        } else if (arg == "--lora") {
+            options.lora_path = value("--lora");
+        } else if (arg == "--ablate") {
+            options.ablate_sidecar_path = value("--ablate");
         } else if (arg == "--spec-min-p") {
             options.speculative.draft_min_p = product::parse_draft_min_p(value("--spec-min-p"));
         } else if (arg == "--ngram-draft-tokens") {
@@ -1089,6 +1101,10 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << format_bytes(env.load.host_to_device_bytes) << ", staging peak "
         << format_bytes(env.load.peak_staging_bytes) << '\n'
         << "  memory:     weights " << format_bytes(env.memory.weights.capacity_bytes)
+        << (env.memory.draft_screen_bytes != 0 ? ", draft screen " + format_bytes(env.memory.draft_screen_bytes)
+                                               : std::string())
+        << (env.memory.adapter_bytes != 0 ? ", LoRA adapter " + format_bytes(env.memory.adapter_bytes)
+                                          : std::string())
         << ", sequence " << format_bytes(env.memory.sequence.capacity_bytes) << ", workspace "
         << format_bytes(env.memory.workspace.capacity_bytes) << ", Vision handoff "
         << (env.memory.vision_workspace
@@ -1111,6 +1127,8 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << " expert_a16_activations=" << (env.expert_a16_activations ? "on" : "off")
         << " a8_activations=" << (env.a8_activations ? "on" : "off")
         << " expert_state=" << env.expert_state
+        << " lora=" << (env.lora_path.empty() ? "none" : env.lora_path)
+        << " ablate=" << (env.ablate_sidecar_path.empty() ? "none" : env.ablate_sidecar_path)
         << " ngram_volume=" << (env.ngram_volume_path.empty() ? "default" : env.ngram_volume_path)
         << " ngram_residency=" << ngram_residency_name(env.ngram_residency)
         << " expert_stripe=" << (env.expert_stripe_path.empty() ? "none" : env.expert_stripe_path)
@@ -1218,7 +1236,9 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"host_to_device_bytes\": " << env.load.host_to_device_bytes << ",\n"
         << "    \"peak_staging_bytes\": " << env.load.peak_staging_bytes << ",\n"
         << "    \"device_object_count\": " << env.load.device_object_count << ",\n"
-        << "    \"host_object_count\": " << env.load.host_object_count << "\n"
+        << "    \"host_object_count\": " << env.load.host_object_count << ",\n"
+        << "    \"lora_adapter\": \"" << json_escape(env.load.lora_adapter) << "\",\n"
+        << "    \"ablate_sidecar\": \"" << json_escape(env.load.ablate_sidecar) << "\"\n"
         << "  },\n"
         << "  \"memory\": {\n"
         << "    \"device\": " << env.memory.device << ",\n"
@@ -1232,6 +1252,8 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << ",\n"
         << "    \"kv_cache\": \"" << kv_cache_name(env.memory.kv_cache) << "\",\n";
     append_arena_json(out, "weights", env.memory.weights, "    ", true);
+    out << "    \"draft_screen_bytes\": " << env.memory.draft_screen_bytes << ",\n"
+        << "    \"adapter_bytes\": " << env.memory.adapter_bytes << ",\n";
     append_arena_json(out, "sequence", env.memory.sequence, "    ", true);
     append_arena_json(out, "workspace", env.memory.workspace, "    ", true);
     append_vision_workspace_json(out, env.memory.vision_workspace, "    ", true);
@@ -1247,6 +1269,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"vram_headroom_bytes\": " << env.memory.vram_headroom_bytes << ",\n"
         << "    \"planned_slack_bytes\": " << env.memory.planned_slack_bytes << ",\n"
         << "    \"cuda_graph_allowance_bytes\": " << env.memory.cuda_graph_allowance_bytes << ",\n"
+        << "    \"cuda_graph_measured_bytes\": " << env.memory.cuda_graph_measured_bytes << ",\n"
         << "    \"kv_payload_bytes\": " << env.memory.kv_payload_bytes << "\n"
         << "  },\n"
         << "  \"config\": {\n"
@@ -1273,6 +1296,8 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"expert_a16_activations\": " << (env.expert_a16_activations ? "true" : "false") << ",\n"
         << "    \"a8_activations\": " << (env.a8_activations ? "true" : "false") << ",\n"
         << "    \"expert_state\": \"" << json_escape(env.expert_state) << "\",\n"
+        << "    \"lora\": \"" << json_escape(env.lora_path) << "\",\n"
+        << "    \"ablate\": \"" << json_escape(env.ablate_sidecar_path) << "\",\n"
         << "    \"ngram_volume\": \"" << json_escape(env.ngram_volume_path) << "\",\n"
         << "    \"ngram_residency\": \"" << ngram_residency_name(env.ngram_residency) << "\",\n"
         << "    \"expert_stripe\": \"" << json_escape(env.expert_stripe_path) << "\",\n"

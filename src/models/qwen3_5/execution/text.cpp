@@ -16,6 +16,7 @@
 #include "infernix/ops/top_logprobs.h"
 #include "infernix/ops/attn_input_proj.h"
 #include "infernix/ops/causal_conv1d_silu.h"
+#include "infernix/ops/direction_cut.h"
 #include "infernix/ops/embedding.h"
 #include "infernix/ops/gated_delta_net.h"
 #include "infernix/ops/gated_rmsnorm.h"
@@ -173,6 +174,21 @@ void DFlashFeatureSink::begin(const Tensor& value) {
     }
 }
 
+void HiddenStateSink::capture_layer(int layer, const Tensor& value, cudaStream_t stream) {
+    if (position < window_first || position >= window_first + window_columns) { return; }
+    const std::int64_t column = position - window_first;
+    if (rows == nullptr || out.dtype != DType::BF16 || value.dtype != DType::BF16 || value.ne[0] != out.ne[0] ||
+        layer < 0 || layer >= out.ne[1] || rows->size() != static_cast<std::size_t>(out.ne[1]) ||
+        column >= value.ne[1]) {
+        throw std::logic_error("the hidden-state capture does not match the prefill window");
+    }
+    const std::size_t column_bytes = 2ULL * static_cast<std::size_t>(out.ne[0]);
+    CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(out.data) + static_cast<std::size_t>(layer) * column_bytes,
+                               static_cast<const std::byte*>(value.data) + static_cast<std::size_t>(column) * column_bytes,
+                               column_bytes, cudaMemcpyDeviceToDevice, stream));
+    ++(*rows)[static_cast<std::size_t>(layer)];
+}
+
 void DFlashFeatureSink::capture_layer(int layer, const Tensor& value, cudaStream_t stream) {
     const auto it = std::find(layers.begin(), layers.end(), layer);
     if (it == layers.end()) { return; }
@@ -230,13 +246,13 @@ void DFlashFeatureSink::capture_positions(const Tensor& source, cudaStream_t str
                                cudaMemcpyDeviceToDevice, stream));
 }
 
-void DFlashFeatureSink::consume_prefill_chunk(std::int32_t tokens, bool rewrite_checkpoint) {
-    if (!consume_prefill || tokens != active_tokens) {
+void DFlashFeatureSink::consume_prefill_columns(std::int32_t first, std::int32_t count) {
+    if (!consume_prefill || first < 0 || count <= 0 || first + count > active_tokens) {
         throw std::logic_error("DFlash prefill feature consumer is unavailable");
     }
-    Tensor feature_window  = features->slice(1, 0, tokens);
-    Tensor position_window = positions->slice(0, 0, tokens);
-    consume_prefill(feature_window, position_window, rewrite_checkpoint);
+    Tensor feature_window  = features->slice(1, first, count);
+    Tensor position_window = positions->slice(0, first, count);
+    consume_prefill(feature_window, position_window, first);
 }
 
 TextContext::TextContext(DeviceContext& ctx, const execution::Parameters& weights,
@@ -652,7 +668,8 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
 }
 
 void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens,
-                                  Tensor* probabilities, const SampledDraftStep* sampled) {
+                                  Tensor* probabilities, const SampledDraftStep* sampled,
+                                  const CoupledDraftStep* coupled) {
     auto proposal_scope = work_.scope();
     const int T         = hidden.ne[1];
     require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), T},
@@ -702,6 +719,16 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
         ops::argmax_with_probability(head_logits, proposal_tokens, *probabilities, valid_rows, work_, ctx_.stream);
     } else {
         ops::argmax(head_logits, proposal_tokens, valid_rows, ctx_.stream);
+    }
+    if (coupled != nullptr) {
+        // QK-04: a Gumbel-max row's draft is its law's Gumbel winner under the verifying column's key
+        // (head rows, before the remap below; the key takes the token id).
+        Tensor no_probability;
+        ops::speculative_couple_drafts(head_logits, valid_rows,
+                                       proposal_head_ != nullptr ? proposal_head_ids_ : nullptr, coupled->configs,
+                                       coupled->frontiers, coupled->column + 1, proposal_tokens,
+                                       probabilities != nullptr ? *probabilities : no_probability, work_,
+                                       ctx_.stream);
     }
     if (proposal_head_ != nullptr && proposal_head_ids_ != nullptr) {
         ops::proposal_remap_token_ids(proposal_tokens, proposal_head_ids_, proposal_head_n_, ctx_.stream);
@@ -977,7 +1004,8 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
 }
 
 void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens,
-                                    Tensor* probabilities, const SampledDraftStep* sampled) {
+                                    Tensor* probabilities, const SampledDraftStep* sampled,
+                                    const CoupledDraftStep* coupled) {
     const std::int32_t batch = hidden.ne[1];
     require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), batch},
                          "MTP proposal batch hidden");
@@ -986,7 +1014,7 @@ void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor
     require_tensor_shape(draft_tokens, DType::I32, {batch}, "MTP proposal batch tokens");
     ScopedValue<const MtpParameters*> drafter_binding(mtp_, batch_mtp());
     ScopedValue<const LinearParameters*> head_binding(proposal_head_, batch_proposal_head());
-    proposal_argmax(hidden, logits, draft_tokens, probabilities, sampled);
+    proposal_argmax(hidden, logits, draft_tokens, probabilities, sampled, coupled);
 }
 
 const MtpParameters* TextContext::batch_mtp() const noexcept {
@@ -1007,7 +1035,7 @@ std::int32_t TextContext::trimmed_attention_columns(std::int32_t T) const noexce
     return active_sequence_batch_ == 0 && output_columns_ > 0 && output_columns_ < T ? output_columns_ : 0;
 }
 
-void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase ph) {
+void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase ph, std::size_t layer) {
     const auto& p  = std::get<AttentionParameters>(w.mixer);
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
@@ -1033,9 +1061,11 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     const auto* single = std::get_if<LinearParameters>(&p.projection);
     if (single != nullptr &&
         ops::attn_input_proj_fused_rmsnorm_nvfp4_eligible(single->weight, single->policy, T)) {
+        // --lora: the norm also stores h (the shrink's input) and the projection takes the term.
         ops::attn_input_proj_fused_rmsnorm_nvfp4(
             x, w.input_norm, config_.rms_norm_eps, single->weight, q_flat, gate_flat, k_flat,
-            v_flat, single->policy, work_, s);
+            v_flat, single->policy, work_, s, p.lora_input ? &*p.lora_input : nullptr,
+            p.lora_input ? &h : nullptr);
     } else {
         ops::rmsnorm(x, w.input_norm, config_.rms_norm_eps, true, h, s);
         attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s);
@@ -1100,10 +1130,19 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
         const std::int32_t heads    = dimension(config_.attention->num_attention_heads);
         const std::int32_t kv_heads = dimension(config_.attention->num_key_value_heads);
         const Tensor positions = cache_positions.view({T});
+        // The batched append finds a KV window's row through its slots (one row here, the lane's destination):
+        // the one-slot view a single sequence's attention takes names none, and every generation prompt's last
+        // layer failed on vq2 and k4v2 from f092da2b (2026-11-12) to 2026-11-17.
+        PagedKVBatchLayerView append_view = text_kv_layer(static_cast<std::uint32_t>(fidx));
+        if (append_view.window.present() && active_sequence_batch_ == 0) {
+            Tensor slot = work_.alloc(DType::I32, {1});
+            ops::set_i32_scalar(slot, linear_state_destination_slot_, s);
+            append_view.window       = state_images_.kv_window_view(static_cast<std::uint32_t>(fidx));
+            append_view.window.slots = slot;
+        }
         ops::kv_cache_append_batch(kn.slice(2, 0, skipped).view({head_dim, kv_heads, skipped, 1}),
                                    v.slice(2, 0, skipped).view({head_dim, kv_heads, skipped, 1}),
-                                   positions.slice(0, 0, skipped).view({skipped, 1}), kv_table_rows,
-                                   text_kv_layer(static_cast<std::uint32_t>(fidx)), s);
+                                   positions.slice(0, 0, skipped).view({skipped, 1}), kv_table_rows, append_view, s);
         Tensor tail = a.slice(2, skipped, kept);
         ops::causal_softmax_attention(
             qn.slice(2, skipped, kept), kn.slice(2, skipped, kept), v.slice(2, skipped, kept),
@@ -1112,9 +1151,11 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
             text_kv_layer(static_cast<std::uint32_t>(fidx)),
             execution_schedule_.apply(*active_causal_attention_envelope_), work_, tail, ctx_.execution_view());
         ops::sigmoid_mul(gate.slice(2, skipped, kept), tail, s);
-        Tensor columns = x.slice(1, skipped, kept);
-        ops::linear_add(tail.view({dimension(config_.attention->query_width()), kept}), p.output.weight, columns,
-                        residual_projection_policy(p.output, false), work_, s, ops::LinearRoutes::Exact);
+        Tensor columns       = x.slice(1, skipped, kept);
+        const Tensor gated   = tail.view({dimension(config_.attention->query_width()), kept});
+        const auto lora      = attention_output_lora(p, gated, work_, s);
+        add_output_projection(gated, p.output.weight, columns, residual_projection_policy(p.output, false),
+                              ops::LinearRoutes::Exact, lora ? &*lora : nullptr, layer);
         return;
     } else {
         ops::causal_softmax_attention(
@@ -1131,20 +1172,44 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
 
     Tensor mixed = a.view({dimension(config_.attention->query_width()), T});
     if (output_columns_ > 0) { // YC-01: only the last columns' output is read past this layer
-        Tensor columns = x.slice(1, T - output_columns_, output_columns_);
-        ops::linear_add(mixed.slice(1, T - output_columns_, output_columns_), p.output.weight, columns,
-                        residual_projection_policy(p.output, false), work_, s, ops::LinearRoutes::Exact);
+        Tensor columns     = x.slice(1, T - output_columns_, output_columns_);
+        const Tensor gated = mixed.slice(1, T - output_columns_, output_columns_);
+        const auto lora    = attention_output_lora(p, gated, work_, s);
+        add_output_projection(gated, p.output.weight, columns, residual_projection_policy(p.output, false),
+                              ops::LinearRoutes::Exact, lora ? &*lora : nullptr, layer);
         return;
     }
-    ops::linear_add(mixed, p.output.weight, x,
-                    residual_projection_policy(
-                        p.output, wide_residual_verification(ph, row_width(T), row_width(T))),
-                    work_, s,
-                    ph == Phase::Verify ? execution_schedule_.residual_decode_routes(T, false)
-                                        : ops::LinearRoutes::Exact);
+    const auto lora = attention_output_lora(p, mixed, work_, s);
+    add_output_projection(mixed, p.output.weight, x,
+                          residual_projection_policy(
+                              p.output, wide_residual_verification(ph, row_width(T), row_width(T))),
+                          ph == Phase::Verify ? execution_schedule_.residual_decode_routes(T, false)
+                                              : ops::LinearRoutes::Exact,
+                          lora ? &*lora : nullptr, layer);
 }
 
-void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase ph) {
+void TextContext::add_output_projection(const Tensor& input, const Weight& weight, Tensor& residual,
+                                        ops::LinearPolicy policy, ops::LinearRoutes routes, const ops::LoraAddend* lora,
+                                        std::size_t layer) {
+    const cudaStream_t s = ctx_.stream;
+    const ops::DirectionCut cut = parameters_.ablate_cut(layer, models::AblateParameters::Lane::Attn);
+    if (!cut.active()) {
+        ops::linear_add(input, weight, residual, policy, work_, s, routes, lora);
+        return;
+    }
+    // A cut lane writes as an uncut one, then loses the direction's component of what it added.
+    const Tensor before = snapshot_residual(residual);
+    ops::linear_add(input, weight, residual, policy, work_, s, routes, lora);
+    ops::residual_delta_cut(before, cut, residual, s);
+}
+
+Tensor TextContext::snapshot_residual(const Tensor& residual) {
+    Tensor before = work_.alloc(DType::BF16, {residual.ne[0], residual.ne[1]});
+    CUDA_CHECK(cudaMemcpyAsync(before.data, residual.data, before.bytes(), cudaMemcpyDeviceToDevice, ctx_.stream));
+    return before;
+}
+
+void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase ph, std::size_t layer) {
     const auto& p  = std::get<GdnParameters>(w.mixer);
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
@@ -1153,8 +1218,13 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     Tensor h           = control.hidden;
     Tensor g           = control.g;
     Tensor beta        = control.beta;
-    gdn_norm_control(x, w.input_norm, config_.rms_norm_eps, p, h, g, beta, work_,
-                     ctx_.execution_view());
+    // --lora: U = A h of the adapted in_proj_qkv / in_proj_z / in_proj_a / in_proj_b, held through the projection.
+    std::optional<Tensor> lora_u;
+    if (p.lora_input) { lora_u = work_.alloc(DType::BF16, {p.lora_input->a.rows, T}); }
+    const std::optional<ops::LoraAddend> projection_lora =
+        gdn_norm_control(x, w.input_norm, config_.rms_norm_eps, p, h, g, beta, lora_u ? &*lora_u : nullptr, work_,
+                         ctx_.execution_view());
+    const ops::LoraAddend* lora = projection_lora ? &*projection_lora : nullptr;
 
     const auto projection = workspace::gdn_projection(work_, config_, T);
     Tensor z  = projection.output_gate.view({dimension(config_.gdn->linear_value_head_dim),
@@ -1195,23 +1265,36 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
             gdn_projection_record(projection_input, p, *config_.gdn, conv_states, valid,
                                   *active_linear_state_source_slots_, records.conv, query_output,
                                   key_output, value_output, gate_output, work_, s,
-                                  verification_tree_);
+                                  verification_tree_, lora);
         } else {
             gdn_projection_snapshot(projection_input, p, *config_.gdn, conv_states, valid,
                                     *active_linear_state_source_slots_,
                                     *active_linear_state_destination_slots_, query_output,
-                                    key_output, value_output, gate_output, work_, s);
+                                    key_output, value_output, gate_output, work_, s, lora);
         }
     } else {
         Tensor qkv    = workspace::gdn_prefill_conv(work_, config_, T);
         Tensor z_flat = z.view({dimension(config_.gdn->value_width()), T});
-        gdn_projection(h, p, qkv, z_flat, work_, s);
+        gdn_projection(h, p, qkv, z_flat, work_, s, lora);
         Tensor conv_state_in =
             state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_source_slot_);
         Tensor conv_state_out =
             state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_destination_slot_);
-        ops::causal_conv1d_silu_split(qkv, p.convolution, conv_state_in, conv_state_out, qc, kc, vc,
-                                      s);
+        if (pair_column_ > 0) {
+            // QK-02: the columns before the tap leave their convolution history in the tap's slot, and the rest
+            // continue from it, as two passes cut at the tap compute it.
+            const std::int32_t a = pair_column_, b = T - pair_column_;
+            Tensor conv_state_tap = state_.conv_slot(static_cast<std::uint32_t>(gidx), prefill_pair_slot_);
+            Tensor qc_a = qc.slice(1, 0, a), kc_a = kc.slice(1, 0, a), vc_a = vc.slice(1, 0, a);
+            Tensor qc_b = qc.slice(1, a, b), kc_b = kc.slice(1, a, b), vc_b = vc.slice(1, a, b);
+            ops::causal_conv1d_silu_split(qkv.slice(1, 0, a), p.convolution, conv_state_in, conv_state_tap, qc_a,
+                                          kc_a, vc_a, s);
+            ops::causal_conv1d_silu_split(qkv.slice(1, a, b), p.convolution, conv_state_tap, conv_state_out,
+                                          qc_b, kc_b, vc_b, s);
+        } else {
+            ops::causal_conv1d_silu_split(qkv, p.convolution, conv_state_in, conv_state_out, qc, kc, vc,
+                                          s);
+        }
     }
 
     Tensor q_recurrent = qc.view({dimension(config_.gdn->linear_key_head_dim),
@@ -1275,11 +1358,29 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
             state_.recurrent_slot(static_cast<std::uint32_t>(gidx), linear_state_source_slot_);
         Tensor recurrent_state_out =
             state_.recurrent_slot(static_cast<std::uint32_t>(gidx), linear_state_destination_slot_);
-        ops::gated_delta_net(q_recurrent, k_recurrent, vv, g, beta,
-                             static_cast<float>(1.0 / std::sqrt(static_cast<double>(
-                                                          config_.gdn->linear_key_head_dim))),
-                             /*normalize_qk=*/true, work_, recurrent_state_in, recurrent_state_out,
-                             o, ctx_.execution_view(), execution_schedule_.gdn_arithmetic);
+        const float scale =
+            static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim)));
+        if (pair_column_ > 0) {
+            // QK-02: the recurrence to the tap publishes its state in the tap's slot, and the rest starts from it:
+            // each call's chunk grid starts at its first column, as in two passes cut at the tap, so both states
+            // are the cut's for the same inputs.
+            const std::int32_t a = pair_column_, b = T - pair_column_;
+            Tensor recurrent_state_tap =
+                state_.recurrent_slot(static_cast<std::uint32_t>(gidx), prefill_pair_slot_);
+            Tensor o_a = o.slice(2, 0, a), o_b = o.slice(2, a, b);
+            ops::gated_delta_net(q_recurrent.slice(2, 0, a), k_recurrent.slice(2, 0, a), vv.slice(2, 0, a),
+                                 g.slice(1, 0, a), beta.slice(1, 0, a), scale, /*normalize_qk=*/true, work_,
+                                 recurrent_state_in, recurrent_state_tap, o_a, ctx_.execution_view(),
+                                 execution_schedule_.gdn_arithmetic);
+            ops::gated_delta_net(q_recurrent.slice(2, a, b), k_recurrent.slice(2, a, b), vv.slice(2, a, b),
+                                 g.slice(1, a, b), beta.slice(1, a, b), scale, /*normalize_qk=*/true, work_,
+                                 recurrent_state_tap, recurrent_state_out, o_b, ctx_.execution_view(),
+                                 execution_schedule_.gdn_arithmetic);
+        } else {
+            ops::gated_delta_net(q_recurrent, k_recurrent, vv, g, beta, scale, /*normalize_qk=*/true, work_,
+                                 recurrent_state_in, recurrent_state_out, o, ctx_.execution_view(),
+                                 execution_schedule_.gdn_arithmetic);
+        }
     }
 
     Tensor on = workspace::gdn_normalized_output(work_, config_, T)
@@ -1288,18 +1389,21 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     ops::gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, ctx_.execution_view());
 
     if (output_columns_ > 0) { // YC-01: only the last columns' output is read past this layer
-        Tensor columns = x.slice(1, T - output_columns_, output_columns_);
-        ops::linear_add(on.view({dimension(config_.gdn->value_width()), T}).slice(1, T - output_columns_, output_columns_),
-                        p.output.weight, columns, residual_projection_policy(p.output, false), work_, s,
-                        ops::LinearRoutes::Exact);
+        Tensor columns     = x.slice(1, T - output_columns_, output_columns_);
+        const Tensor input = on.view({dimension(config_.gdn->value_width()), T}).slice(1, T - output_columns_, output_columns_);
+        const auto out_lora = gdn_output_lora(p, input, work_, s);
+        add_output_projection(input, p.output.weight, columns, residual_projection_policy(p.output, false),
+                              ops::LinearRoutes::Exact, out_lora ? &*out_lora : nullptr, layer);
         return;
     }
-    ops::linear_add(on.view({dimension(config_.gdn->value_width()), T}), p.output.weight, x,
-                    residual_projection_policy(
-                        p.output, wide_residual_verification(ph, row_width(T), row_width(T))),
-                    work_, s,
-                    ph == Phase::Verify ? execution_schedule_.residual_decode_routes(T, false)
-                                        : ops::LinearRoutes::Exact);
+    const Tensor input  = on.view({dimension(config_.gdn->value_width()), T});
+    const auto out_lora = gdn_output_lora(p, input, work_, s);
+    add_output_projection(input, p.output.weight, x,
+                          residual_projection_policy(
+                              p.output, wide_residual_verification(ph, row_width(T), row_width(T))),
+                          ph == Phase::Verify ? execution_schedule_.residual_decode_routes(T, false)
+                                              : ops::LinearRoutes::Exact,
+                          out_lora ? &*out_lora : nullptr, layer);
 }
 
 ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
@@ -1310,6 +1414,19 @@ ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
 
 void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase ph,
                            const ops::SparseMoeHints& hints, std::size_t layer) {
+    // --ablate: a cut MLP lane writes as an uncut one, then loses the direction's component of what it added.
+    const ops::DirectionCut cut = parameters_.ablate_cut(layer, models::AblateParameters::Lane::Mlp);
+    if (!cut.active()) {
+        mlp_write(weights, x, ph, hints, layer);
+        return;
+    }
+    const Tensor before = snapshot_residual(x);
+    mlp_write(weights, x, ph, hints, layer);
+    ops::residual_delta_cut(before, cut, x, ctx_.stream);
+}
+
+void TextContext::mlp_write(const BlockParameters& weights, Tensor& x, Phase ph, const ops::SparseMoeHints& hints,
+                            std::size_t layer) {
     const std::int32_t width = row_width(x.ne[1]);
     // The NVFP4 MLP's A4 residual rounds: the norm and both projections in three launches, the same bits.
     if (fused_dense_mlp(x, weights.post_attention_norm, config_.rms_norm_eps, weights.ffn, work_, ctx_.stream,
@@ -1378,9 +1495,9 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     full ? nvtx::Category::Attention : nvtx::Category::Gdn, layer);
                 auto scope = work_.scope();
                 if (full) {
-                    attn_mix(block, x, compact, ph);
+                    attn_mix(block, x, compact, ph, layer);
                 } else {
-                    gdn_mix(block, x, compact, ph);
+                    gdn_mix(block, x, compact, ph, layer);
                 }
                 output_columns_ = 0;
             }
@@ -1391,9 +1508,11 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 auto scope = work_.scope();
                 if (trim) {
                     Tensor columns = x.slice(1, x.ne[1] - kept, kept);
+                    // Reset however mlp_tail leaves (a recovered exception too): a later prefill on this context
+                    // must not route with this window's skip.
+                    ResetColumns reset_skipped{trim_route_skipped_};
                     trim_route_skipped_ = x.ne[1] - kept;
                     mlp_tail(block, columns, ph, next_projection_hints(static_cast<int>(layer)), layer);
-                    trim_route_skipped_ = 0;
                 } else {
                     mlp_tail(block, x, ph, next_projection_hints(static_cast<int>(layer)), layer);
                 }
@@ -1592,6 +1711,16 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
     const std::int64_t split_abs = prefill_split_frontier_;
     const bool has_split = split_abs > base64 && split_abs <= base64 + static_cast<std::int64_t>(T);
     const int split_rel  = has_split ? static_cast<int>(split_abs - base64) : -1;
+    // QK-02 (set_prefill_pair_tap): the tap's column inside the call's one window, 0 without a pair.
+    const std::int64_t pair_abs = prefill_pair_frontier_;
+    const int pair_rel = pair_abs > base64 && pair_abs < base64 + static_cast<std::int64_t>(T)
+                             ? static_cast<int>(pair_abs - base64)
+                             : 0;
+    if (pair_abs >= 0 && (pair_rel == 0 || prefill_pair_slot_ < 0 || has_split || T > chunk ||
+                          multimodal != nullptr || execution_schedule_.lossless || state_images_.has_kv_window())) {
+        throw std::logic_error("a pair window needs one text window holding its tap, a tap slot, no split, no "
+                               "lossless route and no KV window");
+    }
     const bool prepare_mtp_prompt = mtp_enabled() && io_.mtp.has_value();
     if (prepare_mtp_prompt &&
         mtp_proposal_extent_ > static_cast<std::uint32_t>(io_.mtp->draft_tokens.ne[0])) {
@@ -1719,21 +1848,28 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 // every column, the drafter taps the last layer, or no such width exists (trim_columns 0).
                 const TextParameters& text = phase_text(Phase::Prefill, len);
                 const int last_layer       = static_cast<int>(text.layers.size()) - 1;
-                const std::int32_t kept    = prefill_last_rows_only_ && !prepare_mtp_prompt &&
+                std::int32_t kept          = prefill_last_rows_only_ && !prepare_mtp_prompt &&
                                                   !tap.reads_layer(last_layer)
                                               ? trim_columns(text.layers.back(), len,
                                                              offloaded_experts_ != nullptr && offloaded_experts_->router_mma)
                                               : 0;
+                // A pair window also reads the final hidden at the column before its tap (the tap's continuation
+                // hidden): the trimmed tail reaches back to it.
+                if (kept > 0 && pair_rel > 0) { kept = std::max<std::int32_t>(kept, len - pair_rel + 1); }
                 const bool trim_last       = kept > 0 && len > kept;
                 if constexpr (Tap::enabled) { tap.begin(x); }
+                if constexpr (requires { tap.begin_window(std::int64_t{}, 0); }) { tap.begin_window(base64 + t0, len); }
                 trim_last_columns_ = trim_last ? kept : 0;
+                pair_column_       = pair_rel;
                 try {
                     run_layers(x, Phase::Prefill, tap);
                 } catch (...) {
                     trim_last_columns_ = 0;
+                    pair_column_       = 0;
                     throw;
                 }
                 trim_last_columns_ = 0;
+                pair_column_       = 0;
                 if constexpr (requires { tap.capture_positions(positions, s); }) {
                     tap.capture_positions(positions, s);
                 }
@@ -1746,6 +1882,17 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                     ops::rmsnorm(x.slice(1, len - 1, 1), *final_norm_, config_.rms_norm_eps, true, column, s);
                 } else {
                     ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, xf, s);
+                }
+                if (pair_rel > 0) { // the tap's continuation hidden, as a pass ending at the tap writes it
+                    Tensor tap_hidden = state_images_.continuation_hidden_slot(prefill_pair_slot_);
+                    if (trim_last) {
+                        ops::rmsnorm(x.slice(1, pair_rel - 1, 1), *final_norm_, config_.rms_norm_eps, true, tap_hidden,
+                                     s);
+                    } else {
+                        const Tensor column = xf.slice(1, pair_rel - 1, 1);
+                        CUDA_CHECK(cudaMemcpyAsync(tap_hidden.data, column.data, column.bytes(),
+                                                   cudaMemcpyDeviceToDevice, s));
+                    }
                 }
             }
             // Offloaded experts: the pass's routes reach the host for the cache update the Program
@@ -1875,9 +2022,17 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             }
         }
 
-        if constexpr (requires { tap.consume_prefill_chunk(len, false); }) {
+        if constexpr (requires { tap.consume_prefill_columns(0, len); }) {
             work_.reset();
-            tap.consume_prefill_chunk(len, split_rel > 0 && t0 + len == split_rel);
+            if (pair_rel > 0) {
+                // The drafter's local ring as the columns before the tap leave it goes to the tap's image before
+                // the rest overwrite its oldest positions.
+                tap.consume_prefill_columns(0, pair_rel);
+                state_images_.copy_fork_local(linear_state_destination_slot_, prefill_pair_slot_, s);
+                tap.consume_prefill_columns(pair_rel, len - pair_rel);
+            } else {
+                tap.consume_prefill_columns(0, len);
+            }
         }
 
         t0 += len;
@@ -1885,6 +2040,8 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
     }
 
     prefill_split_frontier_ = -1;
+    prefill_pair_frontier_  = -1;
+    prefill_pair_slot_      = -1;
 
     if (prefill_gpu_timer_) { prefill_gpu_timer_->record_stop(); }
     timing.begin_wait();
@@ -1915,6 +2072,18 @@ PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std
 PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std::uint32_t begin,
                                               std::uint32_t nominal_length, bool finalize_at_end,
                                               DFlashFeatureSink& sink) {
+    if (begin >= full_ids.size() || nominal_length == 0 ||
+        nominal_length > full_ids.size() - begin) {
+        throw std::invalid_argument("text prefill chunk is outside the prompt");
+    }
+    const TextPrefill text_prefill{full_ids, begin};
+    return prefill_impl(full_ids.subspan(begin, nominal_length), &text_prefill, nullptr, sink,
+                        finalize_at_end);
+}
+
+PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std::uint32_t begin,
+                                              std::uint32_t nominal_length, bool finalize_at_end,
+                                              HiddenStateSink& sink) {
     if (begin >= full_ids.size() || nominal_length == 0 ||
         nominal_length > full_ids.size() - begin) {
         throw std::invalid_argument("text prefill chunk is outside the prompt");

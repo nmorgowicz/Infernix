@@ -2,13 +2,69 @@
 
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
+#include "models/qwen3_5/program/prefix/test_seams.h"
+#include "runtime/engine/context_cache/online_cost.h"
+#include "runtime/prefix_cache/prefix_holds.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
 #include <cstring>
 #include <exception>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
+
+namespace infernix::models::qwen3_5::testing {
+namespace {
+
+std::atomic<std::uint32_t> restore_delay_us{0};
+std::atomic<std::uint64_t> transfer_wait_count{0};
+std::atomic<std::uint64_t> binding_vision_encode_count{0};
+std::atomic<bool> text_pass_recording{false};
+std::atomic<bool> pair_windows_on{true};
+std::mutex text_pass_mutex;
+std::vector<TextPass> recorded_text_passes;
+
+} // namespace
+
+void record_text_passes(bool enabled) {
+    const std::lock_guard lock(text_pass_mutex);
+    if (enabled) { recorded_text_passes.clear(); }
+    text_pass_recording.store(enabled);
+}
+
+std::vector<TextPass> text_passes() {
+    const std::lock_guard lock(text_pass_mutex);
+    return recorded_text_passes;
+}
+
+void note_text_pass(std::uint32_t base, std::int32_t rope_delta) {
+    if (!text_pass_recording.load(std::memory_order_relaxed)) { return; }
+    const std::lock_guard lock(text_pass_mutex);
+    recorded_text_passes.push_back(TextPass{.base = base, .rope_delta = rope_delta});
+}
+
+void set_pair_windows(bool enabled) noexcept { pair_windows_on.store(enabled); }
+
+bool pair_windows() noexcept { return pair_windows_on.load(std::memory_order_relaxed); }
+
+void set_restore_delay(std::uint32_t microseconds) noexcept { restore_delay_us.store(microseconds); }
+
+std::uint32_t restore_delay() noexcept { return restore_delay_us.load(); }
+
+std::uint64_t transfer_waits() noexcept { return transfer_wait_count.load(); }
+
+void count_transfer_wait() noexcept { transfer_wait_count.fetch_add(1, std::memory_order_relaxed); }
+
+std::uint64_t binding_vision_encodes() noexcept { return binding_vision_encode_count.load(); }
+
+void count_binding_vision_encode() noexcept { binding_vision_encode_count.fetch_add(1, std::memory_order_relaxed); }
+
+} // namespace infernix::models::qwen3_5::testing
 
 namespace infernix::models::qwen3_5::detail {
 
@@ -16,9 +72,11 @@ using runtime::prefix_cache::CacheCostModel;
 using runtime::prefix_cache::CopyState;
 using runtime::prefix_cache::InsertResult;
 using runtime::prefix_cache::kNoId;
+using runtime::prefix_cache::NodePin;
 using runtime::prefix_cache::NodeRef;
 using runtime::prefix_cache::NodeView;
 using runtime::prefix_cache::PrefixIndexConfig;
+using runtime::prefix_cache::SnapshotPin;
 using runtime::prefix_cache::SnapshotRef;
 using runtime::prefix_cache::SnapshotView;
 using runtime::prefix_cache::TapPlannerConfig;
@@ -78,15 +136,24 @@ HybridPrefixCache::HybridPrefixCache(const PrefixIndexConfig& config, TapPlanner
         store_.set_floor_chunks(std::max(1U, (2U * host.image_slabs + per_chunk - 1U) / per_chunk));
         CUDA_CHECK(cudaStreamCreateWithFlags(&restore_stream_, cudaStreamNonBlocking));
     }
-    if (config.ssd_slabs != 0) {
-        // Its slabs are Host slabs byte for byte, so a transfer is a plain copy (§5.7).
-        ssd_ = std::make_unique<runtime::prefix_cache::SsdTier>(
-            ssd_directory, config.ssd_slabs, host.slab_bytes, [this](std::uint32_t id) { return slab(id); },
-            ssd_write_bytes_per_hour, /*codec=*/true, ssd_kept_file);
+    // The destructor does not run when the rest of the construction throws (the SSD tier opens a file, the index
+    // allocates): the members unwind by themselves, the restore stream is returned here.
+    try {
+        if (config.ssd_slabs != 0) {
+            // Its slabs are Host slabs byte for byte, so a transfer is a plain copy (§5.7).
+            ssd_ = std::make_unique<runtime::prefix_cache::SsdTier>(
+                ssd_directory, config.ssd_slabs, host.slab_bytes, [this](std::uint32_t id) { return slab(id); },
+                ssd_write_bytes_per_hour, /*codec=*/true, ssd_kept_file);
+        }
+        blocks_.reserve(config.max_nodes);
+        index_.emplace(config_, *this);
+        if (config.host_slabs != 0) { store_.limit_index(*index_); } // only the locked slabs serve until a growth
+    } catch (...) {
+        // The SSD tier's threads stop before the stream goes (none has issued a transfer yet).
+        ssd_.reset();
+        if (restore_stream_ != nullptr) { (void)cudaStreamDestroy(restore_stream_); }
+        throw;
     }
-    blocks_.reserve(config.max_nodes);
-    index_.emplace(config_, *this);
-    if (config.host_slabs != 0) { store_.limit_index(*index_); } // only the locked slabs serve until a growth
 }
 
 bool HybridPrefixCache::poll_ssd() {
@@ -122,11 +189,15 @@ HybridPrefixCache::~HybridPrefixCache() {
     recycle_events(restore_);
     for (RestoreBatch& batch : landing_) { recycle_events(batch); }
     for (cudaEvent_t event : spare_events_) { (void)cudaEventDestroy(event); }
+    if (timed_begin_ != nullptr) { (void)cudaEventDestroy(timed_begin_); }
+    if (timed_end_ != nullptr) { (void)cudaEventDestroy(timed_end_); }
 }
 
 void HybridPrefixCache::set_cost(const CacheCostModel& cost) {
     config_.cost = cost;
-    index_->set_cost(cost);
+    // The link this cache measured on its own restores stands in for the compiled coefficient.
+    if (h2d_measured_ > 0.0) { config_.cost.h2d_bytes_per_second = h2d_measured_; }
+    index_->set_cost(config_.cost);
     // The SSD read rate is this drive's measurement, not the Engine's calibration.
     if (ssd_ && ssd_->counters().read_bytes_per_second > 0.0) {
         index_->set_ssd_rate(ssd_->counters().read_bytes_per_second);
@@ -371,10 +442,10 @@ bool HybridPrefixCache::start_snapshot_host_write(SnapshotRef snapshot, cudaStre
             return false;
         }
     }
-    index_->pin_snapshot(snapshot);
+    // Declared before the try: on a failure the catch below settles the copies and aborts the fill first.
+    SnapshotPin pin(*index_, snapshot);
     if (!index_->begin_snapshot_host_fill(snapshot, claim)) {
         // It stays Device-only: its slot is then its last copy (spec §9.2).
-        index_->unpin_snapshot(snapshot);
         ++counters_.host_image_write_refusals;
         return false;
     }
@@ -412,9 +483,9 @@ bool HybridPrefixCache::start_snapshot_host_write(SnapshotRef snapshot, cudaStre
             pending_.pop_back();
         }
         index_->abort_snapshot_host_fill(snapshot);
-        index_->unpin_snapshot(snapshot);
         throw;
     }
+    (void)pin.release(); // the pending write's: publish_write unpins it
     return true;
 }
 
@@ -431,18 +502,25 @@ void HybridPrefixCache::start_block_host_writes(std::span<const NodeRef> nodes,
         write.nodes.clear();
     };
     try {
+        // A node pinned and filling is in write.nodes before anything else can throw (abort_batch undoes those):
+        // the push cannot allocate, and the pin's hold gives it back when begin_host_fill fails or refuses.
+        write.nodes.reserve(nodes.size());
         for (const NodeRef node : nodes) {
             const NodeView view = index_->node(node);
             if (view.device != CopyState::Resident || view.host != CopyState::Absent) { continue; }
-            index_->pin_node(node);
-            const std::optional<std::uint32_t> slab_id = index_->begin_host_fill(node);
+            // No snapshot at or below the block: no resume can pass through it (a request that reaches it
+            // again recomputes it from a snapshot above), so a Host copy would only take a slab and link time
+            // until the dead-KV sweep (a prefill cancelled past its last tap, a generation that left no endpoint).
+            if (view.live_snapshots_below == 0) { continue; }
+            NodePin pin(*index_, node);
+            const std::optional<std::uint32_t> slab_id = index_->begin_host_fill(node); // may evict, and allocate
             if (!slab_id) {
-                // Everything left on the Host tier is pinned or filling; retry at a later release.
-                index_->unpin_node(node);
+                // Nothing on the Host tier that a block write may take (retained images stay, and one image's room
+                // stays free): the block stays Device-only; retry at a later release.
                 ++counters_.host_block_write_refusals;
                 break;
             }
-            write.nodes.push_back(node);
+            write.nodes.push_back(pin.release());
             add_copies(write_scratch_, block(view.device_id), *slab_id);
         }
     } catch (...) {
@@ -467,9 +545,11 @@ void HybridPrefixCache::start_block_host_writes(std::span<const NodeRef> nodes,
 }
 
 void HybridPrefixCache::publish_write(PendingWrite& write) {
-    for (const NodeRef node : write.nodes) {
-        index_->complete_host_fill(node);
-        index_->unpin_node(node);
+    // Deepest first: a block joins the Device LRU as its pin goes, and deeper blocks are evicted before shallower
+    // ones (as release_path orders a lane's).
+    for (auto node = write.nodes.rbegin(); node != write.nodes.rend(); ++node) {
+        index_->complete_host_fill(*node);
+        index_->unpin_node(*node);
     }
     if (write.snapshot) {
         index_->complete_snapshot_host_fill(*write.snapshot);
@@ -514,6 +594,28 @@ void HybridPrefixCache::drain() {
     }
 }
 
+bool HybridPrefixCache::settle_oldest_transfer() {
+    // A Host write's blocks become evictable as it lands, and so do a prefetch's; a lane's restore lands blocks
+    // the lane maps, which waiting cannot make evictable. So the oldest write is waited for, or without one the
+    // oldest prefetch (the restore stream runs in order: batches submitted before it land with it).
+    // A pending write may hold a snapshot's tail page as well as blocks (its image write pins the tail, which the
+    // index's transfer-held block count does not name), so any pending write is waited for: without that a pause's
+    // one-page tail copy found no room beside its lane's own write and published no resume point.
+    if (!pending_.empty()) {
+        CUDA_CHECK(cudaEventSynchronize(pending_.front().done));
+    } else if (index_->device_transfer_held_blocks() == 0) {
+        return false;
+    } else {
+        const auto prefetch = std::find_if(landing_.begin(), landing_.end(),
+                                           [](const RestoreBatch& batch) { return batch.prefetch; });
+        if (prefetch == landing_.end()) { return false; }
+        CUDA_CHECK(cudaEventSynchronize(prefetch->layers.back()));
+    }
+    testing::count_transfer_wait();
+    poll();
+    return true;
+}
+
 // ---- Host restores -----------------------------------------------------------------------------
 
 void HybridPrefixCache::open_restore(cudaStream_t producer) {
@@ -521,6 +623,15 @@ void HybridPrefixCache::open_restore(cudaStream_t producer) {
         throw std::logic_error("hybrid restore cannot be opened");
     }
     order_after(producer, restore_stream_);
+    // A test's delay (testing::set_restore_delay): a host function holds the restore stream, and nothing else.
+    if (const std::uint32_t delay = testing::restore_delay(); delay != 0) {
+        CUDA_CHECK(cudaLaunchHostFunc(
+            restore_stream_,
+            [](void* microseconds) {
+                std::this_thread::sleep_for(std::chrono::microseconds(reinterpret_cast<std::uintptr_t>(microseconds)));
+            },
+            reinterpret_cast<void*>(static_cast<std::uintptr_t>(delay))));
+    }
     restore_.open = true;
 }
 
@@ -533,15 +644,24 @@ void HybridPrefixCache::restore_block(NodeRef node, HybridBlockPages destination
         throw std::logic_error("hybrid restore source block is not host-only");
     }
     adopt_destination(destination, kFullPage);
-    const std::uint32_t id = allocate_block_id(destination);
+    // From the adoption the destination is the cache's: every failure below returns it, and a Filling node is in
+    // restore_.nodes (abort_restore aborts those) before anything else can throw.
+    std::uint32_t id = 0;
     try {
+        id = allocate_block_id(destination);
+    } catch (...) {
+        release(destination);
+        throw;
+    }
+    try {
+        runtime::prefix_cache::reserve_for_push(restore_.nodes);
         index_->begin_device_fill(node, id);
     } catch (...) {
         release(destination);
         free_block_id(id);
         throw;
     }
-    restore_.nodes.push_back(node);
+    restore_.nodes.push_back(node); // reserved
     add_copies(restore_.copies, destination, view.host_slab);
 }
 
@@ -555,7 +675,13 @@ void HybridPrefixCache::restore_tail(SnapshotRef snapshot, HybridBlockPages dest
         throw std::logic_error("hybrid restore source tail is not host-only");
     }
     adopt_destination(destination, view.tail_len);
-    const std::uint32_t id = allocate_block_id(destination);
+    std::uint32_t id = 0;
+    try {
+        id = allocate_block_id(destination);
+    } catch (...) {
+        release(destination);
+        throw;
+    }
     try {
         index_->begin_tail_device_fill(snapshot, id);
     } catch (...) {
@@ -606,6 +732,17 @@ void HybridPrefixCache::submit_restore() {
     // Prelude: what activation reads (the snapshot tail), what a pass reads outside the layer
     // stack (backend KV, the continuation hidden, DFlash local state) and the StateImage's VQ KV
     // window (the rest of the image, landed whole before the pass starts).
+    // One batch at a time measures the link: a timed event before its first copy and one after its last, on the
+    // restore stream, so the interval is the copies' own (runtime/engine/context_cache/online_cost.h).
+    const std::uint64_t batch_bytes =
+        (restore_.nodes.size() + (restore_.tail ? 1U : 0U)) * host_layout_.block_payload_bytes +
+        (restore_.image ? host_layout_.image_bytes : 0U);
+    const bool timed = timed_ticket_ == 0 && batch_bytes >= runtime::kH2dSampleMinimumBytes;
+    if (timed) {
+        if (timed_begin_ == nullptr) { CUDA_CHECK(cudaEventCreate(&timed_begin_)); }
+        if (timed_end_ == nullptr) { CUDA_CHECK(cudaEventCreate(&timed_end_)); }
+        CUDA_CHECK(cudaEventRecord(timed_begin_, restore_stream_));
+    }
     std::uint64_t copies = enqueue_from_host(restore_.tail_copies, restore_stream_);
     if (!restore_.copies.backend_pages.empty()) {
         copies += backend_pages_->physical_pool().copy_from_host_records(
@@ -637,10 +774,16 @@ void HybridPrefixCache::submit_restore() {
                                         .layer = layer.index},
                 restore_stream_);
         }
+        // Before the last layer's event, so the interval is complete whenever the batch has landed.
+        if (timed && &layer == &layers_.back()) { CUDA_CHECK(cudaEventRecord(timed_end_, restore_stream_)); }
         restore_.layers.push_back(record());
     }
     restore_.submitted = true;
     restore_.ticket    = next_ticket_++;
+    if (timed) {
+        timed_ticket_ = restore_.ticket;
+        timed_bytes_  = batch_bytes;
+    }
     counters_.host_restore_copies += copies;
     counters_.host_block_restores += restore_.nodes.size();
     counters_.host_tail_restores += restore_.tail ? 1U : 0U;
@@ -654,15 +797,19 @@ std::uint64_t HybridPrefixCache::land_restore(cudaStream_t consumer) {
     if (!restore_.submitted) { throw std::logic_error("hybrid restore was not submitted"); }
     CUDA_CHECK(cudaStreamWaitEvent(consumer, restore_.prelude, 0));
     // The admission's own pins end at activation; the copies' sources and destinations stay
-    // pinned by the batch until it lands.
-    for (const NodeRef node : restore_.nodes) { index_->pin_node(node); }
+    // pinned by the batch until it lands. Held until the batch is listed: a batch that cannot be (its
+    // deque block) stays the open restore, which abort_restore returns, and that knows no pins.
+    std::vector<NodePin> pins;
+    pins.reserve(restore_.nodes.size());
+    for (const NodeRef node : restore_.nodes) { pins.emplace_back(*index_, node); }
     const std::optional<SnapshotRef> source = restore_.tail ? restore_.tail : restore_.image;
-    if (source) {
-        index_->pin_snapshot(*source);
-        restore_.pinned_snapshot = source;
-    }
+    SnapshotPin snapshot_pin;
+    if (source) { snapshot_pin = SnapshotPin(*index_, *source); }
     const std::uint64_t ticket = restore_.ticket;
-    landing_.push_back(std::move(restore_));
+    landing_.push_back(std::move(restore_)); // a deque: unchanged when its new block cannot be allocated
+    landing_.back().pinned_snapshot = source;
+    for (NodePin& pin : pins) { (void)pin.release(); }
+    (void)snapshot_pin.release();
     restore_ = RestoreBatch{};
     return ticket;
 }
@@ -671,10 +818,13 @@ void HybridPrefixCache::detach_prefetch() {
     if (!restore_.submitted || restore_.image || restore_.tail) {
         throw std::logic_error("hybrid prefetch is not a submitted batch of blocks");
     }
-    for (const NodeRef node : restore_.nodes) { index_->pin_node(node); }
-    restore_.prefetch = true;
-    counters_.prefetched_blocks += restore_.nodes.size();
+    std::vector<NodePin> pins; // as land_restore's
+    pins.reserve(restore_.nodes.size());
+    for (const NodeRef node : restore_.nodes) { pins.emplace_back(*index_, node); }
     landing_.push_back(std::move(restore_));
+    landing_.back().prefetch = true;
+    for (NodePin& pin : pins) { (void)pin.release(); }
+    counters_.prefetched_blocks += landing_.back().nodes.size();
     restore_ = RestoreBatch{};
 }
 
@@ -719,7 +869,26 @@ void HybridPrefixCache::finish_landing(RestoreBatch& batch) {
     }
     if (batch.tail) { index_->complete_tail_device_fill(*batch.tail); }
     if (batch.pinned_snapshot) { index_->unpin_snapshot(*batch.pinned_snapshot); }
+    if (batch.ticket == timed_ticket_ && timed_ticket_ != 0) {
+        timed_ticket_ = 0;
+        float milliseconds = 0.0F;
+        // An interval that cannot be read is no sample.
+        if (cudaEventElapsedTime(&milliseconds, timed_begin_, timed_end_) == cudaSuccess) {
+            observe_h2d_rate(runtime::blend_h2d_rate(h2d_measured_, timed_bytes_,
+                                                     static_cast<double>(milliseconds) * 1.0e-3));
+        }
+    }
     recycle_events(batch);
+}
+
+void HybridPrefixCache::observe_h2d_rate(double bytes_per_second) {
+    if (!(bytes_per_second > 0.0)) { return; }
+    const double applied = config_.cost.h2d_bytes_per_second;
+    h2d_measured_        = bytes_per_second;
+    // The index revalues its snapshots with a new model, so it gets one only when the rate moved by 5 % or more.
+    if (std::abs(bytes_per_second - applied) < 0.05 * applied) { return; }
+    config_.cost.h2d_bytes_per_second = bytes_per_second;
+    index_->set_cost(config_.cost);
 }
 
 void HybridPrefixCache::recycle_events(RestoreBatch& batch) noexcept {
@@ -738,6 +907,9 @@ void HybridPrefixCache::recycle_events(RestoreBatch& batch) noexcept {
 void HybridPrefixCache::abort_restore() noexcept {
     if (!restore_.open) { return; }
     if (restore_stream_ != nullptr) { (void)cudaStreamSynchronize(restore_stream_); }
+    if (restore_.submitted && restore_.ticket == timed_ticket_) { timed_ticket_ = 0; } // no link sample from it
+    // The destinations go back through release_device_block, which counts evictions: these are none.
+    const std::uint64_t evicted = counters_.evicted_blocks;
     try {
         for (const NodeRef node : restore_.nodes) {
             if (index_->valid(node) && index_->node(node).device == CopyState::Filling) {
@@ -749,6 +921,7 @@ void HybridPrefixCache::abort_restore() noexcept {
             index_->abort_tail_device_fill(*restore_.tail);
         }
     } catch (...) { std::terminate(); }
+    counters_.evicted_blocks = evicted;
     reset_restore();
 }
 
@@ -774,6 +947,7 @@ void HybridPrefixCache::clear() noexcept {
     // are waited for and forgotten (the new index holds no SSD slab).
     for (RestoreBatch& batch : landing_) { recycle_events(batch); }
     landing_.clear();
+    timed_ticket_ = 0;
     reset_restore();
     if (ssd_) { ssd_->abandon(); }
     // A resize's copies land first; the new index gets the slabs the Host tier holds now, not its startup size.

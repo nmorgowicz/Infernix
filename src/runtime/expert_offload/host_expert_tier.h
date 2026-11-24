@@ -96,6 +96,8 @@ public:
         // classes by their layers (HostTier::Class::shadow_floor; the exclusive layout). 0: none kept.
         std::uint32_t shadow_floor = 0;
         DirectReadQueue::Options io;
+        // Test seam: the read queue's injected faults (DirectReadQueue::set_faults), set before the agent starts.
+        DirectReadQueue::Faults io_faults;
         // Pinned memory the device can read (default: cudaHostAlloc portable | mapped), null when the
         // OS refuses, and its release.
         std::function<void*(std::size_t)> allocate;
@@ -137,6 +139,8 @@ public:
 
     struct Stats {
         std::uint64_t demand_reads = 0, demand_failures = 0, prefill_reads = 0, admitted = 0, discarded = 0;
+        std::uint64_t fills_undone = 0; // fills taken back whole because a read of theirs failed (read_records)
+        std::uint64_t fill_retries = 0; // a fill's records read again, one by one, after their read timed out
         // Records the startup fill kept in a reused slot (Options::pool) instead of reading them.
         std::uint64_t kept = 0;
         std::uint64_t copied_admissions = 0; // admissions copied into a class of smaller records
@@ -166,6 +170,24 @@ public:
     // shares each class's lent slots among min(its layers, this), so each layer's reads fit them.
     static constexpr std::uint32_t kStreamWindow = 4;
 
+    // Before a tier of `store` with `options` is built: page-locks the chunks its construction pins (Options::allocate,
+    // on a worker thread, in the order pin_slots takes them) and reads the first keys of `order` (the startup fill's)
+    // into each chunk's resident slots as the chunk lands, then gives every chunk to `pool` with the records it holds
+    // (HostSlotPool::keep under `identity`). A tier built next with that pool takes the chunks and its fill keeps those
+    // records unread, so the page-locking (~0.12 s/GiB, serial in the driver) runs beside the reads instead of before
+    // them (candidates QK-06; a FP4-Local start with 58 GiB of slots spent 7.8 s pinning, then 13.8 s reading). A chunk
+    // the OS refuses ends the pinning: the tier asks for the rest itself and meets the refusal as before. A failed read
+    // leaves its slot unheld (the tier reads it). Records of one size and no CSF only; otherwise nothing is done.
+    struct PoolFill {
+        std::uint32_t chunks  = 0; // given to the pool
+        std::uint32_t records = 0; // read, every one equal to the artifact's bytes
+        std::uint32_t failed  = 0; // reads that failed (their slots left unheld)
+        std::uint64_t bytes   = 0; // of the chunks
+        double seconds = 0, pin_seconds = 0; // the whole call; the worker's page-locking
+    };
+    [[nodiscard]] static PoolFill fill_pool(const ExpertStore& store, Options options, std::span<const std::uint32_t> order,
+                                            HostSlotPool& pool, const std::string& identity);
+
     HostExpertTier(const HostExpertTier&)            = delete;
     HostExpertTier& operator=(const HostExpertTier&) = delete;
 
@@ -192,6 +214,17 @@ public:
     // into free resident slots of their record size until none is left; returns how many. A key whose
     // size has no free slot is passed over, so later keys can be read before it.
     std::uint32_t prefill(std::span<const std::uint32_t> ranked, const std::function<bool(std::uint32_t)>& skip = {});
+    // After the frames' warm start from the first fill, `in_vram` naming the keys VRAM now holds: the RAM copies of
+    // those keys (shadows) give up as many slots as the fill order's other keys need (each class's keys prefill would
+    // place, less its free slots), most-used first (`ranked` order), and those keys are read (prefill(ranked,
+    // in_vram)). The least-used copies stay as the shadows a later prefill_shadows would otherwise read again from the
+    // artifact (1,860-2,857 records of a FP4-Local start). A class whose ranked keys still lack a host copy while it
+    // keeps a shadow then gives up the rest of its shadows and is filled again: no ranked key stays on the SSD for a
+    // shadow. Returns the shadows released and the records read.
+    struct SeedRefill {
+        std::uint32_t released = 0, refilled = 0;
+    };
+    SeedRefill refill_over_seeds(std::span<const std::uint32_t> ranked, const std::function<bool(std::uint32_t)>& in_vram);
     // Reads the keys of `ranked` (best first) that have no host copy and that `skip` rejects into
     // unpinned records until none is left; they keep them for good. Returns how many.
     std::uint32_t fill_unpinned(std::span<const std::uint32_t> ranked, const std::function<bool(std::uint32_t)>& skip);
@@ -313,7 +346,9 @@ public:
     // completed every kernel that may read a slot.) The memory work (releasing, page-locking, decommitting and
     // committing) runs on `worker`, off the engine thread.
     // Gives back at least `bytes` if it can (fewer when pins, loans, refills or Options::min_slots stop it): first the
-    // unpinned records, unused ones and then the lowest-ranked held keys' (HostTier::unhold; their pages decommitted),
+    // unpinned records, unused ones and then the lowest-ranked held keys' (HostTier::unhold; their pages decommitted;
+    // a key a VRAM promotion still needs, queued for a frame or being copied, keeps its record whatever the caller
+    // checked: HostTier::held_pinned),
     // then whole pinned chunks, those holding the least valuable residents first (decayed LFU): their slots are
     // retired (HostTier::retire) and the chunks released (Options::release). The transit region (records of several
     // sizes) and a chunk holding a bounce slot stay; a chunk with a pinned or lent slot, or a slot an issued refill
@@ -335,8 +370,12 @@ public:
     std::uint64_t link_growth();
     // Fills what is still free of the room a growth took back from the artifact with the keys without a host copy
     // that `skip` (when given) rejects, the best first by the decayed LFU (prefill, fill_unpinned): once the Engine
-    // is idle, since the reads wait. Returns how many keys it read; they are dirty.
-    std::uint32_t fill_room(const std::function<bool(std::uint32_t)>& skip = {});
+    // is idle, since the reads wait. At most `max_bytes` of records a call (at least one record), so the caller's
+    // thread is held for one piece at a time: room_unfilled() stays set while more is left, and the caller calls
+    // again. A piece whose read fails goes back whole (the keys keep no host copy), the room stays unfilled and the
+    // failure is thrown. Returns how many keys it read; they are dirty.
+    std::uint32_t fill_room(const std::function<bool(std::uint32_t)>& skip = {},
+                            std::uint64_t max_bytes = ~std::uint64_t{0});
     [[nodiscard]] bool room_unfilled() const noexcept { return room_unfilled_; }
     // What shrink could give back now (every unpinned record and the chunks it would retire) and what a growth could
     // take back (the retired chunks and the decommitted records).
@@ -379,6 +418,9 @@ public:
     // while it runs. Its pending and later demands then fail at once instead of waiting, and the
     // caller treats the tier as failed.
     [[nodiscard]] std::string failure() const;
+    // Test seam: the agent thread stops as on an error of its read queue, with `why` as failure() (non-empty), the
+    // reads it has issued left in flight.
+    void stop_agent_for_test(std::string why);
 
 private:
     struct Ticket {
@@ -394,7 +436,12 @@ private:
         const std::uint8_t* copy_from = nullptr;
         bool expand = false;
         const std::uint8_t* bytes     = nullptr; // the record once landed (state 1)
-        std::atomic<bool> done{false};
+        // Who still reads its ring slot: kDeviceHolder (a fetch or read-ahead ticket until the device has copied it or
+        // the guess is dropped) and kCpuHolder (a CPU demand, its own or one sharing the key's round ticket, until
+        // done()). Each holder clears only its own bit, so a release repeated by one never frees the slot under the
+        // other; take_slot recycles a landed slot with no holder. The CPU side is the one service thread, which
+        // finishes a call's records (done) before it demands the next call's.
+        std::atomic<std::uint8_t> holders{0};
         std::atomic<std::uint32_t> state{0}; // 0 pending, 1 landed, 2 failed
         std::atomic<std::uint32_t> status{0};
     };
@@ -606,6 +653,7 @@ private:
     std::condition_variable wake_;
     bool stop_ = false;
     std::string agent_failure_; // non-empty once the agent thread has stopped on an error
+    std::string agent_abort_;   // stop_agent_for_test: the agent throws it at its next turn
     std::vector<std::uint32_t> new_demands_; // ticket indices
     std::vector<RingSlot> ring_;             // free ring slots of this round, taken from the back
     std::deque<std::uint32_t> holding_;      // tickets holding a ring slot, oldest first
@@ -651,7 +699,7 @@ private:
     // Written by the agent; read at boundaries.
     std::atomic<std::uint64_t> agent_reads_{0}, agent_failures_{0}, agent_read_ns_{0};
     std::atomic<std::uint64_t> agent_fetch_requests_{0}, agent_fetch_records_{0}, agent_fetch_from_ram_{0};
-    std::atomic<std::uint64_t> agent_run_reads_{0}, agent_run_records_{0};
+    std::atomic<std::uint64_t> agent_run_reads_{0}, agent_run_records_{0}, agent_fill_retries_{0};
     std::atomic<std::uint64_t> unpinned_served_{0}, unpinned_copies_{0};
     std::uint32_t prefill_failures_ = 0; // published to prefill() by prefill_done_
     std::thread agent_;

@@ -71,9 +71,10 @@ it:
 |---|---|---|
 | NVIDIA NVFP4 Flash-Next (Dense8 and the bit-exact conversion) | Routed experts **4-bit** (W4A4 with NVIDIA's calibrated scales), because NVIDIA's checkpoint specifies it; everything else 16-bit | `--a8-activations`: experts 8-bit. `--a16-activations`: experts 16-bit on the stored 4-bit weights |
 | NVIDIA FP4-Local Flash-Next (and Huihui's abliterated FP4-Local) | 16-bit, as NVIDIA serves it | `--expert-a4-activations`: experts 4-bit. `--a8-activations`: experts 8-bit |
+| NVIDIA NVFP4-QAD Flash-Next (Dense8 and the bit-exact conversion) | Routed and shared experts **4-bit** (W4A4 with NVIDIA's scales), as NVIDIA serves it; MXFP8 projections and everything else 16-bit | `--a16-activations`: experts 16-bit (perplexity 3.4138 against 3.4422, decode within 1 %). `--a8-activations`: experts 8-bit (3.4139 on the default route, with `expert-a4-residual`) |
 | Uncensored NVFP4 Flash-Next | 16-bit (weight-only NVFP4 experts) | `--a8-activations`: experts 8-bit |
 | IQ3_S GGUF Flash-Next | 16-bit everywhere | `--a8-activations`: dense projections and experts 8-bit, as Strata and Basalt |
-| Qwen3.8-27B NVFP4 | 4-bit at its NVFP4 layers, as the artifact specifies (NInfer the same) | none |
+| Qwen3.8-27B NVFP4 | Prompts **4-bit** at the NVFP4 layers and **8-bit** at the FP8 ones, as the artifact specifies (NInfer the same); decode and verification 16-bit (wide rounds of several requests: the MLP two-term 4-bit residual, fast path batched-a4-residual-decode). NVIDIA's NVFP4-QAD bit-exact conversion: the same, with NVIDIA's calibrated input scales (W4A4 and static W8A8, as NVIDIA serves it) | `--a16-activations`: 16-bit everywhere. `--a8-activations`: every NVFP4 and FP8 projection 8-bit at every width, for precision comparisons. On the NVFP4-QAD conversion (RTX 5090, INT8 KV): prompts 3.9x slower than the default and 1.3x faster than `--a16-activations` (pp16384 15.5K / 3.96K / 3.0K tok/s, each with its fast paths), plain decode 5 % slower (85.7 against 90.2 tok/s) |
 
 On NVIDIA's NVFP4 weights Strata, strata-nvfp4 and Basalt run the experts at 8 bits in decode and
 every other activation at 8 bits. The options on Dense8 (RTX 5090, one request):
@@ -150,8 +151,13 @@ Against NInfer on the same artifact ([benchmarks](#qwen38-27b-infernix-vs-ninfer
   default with the drafter measured fastest for each model (`--spec auto`).
 - **KV formats**: `int8`, `bf16`, `fp8`, `nvfp4`, `k8v4`, `vq2` and `k4v2`.
 - **Vision**: images and video; the vision encoder can stay in system RAM.
+- **Documents**: PDFs (page text, and page images with vision, read with PDFium), plain-text documents and
+  search results, with Anthropic citations
+  ([serving](docs/serving.md#documents-pdfs-and-citations)).
 - **Conversion**: Hugging Face, NVIDIA ModelOpt, Quasar and GGUF sources; Q4-Q8, FP8, NVFP4 and
   mixed recipes.
+- **LoRA adapters**: `--lora` applies a Hugging Face PEFT adapter to the Qwen3.8-27B artifacts at runtime,
+  read from its own files ([LoRA adapters](docs/lora.md)).
 - **Windows and Linux**: native MSVC and GCC builds, WSL2 included.
 
 ## Benchmarks
@@ -515,6 +521,9 @@ run without command lines:
   server's console, an event log, token usage by model and client, and a chat with image input.
 - **Watchdog**: restarts a server that crashes or locks up, and explains a load that does not fit,
   with suggested changes.
+- **Ablation**: makes a refusal-ablation sidecar ([`--ablate`](docs/ablate.md)) for one of your models:
+  downloads a public prompt set (licences shown), runs the fitter on your GPU and adds the sidecar to the
+  model's configuration choices, beside its LoRA adapters and drafter.
 
 To use it, build as in the quick start below and run `infernix-launcher.exe` from the folder of
 `infernix-serve.exe`: it opens `http://127.0.0.1:1234` in your browser. Add your model folders (or
@@ -525,34 +534,61 @@ download a model) under **Models**, press **Load**, and point your tools at the 
 ## Quick start (Windows)
 
 Prerequisites: Visual Studio 2026 (or 2022, MSVC 14.44) with its C++ CMake tools (they bring Ninja),
-the CUDA 13.4 toolkit or later (CMake refuses an older one), and FFmpeg, libjpeg-turbo and curl from vcpkg (`x64-windows`, at `C:\vcpkg`;
-`vcpkg install libjpeg-turbo:x64-windows` adds libjpeg-turbo to an existing tree); adjust the paths at
+the CUDA 13.4 toolkit (CMake refuses an older one; later ones are untested, and 13.5's device link may need over 46 GB of RAM:
+[build system](docs/maintainer/build-system.md)), and FFmpeg, libjpeg-turbo and curl from vcpkg (`x64-windows`, at `C:\vcpkg`;
+`vcpkg install libjpeg-turbo:x64-windows` adds libjpeg-turbo to an existing tree), and Python 3.11 or
+later for the PDFium download below; adjust the paths at
 the top of `build_native.bat`. It builds with Ninja Multi-Config (about 30 % faster than the Visual
 Studio generator); a `build-windows` tree from the Visual Studio generator is configured afresh on its
 next build.
 
+PDF documents need PDFium: `tools\deps\fetch_pdfium.py` downloads the pinned prebuilt release
+(bblanchon/pdfium-binaries), checks its SHA-256 and unpacks it into `build-deps\pdfium`, where
+`build_native.bat` finds it (`--archive FILE` unpacks a copy you already downloaded; set `PDFIUM_ROOT`
+to use a tree elsewhere). Without it the build succeeds and PDFs are refused.
+
 ```bat
+py -3 -I tools\deps\fetch_pdfium.py
 build_native.bat configure
 build_native.bat build
 ```
 
-The server is `build-windows\apps\Release\infernix-serve.exe`, with its DLLs beside it.
+The configure step confirms it with `infernix: PDF documents through PDFium 159.0.8152.0 (...)`. A
+`build-windows` configured before the download keeps refusing PDFs until `build_native.bat configure`
+runs again.
+
+The server is `build-windows\apps\Release\infernix-serve.exe`, with its DLLs (`pdfium.dll` among them) beside it.
 
 **The easy way: the launcher.** Run `infernix-launcher.exe`, beside the server: see
 [Infernix Launcher](#infernix-launcher-beta).
 
-To run the server directly instead, Qwen3.8-Flash-Next ([guide](docs/qwen3_8-flash-next.md#run)):
+To run the server directly instead, Qwen3.8-Flash-Next ([guide](docs/qwen3_8-flash-next.md#run)) with the
+recommended conversion, NVIDIA's NVFP4-QAD Dense8. It needs a build from `main` at `eac2b3d8` or later, or a Windows
+release after `windows-2026.11.07`:
+
+```bat
+infernix-serve.exe Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Dense8-Infernix-00001-of-00003.infernix --ngram-volume Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram --kv-dtype int8 --max-context 262144 --spec dflash2 --draft-model Qwen3.8-Flash-Next-DFlash2-Infernix.infernix --draft-tokens auto --lm-head-draft --max-concurrency 2 --vram-past-budget
+```
+
+Its repository carries no n-gram volume. Download NVIDIA's FP8 volume, the table it stores (NVIDIA
+kept it frozen through QAD), from
+[Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix/blob/main/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram),
+or use the one you have. The drafter is
+[Qwen3.8-Flash-Next-DFlash2-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-DFlash2-Infernix).
+Without it, `--spec mtp --draft-tokens auto --lm-head-draft` uses the model's own MTP drafter, about
+10 % slower; builds from 2026-10-31 choose between the two by themselves (see below).
+`--vram-past-budget` (Windows) also gives the expert cache the ~0.6 GiB of VRAM the per-process budget
+withholds, as in the benchmarks; leave it out when another program needs that memory.
+
+These conversions take the same options, n-gram volume and drafter:
+
+- the bit-exact QAD conversion (`Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Infernix-00001-of-00003.infernix`);
+- NVIDIA's NVFP4 Dense8, the conversion the benchmarks below measured, which runs on older builds and releases;
+- the uncensored conversion.
 
 ```bat
 infernix-serve.exe Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix-00001-of-00003.infernix --ngram-volume Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram --kv-dtype int8 --max-context 262144 --spec dflash2 --draft-model Qwen3.8-Flash-Next-DFlash2-Infernix.infernix --draft-tokens auto --lm-head-draft --max-concurrency 2 --vram-past-budget
 ```
-
-The drafter is [Qwen3.8-Flash-Next-DFlash2-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-DFlash2-Infernix);
-without it, `--spec mtp --draft-tokens auto --lm-head-draft` uses the model's own MTP drafter, about
-10 % slower (builds from 2026-10-31 choose between the two by themselves, see below).
-`--vram-past-budget` (Windows) also gives the expert cache the ~0.6 GiB of VRAM the per-process budget
-withholds, as in the benchmarks; leave it out when another program needs that memory. The uncensored
-conversion takes the same options, n-gram volume and drafter:
 
 ```bat
 infernix-serve.exe Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix-00001-of-00003.infernix --ngram-volume Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram --kv-dtype int8 --max-context 262144 --spec dflash2 --draft-model Qwen3.8-Flash-Next-DFlash2-Infernix.infernix --draft-tokens auto --lm-head-draft --max-concurrency 2 --vram-past-budget
@@ -570,7 +606,7 @@ infernix-serve.exe Huihui-Qwen3.8-Flash-Next-abliterated-FP4-Local-Infernix-0000
 Qwen3.8-27B on a 32 GB RTX 5090:
 
 ```bat
-infernix-serve.exe qwen3_8_27b_nvfp4-nvidia.ninfer --max-context 240000 --max-concurrency 2 --spec dflash2 --draft-tokens auto --lm-head-draft --ngram-draft-tokens auto --kv-dtype int8 --preserve-thinking --prefill-chunk 4096 --kv-capacity auto --tolerant-tool-calls
+infernix-serve.exe Qwen3.8-27B-NVIDIA-NVFP4-QAD-Infernix-Exact.infernix --max-context auto --max-concurrency 2 --spec dflash2 --draft-tokens auto --lm-head-draft --ngram-draft-tokens auto --kv-dtype int8 --preserve-thinking --prefill-chunk 4096 --tolerant-tool-calls
 ```
 
 Ornith-1.5-122B (experts in about 70 GiB of RAM; [guide](docs/qwen3_5-122b.md)):
@@ -594,6 +630,16 @@ measured overall, and `auto` picks the draft length):
 | Qwen3.6-27B (NVFP4, groupwise) | `--spec mtp --draft-tokens auto --lm-head-draft` | the per-round MTP length where its configuration registers `adaptive-mtp` (startup reports it), else 3 every round |
 | Ornith-1.5-122B (and its UNCENSORED conversion) | `--spec mtp --draft-tokens auto` | 2 confidence-gated drafts: 14 % faster than plain decode at one request, about 6 % slower while two decode together; DFlash2's `auto` decodes plain |
 
+For long conversations on the 27Bs, whose KV cache two long conversations outgrow, add `--embedding-host`:
+the token embedding moves to pinned RAM and its VRAM (1.18 GiB on the 27B, about 37K tokens of INT8 KV) becomes
+KV cache, with the same output. Leave `--prefill-chunk` at its default: prefill already takes 4,096-token steps
+while nothing else runs, and a larger chunk makes every other request wait longer and takes KV cache for its
+workspace. On an RTX 5090, two agent conversations of 185K and 100K tokens on the 27B NVFP4 at four lanes reached
+their first token in 0.5 s on average (0.7 s at worst) with these settings, against 2.5 s (16.5 s) with
+`--prefill-chunk 4096` and neither option, where the two did not fit the KV cache together. The 35B-A3B's KV cache
+already holds about 850K tokens at four lanes, so there `--embedding-host` only costs its prompts' row reads (cold
+prefill 0.5-0.8 % slower).
+
 Without `--spec`, `infernix-serve` and `infernix` speculate as `--spec auto --draft-tokens auto`: they make the
 table's drafter choice by themselves from the artifact's drafters and report it at startup. On Flash-Next that is
 DFlash2 when `--draft-model` names its drafter or the drafter's companion artifact is the only one in the model's
@@ -614,22 +660,27 @@ prompts ([guide](docs/qwen3_5-122b.md)). `--expert-csf` keeps the offloaded NVFP
 Another PC needs an RTX 50-series GPU and NVIDIA driver 580 or later (no CUDA toolkit): copy the
 DLLs beside `infernix-serve.exe` and install the Visual C++ redistributable if missing.
 `packaging\windows\package_release.ps1` packs the server, DLLs and licences into a release zip
-([third-party notices](packaging/windows/THIRD_PARTY_NOTICES.md)).
+([third-party notices](packaging/windows/THIRD_PARTY_NOTICES.md)); it stops on a build without PDFium.
 
 ## Quick start (Linux)
 
-64-bit Linux and WSL2 (tested on Ubuntu 24.04, CUDA 13.4, GCC 13.3). Prerequisites: CUDA 13.4 or
-later (CMake refuses an older toolkit: CUDA 13.2 miscompiles sm_120a code), CMake 3.28+, a C++20
-compiler, Ninja, `pkg-config`, and the FFmpeg, libjpeg-turbo and curl development packages:
+64-bit Linux and WSL2 (tested on Ubuntu 24.04, CUDA 13.4, GCC 13.3). Prerequisites: CUDA 13.4
+(CMake refuses an older toolkit: CUDA 13.2 miscompiles sm_120a code; later ones are untested), CMake 3.28+, a C++20
+compiler, Ninja, `pkg-config`, the FFmpeg, libjpeg-turbo and curl development packages, and Python 3.11
+or later for the PDFium download:
 
 ```bash
 sudo apt-get install -y build-essential cmake ninja-build pkg-config libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libjpeg-turbo8-dev libcurl4-openssl-dev
-cmake --preset release
+python3 -I tools/deps/fetch_pdfium.py   # PDF documents (PDFium); prints the tree for PDFIUM_ROOT
+cmake --preset release -DPDFIUM_ROOT="$PWD/build-deps/pdfium/chromium-8152/linux-x64"
 cmake --build build -j
 ```
 
-The server is `build/apps/infernix-serve`, with the same options, and the launcher
-`build/apps/infernix-launcher`. Under WSL2 use the Windows NVIDIA
+Without `PDFIUM_ROOT` the build succeeds and PDFs are refused; the configure step confirms PDFium as on
+Windows. The server is `build/apps/infernix-serve`, with the same options, and the launcher
+`build/apps/infernix-launcher`. The server loads `libpdfium.so` from the PDFium tree: keep that tree
+in place, or put the library on the loader path (the Dockerfile copies it to `/usr/local/lib`) when
+moving the server. Under WSL2 use the Windows NVIDIA
 driver (install none inside WSL) and copy models into the Linux filesystem; `/mnt/` reads are slow.
 Ubuntu 24.04's FFmpeg (6.1) decodes every image format but animated WebP, which needs FFmpeg 8; an
 animated WebP sent to such a build is refused with a message saying so. Under WSL2 Infernix plans RAM
@@ -773,9 +824,11 @@ requests refuse rather than silently selecting a Qwen implementation.
 
 | Repository | Converted from | What it is |
 |---|---|---|
-| **[Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix)** (**recommended**) | [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) | NVIDIA's NVFP4 experts and FP8 n-gram table bit-exact, dense projections in 8 bits: about 22 % faster than the bit-exact conversion at the same quality (perplexity 4.654 against 4.666); the one [benchmarked](#qwen38-flash-next-nvfp4-infernix-vs-strata-strata-nvfp4-and-basalt). |
+| **[Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Dense8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Dense8-Infernix)** (**recommended**) | [nvidia/Qwen3.8-Flash-Next-NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4-QAD) | NVIDIA's quantization-aware distillation with NVFP4 shared experts and MXFP8 GDN, attention and indexer projections. Experts, MXFP8 words and FP8 n-gram table are bit-exact; the hyper-connection mixers, PLE projections and `lm_head` are in 8 bits, as in Dense8. Experts run W4A4 as NVIDIA serves it. Perplexity 3.4385 on the quick corpus (BF16 KV), against 3.5095 for NVIDIA NVFP4 Dense8 on the same build and 3.5066 for FP4-Local at the same 4-bit expert arithmetic; decode 2-7 % faster than the bit-exact QAD conversion. Against NVIDIA NVFP4 Dense8 on one build (benchmark text, three interleaved runs): DFlash2 decode 3.1 % slower (272 against 281 tok/s), MTP decode 3.5 % faster, prefill level. Its repository has no n-gram volume: use the FP8 one. Needs `main` at `eac2b3d8` or later (a release after `windows-2026.11.07`). |
+| [Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Infernix) | [nvidia/Qwen3.8-Flash-Next-NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4-QAD) | The same checkpoint with every weight exactly as NVIDIA stores it. Perplexity 3.4422, or 3.4138 with `--a16-activations` (16-bit expert activations). |
+| [Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix) | [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) | NVIDIA's NVFP4 experts and FP8 n-gram table bit-exact, dense projections in 8 bits: about 22 % faster than the bit-exact conversion at the same quality (perplexity 4.654 against 4.666); the one [benchmarked](#qwen38-flash-next-nvfp4-infernix-vs-strata-strata-nvfp4-and-basalt). |
 | [Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix) | [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) | Every weight exactly as NVIDIA stores it. |
-| [Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix) | [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) (`IQ3_S`) | Every GGUF tensor bit-exact in exact integer arithmetic, plus MTP and vision. Fastest decode (146 tok/s plain, 260 with MTP, against Dense8's 110 and 143), experts in 46.9 GiB of RAM; slower long prefill (4,324 against 10,933 tok/s at 131K). |
+| [Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix) | [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) (`IQ3_S`) | Every GGUF tensor bit-exact in exact integer arithmetic, plus MTP and vision. Fastest decode (146 tok/s plain, 260 with MTP, against NVIDIA NVFP4 Dense8's 110 and 143), experts in 46.9 GiB of RAM; slower long prefill (4,324 against 10,933 tok/s at 131K). |
 | [Qwen3.8-Flash-Next-FP8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix) | [Qwen/Qwen3.8-Flash-Next-FP8](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8) | Qwen's FP8 checkpoint bit-exact with its BF16 n-gram table: the most accurate and the slowest (about 44 tok/s plain; its 112.6 GiB of experts need the SSD tier on 96 GB). |
 | [Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix) | [nvidia/Qwen3.8-Flash-Next-FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local) | NVIDIA's quantization-aware-distilled FP4 checkpoint bit-exact (NVFP4 experts, MXFP8 dense, its own NVFP4 n-gram volume), 16-bit expert activations as NVIDIA serves it (`--expert-a4-activations`: 4-bit, changes the output). Perplexity 3.4865 against FP8's 3.4854 (quick corpus). |
 | [Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix) | [orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4) | Abliterated (refusals removed; see its card): weight-only NVFP4 experts and FP8 projections bit-exact, other dense classes 8-bit as Dense8. Perplexity 4.772. |
@@ -786,10 +839,10 @@ Every conversion can draft with **[Qwen3.8-Flash-Next-DFlash2-Infernix](https://
 (**recommended**, 776 MB), Inco AI's [DFlash2 drafter](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2)
 in 8 bits (`--spec dflash2 --draft-model FILE --draft-tokens auto`), 8-11 % faster than MTP
 ([benchmarks](#qwen38-flash-next-dflash2-against-mtp)). On the 1M-token perplexity corpus (4,096
-context, INT8 KV) FP8 scores 3.487, Dense8 3.508 and IQ3_S 3.522.
+context, INT8 KV) FP8 scores 3.487, NVIDIA NVFP4 Dense8 3.508 and IQ3_S 3.522.
 
 Every conversion also needs a PLE n-gram volume (`--ngram-volume`) on an NVMe drive. Any of the
-four runs any conversion; **the FP8 volume is recommended**, except for the two FP4-Local
+five runs any conversion; **the FP8 volume is recommended**, except for the two FP4-Local
 conversions (NVIDIA's and Huihui's), which store NVIDIA FP4-Local's NVFP4 table and recommend its
 volume:
 
@@ -797,22 +850,28 @@ volume:
 |---|---|---:|---|
 | [`Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram`](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix/blob/main/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram) (**recommended**) | FP8, one scale (NVIDIA's) | 52,429,058,048 | [NVIDIA-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix), copy in [Dense8](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix) |
 | [`Qwen3.8-Flash-Next-BF16.ngram`](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix/blob/main/Qwen3.8-Flash-Next-BF16.ngram) | BF16 (Qwen's) | 109,227,196,416 | [FP8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix) |
+| [`Qwen3.8-Flash-Next-BF16-P12.ngram`](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix/blob/main/Qwen3.8-Flash-Next-BF16-P12.ngram) | BF16 P12: the BF16 values bit for bit in 12.8 bits each | 81,920,397,312 | [FP8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix) |
 | [`Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram`](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix/blob/main/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram) | IQ4_NL, 4.5 bits (the GGUF's) | 29,127,258,112 | [GSQ-RCO-IQ3_S-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix) |
 | [`Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram`](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix/blob/main/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram) (**recommended for the FP4-Local conversions**) | NVFP4, 4.5 bits (NVIDIA FP4-Local's) | 29,127,258,112 | [NVIDIA-FP4-Local-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix) |
 
-The NVFP4 conversions were measured with the FP8 table, IQ3_S with its IQ4_NL table, FP8 with BF16,
-both FP4-Local conversions with FP4-Local's NVFP4 table; the uncensored, Huihui and Swift
-repositories carry none
+The NVFP4 and NVFP4-QAD conversions were measured with the FP8 table, IQ3_S with its IQ4_NL table,
+FP8 with BF16, both FP4-Local conversions with FP4-Local's NVFP4 table; the uncensored, Huihui,
+Swift and NVFP4-QAD repositories carry none
 ([n-gram table formats](docs/qwen3_8-flash-next.md#n-gram-table-formats)). IQ3_S and FP8 need
 Infernix `windows-2026.10.18` or later, the uncensored conversion `windows-2026.10.09.2`, the
-DFlash2 drafter a build whose `--help` lists `--draft-model`; older builds accept only an
-artifact's own n-gram table or BF16.
+NVFP4-QAD conversions `main` at `eac2b3d8` or later (a release after `windows-2026.11.07`), the DFlash2
+drafter a build whose `--help` lists `--draft-model`, the BF16 P12 volume `main` at `fed37c0e` or later
+(a release after `windows-2026.11.20`); older builds accept only an artifact's own n-gram table or BF16.
+The BF16 P12 volume gives the same output as the BF16 one in three quarters of the space; it reads as
+many blocks per token ([BF16 P12](docs/qwen3_8-flash-next.md#bf16-p12-n-gram-table)).
 
 ### Qwen3.8-27B
 
 | Repository | Converted from | What it is |
 |---|---|---|
-| **[Qwen3.8-27B-NVIDIA-NVFP4-NInferV3](https://huggingface.co/Wallawalla47/Qwen3.8-27B-NVIDIA-NVFP4-NInferV3)** (**recommended**) | [nvidia/Qwen3.8-27B-NVFP4](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4) | NVIDIA's NVFP4 checkpoint with a DFlash2 drafter and a proposal head for `--lm-head-draft`. |
+| **[Qwen3.8-27B-NVIDIA-NVFP4-QAD-Infernix-Exact](https://huggingface.co/Wallawalla47/Qwen3.8-27B-NVIDIA-NVFP4-QAD-Infernix-Exact)** (**recommended**) | [nvidia/Qwen3.8-27B-NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4-QAD) | NVIDIA's quantization-aware-distilled NVFP4 checkpoint, bit-exact (Infernix only), with MTP, the DFlash2 drafter and a proposal head; it runs at NVIDIA's served precision (4-bit and static 8-bit prompts, 16-bit decode). Against the NVIDIA NVFP4 conversion below: perplexity 4.3373 against 4.3472, plain decode 1.12x, DFlash2 1.04x (RTX 5090, INT8 KV). |
+| [Qwen3.8-27B-NVIDIA-NVFP4-QAD-NInferV3](https://huggingface.co/Wallawalla47/Qwen3.8-27B-NVIDIA-NVFP4-QAD-NInferV3) | [nvidia/Qwen3.8-27B-NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4-QAD) | The same checkpoint in NInfer's form (NInfer and Infernix), a Q8 head and FP8 embedding; same drafters and head. |
+| [Qwen3.8-27B-NVIDIA-NVFP4-NInferV3](https://huggingface.co/Wallawalla47/Qwen3.8-27B-NVIDIA-NVFP4-NInferV3) | [nvidia/Qwen3.8-27B-NVFP4](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4) | NVIDIA's NVFP4 checkpoint with a DFlash2 drafter and a proposal head for `--lm-head-draft`. |
 | [Qwen3.8-27B-Quasar-NVFP4-NInferV3](https://huggingface.co/Wallawalla47/Qwen3.8-27B-Quasar-NVFP4-NInferV3) | [QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4) | The QAT-trained NVFP4 model, same drafter and head. |
 | [Qwen3.8-27B-Uncensored-NVFP4-NInferV3](https://huggingface.co/Wallawalla47/Qwen3.8-27B-Uncensored-NVFP4-NInferV3) | [orcarouter/Qwen3.8-27B-Uncensored-NVFP4](https://huggingface.co/orcarouter/Qwen3.8-27B-Uncensored-NVFP4) | Abliterated (safety alignment largely removed; see its card), same drafter and head. |
 | [Swift-Qwen3.8-27B-NVFP4-NInferV3](https://huggingface.co/Wallawalla47/Swift-Qwen3.8-27B-NVFP4-NInferV3) | [ukisai/Swift-Qwen3.8-27B-NVFP4](https://huggingface.co/ukisai/Swift-Qwen3.8-27B-NVFP4) | UkisAI's token-efficient fine-tune, converted like the NVIDIA artifact. Smoke-tested; quality and speed not measured. |

@@ -10,7 +10,11 @@
 // after chunks 0..c-1), so every output bit equals the chunk-major prefill's. Only placement
 // differs (resident, streamed or staged experts), which the MoE's arithmetic does not see. A
 // layer's MoE runs once per group of consecutive chunks (walk_.groups, up to kWalkMoeColumns
-// columns): every MoE step acts column by column, so grouping changes no bit either.
+// columns): its router, routed experts and combine act column by column, and its dense shared
+// expert, whose projections pick their routes by width, gave each chunk's bits over a group of
+// streamed chunks in every walk infernix_qwen4_exp_forward_real_test --trim-last-layer runs, so
+// on the exact routes grouping changes no bit either (a fast path that routes an expert job by its
+// entry count gives a group's jobs the group's routes).
 //
 // The span's residual stream (BF16 [S*H, tokens]) and every chunk's staged io image live in the
 // stream lease after the ring. Each advance_prefill call enqueues about one call's work (a few
@@ -87,6 +91,14 @@ std::size_t ProgramImpl::walk_span_end(const Lane& lane, std::uint32_t index) {
     if (total < static_cast<std::uint32_t>(stream_min_columns())) { return first; }
     const bool one_then_last = end - first == 1U && end + 1 == lane.calls.size() && lane.calls[end] - from >= kWalkJoinMinTokens;
     if (end - first < 2U && !one_then_last) { return first; }
+    // Within the CPU split's width that one call stays chunk-major: its gated stream copies only what it routes and the
+    // CPU serves the rest, where a walk streams every expert a layer lacks, from the SSD too. An agent turn that does
+    // not echo its reply has this shape (a few thousand tokens and the generation opener's last call): prefill of 600-
+    // 3,000 new tokens took 0.40-0.93x the walk's time on Dense8 and FP4-Local (issue #77, design §19.3.42).
+    if (one_then_last && split_policy_ && options_.prefill_cpu_split &&
+        total <= static_cast<std::uint32_t>(split_columns())) {
+        return first;
+    }
     // The prompt's last call, too narrow to stream, joins a
     // span of streamed calls (as its own MoE group, walk_begin), so its experts are read from the span's ring
     // instead of being staged again right after it. It also puts a divergence inside that last call (a /v1/decide
@@ -102,6 +114,36 @@ std::size_t ProgramImpl::walk_span_end(const Lane& lane, std::uint32_t index) {
         tokens.push_back(total);
     }
     if (end - first < 2) { return first; }
+    // The span's MoE groups and the wide arena they plan, decided before its lease is taken (walk_begin groups the
+    // span again by the same budget). Off the fixed budget (free cache resume), a held lease too small for them first
+    // groups the span within it.
+    std::vector<std::int32_t> widths;
+    for (std::size_t i = 1; i < tokens.size(); ++i) { widths.push_back(static_cast<std::int32_t>(tokens[i] - tokens[i - 1])); }
+    const std::int32_t cells = mtp_ ? *std::max_element(widths.begin(), widths.end()) + 1 : 0;
+    const auto span_need     = [&](std::size_t budget) {
+        walk_span_budget_ = budget;
+        return planner_ ? planned_walk(widths, walk_groups(widths, budget), cells) + kWideSlack : std::size_t{0};
+    };
+    // A span of chunks the static arena holds (none past its columns) opens no wide scope: its groups' MoE runs in the
+    // static arena, so they are grouped by its capacity and lend nothing.
+    const bool narrow     = *std::max_element(widths.begin(), widths.end()) <= plan_.static_columns;
+    std::size_t walk_wide = 0;
+    if (narrow) {
+        (void)span_need(work_capacity_ > kWideSlack ? work_capacity_ - kWideSlack : 0); // sets the groups' budget
+    } else {
+        walk_wide = span_need(walk_budget());
+    }
+    if (!narrow && stream_lease_.valid() && walk_wide > stream_wide_bytes_) {
+        const std::size_t held = options_.free_cache_resume && stream_wide_bytes_ > kWideSlack
+                                     ? span_need(stream_wide_bytes_ - kWideSlack)
+                                     : walk_wide;
+        if (held <= stream_wide_bytes_) {
+            walk_wide = held;
+        } else {
+            walk_wide = span_need(walk_budget());
+            return_stream_lease(); // between calls nothing reads it: it is lent again with room for the span
+        }
+    }
     if (stream_lease_.valid() && walk_bytes(tokens[2], 2) > stream_walk_bytes_) {
         // Between calls nothing reads the lease; its frames go back and come out again with the area.
         return_stream_lease();
@@ -112,7 +154,7 @@ std::size_t ProgramImpl::walk_span_end(const Lane& lane, std::uint32_t index) {
         const std::uint32_t remaining = std::min(lane.prefill_end - lane.state_tokens, kWalkMaxTokens);
         const std::size_t chunks      = remaining / static_cast<std::uint32_t>(chunk_) + 2;
         if (!stream_chunk(static_cast<std::int32_t>(lane.calls[first] - lane.state_tokens),
-                          walk_bytes(remaining, chunks))) {
+                          walk_bytes(remaining, chunks), walk_wide)) {
             return first;
         }
     }
@@ -122,6 +164,7 @@ std::size_t ProgramImpl::walk_span_end(const Lane& lane, std::uint32_t index) {
 
 void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
     const cudaStream_t s = device_.stream;
+    walk_abandon_taps(); // an earlier span's, left by a failure (none after a completed one)
     walk_                = LayerWalk{};
     walk_.lane           = index;
     walk_.first_call     = lane.next_call;
@@ -139,35 +182,28 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
     walk_.io_stride      = walk_align(io_layout_.bytes);
     walk_.residual_bytes = walk_align(2ULL * static_cast<std::size_t>(width_) * static_cast<std::size_t>(offset));
     walk_.moe_offset     = walk_.residual_bytes + n * walk_.io_stride;
-    // MoE groups: consecutive chunks while their columns fit kWalkMoeColumns and the arena the calls
-    // run in (WideWork of the span's widest chunk: the wide arena when it exceeds the static one's). A
-    // chunk too narrow to stream (the prompt's last, walk_span_end) is a group of its own, so its router
-    // takes the chunk-major call's form (router-mma acts on calls of kRouterMmaMinColumns or more).
+    // MoE groups (walk_groups), by the budget walk_span_end planned the span's wide arena with.
     const std::int32_t widest = *std::max_element(walk_.widths.begin(), walk_.widths.end());
-    const std::size_t arena   = widest > plan_.static_columns && wide_work_ > 0 ? wide_work_ : plan_.work;
-    for (std::size_t c = 0; c < n;) {
-        std::size_t e       = c + 1;
-        std::int32_t columns = walk_.widths[c];
-        while (e < n && walk_.widths[e] >= kStreamMinColumns && columns + walk_.widths[e] <= kWalkMoeColumns &&
-               execution::Forward::moe_workspace_bytes(c_, columns + walk_.widths[e], wide_a16(options_)) <= arena) {
-            columns += walk_.widths[e];
-            ++e;
-        }
-        walk_.groups.emplace_back(c, e);
-        c = e;
-    }
+    walk_.groups              = walk_groups(walk_.widths, walk_span_budget_);
     walk_.layers_per_step =
         static_cast<std::uint32_t>((c_.num_hidden_layers + n - 1) / n); // about one call's work per step
     walk_.mtp.assign(n, std::nullopt);
     walk_.vision.assign(n, std::nullopt);
     walk_.mtp_vision.assign(n, {});
-    walk_plan_taps(lane);
-    walk_dflash_frontier_ = lane.dflash_frontier;
-    walk_.host_slot = host_lanes_[0] = static_cast<std::int32_t>(index);
+    // The pinned image first (an allocation that fails under host RAM pressure), then the taps, which open staged
+    // captures: one that fails part-way gives back those it opened.
     if (walk_host_.size() < n * walk_.io_stride) {
         walk_host_     = PinnedHostBuffer(n * walk_.io_stride);
         walk_prefetch_ = WalkPrefetch{};
     }
+    try {
+        walk_plan_taps(lane);
+    } catch (...) {
+        walk_abandon_taps();
+        throw;
+    }
+    walk_dflash_frontier_ = lane.dflash_frontier;
+    walk_.host_slot = host_lanes_[0] = static_cast<std::int32_t>(index);
     walk_.active = true;
 
     auto* io        = static_cast<std::byte*>(io_device_.p);
@@ -232,7 +268,8 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
         }
         // The chunk's embedding and first layer run while the host stages the next chunk (its MoE
         // once its group's last chunk is staged).
-        const WideWork wide(*this, widest);
+        const WideWork wide(*this, widest, testing::WideSite::WalkSpan, planned_walk());
+        wide_scope_.inner = std::max(widest, walk_widest_group());
         walk_mixer(c, 0);
         for (std::size_t g = 0; g < walk_.groups.size(); ++g) {
             if (walk_.groups[g].second == c + 1) { walk_moe(g, 0); }
@@ -325,7 +362,10 @@ execution::ForwardBatch ProgramImpl::walk_batch(std::size_t c) {
     fb.stream         = true;
     fb.release_stream = c + 1 == walk_.widths.size();
     fb.stream_whole   = tier_losses() == tier_losses_at_span_;
-    if (scoring_) { fb.residual_out = score_residuals(walk_.begins[c], w); } // a scored prompt's (causal_score)
+    if (scoring_) { // a scored prompt's (causal_score)
+        fb.residual_out = score_residuals(walk_.begins[c], w);
+        set_hidden_capture(fb, walk_.begins[c], w);
+    }
     return fb;
 }
 
@@ -356,6 +396,63 @@ void ProgramImpl::walk_mixer(std::size_t c, std::uint32_t l) {
     walk_capture(c, l); // the layer's state (the MoE writes none) at the chunk's end
 }
 
+std::size_t ProgramImpl::planned_walk() const {
+    std::int32_t cells = 0;
+    for (const auto& chunk : walk_.mtp) {
+        if (chunk) { cells = std::max(cells, (chunk->prepend ? 1 : 0) + chunk->columns); }
+    }
+    return planned_walk(walk_.widths, walk_.groups, cells);
+}
+
+std::size_t ProgramImpl::planned_walk(std::span<const std::int32_t> widths,
+                                      std::span<const std::pair<std::size_t, std::size_t>> groups,
+                                      std::int32_t cells) const {
+    if (!planner_ || widths.empty()) { return 0; }
+    // Every step begins its call (begin_call resets the arena): a chunk's embedding and layer mixers, a group's MoE,
+    // a chunk's finish (its MTP cells, and the logits of the prompt's last chunk).
+    const std::int32_t widest = *std::max_element(widths.begin(), widths.end());
+    std::size_t most = std::max(planner_->plan_walk_mixer(widest), planner_->plan_walk_finish(widest, cells, true));
+    for (const auto& [first, end] : groups) {
+        std::int32_t columns = 0;
+        for (std::size_t c = first; c < end; ++c) { columns += widths[c]; }
+        if (columns > 0) { most = std::max(most, planner_->plan_walk_moe(columns)); }
+    }
+    return most;
+}
+
+std::vector<std::pair<std::size_t, std::size_t>> ProgramImpl::walk_groups(std::span<const std::int32_t> widths,
+                                                                          std::size_t budget) const {
+    std::vector<std::pair<std::size_t, std::size_t>> groups;
+    const std::size_t n = widths.size();
+    for (std::size_t c = 0; c < n;) {
+        std::size_t e        = c + 1;
+        std::int32_t columns = widths[c];
+        while (planner_ && e < n && widths[e] >= kStreamMinColumns && columns + widths[e] <= kWalkMoeColumns &&
+               planner_->plan_walk_moe(columns + widths[e]) <= budget) {
+            columns += widths[e];
+            ++e;
+        }
+        groups.emplace_back(c, e);
+        c = e;
+    }
+    return groups;
+}
+
+std::size_t ProgramImpl::walk_budget() const {
+    if (!options_.free_cache_resume) { return walk_budget_; }
+    return walk_room(residency_->lendable_bytes());
+}
+
+std::int32_t ProgramImpl::walk_widest_group() const noexcept {
+    std::int32_t widest = 0;
+    for (const auto& [first, end] : walk_.groups) {
+        if (end > first) {
+            widest = std::max(widest, walk_.offsets[end - 1] + walk_.widths[end - 1] - walk_.offsets[first]);
+        }
+    }
+    return widest;
+}
+
 // Layer l's MoE over group g's chunks, then (the last layer) each chunk's MTP cells and, for the
 // prompt's last chunk, the logits.
 void ProgramImpl::walk_moe(std::size_t g, std::uint32_t l) {
@@ -370,21 +467,29 @@ void ProgramImpl::walk_moe(std::size_t g, std::uint32_t l) {
     // The group's last chunk's call opens it (its release_stream ends the span's last layer copies);
     // the route log keeps that chunk's columns, the span's last as walk_step downloads them.
     const execution::ForwardBatch fb = walk_batch(end - 1);
-    // YC-01 (forward_call's trim): the last layer's MoE only over the span's last chunk's trailing columns, as that
-    // chunk's chunk-major call runs it (Forward::last_layer_kept of its width); no other final residual is read, so
-    // earlier groups run no MoE in the last layer. The span's last chunk still opens the layer's stream release.
+    // YC-01 (forward_call's trim): the last layer's MoE only over the span's last chunk's trailing columns
+    // (Forward::last_layer_kept of its width), as the untrimmed walk's MoE over the group gives them: its dense shared
+    // expert over the group, its routed experts on the group call's routes (TrimmedCall); no other final residual is
+    // read, so earlier groups run no MoE in the last layer. The span's last chunk still opens the layer's stream
+    // release. The kept columns' router takes the form the group's takes (Forward::last_layer_kept goes by the last
+    // chunk's width) because a group of several chunks holds chunks of kStreamMinColumns or more only (walk_groups;
+    // a narrower last chunk is a group of its own).
+    static_assert(kStreamMinColumns >= execution::kRouterMmaMinColumns,
+                  "a walk group of several chunks must take the router's MMA form in each of its chunks");
     const std::int32_t last_width = walk_.widths.back();
     const std::int32_t kept       = l + 1 == L && trims_last_layer() ? forward_->last_layer_kept(last_width) : 0;
     if (kept > 0) {
         if (end == walk_.widths.size()) {
-            const std::int32_t at = walk_.offsets[end - 1] - walk_.offsets[first] + last_width - kept;
+            const std::int32_t chunk = walk_.offsets[end - 1] - walk_.offsets[first];
+            const std::int32_t at    = chunk + last_width - kept;
             Tensor xm_kept(moe + static_cast<std::size_t>(at) * 2ULL * H, DType::BF16, {H, kept});
             Tensor inject_kept(moe + walk_align(static_cast<std::size_t>(kWalkMoeColumns) * 2ULL * H) +
                                    static_cast<std::size_t>(at) * 4ULL * S,
                                DType::FP32, {S, kept});
             Tensor residual_kept = walk_residual(end - 1, end).slice(1, last_width - kept, kept);
             forward_->begin_call(fb, nullptr);
-            forward_->layer_moe(l, fb, xm_kept, inject_kept, residual_kept, last_width, last_width - kept);
+            forward_->layer_moe(l, fb, xm_kept, inject_kept, residual_kept, last_width, last_width - kept, 0,
+                                execution::TrimmedCall{.shared = &xm, .routes = &xm});
         }
     } else {
         forward_->begin_call(fb, nullptr);
@@ -431,30 +536,55 @@ void ProgramImpl::walk_plan_taps(Lane& lane) {
             continue;
         }
         const bool tail   = B % kBlock != 0;
-        const auto staged = prefix_->open_staged_capture(tail, prefix_->index().estimate_priority(deepest, B, tail));
-        if (!staged) { continue; }
+        // A tap is a deeper state of the path: on a shortage of Host room its lineage's source gives way.
+        std::optional<pc::SnapshotRef> source;
+        std::span<const TokenId> continuation;
+        if (lane.prefix.resume && prefix_->index().valid(*lane.prefix.resume)) {
+            source                   = *lane.prefix.resume;
+            const std::uint32_t from = prefix_->index().snapshot(*source).frontier;
+            if (from < B) { continuation = std::span<const TokenId>(lane.history.data() + from, B - from); }
+        }
+        const auto staged = prefix_->open_staged_capture(tail, prefix_->index().estimate_priority(deepest, B, tail),
+                                                         source, continuation);
+        if (!staged) {
+            prefix_retry_tap(lane, B, forward); // no Host room now: due again at the next chunk's end
+            continue;
+        }
         walk_.taps[c] = {B, boundary ? pc::SnapshotKind::Boundary : pc::SnapshotKind::Tap, *staged};
         deepest       = B;
     }
 }
 
 void ProgramImpl::walk_commit_taps(Lane& lane) {
-    for (LayerWalk::Tap& tap : walk_.taps) {
-        if (tap.staged == 0) { continue; }
-        // The blocks up to the tap first, as after its chunk-major call (its anchor is the last).
-        prefix_publish(lane, tap.frontier);
-        const std::uint64_t staged = std::exchange(tap.staged, 0);
-        if (lane.prefix.path.size() < tap.frontier / kBlock) {
-            prefix_->abandon_staged_capture(staged);
-            continue;
+    try {
+        for (LayerWalk::Tap& tap : walk_.taps) {
+            if (tap.staged == 0) { continue; }
+            // The blocks up to the tap first, as after its chunk-major call (its anchor is the last).
+            prefix_publish(lane, tap.frontier);
+            if (lane.prefix.path.size() < tap.frontier / kBlock) {
+                prefix_->abandon_staged_capture(std::exchange(tap.staged, 0));
+                continue;
+            }
+            // Every cell up to the span's end is written (the prompt continues past each inner chunk).
+            prefix::PrefixCache::Capture capture =
+                prefix_capture_at(lane, tap.frontier, tap.kind, false, lane.mtp_live);
+            // Its DFlash2 ring was copied during the span, before the span's context reached the ring.
+            capture.meta.draft_frontier = std::min(capture.meta.draft_frontier, walk_dflash_frontier_);
+            const std::uint64_t id      = capture.id;
+            // The staged image is the capture's from here (commit_staged_capture returns it on its own failure).
+            prefix_->commit_staged_capture(std::exchange(tap.staged, 0), std::move(capture));
+            prefix_captured(lane, id, tap.frontier);
+            prefix_write_through(lane, tap.frontier); // the blocks below it are reachable from a snapshot now
         }
-        // Every cell up to the span's end is written (the prompt continues past each inner chunk).
-        prefix::PrefixCache::Capture capture = prefix_capture_at(lane, tap.frontier, tap.kind, false, lane.mtp_live);
-        // Its DFlash2 ring was copied during the span, before the span's context reached the ring.
-        capture.meta.draft_frontier = std::min(capture.meta.draft_frontier, walk_dflash_frontier_);
-        const std::uint64_t id               = capture.id;
-        prefix_->commit_staged_capture(staged, std::move(capture));
-        prefix_captured(lane, id, tap.frontier);
+    } catch (...) {
+        walk_abandon_taps();
+        throw;
+    }
+}
+
+void ProgramImpl::walk_abandon_taps() noexcept {
+    for (LayerWalk::Tap& tap : walk_.taps) {
+        if (tap.staged != 0) { prefix_->abandon_staged_capture(std::exchange(tap.staged, 0)); }
     }
 }
 
@@ -504,7 +634,9 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
     {
         const nvtx::ScopedRange step_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
                                            static_cast<std::uint64_t>(tokens));
-        const WideWork wide(*this, *std::max_element(walk_.widths.begin(), walk_.widths.end()));
+        const std::int32_t widest = *std::max_element(walk_.widths.begin(), walk_.widths.end());
+        const WideWork wide(*this, widest, testing::WideSite::WalkStep, planned_walk());
+        wide_scope_.inner = std::max(widest, walk_widest_group());
         walk_enqueue(to);
     }
     ++walk_.steps;
@@ -526,6 +658,7 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
         out.summary                 = prefill_summary(lane);
         out.processed_prompt_tokens = 0;
         out.complete                = false;
+        out.snapshot_published      = prefix_publications_observed(); // a tap of the span before this one landed
         out.timing.submit_host_ns   = elapsed_ns(start);
         lane.prefill_ns += out.timing.submit_host_ns;
         return out;
@@ -655,7 +788,7 @@ PrefillProgress ProgramImpl::pair_step(Lane& lane, std::uint32_t index, Clock::t
         settle_round(); // a deferred update precedes the next forward
         residency_->before_round(s);
         split_call_ = false;
-        const WideWork wide(*this, T);
+        const WideWork wide(*this, T, testing::WideSite::PairCall, T > plan_.static_columns ? planned_pair(w0, w1) : 0);
         require_tier_round();
 
         execution::ForwardBatch head = io_batch(static_cast<std::byte*>(io_device_.p), 1, w0, 1);
@@ -723,15 +856,16 @@ PrefillProgress ProgramImpl::pair_step(Lane& lane, std::uint32_t index, Clock::t
 }
 
 void ProgramImpl::walk_abandon() noexcept {
-    if (!walk_.active) { return; }
+    if (!walk_.active) {
+        walk_abandon_taps(); // a span that failed before it began or while it committed its taps
+        return;
+    }
     try {
         device_.synchronize();
     } catch (...) {}
     // The walk's copies of layers it never reached are still landing in the ring: the ring goes back after them.
     expert_stream_->end(device_.stream);
-    for (const LayerWalk::Tap& tap : walk_.taps) {
-        if (tap.staged != 0) { prefix_->abandon_staged_capture(tap.staged); }
-    }
+    walk_abandon_taps();
     walk_          = LayerWalk{};
     walk_prefetch_ = WalkPrefetch{};
 }

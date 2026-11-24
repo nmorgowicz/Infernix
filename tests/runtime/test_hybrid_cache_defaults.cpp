@@ -2,11 +2,15 @@
 #include "runtime/engine/expert_memory.h"
 #include "runtime/engine/model_instance.h"
 
+#include <cuda_runtime.h>
+
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 
 namespace {
 
@@ -25,8 +29,8 @@ int main() {
     int failures = 0;
 
     // The prefix cache derives every tuning value from the rest of the configuration. With the
-    // default (automatic) Host tier at concurrency 2 and a 2048-token chunk: one resident snapshot per
-    // lane plus one staging slot = 3, 8 taps, ladder max(4096, 2 * 2048) = 4096 and minimum gap
+    // default (automatic) Host tier at concurrency 2 and a 2048-token chunk: one Device snapshot slot
+    // (snapshots restore from the Host tier, and further slots would be KV capacity), 8 taps, ladder max(4096, 2 * 2048) = 4096 and minimum gap
     // max(1024, 2048) = 2048. The snapshot slots are the extra Device StateImages. The size stays
     // unset here: construct_model sizes it once the model's RAM is planned.
     {
@@ -37,7 +41,7 @@ int main() {
         const infernix::ContextCacheOptions& out = normalized.context_cache;
         failures +=
             check(!out.host_capacity_bytes &&
-                      out.hybrid.device_snapshot_slots == 3U && out.hybrid.max_new_taps == 8U &&
+                      out.hybrid.device_snapshot_slots == 1U && out.hybrid.max_new_taps == 8U &&
                       out.hybrid.tap_ladder_tokens == 4096U &&
                       out.hybrid.tap_min_gap_tokens == 2048U,
                   "prefix cache defaults did not derive from concurrency, chunk and Host tier");
@@ -170,10 +174,10 @@ int main() {
                               qwen4.hybrid.device_snapshot_slots == 0U && qwen4.hybrid.max_new_taps == 8U,
                           "Qwen3.8-Flash-Next prefix cache defaults are wrong");
         const infernix::ContextCacheOptions qwen35 = normalize_engine_options(options).context_cache;
-        failures += check(!qwen35.host_capacity_bytes && qwen35.hybrid.device_snapshot_slots == 3U,
+        failures += check(!qwen35.host_capacity_bytes && qwen35.hybrid.device_snapshot_slots == 1U,
                           "Qwen3.5 prefix cache defaults changed");
-        // A Qwen3.5 artifact with offloaded experts keeps one Device slot beside its Host tier (the frames
-        // the others would take; candidates §22 VM-03), and the per-lane rule without a Host tier.
+        // With offloaded experts the same: one Device slot beside the Host tier (the frames the others would
+        // take; candidates §22 VM-03), and the per-lane rule without a Host tier.
         const infernix::ContextCacheOptions offloaded =
             normalize_engine_options(options, infernix::models::Architecture::Qwen3_5, true).context_cache;
         failures += check(offloaded.hybrid.device_snapshot_slots == 1U,
@@ -501,6 +505,53 @@ int main() {
             infernix::runtime::validate_engine_options(options, infernix::models::Architecture::Qwen3_5, true);
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(!rejected, "--vram-headroom-mib was refused with offloaded experts");
+    }
+    // A saved prefix cache belongs to the sidecar as it does to the artifact: adding --ablate, or changing the direction
+    // file it names, changes the fingerprint, so KV saved without the cut (or with another) is never reused under it.
+    {
+        const std::filesystem::path dir = std::filesystem::temp_directory_path() / "infernix_ablate_fingerprint_test";
+        std::filesystem::remove_all(dir);
+        std::filesystem::create_directories(dir);
+        std::ofstream(dir / "sidecar.json") << R"({"format":"ablate-direction-v2","direction_file":"d.f32.bin"})";
+        std::ofstream(dir / "d.f32.bin", std::ios::binary) << std::string(16, '\0');
+        EngineOptions options;
+        options.artifact_path = "model.infernix";
+        const cudaDeviceProp device{};
+        const std::string plain = infernix::runtime::hybrid_cache_fingerprint(options, "sig", device);
+        options.ablate_sidecar_path = dir / "sidecar.json";
+        const std::string cut = infernix::runtime::hybrid_cache_fingerprint(options, "sig", device);
+        std::ofstream(dir / "d.f32.bin", std::ios::binary) << std::string(32, '\0');
+        const std::string recut = infernix::runtime::hybrid_cache_fingerprint(options, "sig", device);
+        failures += check(plain != cut, "--ablate left the saved prefix cache's fingerprint unchanged");
+        failures += check(cut != recut, "a changed direction file left the saved prefix cache's fingerprint unchanged");
+        failures += check(cut.find("d.f32.bin") != std::string::npos, "the fingerprint does not name the direction file");
+        std::filesystem::remove_all(dir);
+    }
+    // --ablate: every architecture takes it (Qwen3.5, Qwen3.5-MoE, Qwen3.8-Flash-Next).
+    {
+        EngineOptions options;
+        options.artifact_path       = "model.infernix";
+        options.ablate_sidecar_path = "sidecar.json";
+        for (const auto architecture : {infernix::models::Architecture::Qwen3_5, infernix::models::Architecture::Qwen3_5Moe,
+                                        infernix::models::Architecture::Qwen4Exp}) {
+            bool rejected = false;
+            try {
+                infernix::runtime::validate_engine_options(options, architecture,
+                                                           architecture == infernix::models::Architecture::Qwen4Exp);
+            } catch (const std::invalid_argument& error) {
+                rejected = std::string(error.what()).find("--ablate") != std::string::npos;
+            }
+            failures += check(!rejected, "--ablate was refused for an architecture that takes it");
+        }
+        // The lossless route is refused before anything loads, not when the forward is built.
+        options.lossless = true;
+        bool rejected    = false;
+        try {
+            infernix::runtime::validate_engine_options(options, infernix::models::Architecture::Qwen4Exp, true);
+        } catch (const std::invalid_argument& error) {
+            rejected = std::string(error.what()).find("--lossless") != std::string::npos;
+        }
+        failures += check(rejected, "--ablate with --lossless was not refused at validation");
     }
     // --draft-tokens auto on a Qwen3.5 artifact with offloaded experts: MTP keeps its drafter (its gated
     // drafts beat plain decode there), DFlash2 decodes without one (no policy beat plain decode); a fixed

@@ -120,14 +120,41 @@ std::string render_loaded_tools(std::span<const ToolDefinition> tools) {
     return text;
 }
 
-std::vector<std::string> tool_declaration_params(const GenerationRequest& request) {
-    std::vector<std::string> params;
-    params.reserve(request.tools.size());
-    for (const bool deferred : {false, true}) {
-        for (const ToolDefinition& tool : request.tools) {
-            if (tool.deferred == deferred) { params.push_back(tool.schema_param); }
+ContractDeclarations contract_declarations(const GenerationRequest& request) {
+    const auto change = [&](const std::string& name) -> const ToolContractChange* {
+        for (const ToolContractChange& item : request.tool_contract_changes) {
+            if (item.name == name) { return &item; }
+        }
+        return nullptr;
+    };
+    ContractDeclarations out;
+    out.listed.reserve(request.tools.size());
+    out.deferred.reserve(request.tools.size());
+    std::vector<const ToolDefinition*> redefined_listed;
+    for (const ToolDefinition& tool : request.tools) {
+        const ToolContractChange* changed = change(tool.name);
+        if (!tool.deferred) {
+            out.listed.push_back(&tool);
+            if (changed != nullptr) {
+                out.withdrawn.push_back(tool.name);
+                if (changed->definition) { redefined_listed.push_back(&*changed->definition); }
+            }
+        } else if (changed == nullptr) {
+            out.deferred.push_back(&tool);
+        } else if (changed->definition) {
+            out.deferred.push_back(&*changed->definition);
         }
     }
+    out.deferred.insert(out.deferred.end(), redefined_listed.begin(), redefined_listed.end());
+    return out;
+}
+
+std::vector<std::string> tool_declaration_params(const GenerationRequest& request) {
+    const ContractDeclarations declarations = contract_declarations(request);
+    std::vector<std::string> params;
+    params.reserve(declarations.listed.size() + declarations.deferred.size());
+    for (const ToolDefinition* tool : declarations.listed) { params.push_back(tool->schema_param); }
+    for (const ToolDefinition* tool : declarations.deferred) { params.push_back(tool->schema_param); }
     return params;
 }
 
@@ -260,6 +287,8 @@ infernix::PromptInput to_prompt_input(const GenerationRequest& request,
                 media.kind  = infernix::MessagePartKind::Media;
                 media.media = acquire_media(part);
                 message.parts.push_back(std::move(media));
+            } else if (part.kind == ContentKind::Document) {
+                throw std::logic_error("a document part reached translation unresolved (resolve_documents)");
             } else {
                 ApiError error;
                 error.message = "content type '" + part.type_raw + "' is not supported";
@@ -324,12 +353,15 @@ infernix::PromptInput to_prompt_input(const GenerationRequest& request,
     input.options.open_tool_names           = request.open_tool_names;
     input.options.declared_parameter_names  = semantics.declared_parameter_names;
     // Listed tools render in the prompt's tool section in request order; deferred ones only join
-    // the output contract, so declaring one never changes the prompt.
-    for (const ToolDefinition& tool : request.tools) {
-        if (tool.deferred) {
-            input.options.deferred_tool_jsons.push_back(render_tool_definition(tool));
-            continue;
-        }
+    // the output contract, so declaring one never changes the prompt. So do a conversation's later changes to a
+    // listed tool (withdrawn_tool_names, and a redefinition among the deferred declarations).
+    const ContractDeclarations declarations = contract_declarations(request);
+    for (const ToolDefinition* tool : declarations.deferred) {
+        input.options.deferred_tool_jsons.push_back(render_tool_definition(*tool));
+    }
+    input.options.withdrawn_tool_names = declarations.withdrawn;
+    for (const ToolDefinition* listed : declarations.listed) {
+        const ToolDefinition& tool = *listed;
         input.options.tool_jsons.push_back(render_tool_definition(tool));
         if (tool.cache_boundary_after) {
             input.context_cache.markers.push_back(infernix::PromptCacheMarker{
@@ -433,7 +465,7 @@ std::optional<GenerationRequest> omit_tool_result_media(const GenerationRequest&
         if (req.messages[m].role != ChatRole::Tool) { continue; }
         for (std::size_t p = 0; p < req.messages[m].content.size(); ++p) {
             const ContentKind kind = req.messages[m].content[p].kind;
-            if (kind == ContentKind::Text) { continue; }
+            if (kind != ContentKind::Image && kind != ContentKind::Video) { continue; }
             if (!out) { out = req; }
             ContentPart& part = out->messages[m].content[p];
             part.kind         = ContentKind::Text;

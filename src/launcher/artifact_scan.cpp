@@ -1,5 +1,7 @@
 #include "launcher/artifact_scan.h"
 
+#include "launcher/sha256.h"
+
 #include <algorithm>
 #include <cstring>
 #include <fstream>
@@ -18,6 +20,12 @@ constexpr char kNgramMagic[8]  = {'N', 'I', 'N', 'F', 'E', 'R', 'N', 'G'};
 constexpr std::uint64_t kPayloadAlignment = 4096;
 constexpr std::uint64_t kMaxDirectoryBytes = 512ull << 20;
 constexpr std::size_t kNgramHeaderBytes   = 68;
+constexpr std::uint64_t kMaxAdapterConfigBytes = 4ull << 20; // a PEFT adapter_config.json is about 1 kB
+constexpr const char* kAdapterConfig  = "adapter_config.json";
+constexpr const char* kAdapterWeights = "adapter_model.safetensors";
+constexpr const char* kSidecarFile    = "sidecar.json";
+constexpr std::uint64_t kMaxSidecarBytes = 1ull << 20; // a sidecar.json is a few kB
+constexpr const char* kSidecarFormat  = "ablate-direction-v2";
 
 // NVIDIA's published FP8 table records no scale in its header; infernix-serve knows it by id.
 constexpr const char* kKnownFp8Volumes[] = {"59e5d77e802ac95d8faf0a800b8f2301"};
@@ -58,9 +66,12 @@ std::string artifact_stem(const std::filesystem::path& path) {
     return stem;
 }
 
+// The formats an artifact binds as its own table (the engine's config.cpp). BF16 P12 is a run-time
+// volume only: it replaces a table through --ngram-volume and is never an artifact's own.
 std::string ngram_format_name(std::string_view artifact_format) {
     if (artifact_format == "fp8_e4m3fn") { return "fp8"; }
-    if (artifact_format == "iq4_nl" || artifact_format == "bf16" || artifact_format == "nvfp4") {
+    if (artifact_format == "iq4_nl" || artifact_format == "bf16" || artifact_format == "nvfp4" ||
+        artifact_format == "q8_0") {
         return std::string(artifact_format);
     }
     return "unknown";
@@ -71,6 +82,7 @@ std::uint32_t head_width(const NgramTableFacts& table) {
     if (table.format == "fp8") { return table.row_bytes; }
     if (table.format == "bf16") { return table.row_bytes / 2; }
     if (table.format == "iq4_nl") { return table.row_bytes / 18 * 32; }
+    if (table.format == "q8_0") { return table.row_bytes / 34 * 32; }
     if (table.format == "nvfp4") { return table.row_bytes * 16 / 9; }
     return 0;
 }
@@ -79,7 +91,9 @@ std::uint32_t row_bytes_for(std::string_view format, std::uint32_t width) {
     if (format == "fp8") { return width; }
     if (format == "bf16") { return 2 * width; }
     if (format == "iq4_nl") { return width % 32 == 0 ? width / 32 * 18 : 0; }
+    if (format == "q8_0") { return width % 32 == 0 ? width / 32 * 34 : 0; }
     if (format == "nvfp4") { return width % 16 == 0 ? width / 2 + width / 16 : 0; }
+    if (format == "bf16_p12") { return width % 2 == 0 && width <= 255 ? width + width / 2 + 16 : 0; }
     return 0;
 }
 
@@ -128,6 +142,77 @@ void classify_family(ScannedModel& model) {
     }
     model.family       = "unknown";
     model.family_label = model.model_type.empty() ? "Unknown" : model.model_type;
+}
+
+// An adapter folder: adapter_config.json with adapter_model.safetensors beside it. Nothing when the weights are not
+// there (a download still running, or a GGUF adapter's folder); `issue` when the config cannot be read.
+std::optional<ScannedAdapter> read_adapter(const std::filesystem::path& config_path, std::optional<std::string>& issue) {
+    const std::filesystem::path folder = config_path.parent_path();
+    const std::uint64_t weights_bytes  = file_size_or_zero(folder / kAdapterWeights);
+    if (weights_bytes == 0) { return std::nullopt; }
+    const std::uint64_t config_bytes = file_size_or_zero(config_path);
+    if (config_bytes == 0 || config_bytes > kMaxAdapterConfigBytes) {
+        issue = std::string(kAdapterConfig) + ": empty or too large";
+        return std::nullopt;
+    }
+    std::ifstream in(config_path, std::ios::binary);
+    std::string text(static_cast<std::size_t>(config_bytes), '\0');
+    if (!in.read(text.data(), static_cast<std::streamsize>(text.size()))) {
+        issue = std::string(kAdapterConfig) + ": cannot be read";
+        return std::nullopt;
+    }
+    Json config;
+    try {
+        config = Json::parse(text);
+    } catch (const Json::exception&) {
+        issue = std::string(kAdapterConfig) + ": not JSON";
+        return std::nullopt;
+    }
+    if (!config.is_object()) {
+        issue = std::string(kAdapterConfig) + ": not a JSON object";
+        return std::nullopt;
+    }
+    ScannedAdapter adapter;
+    adapter.path     = folder;
+    adapter.key      = sha256_hex(path_utf8(folder)).substr(0, 32);
+    adapter.name     = path_utf8(folder.filename());
+    adapter.bytes    = weights_bytes;
+    adapter.config   = parse_adapter_config(config);
+    adapter.modified = modified_ms(folder / kAdapterWeights);
+    return adapter;
+}
+
+// A sidecar.json in the folders: nothing when it is another file of that name or a sidecar cutting no layer.
+std::optional<ScannedSidecar> read_sidecar(const std::filesystem::path& path, std::optional<std::string>& issue) {
+    const std::uint64_t bytes = file_size_or_zero(path);
+    if (bytes == 0 || bytes > kMaxSidecarBytes) { return std::nullopt; }
+    std::ifstream in(path, std::ios::binary);
+    std::string text(static_cast<std::size_t>(bytes), '\0');
+    if (!in.read(text.data(), static_cast<std::streamsize>(text.size()))) { return std::nullopt; }
+    Json sidecar;
+    try {
+        sidecar = Json::parse(text);
+    } catch (const Json::exception&) {
+        return std::nullopt;
+    }
+    return parse_sidecar(path, sidecar, issue);
+}
+
+// A tools/ablate run directory's fit/ folder (one trial sidecar per trial): not walked.
+bool ablate_run_fit_folder(const std::filesystem::path& dir) {
+    if (!iequals(path_utf8(dir.filename()), "fit")) { return false; }
+    const std::filesystem::path run = dir.parent_path() / "run.json";
+    const std::uint64_t bytes       = file_size_or_zero(run);
+    if (bytes == 0 || bytes > kMaxSidecarBytes) { return false; }
+    std::ifstream in(run, std::ios::binary);
+    std::string text(static_cast<std::size_t>(bytes), '\0');
+    if (!in.read(text.data(), static_cast<std::streamsize>(text.size()))) { return false; }
+    try {
+        const Json json = Json::parse(text);
+        return json.is_object() && json.value("schema", std::string{}).starts_with("infernix-ablate-run-");
+    } catch (const Json::exception&) {
+        return false;
+    }
 }
 
 std::optional<std::string> recipe_of(const Json& provenance) {
@@ -404,8 +489,8 @@ std::optional<ScannedNgramVolume> parse_ngram_header(const std::filesystem::path
     volume.key       = hex_string(reinterpret_cast<const std::uint8_t*>(p + 44), 16);
     volume.fp8_scale = read_le<std::uint16_t>(p + 60);
     volume.tag       = read_le<std::uint16_t>(p + 62);
-    static constexpr const char* kTagged[] = {"fp8", "iq4_nl", "bf16", "nvfp4"};
-    if (volume.tag >= 1 && volume.tag <= 4) {
+    static constexpr const char* kTagged[] = {"fp8", "iq4_nl", "bf16", "nvfp4", "q8_0", "bf16_p12"};
+    if (volume.tag >= 1 && volume.tag <= 6) {
         volume.format = kTagged[volume.tag - 1];
     } else {
         // Untagged volumes predate NVFP4 tables; Qwen3.8-Flash-Next rows are 160 elements wide.
@@ -445,7 +530,10 @@ std::optional<int> ngram_rank(const ScannedModel& model, const ScannedNgramVolum
     if (format == "fp8") { return 1; }
     if (format == "nvfp4") { return 2; }
     if (format == "iq4_nl") { return 3; }
-    return 4;
+    if (format == "q8_0") { return 4; }
+    if (format == "bf16_p12") { return 5; }
+    if (format == "bf16") { return 6; }
+    return 6;
 }
 
 LibraryScan scan_library(const std::vector<std::filesystem::path>& dirs, int depth) {
@@ -468,14 +556,14 @@ LibraryScan scan_library(const std::vector<std::filesystem::path>& dirs, int dep
             dir.total_bytes = space.capacity;
         }
         if (!dir.exists) {
-            dir.error = error ? error.message() : "folder not found";
+            dir.error = error ? error_text(error) : "folder not found";
             scan.dirs.push_back(std::move(dir));
             continue;
         }
         const auto options = std::filesystem::directory_options::skip_permission_denied;
         std::filesystem::recursive_directory_iterator it(root, options, error);
         if (error) {
-            dir.error = error.message();
+            dir.error = error_text(error);
             scan.dirs.push_back(std::move(dir));
             continue;
         }
@@ -486,11 +574,33 @@ LibraryScan scan_library(const std::vector<std::filesystem::path>& dirs, int dep
             const std::filesystem::directory_entry& entry = *it;
             std::error_code status_error;
             if (entry.is_directory(status_error)) {
-                if (it.depth() >= depth) { it.disable_recursion_pending(); }
+                if (it.depth() >= depth || ablate_run_fit_folder(entry.path())) { it.disable_recursion_pending(); }
                 continue;
             }
             if (!entry.is_regular_file(status_error)) { continue; }
             const std::filesystem::path& path = entry.path();
+            if (iequals(path_utf8(path.filename()), kSidecarFile)) {
+                const std::string id = path_utf8(std::filesystem::weakly_canonical(path, status_error));
+                if (!visited_files.insert(id).second) { continue; }
+                std::optional<std::string> issue;
+                if (std::optional<ScannedSidecar> sidecar = read_sidecar(path, issue)) {
+                    ++dir.sidecars;
+                    scan.sidecars.push_back(std::move(*sidecar));
+                }
+                if (issue) { scan.issues.push_back({path, *issue}); }
+                continue;
+            }
+            if (iequals(path_utf8(path.filename()), kAdapterConfig)) {
+                const std::string id = path_utf8(std::filesystem::weakly_canonical(path, status_error));
+                if (!visited_files.insert(id).second) { continue; }
+                std::optional<std::string> issue;
+                if (std::optional<ScannedAdapter> adapter = read_adapter(path, issue)) {
+                    ++dir.adapters;
+                    scan.adapters.push_back(std::move(*adapter));
+                }
+                if (issue) { scan.issues.push_back({path, *issue}); }
+                continue;
+            }
             if (!has_extension(path, ".infernix") && !has_extension(path, ".ninfer") &&
                 !has_extension(path, ".ngram")) {
                 continue;
@@ -511,6 +621,11 @@ LibraryScan scan_library(const std::vector<std::filesystem::path>& dirs, int dep
                 model.path      = path;
                 model.locations = {path};
                 for (const auto& [part, expected] : facts.parts) {
+                    if (!safe_relative(part)) {
+                        // Never looked at, counted or deleted with the model's files.
+                        model.missing_files.push_back(part + " (outside the artifact's folder)");
+                        continue;
+                    }
                     const std::filesystem::path part_path = path.parent_path() / utf8_path(part);
                     const std::uint64_t actual             = file_size_or_zero(part_path);
                     if (actual != expected) {
@@ -560,7 +675,7 @@ LibraryScan scan_library(const std::vector<std::filesystem::path>& dirs, int dep
                 }
             }
         }
-        if (error) { dir.error = "scanned only in part: " + error.message(); }
+        if (error) { dir.error = "scanned only in part: " + error_text(error); }
         scan.dirs.push_back(std::move(dir));
     }
     // Forget files no longer present.
@@ -585,6 +700,24 @@ LibraryScan scan_library(const std::vector<std::filesystem::path>& dirs, int dep
             if (*rank == 0) { volume.own_for.push_back(model.key); }
         }
     }
+    for (ScannedAdapter& adapter : scan.adapters) {
+        for (const ScannedModel& model : scan.models) {
+            if (adapter_matches(model, adapter)) { adapter.compatible_models.push_back(model.key); }
+        }
+    }
+    std::sort(scan.adapters.begin(), scan.adapters.end(), [](const ScannedAdapter& a, const ScannedAdapter& b) {
+        return std::tie(a.name, a.key) < std::tie(b.name, b.key);
+    });
+    for (ScannedSidecar& sidecar : scan.sidecars) {
+        for (const ScannedModel& model : scan.models) {
+            if (!sidecar_fits(model, sidecar)) { continue; }
+            sidecar.compatible_models.push_back(model.key);
+            if (sidecar.artifact_id && *sidecar.artifact_id == model.key) { sidecar.fitted_models.push_back(model.key); }
+        }
+    }
+    std::sort(scan.sidecars.begin(), scan.sidecars.end(), [](const ScannedSidecar& a, const ScannedSidecar& b) {
+        return std::tie(a.name, a.key) < std::tie(b.name, b.key);
+    });
     std::sort(scan.models.begin(), scan.models.end(), [](const ScannedModel& a, const ScannedModel& b) {
         return std::tie(a.family_label, a.name) < std::tie(b.family_label, b.name);
     });
@@ -599,6 +732,8 @@ Json to_json(const LibraryScan& scan) {
                         {"models", dir.models},
                         {"drafters", dir.drafters},
                         {"ngram_volumes", dir.ngram_volumes},
+                        {"adapters", dir.adapters},
+                        {"sidecars", dir.sidecars},
                         {"free_bytes", dir.free_bytes ? Json(*dir.free_bytes) : Json(nullptr)},
                         {"total_bytes", dir.total_bytes ? Json(*dir.total_bytes) : Json(nullptr)},
                         {"error", dir.error ? Json(*dir.error) : Json(nullptr)}});
@@ -676,6 +811,40 @@ Json to_json(const LibraryScan& scan) {
             {"modified", v.modified},
         });
     }
+    Json adapters = Json::array();
+    for (const ScannedAdapter& a : scan.adapters) {
+        adapters.push_back({
+            {"key", a.key},
+            {"name", a.name},
+            {"path", path_utf8(a.path)},
+            {"dir", path_utf8(a.path.parent_path())},
+            {"bytes", a.bytes},
+            {"config", to_json(a.config)},
+            {"compatible_models", a.compatible_models},
+            {"modified", a.modified},
+        });
+    }
+    const auto optional_text = [](const std::optional<std::string>& text) { return text ? Json(*text) : Json(nullptr); };
+    Json sidecars = Json::array();
+    for (const ScannedSidecar& c : scan.sidecars) {
+        sidecars.push_back({
+            {"key", c.key},
+            {"name", c.name},
+            {"path", path_utf8(c.path)},
+            {"dir", path_utf8(c.path.parent_path())},
+            {"bytes", c.bytes},
+            {"direction_dim", c.direction_dim},
+            {"rows", c.rows},
+            {"attn_layers", c.attn_layers},
+            {"mlp_layers", c.mlp_layers},
+            {"artifact_id", optional_text(c.artifact_id)},
+            {"fitted_artifact", optional_text(c.fitted_artifact)},
+            {"source", optional_text(c.source)},
+            {"compatible_models", c.compatible_models},
+            {"fitted_models", c.fitted_models},
+            {"modified", c.modified},
+        });
+    }
     Json issues = Json::array();
     for (const ScanIssue& issue : scan.issues) {
         issues.push_back({{"path", path_utf8(issue.path)}, {"message", issue.message}});
@@ -686,7 +855,143 @@ Json to_json(const LibraryScan& scan) {
             {"models", models},
             {"drafters", drafters},
             {"ngram_volumes", volumes},
+            {"adapters", adapters},
+            {"sidecars", sidecars},
             {"issues", issues}};
+}
+
+AdapterConfigFacts parse_adapter_config(const Json& config) {
+    AdapterConfigFacts facts;
+    if (!config.is_object()) { return facts; }
+    const auto text = [&](const char* key) -> std::optional<std::string> {
+        const auto it = config.find(key);
+        return it != config.end() && it->is_string() ? std::optional<std::string>(it->get<std::string>()) : std::nullopt;
+    };
+    const auto count = [](const Json& value) -> std::optional<std::uint64_t> {
+        return value.is_number_unsigned() || (value.is_number_integer() && value.get<std::int64_t>() > 0)
+                   ? std::optional<std::uint64_t>(value.get<std::uint64_t>())
+                   : std::nullopt;
+    };
+    facts.peft_type  = text("peft_type");
+    facts.base_model = text("base_model_name_or_path");
+    if (const auto it = config.find("r"); it != config.end()) { facts.rank = count(*it); }
+    if (const auto it = config.find("lora_alpha"); it != config.end() && it->is_number()) {
+        facts.alpha = it->get<double>();
+    }
+    facts.max_rank = facts.rank;
+    if (const auto it = config.find("rank_pattern"); it != config.end() && it->is_object()) {
+        for (const auto& [key, value] : it->items()) {
+            if (const std::optional<std::uint64_t> rank = count(value)) {
+                facts.max_rank = std::max(facts.max_rank.value_or(0), *rank);
+            }
+        }
+    }
+    if (const auto it = config.find("target_modules"); it != config.end() && it->is_array()) {
+        for (const Json& module : *it) {
+            if (module.is_string()) { facts.target_modules.push_back(module.get<std::string>()); }
+        }
+    }
+    if (const auto it = config.find("use_rslora"); it != config.end() && it->is_boolean()) {
+        facts.rslora = it->get<bool>();
+    }
+    return facts;
+}
+
+Json to_json(const AdapterConfigFacts& facts) {
+    const auto optional = [](const auto& value) { return value ? Json(*value) : Json(nullptr); };
+    return {{"peft_type", optional(facts.peft_type)},
+            {"base_model", optional(facts.base_model)},
+            {"rank", optional(facts.rank)},
+            {"max_rank", optional(facts.max_rank)},
+            {"alpha", optional(facts.alpha)},
+            {"target_modules", facts.target_modules},
+            {"rslora", facts.rslora}};
+}
+
+bool adapter_matches(const ScannedModel& model, const ScannedAdapter& adapter) {
+    if (model.model_type != "qwen3_5_text" || model.num_experts || !adapter.config.base_model) { return false; }
+    if (model.family != "qwen3.8-27b" && model.family != "qwen3.6-27b") { return false; }
+    // "Qwen/Qwen3.8-27B", "unsloth/Qwen3.8-27B-bnb-4bit", ...: the family's name in the base model's.
+    return lower(*adapter.config.base_model).find(model.family) != std::string::npos;
+}
+
+std::optional<ScannedSidecar> parse_sidecar(const std::filesystem::path& path, const Json& sidecar,
+                                            std::optional<std::string>& issue) {
+    if (!sidecar.is_object()) { return std::nullopt; }
+    const auto format = sidecar.find("format");
+    if (format == sidecar.end() || !format->is_string() || format->get<std::string>() != kSidecarFormat) {
+        return std::nullopt;
+    }
+    const auto text = [](const Json& object, const char* key) -> std::optional<std::string> {
+        if (!object.is_object()) { return std::nullopt; }
+        const auto it = object.find(key);
+        return it != object.end() && it->is_string() ? std::optional<std::string>(it->get<std::string>()) : std::nullopt;
+    };
+    ScannedSidecar result;
+    result.path = path;
+    result.key  = sha256_hex(path_utf8(path)).substr(0, 32);
+    result.name = path_utf8(path.parent_path().filename());
+    const auto dim = sidecar.find("direction_dim");
+    if (dim == sidecar.end() || !dim->is_number_unsigned() || dim->get<std::uint64_t>() == 0) {
+        issue = "ablation sidecar: direction_dim is not a positive integer";
+        return std::nullopt;
+    }
+    result.direction_dim            = dim->get<std::uint64_t>();
+    const std::optional<std::string> file = text(sidecar, "direction_file");
+    if (!file || !safe_relative(*file)) {
+        issue = "ablation sidecar: no direction_file beside it";
+        return std::nullopt;
+    }
+    result.direction_file           = path.parent_path() / utf8_path(*file);
+    result.bytes                    = file_size_or_zero(result.direction_file);
+    const std::uint64_t row_bytes   = result.direction_dim * 4;
+    const bool per_layer            = text(sidecar, "direction_layout").value_or("shared") == "per_layer";
+    if (result.bytes == 0 || result.bytes % row_bytes != 0 || (!per_layer && result.bytes != row_bytes)) {
+        issue = "ablation sidecar: " + *file + " is not " + (per_layer ? "whole rows" : "one row") + " of " +
+                std::to_string(result.direction_dim) + " float32 values";
+        return std::nullopt;
+    }
+    result.rows = result.bytes / row_bytes;
+    // The lanes' tables: alpha_attn_per_layer and alpha_mlp_per_layer, or alpha_per_layer for both.
+    const auto lane = [&](const char* key, std::uint64_t& cut) -> bool {
+        const auto table = sidecar.find(key);
+        if (table == sidecar.end()) { return true; }
+        if (!table->is_object()) { return false; }
+        for (const auto& [layer, alpha] : table->items()) {
+            if (!alpha.is_number() || layer.empty() ||
+                !std::all_of(layer.begin(), layer.end(), [](char c) { return c >= '0' && c <= '9'; }) ||
+                layer.size() > 6) {
+                return false;
+            }
+            result.layer_bound = std::max<std::uint64_t>(result.layer_bound, std::stoull(layer) + 1);
+            if (alpha.get<double>() > 0.0) { ++cut; }
+        }
+        return true;
+    };
+    std::uint64_t shared_cut = 0;
+    if (!lane("alpha_attn_per_layer", result.attn_layers) || !lane("alpha_mlp_per_layer", result.mlp_layers) ||
+        !lane("alpha_per_layer", shared_cut)) {
+        issue = "ablation sidecar: an alpha table is not layer indices with numbers";
+        return std::nullopt;
+    }
+    result.attn_layers += shared_cut;
+    result.mlp_layers += shared_cut;
+    if (result.attn_layers == 0 && result.mlp_layers == 0) { return std::nullopt; } // a base direction: no cut
+    result.artifact_id = text(sidecar, "artifact_id");
+    const auto generation  = sidecar.find("generation");
+    if (generation != sidecar.end()) {
+        result.source = text(*generation, "source");
+        if (const auto fitted = generation->find("fitted_under"); generation->is_object() && fitted != generation->end()) {
+            result.fitted_artifact = text(*fitted, "artifact");
+        }
+    }
+    result.modified = modified_ms(path);
+    return result;
+}
+
+bool sidecar_fits(const ScannedModel& model, const ScannedSidecar& sidecar) {
+    return model.hidden_size != 0 && sidecar.direction_dim == model.hidden_size &&
+           (sidecar.rows == 1 || sidecar.rows == model.num_layers) && sidecar.layer_bound <= model.num_layers;
 }
 
 } // namespace infernix::launcher

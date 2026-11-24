@@ -511,7 +511,8 @@ PreparedTapHints prepare_tap_hints(const ContextCacheHints& hints,
                                    std::span<const std::optional<std::uint32_t>> cache_boundaries,
                                    std::optional<std::size_t> engine_tool_marker_index,
                                    std::optional<std::uint32_t> leading_boundary,
-                                   const std::optional<RewriteCheckpointSpec>& rewrite_checkpoint) {
+                                   const std::optional<RewriteCheckpointSpec>& rewrite_checkpoint,
+                                   std::optional<std::uint32_t> media_end) {
     using runtime::prefix_cache::TapHint;
     using runtime::prefix_cache::TapHintKind;
     // Taps are cheap and content-deduplicated, so explicit markers only add taps. A protocol
@@ -546,6 +547,10 @@ PreparedTapHints prepare_tap_hints(const ContextCacheHints& hints,
         add(message_boundaries[*leading_boundary], TapHintKind::Structural);
     }
     if (rewrite_checkpoint) { add(rewrite_checkpoint->frontier, TapHintKind::GenerationOpener); }
+    // Where the prompt's last media item ends (candidates QC-01): a new conversation that asks about the same
+    // pictures or clip shares the prompt up to there, and resumes past them (encoding none of them) instead of at
+    // the last message boundary before them.
+    add(media_end, TapHintKind::Structural);
     for (const std::optional<std::uint32_t> boundary : message_boundaries) {
         add(boundary, TapHintKind::MessageBoundary);
     }
@@ -670,6 +675,9 @@ public:
                 "Frontend requires the parsed model tokenizer and public token domain");
         }
         markers               = output_marker_tokens(*tokenizer);
+        if (const fi::AddedToken* open = tokenizer->find_added_token("<think>"); open != nullptr) {
+            reasoning_open = static_cast<TokenId>(open->id);
+        }
         ngram_sources_enabled = options.ngram_sources_enabled;
         ngram_archive_enabled = options.ngram_archive_enabled;
         if (ngram_archive_enabled) {
@@ -742,6 +750,7 @@ public:
     fi::CompiledChatTemplate chat_template;
     std::shared_ptr<const fi::Tokenizer> tokenizer;
     fi::OutputMarkerTokens markers;
+    TokenId reasoning_open = -1; // `<think>`
     fi::ProcessorOptions processor;
     std::shared_ptr<fi::MediaPreprocessCache> media_cache;
     StopPolicy defaults;
@@ -844,6 +853,15 @@ ChatTemplateRoleSupport Frontend::chat_template_role_support() const noexcept {
     return impl_->chat_template.role_support();
 }
 
+VisionImageBudget Frontend::vision_image_budget() const noexcept {
+    if (!impl_->vision_enabled) { return {}; }
+    const fi::ProcessorOptions& processor = impl_->processor;
+    return VisionImageBudget{.prompt_tokens = processor.max_vision_tokens,
+                             .token_edge    = fi::merged_token_image_edge(),
+                             .min_pixels    = processor.image_min_pixels,
+                             .max_pixels    = processor.image_max_pixels};
+}
+
 Frontend make_frontend(const FrontendResources& resources, FrontendOptions options) {
     return Frontend(std::make_shared<const Frontend::Impl>(resources, options));
 }
@@ -899,8 +917,9 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     if (cache_hints.markers.size() > kMaximumExplicitPromptCacheMarkers) {
         throw std::invalid_argument("PromptInput supports at most four explicit cache markers");
     }
-    const auto tool_call_output = fi::build_tool_call_output_contract(
-        options.tool_jsons, options.deferred_tool_jsons, options.open_tool_names, options.declared_parameter_names);
+    const auto tool_call_output =
+        fi::build_tool_call_output_contract(options.tool_jsons, options.deferred_tool_jsons, options.open_tool_names,
+                                            options.declared_parameter_names, options.withdrawn_tool_names);
     std::vector<PromptCacheMarker> rendered_markers = cache_hints.markers;
     std::optional<std::size_t> engine_tool_marker_index;
     if (cache_hints.allow_engine_automatic_shared_prefixes && !options.tool_jsons.empty()) {
@@ -1003,8 +1022,9 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         result.identity.rewrite_checkpoint = processed.rewrite_checkpoint;
         result.identity.rewrite_execution_frontiers =
             std::move(processed.rewrite_execution_frontiers);
-        message_boundaries = std::move(processed.message_boundaries);
-        cache_boundaries   = std::move(processed.cache_boundaries);
+        message_boundaries     = std::move(processed.message_boundaries);
+        cache_boundaries       = std::move(processed.cache_boundaries);
+        result.reply_frontiers = std::move(processed.reply_frontiers);
     } else {
         const fi::RenderedChat rendered = impl_->chat_template.render(
             messages, render_options(options, rendered_markers), control);
@@ -1026,9 +1046,19 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         result.identity.rewrite_checkpoint = encoded.rewrite_checkpoint;
         result.identity.rewrite_execution_frontiers =
             std::move(encoded.rewrite_execution_frontiers);
-        message_boundaries = std::move(encoded.message_boundaries);
-        cache_boundaries   = std::move(encoded.cache_boundaries);
+        message_boundaries     = std::move(encoded.message_boundaries);
+        cache_boundaries       = std::move(encoded.cache_boundaries);
+        result.reply_frontiers = std::move(encoded.reply_frontiers);
         assign_text_positions(result);
+    }
+    // A generation prompt that opens the reasoning (`<think>` "\n"): a reply that closes it at once with
+    // `</think>` comes back as `<think>\n\n</think>` (the template writes an empty reasoning with its
+    // inner newline), so its next turn departs from the reply's endpoint at this prompt's end.
+    const std::size_t prompt_ids = result.token_ids.size();
+    if (result.starts_in_reasoning && result.continuation_content.empty() && impl_->reasoning_open >= 0 &&
+        prompt_ids >= 2 && result.token_ids[prompt_ids - 2U] == impl_->reasoning_open &&
+        impl_->tokenizer->decode_token_bytes(result.token_ids[prompt_ids - 1U]) == "\n") {
+        result.prompt_end_tap_token = impl_->markers.reasoning_close;
     }
     (void)checked_token_count(result.token_ids.size());
     if (impl_->ngram_archive_enabled) {
@@ -1084,9 +1114,12 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         }
     }
     result.identity.reusable = true;
-    result.tap_hints         = prepare_tap_hints(cache_hints, message_boundaries, cache_boundaries,
-                                                 engine_tool_marker_index, leading_boundary,
-                                                 result.identity.rewrite_checkpoint);
+    std::optional<std::uint32_t> media_end;
+    for (const detail::VisionTokenRange& range : detail::vision_ranges(result)) {
+        media_end = std::max(media_end.value_or(0U), range.end);
+    }
+    result.tap_hints = prepare_tap_hints(cache_hints, message_boundaries, cache_boundaries, engine_tool_marker_index,
+                                         leading_boundary, result.identity.rewrite_checkpoint, media_end);
     validate_context_cache_hints(cache_hints, message_count, rendered_markers, cache_boundaries);
     detail::prompt_block_keys(result, result.block_hashes, result.block_extras);
     if (impl_->ngram_sources_enabled) {

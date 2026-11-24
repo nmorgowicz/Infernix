@@ -99,8 +99,10 @@ public:
     [[nodiscard]] std::string failure() const;
     // A round that may hand the service requests is about to be enqueued: an idle service thread
     // wakes now and spins again. Requests are served without it too, only later: after 20 ms
-    // without a request the thread idles in waits of about 0.5 ms (Windows: a high-resolution
-    // waitable timer; a plain sleep_for(50 us) there lasts one 15.6 ms timer tick).
+    // without a request or a wake() the thread idles in timed waits (kIdleWaitUs; kIdleDeepWaitUs
+    // once the quiet stretch passes 1 s) that this ends at once (Windows: an event beside a
+    // high-resolution timer; Linux: a futex on the wake count). A spinning thread is not signalled:
+    // it sees the count at its next check, so this costs no system call while the service is busy.
     void wake() const noexcept;
     // The team's speed against the caller's reference rates (CpuSpeed): each request's experts with their records in
     // memory are timed as the team computes them (tier reads excluded). Before set_reference_rates, 1.
@@ -108,8 +110,17 @@ public:
     [[nodiscard]] double speed_ratio() const noexcept { return speed_.ratio(); }
 
 private:
+    // The idle waits (idle_wait): the latency a request pays when it arrives at a waiting service without a
+    // wake() first, so both stay far below a decode step.
+    static constexpr std::uint32_t kIdleWaitUs     = 50;
+    static constexpr std::uint32_t kIdleDeepWaitUs = 1000;
+
     void serve();
-    void idle_wait() noexcept;
+    // Frees the mapped and device words and the wait handles (whichever were taken): the destructor's, and a
+    // constructor's that throws partway.
+    void release() noexcept;
+    // One timed wait, ended early by wake(); none when a wake() is already pending.
+    void idle_wait(std::uint32_t microseconds) noexcept;
     void record_failure(std::string what) noexcept;
 
     std::vector<Layer> layers_;
@@ -123,7 +134,11 @@ private:
     std::uint32_t* heartbeat_ = nullptr; // mapped, beside status_: advanced while the service thread lives
     std::uint32_t* sequence_ = nullptr; // device
     std::atomic<bool> stop_{false};
-    mutable std::atomic<std::uint32_t> wakes_{0};   // wake() calls the service thread has not seen yet
+    // wake() calls the service thread has not seen yet; on Linux also the futex word idle_wait sleeps on.
+    mutable std::atomic<std::uint32_t> wakes_{0};
+    static_assert(sizeof(std::atomic<std::uint32_t>) == sizeof(std::uint32_t) &&
+                  std::atomic<std::uint32_t>::is_always_lock_free);
+    std::atomic<bool> sleeping_{false};      // the service thread is in (or entering) an idle_wait
     void* wake_event_ = nullptr;             // Windows: auto-reset event wake() signals
     void* idle_timer_ = nullptr;             // Windows: the idle wait's high-resolution timer
     std::atomic<std::uint64_t> served_{0}, experts_{0};

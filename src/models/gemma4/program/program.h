@@ -144,6 +144,7 @@ struct PrefillProgress {
     std::uint32_t processed_prompt_tokens = 0;
     bool complete = false;
     bool capacity_released = false;
+    bool snapshot_published = false;
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch> pending;
     std::optional<PromptReadout> readout;
@@ -172,11 +173,14 @@ struct FinishResult {
     std::vector<ConstrainedDraw> constrained_draws;
     std::optional<ExpertCacheStats> expert_cache;
     std::optional<std::uint32_t> cache_created_prompt_tokens;
+    // A release failure is reported after the lane is cleared, so the Engine can answer and recover.
+    std::exception_ptr device_error;
 };
 struct AbortResult {
     runtime::ConsumeStatus status = runtime::ConsumeStatus::InvariantMismatch;
     GenerationTimings timings;
     SpeculativeStats speculative;
+    std::exception_ptr device_error;
 };
 struct ReplayProgress {
     std::uint32_t processed_tokens = 0;
@@ -267,6 +271,8 @@ public:
     void release_units(std::span<const SequenceHandle>) noexcept {}
     [[nodiscard]] bool recovery_pending(SequenceHandle) const noexcept { return false; }
     [[nodiscard]] bool start_pause(SequenceHandle, runtime::ExecutionTiming* = nullptr);
+    // Prices the same frontier start_pause can capture: free-cache state, or an exact grid prefix.
+    [[nodiscard]] std::uint32_t pause_replay_tokens(SequenceHandle) const noexcept;
     [[nodiscard]] ReplayProgress advance_replay(SequenceHandle, runtime::ExecutionTiming* = nullptr);
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle, runtime::ExecutionTiming* = nullptr,
         runtime::TokenMaskProvider* = nullptr);
@@ -293,7 +299,7 @@ public:
     // Global KV lives in the sequence's own contiguous pages, so no cached block holds Device
     // memory a shortage could reclaim and there is no spare Device cache to prefetch into.
     [[nodiscard]] bool hybrid_reclaim(runtime::ContextResourceUsage) noexcept { return false; }
-    [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan&) const noexcept { return 0; }
+    [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan&, bool) const noexcept { return 0; }
     [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept { return 0; }
     // Holds the snapshots the queued requests would resume from (hybrid-prefix-cache-spec §9.6);
     // `resumes` names each paused request's state (null for a fresh one).
@@ -307,6 +313,9 @@ public:
     [[nodiscard]] bool hybrid_poll_storage() noexcept { return false; }
     [[nodiscard]] bool hybrid_source_pending() const noexcept { return false; }
     [[nodiscard]] bool hybrid_storage_due() const noexcept { return false; }
+    [[nodiscard]] std::optional<std::chrono::steady_clock::time_point> hybrid_storage_retry_at() const noexcept {
+        return std::nullopt;
+    }
     // A request resumes from any position with free-cache-resume (the grid is one token), else only
     // at multiples of the prefill chunk.
     [[nodiscard]] std::uint32_t hybrid_resume_grid() const noexcept;

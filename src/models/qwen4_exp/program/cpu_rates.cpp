@@ -90,7 +90,16 @@ std::optional<runtime::expert_offload::CpuRateReading> ProgramImpl::measure_cpu_
                              .ggml_a8    = cpu_ggml_a8(), // decode's misses take the 8-bit route
                              .nvfp4_a8   = cpu_narrow_a16() == moe::NarrowA16::kA8, // likewise
                              .cpus       = placement_.cpus});
-    const std::uint64_t caller_cpus = set_current_thread_cpus(placement_.cpus.empty() ? 0 : placement_.cpus.front());
+    // The engine thread's CPUs and the probe's stream come back on every way out (a CUDA error or a team failure
+    // throws from rate()): left pinned to the placement's first CPU, the engine thread would compete with the team.
+    ScopedThreadCpus pinned(placement_.cpus.empty() ? 0 : placement_.cpus.front());
+    cudaStream_t stream = nullptr;
+    struct StreamGuard {
+        cudaStream_t& stream;
+        ~StreamGuard() {
+            if (stream != nullptr) { (void)cudaStreamDestroy(stream); }
+        }
+    } stream_guard{stream};
     std::vector<std::uint16_t> x(static_cast<std::size_t>(moe::kHidden) * kNarrowColumns);
     std::vector<std::uint16_t> y(static_cast<std::size_t>(moe::kHidden) * kRateJobs * kNarrowColumns);
     for (std::size_t i = 0; i < x.size(); ++i) { x[i] = static_cast<std::uint16_t>(0x3C00U + (i * 7919U) % 640U); }
@@ -118,7 +127,6 @@ std::optional<runtime::expert_offload::CpuRateReading> ProgramImpl::measure_cpu_
             }
         }
     };
-    cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     const std::uint64_t source_stride = layers.front().moe.bank->planes.record_stride; // ≤ the staging pitch
     // Jobs per second at `columns` columns: the best of kRepeats timed batches, as the link probe
@@ -166,8 +174,8 @@ std::optional<runtime::expert_offload::CpuRateReading> ProgramImpl::measure_cpu_
         if (quiet || std::chrono::steady_clock::now() - began >= kRetryBudget) { break; }
         std::this_thread::sleep_for(kRetryPause);
     }
-    (void)set_current_thread_cpus(caller_cpus);
-    CUDA_CHECK(cudaStreamDestroy(stream));
+    pinned.restore();
+    CUDA_CHECK(cudaStreamDestroy(std::exchange(stream, nullptr)));
     reading.note = tier_ ? "measured on the SSD tier's RAM copies" : "measured";
     char share[160];
     if (attempts > 1) {
@@ -186,16 +194,15 @@ std::optional<runtime::expert_offload::CpuRateReading> ProgramImpl::measure_cpu_
 // cpu_rates): the same machine, artifact, team, CPUs, arithmetic and records.
 void ProgramImpl::measure_cpu_rate_settled(std::uint64_t record_stride) {
     namespace moe = ops::offloaded_moe;
-    std::string pool_key;
+    // What the rates depend on besides the machine: the artifact, the team's workers and CPUs, its arithmetic and the
+    // records it reads.
+    std::string pool_key = pool_identity() + "|workers " + std::to_string(cpu_workers()) + "|cpus";
+    for (const auto cpu : placement_.cpus) { pool_key += " " + std::to_string(cpu); }
+    pool_key += "|narrow " + std::to_string(static_cast<int>(cpu_narrow_a16())) + "|ggml-a8 " +
+                std::to_string(cpu_ggml_a8() ? 1 : 0) + "|stride " + std::to_string(record_stride) +
+                (tier_ ? "|tier" : "|banks");
     std::optional<runtime::expert_offload::HostSlotPool::CpuRates> carried;
-    if (options_.expert_slot_pool) {
-        pool_key = pool_identity() + "|workers " + std::to_string(cpu_workers()) + "|cpus";
-        for (const auto cpu : placement_.cpus) { pool_key += " " + std::to_string(cpu); }
-        pool_key += "|narrow " + std::to_string(static_cast<int>(cpu_narrow_a16())) + "|ggml-a8 " +
-                    std::to_string(cpu_ggml_a8() ? 1 : 0) + "|stride " + std::to_string(record_stride) +
-                    (tier_ ? "|tier" : "|banks");
-        carried = options_.expert_slot_pool->cpu_rates(pool_key);
-    }
+    if (options_.expert_slot_pool) { carried = options_.expert_slot_pool->cpu_rates(pool_key); }
     SettledCpuRates rates;
     if (carried) {
         rates.experts = carried->experts;
@@ -203,7 +210,15 @@ void ProgramImpl::measure_cpu_rate_settled(std::uint64_t record_stride) {
         rates.readings.push_back(carried->experts);
         rates.note = "kept from an earlier Engine of this EngineHost, " + carried->note;
     } else {
-        rates = settle_cpu_rates([&] { return measure_cpu_rate(record_stride); });
+        // An earlier start's settled reading of this machine and configuration, beside the saved expert state: this
+        // start's readings, taken as ever, end without the settling pause when they agree with it (settle_cpu_rates).
+        std::filesystem::path reference_path;
+        if (!options_.expert_state.empty()) { (reference_path = options_.expert_state) += ".cpu-rates"; }
+        const std::string reference_key = runtime::expert_offload::cpu_rate_machine_key() + " | " + pool_key;
+        std::optional<runtime::expert_offload::CpuRateReference> reference;
+        if (!reference_path.empty()) { reference = runtime::expert_offload::load_cpu_rate_reference(reference_path, reference_key); }
+        rates = settle_cpu_rates([&] { return measure_cpu_rate(record_stride); }, {}, reference ? &*reference : nullptr);
+        if (!reference_path.empty()) { runtime::expert_offload::save_cpu_rate_reference(reference_path, reference_key, rates); }
         if (options_.expert_slot_pool && !rates.readings.empty() && rates.busy_share < 0.0) {
             options_.expert_slot_pool->note_cpu_rates(pool_key, {.experts = rates.experts,
                                                                  .columns = rates.columns,

@@ -54,6 +54,7 @@ struct HybridCacheCounters {
     std::uint64_t taps_created        = 0;
     std::uint64_t taps_skipped        = 0;
     std::uint64_t taps_skipped_no_slot = 0; // of taps_skipped: no Device snapshot slot
+    std::uint64_t taps_retried        = 0; // flexible taps taken a boundary later after a skip for room
     std::uint64_t endpoints_created   = 0;
     // Endpoints that passed their gates but were not published (no Device snapshot slot, a full
     // snapshot table, or a failure while publishing).
@@ -121,8 +122,14 @@ public:
 
     [[nodiscard]] const HybridHostLayout& host_layout() const noexcept { return host_layout_; }
 
-    // Replaces the admission/eviction machine model (the Engine's calibrated context costs).
+    // Replaces the admission/eviction machine model (the Engine's calibrated context costs). Its Host-to-Device
+    // rate gives way to the one this cache measured, once it has one.
     void set_cost(const runtime::prefix_cache::CacheCostModel& cost);
+    // The link's measured Host-to-Device rate: an offloaded start's probe, then each large restore's own copies
+    // (runtime/engine/context_cache/online_cost.h). It replaces the model's rate, for ranking and valuation only.
+    void observe_h2d_rate(double bytes_per_second);
+    // 0 until a rate was measured.
+    [[nodiscard]] double measured_h2d_bytes_per_second() const noexcept { return h2d_measured_; }
 
     // ---- blocks -------------------------------------------------------------------------------
     // Inserts a committed full block. The cache takes references on `pages` only when the index
@@ -168,16 +175,13 @@ public:
     [[nodiscard]] bool transfers_pending() const noexcept {
         return !pending_.empty() || !landing_.empty();
     }
-    // Device blocks those pins hold now (an upper bound on what drain() can make evictable).
-    [[nodiscard]] std::uint32_t transfer_pinned_blocks() const noexcept {
-        std::size_t blocks = 0;
-        for (const PendingWrite& write : pending_) { blocks += write.nodes.size(); }
-        for (const RestoreBatch& batch : landing_) { blocks += batch.nodes.size(); }
-        return static_cast<std::uint32_t>(blocks);
-    }
 
     // Waits for every Host write and landing restore and publishes them.
     void drain();
+    // Room-making's wait: waits for the oldest Host write, or without one the oldest landing prefetch, and
+    // publishes what landed. False (and no wait) when neither is in flight: a lane's own restore is never waited
+    // for, since the blocks it lands stay mapped. Call it only while the index reports transfer-held blocks.
+    [[nodiscard]] bool settle_oldest_transfer();
 
     // ---- SSD tier (§5.7) -------------------------------------------------------------------------
     [[nodiscard]] runtime::prefix_cache::SsdTier* ssd() noexcept { return ssd_.get(); }
@@ -189,6 +193,9 @@ public:
     void service_ssd();
     // Whether service_ssd would start a write-back now.
     [[nodiscard]] bool ssd_due() const noexcept { return ssd_ && ssd_->write_back_due(); }
+    [[nodiscard]] std::optional<std::chrono::steady_clock::time_point> ssd_retry_at() const noexcept {
+        return ssd_ ? ssd_->write_back_retry_at() : std::nullopt;
+    }
     // Starts reading the parts of `snapshot` only on the SSD into the Host tier (Ready without an
     // SSD tier or when nothing is only there).
     [[nodiscard]] runtime::prefix_cache::SsdTier::Promotion promote(runtime::prefix_cache::SnapshotRef snapshot);
@@ -369,6 +376,13 @@ private:
     std::deque<RestoreBatch> landing_;
     std::uint64_t next_ticket_ = 1;
     std::vector<cudaEvent_t> spare_events_;
+    // The link measurement: the timed events around one landing batch's copies (the batch of timed_ticket_, 0:
+    // none in flight), its bytes, and the rate measured so far (0: none).
+    cudaEvent_t timed_begin_    = nullptr;
+    cudaEvent_t timed_end_      = nullptr;
+    std::uint64_t timed_ticket_ = 0;
+    std::uint64_t timed_bytes_  = 0;
+    double h2d_measured_        = 0.0;
     PageCopies write_scratch_;
     HybridCacheCounters counters_;
     std::optional<runtime::prefix_cache::PrefixCacheIndex> index_;

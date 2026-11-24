@@ -67,10 +67,9 @@ int run_tests() {
     failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--max-context", "16384",
                               "--max-context", "auto"}).max_context_auto,
                       "last automatic context must replace numeric state");
-    failures += check(rejects([] {
-                          (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x",
-                                       "--max-context", "auto", "--kv-capacity", "131072"});
-                      }), "automatic context must refuse fixed explicit KV capacity");
+    failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "x",
+                              "--max-context", "auto", "--kv-capacity", "131072"}).kv_capacity.explicit_tokens == 131072,
+                      "the parser must retain Qwen's explicit auto-context ceiling; Gemma validates after model selection");
     failures += check(rejects([] {
                           (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x",
                                        "--gemma4-key-only-kv=1"});
@@ -193,6 +192,19 @@ int run_tests() {
         failures += check(yarn.rope_yarn_factor == std::stof(factor) && yarn.max_context == 2048 &&
                               yarn.kv_capacity.explicit_tokens == 2048,
                           "YaRN must preserve factor without growing default context or KV");
+    }
+    {
+        // --max-context auto: the Engine sizes the context; the default KV capacity becomes automatic, and an
+        // explicit one is the ceiling the search keeps to.
+        const auto sized = parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--max-context", "auto"});
+        failures += check(sized.max_context_auto && sized.kv_capacity.mode == infernix::KvCapacityMode::Automatic,
+                          "--max-context auto did not take an automatic KV capacity");
+        const auto bounded = parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--max-context", "auto",
+                                    "--kv-capacity", "1024"});
+        failures += check(bounded.max_context_auto && bounded.kv_capacity.explicit_tokens == 1024,
+                          "--max-context auto refused an explicit KV capacity below its starting point");
+        failures += check(!parse({"infernix-cli", "model.ninfer", "--prompt", "x"}).max_context_auto,
+                          "the context is automatic without --max-context auto");
     }
     for (const auto* factor : {"0", "0.99", "4.01", "-1", "nan", "inf", "-inf", "1e999", "2x", ""}) {
         failures += check(rejects([&] {

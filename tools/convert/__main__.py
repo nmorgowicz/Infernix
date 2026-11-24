@@ -10,6 +10,9 @@ from pathlib import Path
 import sys
 from collections.abc import Mapping
 
+from tools.artifact.reader import Artifact
+
+from .graft import Graft
 from .official_recipes import RECIPES
 from .pipeline import DEFAULT_MAX_BUFFERED_BYTES, convert
 from .proposal import DEFAULT_RANKING, add_official_proposal
@@ -134,6 +137,14 @@ def main(argv=None):
         "DFlash2 companion artifact (--model: the target checkpoint)",
     )
     parser.add_argument(
+        "--graft",
+        action="append",
+        default=[],
+        metavar="COMPONENT=ARTIFACT",
+        help="Qwen3.5: copy this drafter (dflash or dflash2) byte for byte from an existing v3 artifact of "
+        "the same geometry instead of converting it (not also in --components)",
+    )
+    parser.add_argument(
         "--resource",
         action="append",
         default=[],
@@ -207,11 +218,20 @@ def main(argv=None):
     if "base" in paths:
         raise ValueError("select the base source with --model")
     overrides = _pairs(args.resource, "resource")
+    graft_paths = _pairs(args.graft, "graft")
     with ExitStack() as stack:
         base = stack.enter_context(SafetensorsSource(args.model))
         sources = SourceInputs(base, paths, stack)
         qwen4 = qwen4_exp.is_qwen4_exp(base.config)
         companion = "text" not in components
+        if graft_paths and (qwen4 or companion or args.gguf):
+            raise ValueError("--graft copies a drafter into a Qwen3.5 artifact converted from its checkpoint")
+        if set(graft_paths) & (set(components) | set(paths)):
+            raise ValueError("a grafted drafter is not also converted (--components) or sourced (--source)")
+        grafts = [
+            Graft.read(stack.enter_context(Artifact(path)), component)
+            for component, path in graft_paths.items()
+        ]
         if companion and (
             components != ("dflash2",)
             or not qwen4
@@ -249,6 +269,9 @@ def main(argv=None):
             ngram_format = None
             if args.ngram_reuse is not None:
                 ngram_format = qwen4_exp.ngram_volume_format(base, args.ngram_reuse)
+                if ngram_format == "bf16_p12":
+                    raise ValueError("a BF16 P12 volume replaces a table at run time only (--ngram-volume); bind "
+                                     "the BF16 volume it was packed from")
             if gguf_store is not None:
                 if ngram_format == "bf16":
                     raise ValueError("a GGUF import binds its own IQ4_NL or Q8_0 volume; give it a BF16 volume at "
@@ -279,6 +302,8 @@ def main(argv=None):
         else:
             if args.ngram_out is not None:
                 raise ValueError("--ngram-out applies only to Qwen4Exp sources")
+            if args.ngram_reuse is not None:
+                raise ValueError("--ngram-reuse applies only to Qwen4Exp sources")
             gemma4 = (base.config.get("architectures") or [""])[0] == "Gemma4ForConditionalGeneration"
             if gemma4:
                 if gguf_store is not None:
@@ -304,6 +329,7 @@ def main(argv=None):
                     components=components,
                     companions=companions,
                     resource_overrides=overrides,
+                    grafted={graft.component: graft.record for graft in grafts},
                 )
         recipe = Recipe(model)
         _function(args.recipe)(model, recipe, sources)
@@ -341,6 +367,8 @@ def main(argv=None):
             provenance["ranking"] = str(args.ranking)
         if args.screen_heads:
             provenance["screen_heads"] = {"format": "q2_g64_fp16", "method": "grouped_mse_norm"}
+        if grafts:
+            provenance["grafts"] = {graft.component: graft.provenance() for graft in grafts}
         report = convert(
             model,
             recipe,
@@ -353,6 +381,7 @@ def main(argv=None):
             max_buffered_bytes=args.max_buffered_bytes,
             max_file_bytes=args.max_file_bytes,
             progress=progress,
+            grafts=grafts,
         )
         print(
             f"wrote {args.out}: {report['objects']} objects, {len(report['files'])} files, {report['seconds']:.1f}s",

@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/execution_context.h"
+#include "models/qwen3_5/program/prefix/test_seams.h"
 #include "models/qwen3_5/execution/linear.h"
 #include "models/qwen3_5/execution/lossless.h"
 #include "models/qwen3_5/execution/vision_overlay.h"
@@ -33,17 +34,18 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
         throw std::logic_error("DFlash prefill controls are unavailable");
     }
     return dflash_feature_sink(
-        state, [&state](const Tensor& features, const Tensor& positions, bool rewrite_checkpoint) {
+        state, [&state](const Tensor& features, const Tensor& positions, std::int32_t first) {
             // The append's temporaries live on the Program's workspace, which the pass resets only when
             // it runs there: a pass on a lent workspace (offloaded experts) leaves it untouched.
             auto scope  = state.execution.work.scope();
             auto& frame = *state.execution.io.dflash_prefill;
-            // YE-01: columns below the floor (positions from text_kv_base on) are never read before a
-            // later column overwrites their ring slot.
-            std::int32_t skip = 0;
-            if (state.dflash_context_floor > static_cast<std::int64_t>(state.text_kv_base)) {
-                skip = static_cast<std::int32_t>(std::min<std::int64_t>(
-                    state.dflash_context_floor - static_cast<std::int64_t>(state.text_kv_base), features.ne[1]));
+            // YE-01: columns below the floor (positions from the window's column `first` on) are never read
+            // before a later column overwrites their ring slot.
+            const std::int64_t begin = static_cast<std::int64_t>(state.text_kv_base) + first;
+            std::int32_t skip        = 0;
+            if (state.dflash_context_floor > begin) {
+                skip = static_cast<std::int32_t>(
+                    std::min<std::int64_t>(state.dflash_context_floor - begin, features.ne[1]));
             }
             if (skip == features.ne[1]) { return; }
             const std::int32_t kept   = features.ne[1] - skip;
@@ -51,19 +53,27 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
             const Tensor kept_positions = skip == 0 ? positions : positions.slice(0, skip, kept);
             // Target execution and draft append use the same chunk bindings. Decode may have
             // used another compact row, or a checkpoint may have forked the destination slot.
-            *state.dflash_prefill_host_ingress = {
-                .append_count           = kept,
-                .state_destination_slot = state.state_destination_slot,
-                .full_kv_table_row      = state.dflash_kv_table_row,
-            };
-            CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, state.dflash_prefill_host_ingress,
-                                       sizeof(qwen3_5::DFlashPrefillIngress),
-                                       cudaMemcpyHostToDevice, state.execution.device.stream));
+            if (first == 0) {
+                *state.dflash_prefill_host_ingress = {
+                    .append_count           = kept,
+                    .state_destination_slot = state.state_destination_slot,
+                    .full_kv_table_row      = state.dflash_kv_table_row,
+                };
+                CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, state.dflash_prefill_host_ingress,
+                                           sizeof(qwen3_5::DFlashPrefillIngress),
+                                           cudaMemcpyHostToDevice, state.execution.device.stream));
+            } else {
+                // A pair window's tail (the window's second append): the pinned ingress may not have been read yet
+                // by the first append's copy, so the bindings are written on the device in stream order.
+                ops::set_i32_scalar(frame.append_count, kept, state.execution.device.stream);
+                ops::set_i32_scalar(frame.state_destination_slot, state.state_destination_slot,
+                                    state.execution.device.stream);
+                ops::set_i32_scalar(frame.full_kv_table_row, state.dflash_kv_table_row, state.execution.device.stream);
+            }
             const auto exact = static_cast<std::uint32_t>(kept);
             dflash_append_context(state, kept_columns, kept_positions, frame.append_count,
                                   frame.state_destination_slot, frame.full_kv_table_row,
                                   {exact, exact});
-            (void)rewrite_checkpoint;
         });
 }
 
@@ -104,12 +114,20 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     card.set_before_first_sample(state.before_first_sample);
     card.set_prefill_last_rows_only(state.last_rows_only);
     card.set_rope_delta(state.rope_delta);
+    testing::note_text_pass(state.text_kv_base, state.rope_delta); // a test's recorder; off, nothing
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
+    card.set_prefill_pair_tap(state.pair_tap_frontier, state.pair_tap_slot);
     if (state.take_layer_ready) { card.set_layer_ready(state.take_layer_ready()); }
     card.set_offloaded_experts(state.execution.io.offloaded_experts, state.offloaded_call);
     const std::span<const int> prompt(ids.data(), ids.size());
+    if (state.hidden_states != nullptr) {
+        // Causal scoring only, which runs no drafter.
+        if (state.dflash != nullptr) { throw std::logic_error("a hidden-state capture takes no DFlash features"); }
+        return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end,
+                                  *state.hidden_states);
+    }
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
         return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end,
@@ -226,6 +244,11 @@ namespace {
 std::array<std::int32_t, 3> prompt_rope_position(const PreparedPromptData& prompt,
                                                  std::uint32_t token);
 
+// QK-02: the longest tail past an exact tap a prompt's last pass takes as a pair window, the generation opener's
+// 2-8 tokens. Its continuation hidden then lies within the trimmed last layer's columns (YC-01 keeps about 20), so
+// the pair adds no last-layer work there.
+constexpr std::uint32_t kPairTailTokens = 8;
+
 std::array<std::int32_t, 3> prompt_rope_position(const PreparedPromptData& prompt,
                                                  std::uint32_t token) {
     const std::size_t tokens = prompt.token_ids.size();
@@ -235,6 +258,109 @@ std::array<std::int32_t, 3> prompt_rope_position(const PreparedPromptData& promp
     return {prompt.positions[token], prompt.positions[tokens + token],
             prompt.positions[2 * tokens + token]};
 }
+
+// QK-02, the pair window: a prompt's last pass whose exact tap leaves a short tail (the generation opener's: the next
+// turn re-renders the history after it) runs as one pass instead of two, the tap's state written inside it
+// (TextContext::set_prefill_pair_tap). The tap the head pass would realize (hybrid_tap_due; the drafter ring's floor
+// already planned for it) takes its room here, before the pass that writes it, and is published after it. With
+// nothing due there the pass runs whole (a split that captures nothing is a pass for nothing). Without room now (a
+// slot the previous request's snapshots still hold while their Host copies land) the pass is cut as before, and the
+// capture after its head pass tries again and counts what it finds.
+//
+// One prefill pass's pair window, from before the pass to the publication after it. A reservation the pass did not
+// get to publish (it failed, or a step between the reservation and the pass did) gives its room back when the window
+// ends: the guard holds from before anything is reserved.
+class PairWindow {
+public:
+    // A pass starts without a pair tap.
+    PairWindow(ProgramImpl& program, SequenceState& sequence, execution::PrefillContext& schedule)
+        : program_(program), sequence_(sequence), schedule_(schedule) {
+        schedule_.pair_tap_frontier = -1;
+        schedule_.pair_tap_slot     = -1;
+    }
+
+    ~PairWindow() {
+        if (!tap_) { return; }
+        try {
+            program_.hybrid_release_reserved(sequence_, *tap_);
+        } catch (...) {} // the pass's own failure is the one that propagates
+    }
+
+    PairWindow(const PairWindow&)            = delete;
+    PairWindow& operator=(const PairWindow&) = delete;
+
+    // The pass of `width` tokens from staged.cursor (reaching the prompt end when `final_candidate`) is cut at the
+    // lane's exact tap `tap` (`split_frontier`). As a pair window it runs whole (`split_frontier` reset), writing the
+    // state of the tap due there into the room reserved for it, or with nothing due there; without room it stays cut.
+    void plan(const HybridLaneState& lane, const RequestControl::Prefill& staged, std::uint32_t tap,
+              std::uint32_t width, bool final_candidate, std::optional<std::uint32_t>& split_frontier) {
+        if (!qualifies(lane, staged, tap, width, final_candidate)) { return; }
+        const std::optional<ProgramImpl::HybridTapDue> due =
+            program_.hybrid_tap_due(sequence_, tap, staged.prompt_tokens, false);
+        if (!due) {
+            (void)program_.hybrid_tap_due(sequence_, tap, staged.prompt_tokens); // the cut's bookkeeping
+            split_frontier.reset();
+            return;
+        }
+        bool no_room = false;
+        tap_         = program_.hybrid_reserve_tap(sequence_, tap, due->boundary, true, no_room);
+        // Every slot may still hold one of the previous request's snapshots whose Host copy is landing (none may give
+        // its Device copy up yet): the copies that landed are published (non-blocking) and the room asked for again
+        // (2026-11-17, 27B: without it 13 of 48 opener turns found no room at once and fell back to the cut).
+        if (!tap_ && no_room) {
+            program_.hybrid_->poll();
+            tap_ = program_.hybrid_reserve_tap(sequence_, tap, due->boundary, true, no_room);
+        }
+        if (tap_) {
+            (void)program_.hybrid_tap_due(sequence_, tap, staged.prompt_tokens); // its bookkeeping
+            due_ = due;
+            split_frontier.reset();
+            schedule_.pair_tap_frontier = tap;
+            schedule_.pair_tap_slot     = program_.state_store->physical_slot(tap_->image);
+        }
+    }
+
+    // After the pass, which wrote the reserved tap's image: it is published as the cut's capture after its head pass
+    // would be (hybrid_capture_tap's checks, then hybrid_after_prefill_chunk's retry bookkeeping).
+    void publish() {
+        if (!tap_) { return; }
+        const HybridPendingTap reserved = *tap_;
+        tap_.reset();
+        program_.hybrid_lanes_[sequence_.lane].tap_retry = false;
+        if (reserved.frontier <= sequence_.text_kv_valid && program_.dflash_ring_whole(sequence_, reserved.frontier)) {
+            program_.hybrid_publish_reserved(sequence_, reserved, due_->retry_only);
+        } else {
+            program_.hybrid_release_reserved(sequence_, reserved);
+            if (!due_->retry_only) { ++program_.hybrid_->counters().taps_skipped; }
+        }
+    }
+
+private:
+    // Whether the pass may run as a pair window at `tap`: a tail of 2-8 tokens past it (the generation opener's), a
+    // head of two or more, no other exact tap in the tail, one text window (no Vision), no KV window to cut.
+    [[nodiscard]] bool qualifies(const HybridLaneState& lane, const RequestControl::Prefill& staged, std::uint32_t tap,
+                                 std::uint32_t width, bool final_candidate) const {
+        if (!testing::pair_windows() || !final_candidate || staged.vision || program_.state_images->has_kv_window() ||
+            width > program_.idle_prefill_width || tap <= staged.cursor + 1U || tap + 2U > staged.prompt_tokens ||
+            staged.prompt_tokens - tap > kPairTailTokens) {
+            return false;
+        }
+        for (std::size_t i = lane.next_tap; i < lane.taps.size(); ++i) {
+            const runtime::prefix_cache::PlannedTap& planned = lane.taps[i];
+            if (planned.placement == runtime::prefix_cache::TapPlacement::Exact && planned.position > tap &&
+                planned.position < staged.prompt_tokens) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    ProgramImpl& program_;
+    SequenceState& sequence_;
+    execution::PrefillContext& schedule_;
+    std::optional<HybridPendingTap> tap_;
+    std::optional<ProgramImpl::HybridTapDue> due_;
+};
 
 } // namespace
 
@@ -274,7 +400,11 @@ PrefillProgress ProgramImpl::advance_prefill(SequenceHandle handle,
         std::function<void()>& hook;
         ~ClearHook() { hook = nullptr; }
     } clear_hook{prefill_first_sample_};
-    auto progress = wrap_prefill(lane, advance_prefill_raw(lane, timing));
+    // Taps this unit publishes (one taken at a chunk boundary, or a deferred one whose anchor block the unit
+    // committed): a queued request coalesced onto this prefill can resume from one, so the Engine re-runs admission.
+    const std::uint64_t taps = hybrid_ ? hybrid_->counters().taps_created : 0U;
+    auto progress            = wrap_prefill(lane, advance_prefill_raw(lane, timing));
+    progress.snapshot_published = hybrid_ && hybrid_->counters().taps_created != taps;
     if (!progress.complete) { settle_unit(lane); }
     return progress;
 }
@@ -703,8 +833,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             selectors.destination,
             staged.initial_mtp_extent,
             0,
-            dflash_prefill_host_ingress,
-            sequence.rope_delta};
+            dflash_prefill_host_ingress};
+        schedule_state.rope_delta        = sequence.rope_delta; // by name: see PrefillContext
         schedule_state.prefill_gpu_timer = &prefill_gpu_timer_;
         schedule_state.before_first_sample = &prefill_first_sample_;
         schedule_state.last_rows_only      = true; // YC-01: a generation prompt
@@ -834,6 +964,12 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                     if (rewrite_split != rewrite_frontiers.end()) { consider(*rewrite_split); }
                     schedule_state.dflash_context_floor = static_cast<std::int64_t>(read > window ? read - window : 0U);
                 }
+                // QK-02's pair window: a prompt's last pass cut at its exact tap may run whole, writing the tap's
+                // state inside it (PairWindow).
+                PairWindow pair_window(*this, sequence, schedule_state);
+                if (hybrid_split && split_frontier == hybrid_split) {
+                    pair_window.plan(*hybrid_lane, staged, *hybrid_split, remaining, final_candidate, split_frontier);
+                }
                 if (offload) {
                     std::uint32_t expected = std::min(idle_prefill_width, remaining);
                     if (split_frontier && *split_frontier > pass_begin) {
@@ -896,6 +1032,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                           prefill_hidden.slice(
                               1, static_cast<std::int32_t>(result.processed_tokens) - 1, 1));
                 sequence.tail_hidden_valid = true;
+                pair_window.publish();
                 if (hybrid_lane != nullptr && !result.finalized) {
                     hybrid_after_prefill_chunk(sequence, staged.cursor, staged.prompt_tokens);
                 }
@@ -1009,6 +1146,10 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             }
         }
         request.timings.prefill_seconds = std::max(0.0, staged.elapsed_seconds - vision_seconds);
+        // The prefix cache's cost model learns its prefill scale from text prompts (ranking and valuation only).
+        if (!staged.vision_plan) {
+            hybrid_observe_prefill(sequence.lane, staged.base, prompt_tokens, request.timings.prefill_seconds);
+        }
         if (staged.vision) { staged.vision->retire_handoff(); }
 
         request.prefill.reset();

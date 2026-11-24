@@ -27,10 +27,11 @@ with `--expert-stripe` in the SSD tier.
   `nvidia-smi --query-gpu=pcie.link.width.current --format=csv`.
 - **RAM.** About 96 GB for full speed. A run pins ~64.5 GiB. At startup a RAM ledger plans every
   allocation (experts, n-gram table, prefix cache) and keeps `--ram-free-mib` (default 4096 since
-  2026-11-13, when the ledger started counting the 4.5 GiB of CUDA kernel code Infernix reads at
-  startup, which had left less free than planned; 8192 from 2026-10-26; 2048 before, when a desktop
+  2026-11-13, when the ledger started counting the CUDA kernel code Infernix reads at startup, which
+  had left less free than planned: 1.5 GiB since 2026-11-15, 4.5 GiB before, when the build carried
+  profiling line information; 8192 from 2026-10-26; 2048 before, when a desktop
   paged once the experts and the n-gram table took the rest) free for other programs; with the
-  defaults about 76.7 GiB must be available when it starts, the kernel code included, with the
+  defaults about 73.6 GiB must be available when it starts, the kernel code included, with the
   smallest prefix cache, which takes whatever the experts leave beyond the reserve (see
   [Prefix cache](#prefix-cache)). With less, the [SSD expert tier](#ssd-expert-tier) keeps the
   experts that fit in RAM and reads the others from the artifact; the ledger line names every term.
@@ -107,7 +108,8 @@ opens part 1. `--resource` stores the maintained Qwen3.8 template, as for Qwen3.
   the [design notes](maintainer/qwen3_8-flash-next-design.md) (§6.1.1, §16.2.1).
 - **Verification.** `python -m tools.flash_next.verify_artifact --model <checkpoint> --artifact
   <part 1> --ngram <volume>` compares every stored tensor, expert and n-gram row with the
-  checkpoint and lists the re-quantized parameters per component.
+  checkpoint and lists the re-quantized parameters per component. The volume is required; `--no-ngram`
+  skips it explicitly, and the report then says the volume was not checked.
 - **Second artifact of the same checkpoint.** It can share an existing n-gram volume: pass
   `--ngram-reuse <volume>` instead of `--ngram-out`. The converter checks the volume's geometry and
   512 of its rows against the checkpoint, so a volume of another checkpoint is refused.
@@ -369,6 +371,85 @@ those 96 objects only, verifies with no mismatch against its checkpoint, and sco
 quick corpus against FP4-Local's 3.4865 on the same build (BF16 KV, reproducible route; mean KL
 from FP4-Local 0.018, top-1 agreement 95.2 %).
 
+### NVIDIA NVFP4-QAD checkpoint
+
+Recipes `qwen3_8_flash_next_nvfp4_qad` (exact) and `qwen3_8_flash_next_nvfp4_qad_dense8` import
+[nvidia/Qwen3.8-Flash-Next-NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4-QAD), NVIDIA's
+quantization-aware distillation of its NVFP4 release (100 updates), bit-exactly
+([design §6.1.3](maintainer/qwen3_8-flash-next-design.md#613-recipes-qwen3_8_flash_next_nvfp4_qad-e-and-qwen3_8_flash_next_nvfp4_qad_dense8)):
+
+- The routed experts keep their NVFP4 codes, block scales, multipliers and activation scales and run **W4A4**, as
+  recipe A's do and as NVIDIA serves this checkpoint.
+- The shared experts are NVFP4 too (the earlier Flash-Next checkpoints store them BF16, FP8 or MXFP8). Each is
+  stored as one more expert record with its own activation scales, held in VRAM, and runs in the same exact W4A4
+  arithmetic inside the routed experts' call.
+- The GDN, attention and indexer projections keep their MXFP8 words and run with BF16 activations (W8A16), as
+  FP4-Local's; the GDN a/b projections become their exact BF16 values.
+- Everything else keeps NVIDIA's BF16. The Dense8 recipe stores the hyper-connection mixers, the PLE projections, the
+  final mixer and `lm_head` in `q8_g32_fp16` instead, as recipe B does; the experts and MXFP8 projections are
+  unchanged there.
+- The n-gram table is recipe A's FP8 table (NVIDIA froze it): bind NVIDIA's FP8 volume with `--ngram-reuse`.
+- The MTP drafter is re-quantized as for recipes A and B. NVIDIA did not evaluate MTP on these weights.
+
+```text
+python -m tools.convert --model <dir>/Qwen3.8-Flash-Next-NVFP4-QAD --recipe qwen3_8_flash_next_nvfp4_qad \
+  --components text,vision,mtp --proposal --screen-heads --device cpu --name Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Infernix \
+  --resource chat_template.jinja=tools/chat_templates/qwen3_8.jinja \
+  --out <dir>/Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Infernix.infernix --ngram-reuse <nvme>/qwen3_8_flash_next_nvfp4.ninfer.ngram
+python -m tools.artifact.rename <dir>/Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Infernix.infernix \
+  Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Infernix.infernix --numbered
+python -m tools.flash_next.verify_artifact --model <dir>/Qwen3.8-Flash-Next-NVFP4-QAD \
+  --artifact <dir>/Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Infernix-00001-of-0000N.infernix \
+  --ngram <nvme>/qwen3_8_flash_next_nvfp4.ninfer.ngram --ngram-rows all
+```
+
+The Dense8 artifact takes `--recipe qwen3_8_flash_next_nvfp4_qad_dense8` and the name
+`Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Dense8-Infernix`.
+
+Both are published:
+[Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Infernix)
+and [Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Dense8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-QAD-Dense8-Infernix).
+Neither repository carries an n-gram volume: run them with NVIDIA's FP8 volume
+[`Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram`](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix/blob/main/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram),
+whose SHA-256 equals the volume they were converted against.
+
+The exact artifact is 77.7 GB and the Dense8 one 76.5 GB, three parts each; each conversion took 25-33 minutes
+(beside a build). `verify_artifact` found all 24,624 expert records (the 48 shared experts among them) and every
+imported tensor equal to the checkpoint, only the drafter re-quantized (and Dense8's 293 BF16-class parameters), and
+all 320,001,536 n-gram rows equal to NVIDIA's FP8 volume (2026-11-17).
+
+Builds before `eac2b3d8` refuse both artifacts at load ("missing logical parameter text/layers/0/moe/shared/gate",
+checked with a build of `main` at `49893d9c`, `windows-2026.11.07-120-g49893d9c`).
+
+**Quality.** On the 1M-token corpus (quick, 4K context, BF16 KV, `--reproducible`; 2026-11-17) the exact artifact
+scores 3.4422 and Dense8 3.4385, against 3.5095 for NVIDIA's NVFP4 Dense8 on the same build and 3.5066 for FP4-Local
+with `--expert-a4-activations` (the same 4-bit expert arithmetic), lower than both in every domain. With
+`--a16-activations` the exact artifact scores 3.4138 (3.4122 on the default route, where `expert-a4-residual` takes its
+prefill experts); with `--a8-activations`, which runs on the default route only, 3.4139 (its 8-bit routes and the
+`expert-a4-residual` fast path its 16-bit-bank configuration registers; the default arithmetic scores 3.4422 there
+too).
+
+**Speed** (RTX 5090 on PCIe 5.0 x8, INT8 KV, one request, `infernix_bench --expert-state off`, two interleaved runs
+each against FP4-Local in the matching mode, 2026-11-17): MTP auto decode after a 4K prompt 250.8 / 249.4 tok/s
+against 253.6 / 253.0 (FP4-Local with `--expert-a4-activations`), 248.4 / 249.0 with `--a16-activations` against
+249.0 / 255.9 (FP4-Local's default) and 253.2 / 250.6 with `--a8-activations` against 255.5 / 259.3; Dense8 269.4 /
+254.0. DFlash2 auto decode 264.0 / 263.8 against 270.3 / 269.7: QAD's routing sends about 3 % more misses to the CPU in
+the same rounds. Prefill is level (pp1024-16384 within 0.5 %, pp8192 3,306-3,334 tok/s on both). Both runs left part of
+the experts on the artifact (the exclusive layout with no saved expert state).
+
+Re-measured on `b5242057` (the same settings, three interleaved runs, every n-gram volume on one drive, 2026-11-17
+evening). Runs that measured an 8,192-token prefill before the decode test decode about 7 % slower than runs that
+did not (the exact artifact's DFlash2: 259.5 against 280.2 tok/s), so compare rows of the same kind only:
+- **Drive check** (with the prefill test first): the exact artifact's DFlash2 decode was 259.5 tok/s mean with its FP8
+  volume on either drive, since 99 % of its rows came from the host cache. The drive was not behind the gaps above.
+- **Exact artifact against FP4-Local** (decode test only): DFlash2 decode 279.8-280.7 against FP4-Local's
+  288.0-289.2 tok/s (`--expert-a4-activations`), 2.9 % slower with the same acceptance. Plain decode 118.7 and 118.9
+  against 120.0-120.5; a third run at 127.8 took another expert-cache course (475 landings against 671).
+- **Dense8 against NVIDIA's NVFP4 Dense8** (with the prefill test first): DFlash2 decode 271.0-272.8 against
+  280.1-281.3 tok/s, 3.1 % slower in every run; acceptance 7.53 against 7.63 tokens a round explains part of that.
+  The bit-exact artifact's 259.5 under the same workload puts Dense8 4.9 % ahead of it. MTP decode 244.3-258.8 against
+  242.8-250.8, 3.5 % faster on average. pp8192 level (3,345-3,373 against 3,368-3,383).
+
 ## Run
 
 ```text
@@ -410,9 +491,11 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
   frames of ~8,560). A smaller `--prefill-chunk` only shrinks the prefill workspace. A long
   prompt's prefill workspace is lent from the expert cache (at most three quarters of the frames of
   its largest frame pool; a GGUF import keeps a pool per record size), which also gives its frames to
-  the KV pool as contexts grow. A chunk whose workspace the cache cannot lend is cut at startup to
-  the widest one it can (a multiple of 128 tokens), with a warning: 65,536 tokens under the SSD tier
-  wanted ~27 GiB, and the IQ3_S import's 16,384 does not fit on a 32 GB card. A prompt whose
+  the KV pool as contexts grow. Each call borrows what the forward's own plan of that call needs: on
+  an RTX 5090 with INT8 KV a 16,384-token FP4-Local call borrows 3.9 GiB (7.6 GiB before
+  2026-11-17), and the IQ3_S import's 16,384, cut to 13,440 before, fits. A chunk whose workspace
+  the cache cannot lend is cut at startup to the widest one it can (a multiple of 128 tokens), with
+  a warning. A prompt whose
   contexts have grown since runs its calls at the widest chunk the cache lends then. Calls of
   different widths can round differently, so the chunk can change a near-tie token.
   `--reproducible` keeps one chunk: the one the cache lends with every lane's context full (a lower
@@ -446,7 +529,7 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
     drafts (as MTP's do without `adaptive-speculation`), except under the default fast path
     `dflash2-pairs`: rounds of two requests share one proposal and verify up to two drafts each (with
     `auto`, the number both requests' calibrated drafts make fastest). It is on by the owner's decision
-    ahead of its quality gate; `--disable-fast-paths` or `--reproducible` turns it off.
+    ahead of its quality gate; `--no-fast-path dflash2-pairs` or `--reproducible` turns it off.
 - `--spec mtp --draft-tokens auto --lm-head-draft` drafts with the model's MTP layer.
   - `auto`: each round drafts the number of tokens, 0 to 7, the request's recent acceptance makes
     worthwhile (down to none on text it predicts poorly). A one-request round of argmax drafts
@@ -583,16 +666,18 @@ about healthy drives. The probe only reports; it never changes where the table l
 
 ## N-gram table formats
 
-The PLE n-gram table has four volume formats: NVIDIA's FP8 rows with one scale for the whole table
-(recipes A-C bind it), the GGUF import's IQ4_NL rows (4.5 bits per value), the BF16 rows of
+The PLE n-gram table has six volume formats. Five can be an artifact's own table: NVIDIA's FP8 rows
+with one scale for the whole table (recipes A-C bind it), the GGUF import's IQ4_NL rows (4.5 bits
+per value), the Q8_0 rows of a Q8_0 GGUF or a .basalt pack (8.5 bits per value), the BF16 rows of
 Qwen's checkpoint (the FP8 checkpoint's exact artifact binds it) and NVIDIA FP4-Local's NVFP4 rows
 (4.5 bits per value: E2M1 codes, an E4M3 scale per 16 values and one FP32 multiplier; the FP4-Local
-artifact binds it). Every artifact binds one of them as its own, and **any Qwen3.8-Flash-Next
-artifact runs with a volume of any of the four formats**: pass it with `--ngram-volume`. The engine
-reads the row format from the volume's header and logs
+artifact binds it). The sixth, [BF16 P12](#bf16-p12-n-gram-table), stores the BF16 rows losslessly in
+less space and serves only at run time. **Any Qwen3.8-Flash-Next artifact runs with a volume of any
+of the six formats**: pass it with `--ngram-volume`. The engine reads the row format from the
+volume's header and logs
 `n-gram table: <format> rows from <volume> in place of the artifact's <format> table`; the PLE
-decodes the FP8, IQ4_NL or NVFP4 rows (or takes the BF16 rows as its embedding) as it does for the
-artifact's own table. The volumes hold the same table row for row: on 3,002 sampled rows,
+decodes the FP8, IQ4_NL, Q8_0, NVFP4 or BF16 P12 rows (or takes the BF16 rows as its embedding) as it
+does for the artifact's own table. The volumes hold the same table row for row: on 3,002 sampled rows,
 the FP8 rows' relative L2 error against the BF16 rows was 2.7 % (median; 3.1 % at the 99th
 percentile) and the IQ4_NL rows' 7.6 % (8.7 %), against 142 % for rows shifted by one; on 65,536
 sampled rows the NVFP4 rows' was 9.5 % (median; 11.3 % at most), an NVFP4 quantization of Qwen's
@@ -611,7 +696,8 @@ record their row format in the header (NVFP4 rows have IQ4_NL's 90 bytes); older
 their row size.
 
 The FP8 checkpoint's artifact, converted with the BF16 table, is bit-exact to Qwen's checkpoint
-only with its own BF16 volume; another table rounds the PLE's values as that table's artifacts do.
+only with its own BF16 volume or a BF16 P12 volume packed from it; another table rounds the PLE's
+values as that table's artifacts do.
 
 ### BF16 n-gram table
 
@@ -634,7 +720,48 @@ The table is ~102 GB in the checkpoint and the volume ~109 GB (rows of 320 bytes
 block, against 52 GB for FP8). A token reads as many 4 KiB blocks as with the FP8 volume, so a drive
 with fast random reads serves it as fast; it does not fit in RAM (`--ngram-residency auto` keeps it
 on the volume). A persistent prefix cache saved with one table is not restored with the other.
-The quality change against the FP8 table has not been measured yet.
+Against the FP8 table the perplexity differs in the fourth decimal (3.5101 against 3.5102, above).
+
+### BF16 P12 n-gram table
+
+A BF16 P12 volume holds the same BF16 values as the BF16 volume, bit for bit, in 256-byte rows instead
+of 320 (16 per 4 KiB block instead of 12). Each value keeps its sign and 7 mantissa bits in a byte
+and its exponent as a 4-bit offset from the row's base; a value whose exponent lies outside the row's
+15-exponent window is stored whole in one of up to four escapes in the row's 16-byte tail. Every row
+of Qwen's table fits: 98.4 % need no escape and the rest at most three. The PLE decodes the rows to
+their exact BF16 values, so an artifact gives the same output with the BF16 P12 volume as with the
+BF16 volume, on every route (NVIDIA NVFP4 Dense8 gave the same tokens with either volume on the
+reproducible, default and lossless routes). The volume packed from Qwen's table is published beside
+the BF16 volume:
+
+```text
+hf download Wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix Qwen3.8-Flash-Next-BF16-P12.ngram --local-dir <fast drive>
+```
+
+Its SHA-256 is `70d19c5666a74f44604143aa947c7ac4b6f6fda7ae275463dea31cbbb9ce5abb`. To make it from a
+BF16 volume instead and check every row:
+
+```text
+python -m tools.flash_next.ngram_p12 --source <fast drive>/Qwen3.8-Flash-Next-BF16.ngram --census
+python -m tools.flash_next.ngram_p12 --source <fast drive>/Qwen3.8-Flash-Next-BF16.ngram --out <fast drive>/Qwen3.8-Flash-Next-BF16-P12.ngram
+python -m tools.flash_next.ngram_p12 --source <fast drive>/Qwen3.8-Flash-Next-BF16.ngram --out <fast drive>/Qwen3.8-Flash-Next-BF16-P12.ngram --verify --rows all
+infernix-serve <artifact part 1> --ngram-volume <fast drive>/Qwen3.8-Flash-Next-BF16-P12.ngram ...
+```
+
+`--census` counts the escapes each row needs (the packer refuses a row that needs more than four).
+The packed volume's id follows from its source's, so packing one BF16 volume always gives the same
+file. From and to Samsung 990 PRO drives, with other jobs running, packing took 29 minutes and
+`--verify --rows all` 39. The
+volume is 81.9 GB against the BF16 volume's 109.2 GB (FP8: 52.4 GB). A missed row costs one 4 KiB
+read whatever the format, so a token reads as many blocks as with the BF16 or FP8 volume (a
+7,578-token prompt: 73,289 reads from the BF16 volume, 73,263 from the BF16 P12 one). What changes
+is the space: on disk, and in RAM when the whole table is held there (`--ngram-residency`). Decoding
+the rows costs the PLE one more kernel launch per call, which did not measurably change speed: NVIDIA
+NVFP4 Dense8 with 8,192-token prompts and 256 generated tokens (INT8 KV, rows in the host cache, four
+interleaved runs on an RTX 5090, 2026-11-21) decoded 127.0 tok/s with the BF16 P12 volume and 126.7
+with the BF16 one and read prompts at 4,856 and 4,807 tok/s; the BF16 volume against itself varied
+as much (decode down to 0.973 of itself in one pair). No artifact binds a BF16 P12 table as its own (`--ngram-reuse` refuses one);
+pass it at run time.
 
 ## Chat template
 
@@ -853,13 +980,25 @@ startup
   it stops with the largest terms and what to lower (`--max-context`, `--max-concurrency`,
   `--prefill-chunk`, `--kv-dtype int8`). Below 2,048 expert frames it warns that decode will be slow.
 - **No silent spill.** On Windows the driver can place an allocation that does not fit in shared
-  system memory without an error, which slows everything down. The engine checks that every startup
-  allocation lowered free VRAM by its size: dense weights or fixed buffers that spilled stop
-  startup; expert frames that spilled are given back once and the cache starts smaller. The error
-  prints the readings it compared: free VRAM before and after the allocations and, on Windows and
-  under WSL2, this process's shared system memory use, which a real spill raises. Setting the
+  system memory without an error, which slows everything down. The engine checks every startup
+  allocation: dense weights or fixed buffers that spilled stop startup; expert frames that spilled
+  are given back once and the cache starts smaller. On Windows and under WSL2 an expert-frame chunk
+  counts as spilled only when this process's own device-memory use did not rise by it, so a budget
+  Windows moves during the step (as on a GPU that drives a display) is not taken for a spill;
+  elsewhere the drop in free VRAM decides. The error prints the readings it
+  compared, and with `--log-level debug` the expert frames' warning is followed by them: free VRAM,
+  the OS budget, this process's device and shared system memory use, and NVML's free memory. Setting the
   NVIDIA Control Panel's *CUDA - Sysmem Fallback Policy* to *Prefer No Sysmem Fallback* for the
   Infernix executables makes such an allocation fail instead (optional).
+- **Other programs' VRAM.** On Windows the per-process budget and free VRAM can leave out memory
+  another program holds (on an RTX 5090 they ignored another process's 3 GiB), so the cache can be
+  sized as if the card were empty. As it grows into that memory,
+  Windows lowers the budget; the engine reads free VRAM before each 64 MiB chunk and stops once the next
+  chunk would not leave the headroom and reserve, logging `free VRAM went while the expert cache grew
+  … starts with N of M frames`. With another process holding 3 GiB on an RTX 5090 the cache started
+  about 3 GiB short of its plan, as it should; before the check, the grow mapped past the lowered budget
+  and warned that a chunk was placed in system memory. With `--log-level debug` the sizing and ledger
+  lines also give NVML's figures for the whole card, which do count other programs.
 - **At runtime** the cache follows free VRAM. When another program (a browser, a game, the
   desktop) takes memory and free VRAM falls below half the headroom, the cache gives back the
   least valuable experts at the next round boundary, or at once when idle, and logs it; it grows
@@ -882,7 +1021,11 @@ startup
   - The engine measures this allowance at startup: physical memory less the reserve, less the
     budget, less a 128 MiB margin. It reports it in the ledger (`… in use before loading (640 MiB
     past the OS budget)`).
-  - If Windows lowers the budget later, the cache shrinks by the same amount.
+  - It never takes other programs' memory: free VRAM is at most what NVML finds free over every
+    process, at startup and later (until 2026-11-20 the allowance could count the desktop's and other
+    programs' VRAM as free, about 70-170 MiB on a headless RTX 5090).
+  - If Windows lowers the budget later, or another program takes VRAM, the cache shrinks by the same
+    amount.
   - The cost: memory past the budget may be moved to system memory if another program needs VRAM,
     which slows decode until the cache shrinks. It is off by default.
   - Measured on an RTX 5090 (2026-10-30, greedy 500-token decodes, three runs a side,
@@ -930,9 +1073,10 @@ startup
     MXFP8 dense projections take two E4M3 terms per 32 activation values (`fp8-a8-pair-block32`'s route,
     in place of `f16-accumulate-prefill`). Recipe C's FP8 dense projections take those two terms in
     prefill by default already.
-  - Recipes A and B (Dense8): NVIDIA's W4A4 experts load as 16-bit banks (as with `--a16-activations`)
-    and take the 8-bit route in place of their 4-bit one, and the engine warns at launch that the
-    default follows NVIDIA's specification.
+  - Recipes A and B (Dense8) and the NVFP4-QAD artifacts: NVIDIA's W4A4 experts load as 16-bit banks (as with
+    `--a16-activations`) and take the 8-bit route in place of their 4-bit one, and the engine warns at launch that
+    the default follows NVIDIA's specification. The NVFP4-QAD artifacts' shared experts take the same route as their
+    routed experts (they run as the routed call's last job), and their MXFP8 projections take the prefill pair above.
   - On a GGUF import (IQ3_S) it also changes weights at load and scheduling (2026-11-01): the BF16
     hyper-connection matrices become 8-bit (`q8_g32_fp16`), the hyper-connection mix and the GDN gated norm write
     the next projection's 8-bit codes themselves, the CPU team takes 24 workers, the side streams yield to the
@@ -959,9 +1103,10 @@ startup
     28 % slower than its 4-bit route (15.53 against 12.16 s at 128K). In the agentic replay (three seeds)
     it decodes 5.8 % faster and reads uncached prompts 15.7 % slower, the same wall time.
 - <a id="a16-activations"></a>**`--a16-activations`** (off by default) runs NVIDIA's W4A4 experts
-  (recipes A and B, Dense8) with 16-bit activations: the stored NVFP4 codes, block scales and
-  multipliers on the weight-only banks' exact arithmetic (design §16.2.1), the activation scales left
-  unread. The output changes, and the engine warns at launch. Measured 2026-10-31 on Dense8 (as above):
+  (recipes A and B, Dense8, and the NVFP4-QAD artifacts, whose shared experts follow) with 16-bit activations: the
+  stored NVFP4 codes, block scales and multipliers on the weight-only banks' exact arithmetic (design §16.2.1), the
+  activation scales left unread. It gives the NVFP4-QAD artifacts FP4-Local's default fast-path configuration, so
+  `expert-a4-residual` then takes their routed and shared experts' prefill calls. The output changes, and the engine warns at launch. Measured 2026-10-31 on Dense8 (as above):
   5 %, 6 % and 2 % more decode rounds a second than the 4-bit route at 8K, 128K and 250K (the 16-bit
   banks' tensor-core narrow kernels), the first token level at 8K but 38 % and 37 % later at 128K and
   250K (16.73 against 12.16 s at 128K), since only the 4-bit route reads the prompt on FP4 tensor cores. Artifacts whose experts already run 16-bit accept it unchanged;

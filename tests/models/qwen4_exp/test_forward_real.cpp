@@ -8,6 +8,8 @@
 //       [--dump-from P] [TOKENS --dump-logits OUT.bin [--chunk N] [--kv KV] [--dump-from P]]...
 //   infernix_qwen4_exp_forward_real_test TOKENS --cpu-columns [--kv KV]
 //   infernix_qwen4_exp_forward_real_test TOKENS --decode-widths [--kv KV]
+//   infernix_qwen4_exp_forward_real_test TOKENS --trim-last-layer [--default-fast-paths [--drop-fast-path NAME]...]
+//       [--kv KV] [--expert-a16-activations | --a8-activations]
 //   infernix_qwen4_exp_forward_real_test TOKENS --screened-heads [--kv KV]
 //
 // KV is a KV-cache storage: bf16 (default), int8, fp8, nvfp4 or k8v4.
@@ -20,7 +22,9 @@
 // (decode widths, and prefill calls up to 255 columns with the assist) give the GPU route's logits
 // bit for bit (check_cpu_columns). With --decode-widths it checks that a decode row's bits do not
 // depend on how many rows share the call, 1 to 8, in every block and the logits
-// (check_decode_widths).
+// (check_decode_widths). With --trim-last-layer it checks that a prefill's trimmed last layer
+// (YC-01) gives the untrimmed call's logits bit for bit, in plain and pair calls, and that a layer
+// walk of two chunks, trimmed or not, gives the chunk-major calls' (check_trim_last_layer).
 // TOKENS is a comma-separated id list, or @FILE holding ids separated by commas or whitespace; the
 // options after a TOKENS apply to it. With --dump-logits the test scores the text teacher-forced
 // instead: it prefills it in chunks of N (default 256) with FP32 logits at every position, writes
@@ -51,6 +55,7 @@
 #include "models/qwen4_exp/execution/parameters.h"
 #include "models/qwen4_exp/frontend/ngram_hash.h"
 #include "models/qwen4_exp/load.h"
+#include "models/qwen4_exp/program/fast_paths.h"
 #include "models/qwen4_exp/program/prefix/state_image.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
 #include "models/qwen4_exp/program/rope_positions.h"
@@ -73,8 +78,10 @@
 #include <iterator>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -195,7 +202,7 @@ private:
 // the layer's records read into a pinned buffer before the layer runs).
 struct Harness {
     Harness(const q4::execution::Parameters& parameters, DeviceContext& device, std::int32_t context, std::int32_t columns,
-            std::int32_t rows, KvCacheStorage storage)
+            std::int32_t rows, KvCacheStorage storage, q4::execution::ForwardFastPaths fast = {})
         : config(parameters.model.config().text) {
         const auto& c = config;
         LayoutBuilder builder;
@@ -312,8 +319,7 @@ struct Harness {
         kv_view       = kv;
         experts_view  = experts;
         forward = std::make_unique<q4::execution::Forward>(parameters, device, *work, std::move(state), std::move(kv),
-                                                           std::move(experts), context,
-                                                           q4::execution::ForwardFastPaths{});
+                                                           std::move(experts), context, fast);
     }
 
     // Another Forward over the same state, KV and workspace, with other expert sources.
@@ -560,6 +566,248 @@ bool check_cpu_columns(const q4::execution::Parameters& parameters, DeviceContex
     cudaStreamDestroy(overlap);
     std::printf(ok ? "CPU-served calls equal the GPU route bit for bit\n"
                    : "FAIL: CPU-served calls differ from the GPU route\n");
+    return ok;
+}
+
+// A layer walk of two chunks as ProgramImpl::walk_step / walk_moe run it (prefill_walk.cpp), on Forward's public steps:
+// each chunk's embedding and every layer's mixer chunk by chunk, every layer's MoE once over both chunks, the last
+// layer's over the last chunk's trailing columns when `trim` (its dense shared expert and its experts' routes over both
+// chunks, as the untrimmed walk's MoE runs them); the last chunk's logits.
+std::vector<float> walk_logits(const q4::execution::Parameters& parameters, DeviceContext& device,
+                               const q4::NgramVolume& volume, const std::vector<std::int32_t>& tokens, KvCacheStorage kv,
+                               q4::execution::ForwardFastPaths fast, std::int32_t w0, std::int32_t w1, bool trim,
+                               std::int32_t& kept) {
+    const auto& c     = parameters.model.config().text;
+    const auto vocab  = static_cast<std::int32_t>(c.vocab_size);
+    const std::int32_t W = w0 + w1, H = static_cast<std::int32_t>(c.hidden_size);
+    const auto S = static_cast<std::int32_t>(c.hc.streams), R = static_cast<std::int32_t>(c.residual_width());
+    Harness harness(parameters, device, std::max<std::int32_t>(256, (W + 63) / 64 * 64), W, 1, kv, fast);
+    auto& f    = *harness.forward;
+    auto call0 = make_call(c, volume, {tokens}, 0, w0, {0}, {0});
+    auto call1 = make_call(c, volume, {tokens}, w0, w1, {0}, {0});
+    call1.batch.trim_last_layer = trim;
+    DeviceBuffer residual_buffer(2ULL * R * W), xm_buffer(2ULL * H * W), inject_buffer(4ULL * S * W);
+    Tensor residual(residual_buffer.p, DType::BF16, {R, W}), xm(xm_buffer.p, DType::BF16, {H, W});
+    Tensor inject(inject_buffer.p, DType::FP32, {S, W});
+    Tensor residual0 = residual.slice(1, 0, w0), residual1 = residual.slice(1, w0, w1);
+    Tensor xm0 = xm.slice(1, 0, w0), xm1 = xm.slice(1, w0, w1);
+    Tensor inject0 = inject.slice(1, 0, w0), inject1 = inject.slice(1, w0, w1);
+    f.begin_call(call0.batch, nullptr);
+    f.embed(call0.batch, residual0);
+    f.begin_call(call1.batch, nullptr);
+    f.embed(call1.batch, residual1);
+    const std::uint32_t L       = c.num_hidden_layers;
+    kept                        = trim ? f.last_layer_kept(w1) : 0;
+    for (std::uint32_t l = 0; l < L; ++l) {
+        f.begin_call(call0.batch, nullptr);
+        f.layer_mixer(l, call0.batch, residual0, xm0, inject0);
+        f.begin_call(call1.batch, nullptr);
+        f.layer_mixer(l, call1.batch, residual1, xm1, inject1);
+        f.begin_call(call1.batch, nullptr);
+        if (l + 1 == L && kept > 0) {
+            const Tensor xm_kept     = xm.slice(1, W - kept, kept);
+            const Tensor inject_kept = inject.slice(1, W - kept, kept);
+            Tensor residual_kept     = residual.slice(1, W - kept, kept);
+            f.layer_moe(l, call1.batch, xm_kept, inject_kept, residual_kept, w1, w1 - kept, 0,
+                        q4::execution::TrimmedCall{.shared = &xm, .routes = &xm});
+        } else {
+            f.layer_moe(l, call1.batch, xm, inject, residual, w1);
+        }
+    }
+    DeviceBuffer logits(static_cast<std::size_t>(vocab) * sizeof(float));
+    Tensor out(logits.p, DType::FP32, {vocab, 1});
+    f.begin_call(call1.batch, &out);
+    f.finish(call1.batch, residual1, &out);
+    device.synchronize();
+    return to_float(logits, static_cast<std::size_t>(vocab));
+}
+
+// --trim-last-layer: YC-01's trim (ForwardBatch::trim_last_layer: a prefill's last layer runs its router, routed
+// experts and combine over the trailing columns alone, Forward::last_layer_kept, and its dense shared expert over the
+// whole call) gives the logit column the untrimmed call's bits. Prefills of 9 to 16,384 columns of the text, and pair
+// calls (run_split) whose tail trims (each on a fresh harness), trimmed and untrimmed, with router-mma off and on (on,
+// a call of 256 columns or more keeps 256), on the exact routes: the logits compared bit for bit. Each line prints
+// the kept columns (0: nothing trims, so the line holds trivially).
+// With `selected` (--default-fast-paths: the artifact's default fast paths at this KV storage, as a server runs them),
+// the same comparisons run once on those paths' Forward flags instead of on the exact routes with router-mma off and on.
+bool check_trim_last_layer(const q4::execution::Parameters& parameters, DeviceContext& device,
+                           const q4::NgramVolume& volume, const std::vector<std::int32_t>& tokens, KvCacheStorage kv,
+                           std::optional<q4::execution::ForwardFastPaths> selected = std::nullopt) {
+    const auto& c     = parameters.model.config().text;
+    const auto n      = static_cast<std::int32_t>(tokens.size());
+    const auto vocab  = static_cast<std::int32_t>(c.vocab_size);
+    bool ok           = true;
+    int compared      = 0;
+    const auto compare = [&](const std::string& label, const std::vector<float> (&rows)[2], std::int32_t kept) {
+        std::int32_t differing = 0;
+        double largest         = 0.0;
+        for (std::int32_t v = 0; v < vocab; ++v) {
+            if (std::memcmp(&rows[0][v], &rows[1][v], sizeof(float)) != 0) {
+                ++differing;
+                largest = std::max(largest, std::fabs(static_cast<double>(rows[0][v]) - rows[1][v]));
+            }
+        }
+        std::printf("%s (%d kept): trimmed logits %s (%d of %d differ, largest %.3g)\n", label.c_str(), kept,
+                    differing == 0 ? "equal" : "DIFFER", differing, vocab, largest);
+        ok = ok && differing == 0;
+        ++compared;
+    };
+    if (selected) {
+        // Engagement: the selected paths must change a wide call's untrimmed logits against the exact routes, or the
+        // comparisons below say nothing about them. Repeat: the selected paths' untrimmed call, run again on a fresh
+        // harness, must give the same bits, or trimmed against untrimmed has no oracle on these paths.
+        for (const std::int32_t width : {std::min<std::int32_t>(n, 1000), std::min<std::int32_t>(n, 4096)}) {
+            const std::int32_t context = std::max<std::int32_t>(256, (width + 63) / 64 * 64);
+            std::vector<float> rows[3];
+            for (const int which : {0, 1, 2}) {
+                Harness harness(parameters, device, context, width, 1, kv,
+                                which == 0 ? q4::execution::ForwardFastPaths{} : *selected);
+                auto call = make_call(c, volume, {tokens}, 0, width, {0}, {0});
+                DeviceBuffer logits(static_cast<std::size_t>(vocab) * sizeof(float));
+                Tensor out(logits.p, DType::FP32, {vocab, 1});
+                harness.forward->run(call.batch, out);
+                device.synchronize();
+                rows[which] = to_float(logits, static_cast<std::size_t>(vocab));
+            }
+            std::int32_t engaged = 0, repeat = 0;
+            for (std::int32_t v = 0; v < vocab; ++v) {
+                engaged += std::memcmp(&rows[0][v], &rows[1][v], sizeof(float)) != 0;
+                repeat += std::memcmp(&rows[1][v], &rows[2][v], sizeof(float)) != 0;
+            }
+            std::printf("default fast paths %s at %d columns: %d of %d untrimmed logits differ from the exact routes'\n",
+                        engaged != 0 ? "ENGAGED" : "NOT ENGAGED (equal to the exact routes)", width, engaged, vocab);
+            std::printf("default fast paths, %d columns run twice: %s (%d of %d differ)\n", width,
+                        repeat == 0 ? "repeatable" : "NOT REPEATABLE", repeat, vocab);
+            ok = ok && repeat == 0;
+        }
+    }
+    for (const bool router_mma : {false, true}) {
+        if (selected && router_mma) { break; }
+        q4::execution::ForwardFastPaths fast{};
+        fast.router_mma = router_mma;
+        std::string mode = std::string("router-mma ") + (router_mma ? "on" : "off");
+        if (selected) {
+            fast = *selected;
+            mode = std::string("default fast paths (router-mma ") + (fast.router_mma ? "on)" : "off)");
+        }
+        // Both sides of every width where a route of the last layer's MoE may change, to the default prefill chunk.
+        for (const std::int32_t width : {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 32, 33, 64, 65, 96, 97, 128, 129, 200, 255,
+                                         256, 257, 300, 512, 1000, 4096, 16384}) {
+            if (width > n) { continue; }
+            const std::int32_t context = std::max<std::int32_t>(256, (width + 63) / 64 * 64);
+            std::vector<float> rows[2];
+            std::int32_t kept = 0; // the trimmed call's (0: the last layer runs whole, so the check holds trivially)
+            // On the selected paths the untrimmed call taps its routes (a tap leaves the routing, the experts and their
+            // routes as they are): how many of the call's columns chose each of the last column's experts, the entry
+            // counts that send a job to an expert's wide route (more than 8).
+            const auto K = static_cast<std::int32_t>(c.moe.top_k), L = static_cast<std::int32_t>(c.num_hidden_layers);
+            DeviceBuffer route_buffer(selected ? static_cast<std::size_t>(L) * K * width * sizeof(std::int32_t) : 0);
+            std::vector<Tensor> route_taps;
+            for (std::int32_t l = 0; selected && l < L; ++l) {
+                route_taps.emplace_back(static_cast<std::byte*>(route_buffer.p) +
+                                            static_cast<std::size_t>(l) * K * width * sizeof(std::int32_t),
+                                        DType::I32, std::initializer_list<std::int32_t>{K, width});
+            }
+            q4::execution::ForwardTap route_tap{};
+            route_tap.routes = &route_taps;
+            for (const int trim : {0, 1}) {
+                Harness harness(parameters, device, context, width, 1, kv, fast);
+                if (trim == 1) { kept = harness.forward->last_layer_kept(width); }
+                auto call                  = make_call(c, volume, {tokens}, 0, width, {0}, {0});
+                call.batch.trim_last_layer = trim == 1;
+                DeviceBuffer logits(static_cast<std::size_t>(vocab) * sizeof(float));
+                Tensor out(logits.p, DType::FP32, {vocab, 1});
+                harness.forward->run(call.batch, out, selected && trim == 0 ? &route_tap : nullptr);
+                device.synchronize();
+                rows[trim] = to_float(logits, static_cast<std::size_t>(vocab));
+            }
+            if (selected) {
+                std::vector<std::int32_t> ids(static_cast<std::size_t>(K) * width);
+                if (cudaMemcpy(ids.data(), route_taps.back().data, ids.size() * sizeof(std::int32_t),
+                               cudaMemcpyDeviceToHost) != cudaSuccess) {
+                    throw std::runtime_error("route tap download failed");
+                }
+                std::vector<std::int32_t> count(static_cast<std::size_t>(c.moe.experts), 0);
+                for (const std::int32_t e : ids) { ++count.at(static_cast<std::size_t>(e)); }
+                std::string counts;
+                int wide = 0;
+                for (std::int32_t k = 0; k < K; ++k) {
+                    const std::int32_t e = ids[static_cast<std::size_t>(width - 1) * K + k];
+                    counts += (k == 0 ? "" : " ") + std::to_string(count[static_cast<std::size_t>(e)]);
+                    wide += count[static_cast<std::size_t>(e)] > 8;
+                }
+                std::printf("%s, %d columns: the last column's experts hold %s of the call's columns (%d of %d more "
+                            "than 8)\n", mode.c_str(), width, counts.c_str(), wide, K);
+            }
+            compare(mode + ", " + std::to_string(width) + " columns", rows, kept);
+        }
+        // Pair calls (the zero-split tap): a head chunk, then a tail that trims as its own call would; the tail's
+        // dense shared expert runs over the tail alone.
+        for (const auto [head, tail] : {std::pair{95, 5}, std::pair{500, 17}, std::pair{1000, 200}, std::pair{3000, 300}}) {
+            if (head + tail > n) { continue; }
+            const std::int32_t context = std::max<std::int32_t>(256, (head + tail + 63) / 64 * 64);
+            std::vector<float> rows[2];
+            std::int32_t kept = 0;
+            for (const int trim : {0, 1}) {
+                Harness harness(parameters, device, context, head + tail, 1, kv, fast);
+                if (trim == 1) { kept = harness.forward->last_layer_kept(tail); }
+                auto head_call                  = make_call(c, volume, {tokens}, 0, head, {0}, {0});
+                auto tail_call                  = make_call(c, volume, {tokens}, head, tail, {0}, {0});
+                tail_call.batch.trim_last_layer = trim == 1;
+                DeviceBuffer logits(static_cast<std::size_t>(vocab) * sizeof(float));
+                Tensor out(logits.p, DType::FP32, {vocab, 1});
+                harness.forward->run_split(head_call.batch, tail_call.batch, out, Tensor{}, [](std::uint32_t) {});
+                device.synchronize();
+                rows[trim] = to_float(logits, static_cast<std::size_t>(vocab));
+            }
+            compare(mode + ", pair " + std::to_string(head) + " + " + std::to_string(tail) + " columns", rows, kept);
+        }
+        // Layer walks of two chunks against the chunk-major calls: untrimmed (every layer's MoE once over both chunks)
+        // and with the last layer trimmed.
+        for (const auto [w0, w1] : {std::pair{1024, 1000}, std::pair{4096, 300}, std::pair{3072, 4096}}) {
+            if (w0 + w1 > n) { continue; }
+            std::vector<float> chunk_major;
+            {
+                Harness harness(parameters, device, std::max<std::int32_t>(256, (w0 + w1 + 63) / 64 * 64), w0 + w1, 1, kv,
+                                fast);
+                auto call0 = make_call(c, volume, {tokens}, 0, w0, {0}, {0});
+                auto call1 = make_call(c, volume, {tokens}, w0, w1, {0}, {0});
+                DeviceBuffer logits(static_cast<std::size_t>(vocab) * sizeof(float));
+                Tensor out(logits.p, DType::FP32, {vocab, 1});
+                harness.forward->run(call0.batch, out);
+                harness.forward->run(call1.batch, out);
+                device.synchronize();
+                chunk_major = to_float(logits, static_cast<std::size_t>(vocab));
+            }
+            const std::string label = mode + ", walk " + std::to_string(w0) + " + " + std::to_string(w1) + " columns";
+            std::int32_t kept = 0;
+            if (selected) {
+                // Fast paths such as ggml-bf16-prefill route by how the walk groups its chunks, so a walk need not give
+                // the chunk-major calls' bits (printed only); the trim must still give the untrimmed walk's.
+                std::int32_t whole = 0;
+                std::vector<float> walk = walk_logits(parameters, device, volume, tokens, kv, fast, w0, w1, false, whole);
+                std::int32_t differing = 0;
+                for (std::int32_t v = 0; v < vocab; ++v) {
+                    differing += std::memcmp(&walk[v], &chunk_major[v], sizeof(float)) != 0;
+                }
+                std::printf("%s: the walk against chunk-major (information): %d of %d differ\n", label.c_str(), differing,
+                            vocab);
+                std::vector<float> rows[2] = {walk, walk_logits(parameters, device, volume, tokens, kv, fast, w0, w1, true,
+                                                                kept)};
+                compare(label + ", last layer trimmed, against the untrimmed walk", rows, kept);
+                continue;
+            }
+            for (const bool trim : {false, true}) {
+                std::vector<float> rows[2] = {chunk_major, walk_logits(parameters, device, volume, tokens, kv, fast, w0,
+                                                                       w1, trim, kept)};
+                compare(label + (trim ? ", last layer trimmed, against chunk-major" : ", against chunk-major"), rows,
+                        kept);
+            }
+        }
+    }
+    if (compared == 0) { throw std::invalid_argument("--trim-last-layer needs at least 9 tokens"); }
+    std::printf(ok ? "trimmed last layers give the untrimmed logits bit for bit\n"
+                   : "FAIL: a trimmed last layer changes the logits\n");
     return ok;
 }
 
@@ -834,6 +1082,9 @@ int main(int argc, char** argv) {
         bool cpu_columns    = false;
         bool decode_widths  = false;
         bool screened_heads = false;
+        bool trim_last      = false;
+        bool default_fast   = false; // --default-fast-paths: --trim-last-layer on the artifact's default fast paths
+        std::vector<FastPath> dropped; // --drop-fast-path NAME: one of those paths left out (attribution)
     };
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     try {
@@ -841,6 +1092,7 @@ int main(int argc, char** argv) {
         // Anywhere: --rope-yarn-factor F (the model's YaRN factor) and --expert-a4-activations (NVIDIA
         // FP4-Local's optional 4-bit expert activations).
         models::LoadOptions load;
+        bool a8_activations = false;
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
             if (arg == "--rope-yarn-factor") {
@@ -850,6 +1102,15 @@ int main(int argc, char** argv) {
             }
             if (arg == "--expert-a4-activations") {
                 load.expert_a4_activations = true;
+                continue;
+            }
+            if (arg == "--expert-a16-activations") { // a W4A4 checkpoint's banks (NVFP4-QAD) with 16-bit activations
+                load.expert_a16_activations = true;
+                continue;
+            }
+            if (arg == "--a8-activations") { // --default-fast-paths with --a8-activations' routes (16-bit banks)
+                load.expert_a16_activations = true;
+                a8_activations              = true;
                 continue;
             }
             if (arg == "--stream-experts") {
@@ -869,6 +1130,25 @@ int main(int argc, char** argv) {
             if (arg == "--decode-widths") {
                 if (jobs.empty()) { throw std::invalid_argument("--decode-widths needs a token list before it"); }
                 jobs.back().decode_widths = true;
+                continue;
+            }
+            if (arg == "--trim-last-layer") {
+                if (jobs.empty()) { throw std::invalid_argument("--trim-last-layer needs a token list before it"); }
+                jobs.back().trim_last = true;
+                continue;
+            }
+            if (arg == "--default-fast-paths") {
+                if (jobs.empty()) { throw std::invalid_argument("--default-fast-paths needs a token list before it"); }
+                jobs.back().default_fast = true;
+                continue;
+            }
+            if (arg == "--drop-fast-path") {
+                if (jobs.empty() || !jobs.back().default_fast || i + 1 >= argc) {
+                    throw std::invalid_argument("--drop-fast-path NAME follows --default-fast-paths");
+                }
+                const auto path = parse_fast_path(argv[++i]);
+                if (!path) { throw std::invalid_argument(std::string("unknown fast path: ") + argv[i]); }
+                jobs.back().dropped.push_back(*path);
                 continue;
             }
             if (arg == "--screened-heads") {
@@ -1024,6 +1304,34 @@ int main(int argc, char** argv) {
             return check_cpu_columns(parameters, device, volume, tokens, context, job.kv) ? 0 : 1;
         }
         if (job.decode_widths) { return check_decode_widths(parameters, device, volume, tokens, context, job.kv) ? 0 : 1; }
+        if (job.trim_last) {
+            if (load.stream_experts) { throw std::invalid_argument("--trim-last-layer runs whole calls: not with --stream-experts"); }
+            std::optional<q4::execution::ForwardFastPaths> selected;
+            if (job.default_fast) {
+                // The paths a server qualifies by default for this artifact and KV storage (no drafter, no
+                // --fast-path candidates); only their Forward flags matter here.
+                EngineOptions options;
+                options.kv_cache       = job.kv;
+                options.a8_activations = a8_activations;
+                q4::FastPathSelection selection = q4::select_fast_paths(model->config(), false, options);
+                for (const FastPath path : job.dropped) {
+                    selection.paths.erase(std::remove(selection.paths.begin(), selection.paths.end(), path),
+                                          selection.paths.end());
+                    std::printf("left out: %s\n", fast_path_name(path));
+                }
+                std::string names;
+                for (const FastPath path : selection.paths) { names += std::string(names.empty() ? "" : ", ") + fast_path_name(path); }
+                std::printf("default fast paths at this KV storage: %s\n", names.empty() ? "none" : names.c_str());
+                selected = selection.forward();
+                if (a8_activations) {
+                    const q4::A8Routes a8 = q4::a8_activation_routes(model->config(), selection);
+                    if (!a8.any()) { throw std::invalid_argument("--a8-activations: no 8-bit route applies to this artifact"); }
+                    a8.apply(*selected);
+                    std::printf("--a8-activations: %s\n", a8.describe().c_str());
+                }
+            }
+            return check_trim_last_layer(parameters, device, volume, tokens, job.kv, selected) ? 0 : 1;
+        }
         if (job.screened_heads) { return check_screened_heads(parameters, device, volume, tokens, context, job.kv) ? 0 : 1; }
         Harness harness(parameters, device, context, n, 3, job.kv);
         DeviceBuffer logits(vocab * 2 * sizeof(float));

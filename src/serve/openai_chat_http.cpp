@@ -1,5 +1,6 @@
 #include "serve/http_server.h"
 
+#include "serve/http_stream_driver.h"
 #include "serve/http_transport.h"
 #include "serve/openai_chat.h"
 #include "serve/openai_common.h"
@@ -25,6 +26,7 @@ std::string sse_error_event(const ApiError& error) {
 void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::Response& res) {
     OpenAIChatRequest request;
     try {
+        require_generation();
         RequestLimits limits;
         limits.default_max_tokens        = options_.default_max_tokens;
         const auto body                  = parse_json_body(req);
@@ -78,10 +80,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         write_openai_error(res, exception.error());
         return;
     } catch (const std::exception& exception) {
-        ApiError error;
-        error.status  = 500;
-        error.type    = "internal_error";
-        error.message = exception.what();
+        const ApiError error = internal_server_error(exception);
         record_request_rejected(make_request_rejection_log_context(
             req_id, "openai_chat_completions", request.generation, metadata, error));
         write_openai_error(res, error);
@@ -105,11 +104,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             const RequestFailure failure =
                 make_internal_request_failure(RequestFailurePhase::Generation, exception.what());
             lifecycle->failure(failure);
-            ApiError error;
-            error.status  = 500;
-            error.type    = "internal_error";
-            error.message = exception.what();
-            write_openai_error(res, error);
+            write_openai_error(res, internal_server_error(exception));
             return;
         }
         lifecycle->done(outcome);
@@ -118,27 +113,25 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             std::vector<std::string> call_ids;
             set_owned_json_content(res, make_chat_completion_response(identity, outcome, &call_ids),
                                    prepared.lifetime);
-            remember_reasoning(outcome, call_ids);
+            // A cancelled answer is cut: its reasoning is not kept for the next turn to resend.
+            if (outcome.finish_reason != infernix::FinishReason::Cancelled) { remember_reasoning(outcome, call_ids); }
         } catch (const std::exception& exception) {
             lifecycle->response_failure(make_internal_request_failure(
                 RequestFailurePhase::ResponseRender, exception.what()));
-            ApiError error;
-            error.status  = 500;
-            error.type    = "internal_error";
-            error.message = exception.what();
-            write_openai_error(res, error);
+            write_openai_error(res, internal_server_error(exception));
         }
         return;
     }
 
-    // The SSE response cannot be taken back once committed: wait up to kStreamAdmissionGrace for the
-    // Engine's admission, so the queue's prompt answers (a queue timeout, an orderly stop) are a plain
-    // HTTP status here as on the non-streaming branch. A request still queued then starts its stream:
-    // SSE comments keep the client while it waits, and a later queue answer is the stream's error
-    // event, as a mid-generation failure is.
+    // The SSE response cannot be taken back once committed: wait for the Engine's admission, so the
+    // queue's answers (a queue timeout, an orderly stop) are a plain HTTP status here as on the
+    // non-streaming branch. Unlike Messages and Responses, Chat Completions has no error event clients
+    // agree on: a queue timeout as one `data:` error frame after a 200 is recorded by some clients
+    // (LiteLLM 1.98, raw HTTP) as a successful empty reply and retried at once (NInfer #420), so this
+    // route does not start its stream early (kStreamAdmissionGrace).
     try {
         (void)service_->admit(prepared, [&req] { return client_disconnected(req); },
-                              std::chrono::steady_clock::now() + kStreamAdmissionGrace);
+                              std::chrono::steady_clock::time_point::max());
     } catch (const ApiException& exception) {
         lifecycle->failure(make_generation_request_failure(exception.error()));
         write_openai_error(res, exception.error());
@@ -146,11 +139,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     } catch (const std::exception& exception) {
         lifecycle->failure(
             make_internal_request_failure(RequestFailurePhase::Generation, exception.what()));
-        ApiError error;
-        error.status  = 500;
-        error.type    = "internal_error";
-        error.message = exception.what();
-        write_openai_error(res, error);
+        write_openai_error(res, internal_server_error(exception));
         return;
     }
 
@@ -174,19 +163,9 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 SseTransport transport(sink, stream->cancelled);
                 transport.set_heartbeat([&] { return encoder->keep_alive(); });
                 const auto send_error = [&](const ApiError& error) {
-                    try {
+                    return end_stream_with_error(sink, *lifecycle, [&] {
                         render_and_write(transport, [&] { return sse_error_event(error); });
-                        sink.done();
-                        return true;
-                    } catch (const ClientDisconnected&) {
-                        lifecycle->response_failure(
-                            make_client_disconnected_failure(RequestFailurePhase::Transport));
-                        return false;
-                    } catch (const ResponseRenderFailure& exception) {
-                        lifecycle->response_failure(make_internal_request_failure(
-                            RequestFailurePhase::ResponseRender, exception.what()));
-                        return false;
-                    }
+                    });
                 };
                 // The assistant-role chunk opens the stream with its first event (prompt progress, the
                 // first output delta or the finish), not at admission, so a client's time to its first
@@ -236,38 +215,14 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                     output.is_cancelled = [&] { return transport.poll(); };
 
                     outcome = service_->run(stream->prepared, &output);
-                } catch (const ClientDisconnected&) {
-                    lifecycle->failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                    return false;
-                } catch (const ResponseRenderFailure& exception) {
-                    lifecycle->failure(make_internal_request_failure(
-                        RequestFailurePhase::ResponseRender, exception.what()));
-                    ApiError error;
-                    error.status  = 500;
-                    error.type    = "internal_error";
-                    error.message = exception.what();
-                    return send_error(error);
-                } catch (const ApiException& exception) {
-                    lifecycle->failure(make_generation_request_failure(exception.error()));
-                    return send_error(exception.error());
-                } catch (const std::exception& exception) {
-                    lifecycle->failure(make_internal_request_failure(
-                        RequestFailurePhase::Generation, exception.what()));
-                    ApiError error;
-                    error.status  = 500;
-                    error.type    = "internal_error";
-                    error.message = exception.what();
-                    return send_error(error);
+                } catch (...) {
+                    return end_failed_stream_generation(
+                        *lifecycle, [](const ApiError& error) -> const ApiError& { return error; },
+                        [](const std::exception& exception) { return internal_server_error(exception); },
+                        send_error);
                 }
 
-                lifecycle->done(outcome);
-                if (outcome.finish_reason == infernix::FinishReason::Cancelled ||
-                    stream->cancelled.load(std::memory_order_acquire)) {
-                    lifecycle->response_failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                    return false;
-                }
+                if (!record_stream_generation(*lifecycle, outcome, stream->cancelled)) { return false; }
                 std::vector<std::string> terminal;
                 try {
                     // An answer with no streamed delta (an empty one, or tool calls sent whole) opens here.
@@ -286,37 +241,15 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 } catch (const std::exception& exception) {
                     lifecycle->response_failure(make_internal_request_failure(
                         RequestFailurePhase::ResponseRender, exception.what()));
-                    ApiError error;
-                    error.status  = 500;
-                    error.type    = "internal_error";
-                    error.message = exception.what();
-                    return send_error(error);
+                    return send_error(internal_server_error(exception));
                 }
-                try {
-                    transport.write(terminal);
-                    sink.done();
-                    return true;
-                } catch (const ClientDisconnected&) {
-                    lifecycle->response_failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                    return false;
-                }
+                return write_stream_terminal(transport, sink, *lifecycle, terminal);
             },
-            [stream, lifecycle](bool successful) {
-                stream->cancelled.store(true, std::memory_order_release);
-                if (!successful || !stream->started.load(std::memory_order_acquire)) {
-                    lifecycle->failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                }
-            });
+            stream_release(stream, lifecycle));
     } catch (const std::exception& exception) {
         lifecycle->failure(
             make_internal_request_failure(RequestFailurePhase::ResponseRender, exception.what()));
-        ApiError error;
-        error.status  = 500;
-        error.type    = "internal_error";
-        error.message = exception.what();
-        write_openai_error(res, error);
+        write_openai_error(res, internal_server_error(exception));
     }
 }
 

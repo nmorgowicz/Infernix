@@ -9,7 +9,9 @@ forwards the request to it, as LM Studio does.
 The launcher runs no inference itself. It supervises one `infernix-serve` process at a time on a
 private loopback port and relays requests and streamed answers to it. The server never outlives
 the launcher: if the launcher ends without stopping it (a crash, a forced kill), the system ends
-the server too, on Windows and Linux, so it does not keep holding the GPU.
+the server too, on Windows and Linux, so it does not keep holding the GPU. The one other program it
+runs is the ablation-sidecar fitter of the [Ablation](#ablation) page, which starts engines of its own
+and holds the GPU while it runs.
 
 ## Start
 
@@ -35,9 +37,12 @@ The console prints the addresses and the browser opens the web UI:
 | `--serve FILE` | the `infernix-serve` to run (default: the one beside the launcher) |
 | `--no-browser` | do not open the web UI |
 | `--ui-dir DIR` | serve the web UI from a folder (web UI development) |
-
-Ctrl+C (or closing the console) stops the loaded model in order, so it saves its prefix cache and
-expert-cache state, pauses running downloads and exits. Only the launcher's own events and server
+| `--ablate-tool DIR` | the sidecar fitter the [Ablation](#ablation) page runs: the folder holding `ablate.py` (default: the `ablate` folder beside the launcher) |
+Ctrl+C stops the loaded model in order, so it saves its prefix cache and expert-cache state, pauses
+running downloads and exits. Closing the console window, signing out or shutting Windows down does
+the same, but Windows ends the launcher and the model about 5 seconds after it: a save not finished
+by then leaves the previous prefix-cache file in place (the launcher saves its own settings and usage
+first). Only the launcher's own events and server
 errors appear in its console; the web UI shows the server's full log. A console that holds its
 output (a QuickEdit selection) or a slow log folder never holds up the server: the launcher keeps
 reading its output and writes the console and `serve-logs/` from threads of their own. On Windows
@@ -59,7 +64,10 @@ launcher is portable and its memory travels with its folder:
 Beside it are the logs ([Event log](#event-log); **Settings → Logging** can move them to another
 folder), `infernix-launcher-usage.json` ([Usage](#usage)), `chats/` (one file per chat, with its
 images), `launcher-prefix-cache/`, each model's saved prefix cache when **Keep each model's prefix
-cache** is on (several GB per model), and the scratch folders `plans/` and `updates/`.
+cache** is on (several GB per model), `ablation/` ([Ablation](#ablation): the fitter's packages, prompt
+sets, run folders with their recordings, up to a few GB a run, and the sidecars it made), and the scratch
+folders `plans/` and `updates/`. A portable Python the Ablation page downloaded is `ablate-python` beside the
+launcher itself.
 
 The memory belongs to that copy of the launcher, wherever it is started from: unzipping a new
 release into another folder starts afresh, so copy `infernix-launcher.json` across (or start the new
@@ -106,8 +114,11 @@ One page, top to bottom:
   available (how full it is says little: models with offloaded experts fill it on purpose). A
   temperature past its limit is also named beside **All gauges** while its dial is not shown.
 - **Memory**: what the loaded `infernix-serve` holds, as one bar for VRAM and one for RAM: its
-  parts (model weights, the drafter, experts with their count, the KV cache, model state, the prefix
-  cache, workspace, CUDA graphs, staging, the n-gram table), then **Infernix other** (its memory no
+  parts (model weights, the drafter, a LoRA adapter, experts with their count, model state, the KV cache, the prefix
+  cache, workspace, CUDA graphs, staging, the n-gram table, the n-gram archive; the KV cache and the
+  prefix cache side by side, since they trade pages with every request, so only their shared boundary
+  moves), then
+  **Infernix other** (its memory no
   part names: the CUDA context, the driver, heaps), **Other processes** and **Free**, beside which
   VRAM shows what the server keeps free for the display (its headroom). The KV cache and the prefix
   cache are drawn faint, with the share holding tokens or entries solid. While the server uses an SSD
@@ -147,17 +158,29 @@ folder levels deep, reading file headers only:
 - **N-gram volumes**: `.ngram` files of Qwen3.8-Flash-Next, matched to the models that can read them:
   a model's own table first, then FP8, NVFP4, IQ4_NL and BF16 (an FP8 table without a recorded scale
   serves only its own artifact).
+- **LoRA adapters** ([`--lora`](lora.md)): a folder holding a Hugging Face PEFT adapter's
+  `adapter_config.json` and `adapter_model.safetensors`, named by the folder, with the base model,
+  rank and modules its config names. It is matched to the dense models of that base (an adapter of
+  `Qwen/Qwen3.8-27B`, or of a repackaging such as `unsloth/Qwen3.8-27B-bnb-4bit`, to the Qwen3.8-27B
+  artifacts); whether `infernix-serve` can apply it is the server's to say (below).
+- **Ablation sidecars** ([`--ablate`](ablate.md)): a folder's `sidecar.json` in the `ablate-direction-v2`
+  format with the direction file it names, named by the folder, with the layers it cuts. It is matched
+  to the models whose hidden size and layer count it fits, the artifact it was fitted on (its
+  `artifact_id`) first. A base direction that cuts no layer, another program's `sidecar.json` and the
+  trial sidecars inside a `tools/ablate` run folder are not listed; the run's exports are.
 
 Folders are rescanned when they change in the launcher, after a download and every minute. A folder
 whose listing fails part way (a network share that goes away, say) is marked as scanned only in
 part, with the reason; the files found before it stay listed.
 
 **Models** shows each folder's size, the free space on its drive (read by the last scan, so a
-sleeping network drive never holds up the web UI or the API), and each model's, drafter's and
-volume's size on disk. **Delete files** removes a model's artifact (every part), a drafter or an
-n-gram volume from the disk after you type its file name. A model's deletion takes the files at
-the location shown (every part, its `.conversion.json` and `.expert-state`) and its
-configurations; files a running server uses cannot be deleted.
+sleeping network drive never holds up the web UI or the API), and each model's, drafter's,
+volume's, adapter's and sidecar's size on disk. **Delete files** removes a model's artifact (every
+part), a drafter, an n-gram volume, a LoRA adapter or an ablation sidecar from the disk after you type
+its file (an adapter's: folder; a sidecar's: `sidecar.json`) name. A model's deletion takes the files at
+the location shown (every part, its `.conversion.json` and `.expert-state`) and its configurations; an
+adapter's takes its two files and a sidecar's its `sidecar.json` and direction file, then the folder
+when nothing else is left in it; files a running server uses cannot be deleted.
 
 ## Configure a model
 
@@ -165,7 +188,9 @@ Each model's page edits its launch parameters, the `infernix-serve` options afte
 path. The form and the **Launch parameters** text are two views of the same list: a control changes
 its option in the text, an edit to the text moves the controls, and options without a control are
 kept. The **DFlash2 drafter** and **N-gram volume** pickers (Qwen3.8-Flash-Next) list the compatible
-files found and write `--draft-model` and `--ngram-volume`. The full command line is previewed with
+files found and write `--draft-model` and `--ngram-volume`; the **LoRA adapter** picker (the dense
+27Bs) lists the adapters found, those of the model's base first (another base's is marked, and
+picking it warns), or takes a folder or file elsewhere, and writes `--lora`. The full command line is previewed with
 warnings (an option this `infernix-serve` does not have, a missing file, a Flash-Next model without
 a volume). Every option of the installed `infernix-serve --help` is listed in the reference drawer,
 **All options** (read once per build of `infernix-serve`; a `--help` that fails is run again when
@@ -176,7 +201,7 @@ sets itself (below), in sections that open and close: **Serving**, **Context and
 **Speculative decoding**, **N-gram table** (Qwen3.8-Flash-Next), **Prefix cache** (the Host tier,
 the SSD tier, next-turn prefill), **Offloaded experts** (models that have them), **Thinking and
 tools**, **Requests and clients**, **Sampling overrides**, **Vision**, **Numerical routes and
-speed**, **Logging and diagnostics** and **Environment variables**. A section's badge counts the
+speed**, **Ablation sidecar**, **Logging and diagnostics** and **Environment variables**. A section's badge counts the
 options the configuration sets in it, so a closed section still shows that it holds settings; its
 less common options are under **More options**, which stays open while one of them is set. The
 browser remembers which sections are open. A control appears only for a model it applies to and
@@ -213,14 +238,19 @@ and **Download as .sh** (in the **⋮** menu) write the configuration as a `.bat
 every argument quoted for cmd) or `.sh` that runs `infernix-serve` directly, with its model id.
 
 **Will it fit?** asks the installed `infernix-serve` to size the configuration without loading it
-(`infernix-serve --plan`): the VRAM it would take (weights, KV cache and the context it holds,
-workspace, CUDA graphs, expert cache, headroom), the RAM (experts, pinned prefix cache, n-gram
+(`infernix-serve --plan`): the VRAM it would take (weights, DFlash2's draft screen, the adapters (a LoRA adapter's
+factors, an ablation sidecar's direction), KV cache and the context it holds, workspace (on Qwen3.5 with a cut lane's copy of
+the residual), CUDA graphs, expert cache, headroom), the RAM (experts, pinned prefix cache, n-gram
 table, what stays free), and the largest `--max-context` that fits. A configuration that does not
 fit gets the same suggestions as a failed load ([Watchdog](#watchdog)). The plan reads the GPU as it
 is now, so a loaded model's memory counts against it; unload first to plan for an empty GPU.
 Turning on **Vision** checks at once: the vision tower takes VRAM a 27B's default context was sized
 without, so the default context no longer fits beside it (on a 32 GB GPU the official NVFP4 27B
-fits 177,856 tokens with `--vision` against 222,272 without).
+fits 177,856 tokens with `--vision` against 222,272 without). Setting or changing the **LoRA adapter** checks at
+once too: its factors take VRAM beside the weights (304 MiB for a rank-32 adapter on every projection of a 27B). So
+does setting or changing the **Ablation sidecar**: the plan reads it against the model, so a malformed sidecar or one
+fitted to another geometry is refused here rather than at launch, and its direction (a few KiB) and, on Qwen3.5, the
+cut lanes' copies of the residual are counted.
 
 **Speculative decoding.** **Off** writes `--spec off` when the server lists `off` among its `--spec`
 values (such a server speculates when `--spec` is absent, and the field then shows **Auto**);
@@ -236,7 +266,7 @@ Defaults per family (README "Recommended settings per model"):
 |---|---|
 | all | `--max-concurrency 2 --kv-dtype int8 --preserve-thinking --tolerant-tool-calls --pending-timeout-ms 900000`, and `--spec auto --draft-tokens auto` when a drafter is available |
 | Qwen3.8-Flash-Next | `--max-context 262144 --lm-head-draft`, the best DFlash2 drafter found (`--draft-model`) and n-gram volume (`--ngram-volume`, unless `<artifact>.ngram` exists) |
-| Qwen3.8-27B | `--lm-head-draft --ngram-draft-tokens auto --prefill-chunk 4096`, and the `--max-context` that fits beside the artifact in the GPU's memory (below) |
+| Qwen3.8-27B | `--lm-head-draft --ngram-draft-tokens auto --prefill-chunk 4096 --max-context auto` (the context the GPU's memory holds beside the artifact, below) |
 | Qwen3.6-27B, Qwen3.6-35B-A3B | `--lm-head-draft` where the artifact has a proposal head; the 27B's context as for Qwen3.8-27B |
 | Qwen3.5-122B-A10B | `--max-context 262144` |
 
@@ -244,12 +274,12 @@ No family sets `--host-context-mib`: `infernix-serve`'s default (`auto`) gives t
 the model and its experts leave beyond `--ram-free-mib` ([serving guide](serving.md)).
 
 A 27B keeps all of its KV cache on the GPU, so its context is what the GPU holds beside the
-weights: the launcher reckons 2.03 GB plus 33,792 bytes per token of context (measured with INT8 KV,
-two requests and both draft kinds), the Engine's automatic headroom (256 MiB when NVML reports no
-display on the GPU, else 1 GiB) and 1 GB for the CUDA context and the display, rounded down to
-4,096 tokens and at most 240,000. On a 32 GB RTX 5090 that is 208,896 headless and 188,416 with a
-display for the 23.7 GB official NVFP4 artifact, and 240,000 for artifacts of up to 22.7 GB headless
-(21.9 GB with a display). Raise it with `--vram-headroom-mib 0` when nothing else uses the GPU.
+weights: the launcher sets `--max-context auto`, and the server sizes the context at startup to the
+largest its KV cache holds beside the weights and the automatic headroom (256 MiB when NVML reports no
+display on the GPU, else 1 GiB). Raise it with `--vram-headroom-mib 0` when nothing else uses the
+GPU. Before the model loads, the launcher reports the model's own context for such a configuration
+(at most 262,144 tokens); once it is loaded, the one the server resolved. **Context length**'s
+**Auto** sets it for any model whose experts stay in VRAM; the plan reports what it resolves to.
 
 The launcher sets `--host`, `--port`, `--model-id` (the model id), `--any-model-name`,
 `--log-stats-panel off` and `--log-colours off` itself; they are removed from saved parameters.
@@ -263,11 +293,86 @@ drafter and an n-gram volume (the recommended table preselected). Choose the des
 the folder browser; by default each repository gets its own subfolder. Any other repository can be
 entered by its `owner/name`.
 
+**Discover → LoRA adapters** asks Hugging Face for the PEFT LoRA adapters of a dense 27B base model
+(Qwen3.8-27B or Qwen3.6-27B) whose repository holds `adapter_config.json` and
+`adapter_model.safetensors` at its root, the files [`--lora`](lora.md) reads (GGUF exports and merged
+models are left out): [Harness Hub](https://huggingface.co/harness-hub)'s adapters for agent
+harnesses first (the rank-32 specialists for Pi, OpenCode and Hermes, and the rank-96 super-adapter
+for all three), then the 60 most downloaded, with a search by name. Gated
+ones need a token. **Download** reads the adapter's config first and shows its base model, rank and
+modules (an adapter above rank 128, which `infernix-serve` refuses, is flagged) and selects its two
+files; an adapter always gets a folder of its own, named after the repository, since every
+adapter's files have the same names. Once it is scanned, pick it on a 27B's Configure page; **Will
+it fit?** then asks the server whether it applies it and what it takes.
+
 Downloads run one repository at a time, each file in 64 MiB pieces over several connections
 (**Settings → Downloads**), into `<file>.part`. Pausing, a dropped connection or a launcher restart
 resumes where it stopped (a piece counts as done once it is on the disk). A finished file is checked
 against Hugging Face's hash (an LFS file's SHA-256, else its git blob id) and renamed into place;
 the destination becomes a model folder and is scanned. A Hugging Face token (settings, `HF_TOKEN`, or the `huggingface-cli login` token file) is sent for gated repositories.
+
+## Ablation
+
+**Ablation** makes a refusal-ablation sidecar ([`--ablate`](ablate.md)) for one of the library's models
+on this computer with the fitter in `tools/ablate` ([fitting guide](ablate-fitting.md)). It records the
+model's hidden states on harmful and harmless prompts and computes the direction its activations use to
+refuse. It then searches for the layers and strengths whose cut removes the most refusals while the
+first token on harmless prompts stays close to the stock model's (first-token KL below 0.4 on 40 held-out
+prompts of each list), grades the pick on a test pair the fit never saw and exports it. The page has
+three steps:
+
+1. **The tool.** A release keeps the fitter in the `ablate` folder beside the launcher (`--ablate-tool`
+   names another; a build tree finds `tools/ablate` of the checkout it is in). It needs Python 3.11 or
+   newer with pip: the launcher tries the Pythons the Windows `py` launcher lists, then `python3` and
+   `python` on PATH, runs each and takes the first new enough with pip (a Microsoft Store stub, a removed
+   Python, or Debian's and Ubuntu's Python without its `python3-pip` package is passed over); **Use this
+   Python** names one. When none is found, **Set up** first downloads a portable one: CPython 3.13 from
+   [python-build-standalone](https://github.com/astral-sh/python-build-standalone) (the builds `uv`
+   installs; PSF licence; x86-64 only; a 46 MiB download that unpacks to about 150 MiB on Windows, 73 MiB
+   and about 560 MiB on Linux), one release pinned and
+   checked against its SHA-256, unpacked with the system's `tar` into `ablate-python` beside
+   `infernix-launcher` (whose folder must be writable for it); once there, it is the Python used. Set up
+   then installs the fitter's packages (numpy and optuna, about 40 MB from PyPI) with that Python's pip
+   into `ablation/packages` in the launcher's folder; nothing is installed into the Python itself.
+   Another Python version, or a launcher update that changes the requirements, asks for Set up again.
+2. **Prompt sets.** **Download** fetches a public set from its publishers' pinned files, checks their
+   SHA-256 and converts them to the fitter's lists in `ablation/prompts/<set>`, the publishers'
+   licences shown beside each source. A sidecar records its sets and their licences in its
+   `generation.source`.
+
+   | Set | Fit prompts | Test pair | Licences |
+   |---|---|---|---|
+   | AdvBench + Alpaca (heretic's defaults) | 400 AdvBench behaviors, 400 Alpaca instructions | JBB-Behaviors, harmful and benign | AdvBench, JBB-Behaviors: MIT; Alpaca: CC BY-NC 4.0 (non-commercial use; its README limits it to research) |
+   | HarmBench + Alpaca | 200 HarmBench standard behaviors, 200 Alpaca instructions | JBB-Behaviors, harmful and benign | HarmBench, JBB-Behaviors: MIT; Alpaca: CC BY-NC 4.0 |
+
+   Test prompts that are also fit prompts are dropped from the test pair (11 of JBB's harmful 100 are
+   AdvBench behaviors).
+3. **Make a sidecar.** Choose the model (a configuration: its launch parameters and environment are
+   used as they are, without its own sidecar, since a sidecar is fitted to the model as you run it), the
+   prompt set, the search (**Quick** 150 trials, **Standard** 300, the fitter's default, **Thorough**
+   600) and the sidecar's name, then **Start the run**. The fitter reads the configuration first and
+   refuses one it cannot fit, with its reason, before anything changes.
+
+A run takes the whole GPU. The loaded model is unloaded first, and no model loads until the run ends:
+requests for a model are refused with the reason, and **Load** and the memory plan say so. Each trial
+starts the model twice (a generating engine for the refusals, a scoring one for the KL), so a trial takes
+roughly half a minute to a minute and a half on a large model, and a standard run several hours. The
+page shows the phases, the trials, the stock model's refusals, the best trial so far, an estimate of the
+time left and the fitter's output.
+
+**Stop** asks the fitter to stop its engines (each saves its expert-cache state) and keeps every
+finished trial; **End now**, while it stops, ends it and its engines at once and loses the trial under
+way. Starting the same configuration, prompt set and name again continues the same run folder
+(`ablation/runs/<name>-<hash>`, with its recordings and trials), as **Run again** does after a stop or a
+failure; a changed command line, environment or `infernix-serve` starts a fresh one. The launcher stops
+a run before it exits; a run it could not finish shows as stopped when it starts again.
+
+The pick is the trial with the fewest held-out refusals among those whose KL is below the target, then
+the lowest KL. No sidecar is written when the stock model refuses none of the held-out prompts, no
+trial is below the target, or none refuses fewer than the stock model; the page says which. A sidecar
+goes to `ablation/sidecars/<name>`, which becomes a model folder, so it is listed on **Models** and
+offered first in its model's **Ablation sidecar** field; **Use it with** sets it there. Its test-pair
+results (refusals on both halves, and the KL where the stock model answered) are shown with it.
 
 ## Connect coding tools
 
@@ -282,7 +387,8 @@ OpenAI and Anthropic SDKs. **Endpoints**, at the top of every page, copies eithe
     when the request carries `anthropic-version`; the list's entries again as a top-level `models`,
     which Codex CLI's model-catalog refresh reads;
   - `name` and `description` (family, quantization, context, vision, whether it is loaded);
-  - its context (`--max-context`) as `context_length`, `context_window`, `max_model_len`,
+  - its context (`--max-context`; with `auto`, the loaded server's, else the model's own) as
+    `context_length`, `context_window`, `max_model_len`,
     `max_context_length`, `max_input_tokens` and `meta.n_ctx`, and the default output limit as
     `max_tokens`;
   - whether it is loaded, as `state` (`loaded`, `loading`, `not-loaded`; LM Studio's) and
@@ -303,7 +409,7 @@ OpenAI and Anthropic SDKs. **Endpoints**, at the top of every page, copies eithe
   snippet sets both, and Codex's sets `model_context_window` (Codex otherwise assumes 272K).
 - Generation routes are forwarded unchanged, streaming included: `POST /v1/chat/completions`,
   `/v1/responses`, `/v1/responses/input_tokens`, `/v1/responses/compact`, `/v1/messages`,
-  `/v1/messages/count_tokens` and `/v1/decide`; `GET`/`DELETE /v1/responses/{id}`,
+  `/v1/messages/count_tokens`, `/v1/decide` and `/v1/score`; `GET`/`DELETE /v1/responses/{id}`,
   `GET /v1/responses/{id}/input_items` and `POST /v1/responses/{id}/cancel` go to the loaded model.
   `infernix-serve` refuses compaction (`compaction_not_supported`) and cancellation (it has no
   background Responses), and clients get those answers. The doubled `/v1/v1/...` prefix is accepted
@@ -340,7 +446,10 @@ OpenAI and Anthropic SDKs. **Endpoints**, at the top of every page, copies eithe
   and proxies with idle timeouts do not give up; once the model is ready the server's stream follows
   in the same response. A load that fails, or an error answer from the server, then arrives as one
   error event in the client's protocol (OpenAI `{"error": ...}`, Anthropic `event: error`) instead of
-  an HTTP error status. A non-streaming request receives no bytes until its model is ready.
+  an HTTP error status, as does a whole-body success answer the stream cannot carry
+  (`upstream_not_a_stream`). A non-streaming request receives no bytes until its model is ready, and
+  so does a request to a route that never streams (`count_tokens`, `input_tokens`, `compact`, `decide`,
+  `systemone`, `score`), whatever its `stream` says: it gets the server's own JSON answer and status.
 - **Pooled connections** stay open 6 minutes after a response (advertised as `Keep-Alive:
   timeout=360`, closed 10 s after that), as `infernix-serve`'s `--keep-alive-timeout-sec` default
   ([serving](serving.md)): longer than Bun's 5-minute `fetch` idle timeout, so opencode, whose
@@ -480,8 +589,9 @@ and nothing ends a lock-up, a stall or a load.
 
 For a load that did not fit, the banner lists changes worked out from the server's figures and the
 model's parameters, most effective first: for VRAM, the largest context that fits by the server's
-own plan (`infernix-serve --plan`, run once the failed server's memory is free; the suggestions show
-a second or so after the error), giving up the 1 GiB of VRAM headroom, one request at a time, INT8 KV
+own plan (`infernix-serve --plan`, run once the failed server's memory is free and before the next
+load starts; the suggestions show a second or so after the error, and a plan not done in 20 s leaves
+the estimate), giving up the 1 GiB of VRAM headroom, one request at a time, INT8 KV
 when it was BF16; for RAM, more RAM left free with automatic expert sizing (`--ram-free-mib`,
 `--expert-ram-mib auto`) and a smaller Host prefix cache (`--host-context-mib`); and how much other
 programs hold. **Apply** saves a change into the model's parameters; **Apply and load** also loads it.
@@ -525,7 +635,7 @@ says so.
 | Host, port | `127.0.0.1`, `1234` | listen address (applies after a restart) |
 | API keys | none | named keys; with any, `/v1` needs one ([API keys](#api-keys-and-remote-access)) |
 | Manage from other computers | off | the web UI from other computers; an Admin key once any key exists |
-| CORS | on | browser access headers on every answer (applies after a restart) |
+| CORS | on | browser access headers on every answer: any origin, and `infernix-serve`'s request headers (`Authorization` named, which a wildcard does not cover), `api-key` and the rest (applies after a restart) |
 | llama.cpp endpoints | off | `llama-server`'s router API for llama.cpp providers ([llama.cpp endpoints](#llamacpp-endpoints)) |
 | `infernix-serve` | beside the launcher | the server executable; its `--help` drives the option reference |
 | Server port | automatic | the loopback port of the managed server |
@@ -579,4 +689,7 @@ instead, so the form shows every control.
 and checks the features (configurations, model ids, environment, the memory breakdown, script export
 and import, the fit plan, keep-alive streams, routes and the pin, prompt progress, usage, API keys
 and sign-in, chats, idle unload) and the watchdog, the event log and the request log, and, on Windows, that a launcher
-started on a console without a window still stops its server in order.
+started on a console without a window still stops its server in order. Its `ablation` group runs the
+[Ablation](#ablation) page's backend with `tools/launcher/ablate_stub.py` in place of the fitter (Set up installs a
+local wheel, so no network): the GPU taken from a loaded model and given back, a refused configuration, stop and
+resume, End now with a tool that ignores the stop, and the last run after a restart.

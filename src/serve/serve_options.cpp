@@ -36,6 +36,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--expert-stripe"},
     ServeOptionArity{"--expert-state"},
     ServeOptionArity{"--chat-template"},
+    ServeOptionArity{"--lora"},
     ServeOptionArity{"--claude-code-prompt"},
     ServeOptionArity{"--rope-yarn-factor"},
     ServeOptionArity{"--max-context"},
@@ -54,6 +55,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--use-original-nvfp4-prefill-kernel", false},
     ServeOptionArity{"--reproducible", false},
     ServeOptionArity{"--lossless", false},
+    ServeOptionArity{"--causal-scoring", false},
     ServeOptionArity{"--fast-path", true, true},
     ServeOptionArity{"--no-fast-path", true, true},
     ServeOptionArity{"--expert-a4-activations", false},
@@ -61,6 +63,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--a8-activations", false},
     ServeOptionArity{"--embedding-host", false},
     ServeOptionArity{"--context-cost-presets"},
+    ServeOptionArity{"--ablate"},
     ServeOptionArity{"--log-stats-interval-ms"},
     ServeOptionArity{"--log-colours"},
     ServeOptionArity{"--log-stats-panel"},
@@ -148,6 +151,12 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--log-level"},
     ServeOptionArity{"--plan"},
 };
+
+} // namespace
+
+std::span<const product::ConfigOption> serve_option_arities() noexcept { return kServeOptionArities; }
+
+namespace {
 
 const ServeOptionArity* find_option(std::string_view name) noexcept {
     const auto found =
@@ -303,8 +312,9 @@ std::string serve_usage_text(const char* argv0) {
            "\n"
            "MODEL & CONTEXT\n"
            "  --max-context N|auto       max context tokens per request (default 8192)\n"
-           "                             numeric stays fixed; Gemma4 auto fits resident VRAM\n"
-           "                             less headroom, page aligned, 9216..131072/native;\n"
+           "                             numeric stays fixed; auto sizes resident Qwen3.5\n"
+           "                             to its KV cache. Gemma4 fits resident VRAM less\n"
+           "                             headroom, page aligned, 9216..131072/native and\n"
            "                             needs --kv-capacity auto\n"
            "  --max-concurrency N        max concurrent sequences, 1-8 (default 1)\n"
            "  --prefill-chunk N|auto     positive multiple of 128; auto is Gemma4-only\n"
@@ -335,6 +345,9 @@ std::string serve_usage_text(const char* argv0) {
            "                             request and the artifact alone; text with\n"
            "                             --kv-dtype bf16, no speculation; slower\n"
            "                             (docs/maintainer/lossless-route.md)\n"
+           "  --causal-scoring           start for teacher-forced scoring: POST /v1/score\n"
+           "                             returns per-token log-probabilities and top_k;\n"
+           "                             nothing generates (docs/serving.md)\n"
            "  --fast-path NAME           also run this fast path, qualified or not\n"
            "                             (qualification and timing runs; repeatable)\n"
            "  --no-fast-path NAME        leave this selected fast path out of the default\n"
@@ -344,12 +357,13 @@ std::string serve_usage_text(const char* argv0) {
            "                             the activation scales NVIDIA calibrated for them.\n"
            "                             Changes the output. No other artifact supports it\n"
            "                             (default: 16-bit activations, as NVIDIA serves it)\n"
-           "  --a16-activations          Qwen3.8-Flash-Next artifacts whose routed experts are\n"
-           "                             NVIDIA's W4A4 NVFP4 (Dense8, recipe A): run them with\n"
-           "                             16-bit activations instead of the 4-bit activations\n"
-           "                             the checkpoint specifies. Changes the output; the\n"
-           "                             default follows NVIDIA and is recommended (default:\n"
-           "                             off; other artifacts already run 16-bit)\n"
+           "  --a16-activations          16-bit activations where the checkpoint specifies\n"
+           "                             fewer bits: Qwen3.8-Flash-Next routed experts that are\n"
+           "                             NVIDIA's W4A4 NVFP4 (Dense8, recipe A, NVFP4-QAD and its\n"
+           "                             shared experts), and the NVFP4 (4-bit) and FP8 (8-bit)\n"
+           "                             layers of NVIDIA's NVFP4 Qwen3.8-27B. Changes the\n"
+           "                             output; the default follows NVIDIA and is recommended\n"
+           "                             (default: off; other artifacts already run 16-bit)\n"
            "  --a8-activations           8-bit activations where they measured faster: decode\n"
            "                             and verification calls of GGUF dense projections and\n"
            "                             routed experts (GGUF and NVFP4 W4A16 banks, CPU-served\n"
@@ -358,7 +372,10 @@ std::string serve_usage_text(const char* argv0) {
            "                             projections and those experts (the same codec), a\n"
            "                             groupwise Q4 MLP gate/up (int8 per token) and MXFP8\n"
            "                             dense projections (two E4M3 terms per 32 values).\n"
-           "                             NVIDIA's W4A4 experts (Dense8, recipe A) take the 8-bit\n"
+           "                             The NVFP4 Qwen3.8-27B artifacts: every NVFP4 and FP8 text\n"
+           "                             projection 8-bit at every width (a precision option).\n"
+           "                             NVIDIA's W4A4 experts (Dense8, recipe A, NVFP4-QAD's\n"
+           "                             routed and shared) take the 8-bit\n"
            "                             route in place of their 4-bit one. A GGUF import's BF16\n"
            "                             hyper-connection matrices become 8-bit at load.\n"
            "                             Other calls keep their routes. Approximate: changes\n"
@@ -408,13 +425,19 @@ std::string serve_usage_text(const char* argv0) {
            "                             other name is 404 model_not_found)\n"
            "  --chat-template FILE       replace the artifact frontend chat template at\n"
            "                             startup; must match a template the target accepts\n"
+           "  --lora PATH                apply a LoRA adapter at runtime: a Hugging Face PEFT\n"
+           "                             adapter directory (or its adapter_model.safetensors,\n"
+           "                             adapter_config.json beside it). Every attention and\n"
+           "                             dense MLP projection it targets computes W x + s B(A x)\n"
+           "                             exactly; the artifact is unchanged. Qwen3.5 dense models\n"
+           "                             (the 27Bs); --lossless computes it as PEFT does (docs/lora.md)\n"
            "  --claude-code-prompt as-sent|local\n"
            "                             Anthropic Messages from Claude Code: keep its system\n"
            "                             prompt (as-sent, default) or replace its Claude-\n"
            "                             specific parts with a short local-agent preamble\n"
            "  --ngram-volume FILE        Qwen3.8-Flash-Next n-gram embedding volume: the\n"
-           "                             artifact's, or any FP8, IQ4_NL, BF16 or NVFP4 volume\n"
-           "                             of the table in place of its own\n"
+           "                             artifact's, or any FP8, IQ4_NL, Q8_0, NVFP4, BF16 or\n"
+           "                             BF16 P12 volume of the table in place of its own\n"
            "                             (default: the artifact path + .ngram)\n"
            "  --ngram-residency auto|ram|volume\n"
            "                             where the n-gram table lives: ram reads it all into\n"
@@ -422,15 +445,25 @@ std::string serve_usage_text(const char* argv0) {
            "                             on demand;\n"
            "                             auto (default) takes RAM while every expert still\n"
            "                             fits in RAM beside it\n"
-           "  --expert-state FILE|off    Qwen3.8-Flash-Next expert-cache state: read at\n"
+           "  --expert-state FILE|off    expert cache state (offloaded experts,\n"
+           "                             Qwen3.8-Flash-Next and Qwen3.5-122B): read at\n"
            "                             startup to fill the VRAM expert cache, written at\n"
            "                             stop and every 10 minutes between requests\n"
-           "                             (default: the artifact path + .expert-state)\n"
-           "  --expert-stripe FILE       Qwen3.8-Flash-Next expert stripe on a second drive:\n"
-           "                             the SSD expert tier reads each record's tail from it\n"
-           "                             beside its head in the artifact\n"
+           "                             (default: the artifact path + .expert-state; off:\n"
+           "                             an empty cache, nothing saved)\n"
+           "  --expert-stripe FILE       expert stripe on a second drive (offloaded experts,\n"
+           "                             Qwen3.8-Flash-Next and Qwen3.5-122B): the SSD\n"
+           "                             expert tier reads each record's tail from it beside\n"
+           "                             its head in the artifact\n"
            "  --context-cost-presets F   runtime context-cost preset file (overrides\n"
            "                             matching compiled-in values)\n"
+           "  --ablate FILE              runtime ablation sidecar, Qwen families only\n"
+           "                             (docs/ablate.md): a sidecar.json\n"
+           "                             naming a direction file and per-layer alpha tables;\n"
+           "                             each cut layer removes the direction's component from\n"
+           "                             its attention and/or MLP residual writes. Absent:\n"
+           "                             byte-identical to the standard engine. Not combinable\n"
+           "                             with --lossless; startup-fixed (graphs bake the hooks)\n"
            "  --rope-yarn-factor F       runtime YaRN context extension factor, finite [1,4]\n"
            "                             (default 1); startup-fixed, extends the allowed\n"
            "                             ceiling only, not --max-context\n"
@@ -546,7 +579,7 @@ std::string serve_usage_text(const char* argv0) {
            "                             rewrites the whole file (up to --host-context-mib,\n"
            "                             several GB), so a short interval writes a lot to\n"
            "                             the drive and wears an SSD faster; prefer 15-60\n"
-           "                             minutes\n"
+           "                             minutes (N: 1-525600, a year)\n"
            "  --ssd-context-gib N        an SSD tier of N GiB below the Host pool (default\n"
            "                             0: off). What the Host pool would otherwise lose\n"
            "                             (snapshots and their blocks) is kept in a scratch\n"
@@ -565,9 +598,10 @@ std::string serve_usage_text(const char* argv0) {
            "                             spent, only the snapshots most likely to save the\n"
            "                             most prefill are written. Kept across restarts in\n"
            "                             --ssd-context-dir; unlimited writes everything\n"
-           "  --device-snapshot-slots N  device state snapshot slots (default concurrency\n"
-           "                             + 1; + 2 without a host tier). Qwen3.8-Flash-\n"
-           "                             Next has none\n"
+           "  --device-snapshot-slots N  device state snapshot slots (default 1: their VRAM\n"
+           "                             is KV cache, and snapshots restore from the host\n"
+           "                             tier; concurrency + 2 without a host tier).\n"
+           "                             Qwen3.8-Flash-Next has none\n"
            "  --cache-taps-per-request N new prefill snapshots per request (default 8;\n"
            "                             2 without a host tier)\n"
            "  --cache-tap-ladder N       ladder base in tokens for history snapshots\n"
@@ -773,7 +807,23 @@ const char* reasoning_loop_name(infernix::ReasoningLoopAction action) noexcept {
 
 bool is_loopback_host(std::string_view host) noexcept {
     if (host.size() >= 2 && host.front() == '[' && host.back() == ']') { host = host.substr(1, host.size() - 2); }
-    return host == "localhost" || host == "::1" || host.starts_with("127.");
+    if (host == "localhost" || host == "::1") { return true; }
+    // A dotted quad in 127.0.0.0/8 only: "127.example.com" is a name that may resolve anywhere.
+    if (!host.starts_with("127.")) { return false; }
+    int parts = 0;
+    for (std::size_t at = 0; at <= host.size();) {
+        const std::size_t end = std::min(host.find('.', at), host.size());
+        const std::string_view part = host.substr(at, end - at);
+        if (part.empty() || part.size() > 3 || !std::all_of(part.begin(), part.end(), [](char c) { return c >= '0' && c <= '9'; })) {
+            return false;
+        }
+        int value = 0;
+        for (const char c : part) { value = value * 10 + (c - '0'); }
+        if (value > 255) { return false; }
+        ++parts;
+        at = end + 1;
+    }
+    return parts == 4;
 }
 
 ServeOptions parse_serve_options(int argc, char** argv) {
@@ -818,6 +868,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             return arguments[i].c_str();
         };
         if (find_option(arg) == nullptr) { throw std::invalid_argument("unknown argument: " + arg); }
+        // Split dispatch groups to stay below MSVC's nested-block limit as options grow.
+        bool handled = true;
         if (arg == "--host") {
             options.host = require_value("--host");
         } else if (arg == "--port") {
@@ -843,6 +895,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (options.chat_template_path.empty()) {
                 throw std::invalid_argument("--chat-template must not be empty");
             }
+        } else if (arg == "--lora") {
+            options.lora_path = std::filesystem::path(std::string(require_value("--lora")));
+            if (options.lora_path.empty()) { throw std::invalid_argument("--lora must not be empty"); }
         } else if (arg == "--claude-code-prompt") {
             const std::string_view value = require_value("--claude-code-prompt");
             if (value == "as-sent") {
@@ -905,6 +960,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.fast_paths = false;
         } else if (arg == "--lossless") {
             options.lossless = true;
+        } else if (arg == "--causal-scoring") {
+            options.causal_scoring = true;
         } else if (arg == "--fast-path") {
             const std::string name(require_value("--fast-path"));
             const std::optional<FastPath> path = parse_fast_path(name);
@@ -928,6 +985,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (options.context_cost_presets.empty()) {
                 throw std::invalid_argument("--context-cost-presets must not be empty");
             }
+        } else if (arg == "--ablate") {
+            options.ablate_sidecar_path = require_value("--ablate");
+            if (options.ablate_sidecar_path.empty()) { throw std::invalid_argument("--ablate must not be empty"); }
         } else if (arg == "--log-stats-interval-ms") {
             options.log_stats_interval_ms = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--log-stats-interval-ms"), "log-stats-interval-ms"));
@@ -1004,7 +1064,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             cache_option_flag = "--prefix-cache-file";
         } else if (arg == "--prefix-cache-save-mins") {
             const int minutes = parse_nonnegative_int(require_value("--prefix-cache-save-mins"), "prefix-cache-save-mins");
-            if (minutes == 0) { throw std::invalid_argument("--prefix-cache-save-mins must be positive"); }
+            // At most a year: the Engine adds the interval to a steady_clock time (int64 nanoseconds, ~292 years).
+            if (minutes == 0 || minutes > 525600) {
+                throw std::invalid_argument("--prefix-cache-save-mins must be in [1,525600] (one year)");
+            }
             options.context_cache.hybrid.persistent_save_interval = std::chrono::minutes(minutes);
             cache_option_flag = "--prefix-cache-save-mins";
         } else if (arg == "--no-queue-holds") {
@@ -1152,7 +1215,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 }
                 options.expert_pin_bytes = mib << 20;
             }
-        } else if (arg == "--kv-dtype") {
+        } else {
+            handled = false;
+        }
+        if (handled) { continue; }
+        if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
         } else if (arg == "--gemma4-qk") {
             options.gemma4_qk = parse_gemma4_qk(require_value("--gemma4-qk"));
@@ -1332,7 +1399,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (!kv_capacity_explicit) {
         // The prefix cache turns every Device page no active request holds into block cache,
         // so it sizes the KV pool to free VRAM unless a capacity is given. Without a prefix cache
-        // pages beyond the active requests would sit unused.
+        // pages beyond the active requests would sit unused, unless the context itself takes them
+        // (--max-context auto).
         options.kv_capacity = options.allow_prefix_reuse || options.max_context_auto
                                   ? KvCapacityPolicy::automatic()
                                   : KvCapacityPolicy::explicit_capacity(options.max_context);
@@ -1394,9 +1462,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--port must be in [1,65535]");
     }
     if (options.max_context == 0) { throw std::invalid_argument("--max-context must be positive"); }
-    if (options.max_context_auto && options.kv_capacity.mode != KvCapacityMode::Automatic) {
-        throw std::invalid_argument("--max-context auto requires --kv-capacity auto");
-    }
+    // An automatic context fits the KV capacity by construction.
     if (!options.max_context_auto && options.kv_capacity.mode == KvCapacityMode::Explicit &&
         options.kv_capacity.explicit_tokens < options.max_context) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
@@ -1450,6 +1516,37 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (default_max_tokens_explicit) {
         if (options.default_max_tokens <= 0) {
             throw std::invalid_argument("--default-max-tokens must be positive");
+        }
+    }
+    // Files the server writes are neither the model artifact (a prefix cache save renames its file over its
+    // path; a route trace truncates it) nor one another's (two writers would interleave), as the request log
+    // already checks for itself.
+    {
+        const auto normalized = [](const std::filesystem::path& value) {
+            std::error_code error;
+            std::filesystem::path path = std::filesystem::absolute(value, error);
+            if (error) { path = value; }
+            return path.lexically_normal();
+        };
+        const std::pair<const char*, std::filesystem::path> outputs[] = {
+            {"--prefix-cache-file", options.context_cache.hybrid.persistent_file},
+            {"--route-trace", options.route_trace},
+            {"--log-file", std::filesystem::path(options.log_file)},
+            {"--request-log-jsonl", std::filesystem::path(options.request_log_jsonl)},
+        };
+        const std::filesystem::path artifact = normalized(std::filesystem::path(options.artifact_path));
+        for (std::size_t i = 0; i < std::size(outputs); ++i) {
+            const auto& [flag, value] = outputs[i];
+            if (value.empty()) { continue; }
+            const std::filesystem::path path = normalized(value);
+            if (!options.artifact_path.empty() && path == artifact) {
+                throw std::invalid_argument(std::string(flag) + " names the model artifact");
+            }
+            for (std::size_t j = 0; j < i; ++j) {
+                if (!outputs[j].second.empty() && normalized(outputs[j].second) == path) {
+                    throw std::invalid_argument(std::string(flag) + " names the same file as " + outputs[j].first);
+                }
+            }
         }
     }
     return options;

@@ -15,6 +15,7 @@
 #include "ops/common/math.h"
 #include "ops/common/rowsplit_ring.cuh"
 #include "ops/common/token_slices.h"
+#include "ops/lora/lora_device.cuh"
 
 #include <cuda_bf16.h>
 
@@ -65,8 +66,42 @@ void rowsplit_ring_linear_kernel(const __nv_bfloat16* __restrict__ x, typename F
         return;
     }
 
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        // The term's B rows and U columns into L2 while the ring runs (consumer threads).
+        lora_prefetch_tile(
+            epilogue.lora, BM, [&](int i) { return row0 + i < rows ? row0 + i : rows - 1; }, token_begin + col0,
+            Full ? BN : min(BN, cols - col0), static_cast<int>(threadIdx.x), Tile::THREADS);
+    }
     float acc[MT][NT][4] = {};
     Ring::consume(acc, k_tiles);
+    if constexpr (kLoraEpilogue<Epilogue>) {
+        // --lora: the term on each consumer warp's fragments (canonical chains), before any epilogue form below.
+        const int warp = static_cast<int>(threadIdx.x) >> 5;
+        const int wm = warp / Tile::WARPS_N, wn = warp % Tile::WARPS_N;
+        if constexpr (kLoraStageRank<Epilogue> > kLoraNarrowRank &&
+                      (BM + BN) * (2 * kLoraStageRank<Epilogue> + 16) <= Ring::kBarrierOffset) {
+            // A wide instance: B's rows and U's columns staged in the free ring (every consumer warp busy each pass).
+            // A narrow one reads them from L2: staged, the groupwise 27B's instances took 0.6 % longer at rank 32
+            // (2,048-token prefill, RTX 5090, 2026-11-22).
+            lora_add_rows_tile_staged<BM, BN, Ring::kBarrierOffset>(
+                epilogue.lora, acc, [&](int mm, int i) { return wm * Tile::WM + mm * 16 + i; },
+                [&](int mn, int j) { return wn * Tile::WN + mn * 8 + j; },
+                [&](int i) { return row0 + i < rows ? row0 + i : rows - 1; }, token_begin + col0, token_begin + cols,
+                Ring::storage(), static_cast<int>(threadIdx.x), Tile::THREADS,
+                [] { asm volatile("bar.sync 1, %0;" ::"r"(Tile::THREADS) : "memory"); });
+        } else {
+            lora_add_rows_tile<MT, NT>(
+                epilogue.lora, acc,
+                [&](int mm, int i) {
+                    const int r = row0 + wm * Tile::WM + mm * 16 + i;
+                    return r < rows ? r : rows - 1;
+                },
+                [&](int mn, int j) {
+                    const int t = col0 + wn * Tile::WN + mn * 8 + j;
+                    return t < cols ? token_begin + t : -1;
+                });
+        }
+    }
 
     using Schedule = RowSplitRingSchedule<Ring, Tile>;
     if constexpr (requires {
@@ -122,7 +157,7 @@ void launch_rowsplit_ring_linear(const __nv_bfloat16* x, typename Format::Weight
         const auto launch = [&]<bool Full>() {
             constexpr auto kernel =
                 rowsplit_ring_linear_kernel<Format, Tile, Stages, ProducerWarps, Full, Output, Epilogue>;
-            kernel<<<grid, Ring::kThreads, rowsplit_ring_reserve<kernel, Ring::kSharedBytes>(), stream>>>(
+            kernel<<<grid, Ring::kThreads, reserve_dynamic_shared<kernel, Ring::kSharedBytes>(), stream>>>(
                 x + static_cast<std::int64_t>(offset) * k, weights, output, epilogue, rows, k, count, padded_k, offset);
             CUDA_CHECK(cudaGetLastError());
         };

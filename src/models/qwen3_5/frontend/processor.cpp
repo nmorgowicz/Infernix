@@ -567,22 +567,46 @@ RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<Vision
             source.compare(placeholder.bytes.begin, needle.size(), needle) != 0) {
             throw std::logic_error("rendered media placeholder metadata does not match its text");
         }
-        expanded.append(source, source_cursor, placeholder.bytes.begin - source_cursor);
+        // An image's pad is replaced by its pads. A video's per-frame groups replace the template's whole
+        // <|vision_start|><|video_pad|><|vision_end|>, each group carrying its own pair, as the reference processor
+        // (Qwen3VLProcessor) expands it; replacing the pad alone left an outer pair (two more tokens a video, and
+        // every position after them moved). The layout guarantees the wrapper (prompt_layout.cpp).
+        std::size_t replace_begin = placeholder.bytes.begin;
+        std::size_t replace_end   = placeholder.bytes.end;
+        if (item.modality == Modality::Video) {
+            if (replace_begin < source_cursor + kVisionStart.size() ||
+                source.compare(replace_begin - kVisionStart.size(), kVisionStart.size(), kVisionStart) != 0 ||
+                source.compare(replace_end, kVisionEnd.size(), kVisionEnd) != 0) {
+                throw std::logic_error("rendered video placeholder lacks its vision wrapper");
+            }
+            replace_begin -= kVisionStart.size();
+            replace_end += kVisionEnd.size();
+        }
+        expanded.append(source, source_cursor, replace_begin - source_cursor);
         append_placeholder(expanded, item, index, rendered.media_token_runs);
-        const std::size_t source_end = placeholder.bytes.end;
-        expansions.push_back(PlaceholderExpansion{.source_begin = placeholder.bytes.begin,
-                                                  .source_end   = source_end,
+        expansions.push_back(PlaceholderExpansion{.source_begin = replace_begin,
+                                                  .source_end   = replace_end,
                                                   .rendered_end = expanded.size()});
-        source_cursor = source_end;
+        source_cursor = replace_end;
     }
     expanded.append(source, source_cursor, source.size() - source_cursor);
 
     const auto map_boundary = [&](std::size_t boundary, std::string_view kind) {
         return map_expanded_boundary(boundary, source.size(), expansions, kind);
     };
+    // A literal span edge inside a replaced video wrapper (a template that writes its pieces apart) moves to the
+    // wrapper's edge, so the span covers the whole expansion, which the template's markers alone produce.
+    const auto outside_expansion = [&](std::size_t boundary, bool begin) {
+        for (const PlaceholderExpansion& expansion : expansions) {
+            if (expansion.source_begin < boundary && boundary < expansion.source_end) {
+                return begin ? expansion.source_begin : expansion.source_end;
+            }
+        }
+        return boundary;
+    };
     for (auto& span : rendered.literal_spans) {
-        span.begin = map_boundary(span.begin, "literal span");
-        span.end   = map_boundary(span.end, "literal span");
+        span.begin = map_boundary(outside_expansion(span.begin, true), "literal span");
+        span.end   = map_boundary(outside_expansion(span.end, false), "literal span");
     }
     if (rendered.rewrite_checkpoint) {
         rendered.rewrite_checkpoint->offset =
@@ -738,6 +762,8 @@ std::uint64_t merged_token_image_pixels() {
     return static_cast<std::uint64_t>(kFactor) * kFactor;
 }
 
+std::uint32_t merged_token_image_edge() { return static_cast<std::uint32_t>(kFactor); }
+
 std::uint64_t merged_token_video_pixels() {
     return static_cast<std::uint64_t>(kTemporal) * kFactor * kFactor;
 }
@@ -768,7 +794,7 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
     byte_boundaries.reserve((rendered.rewrite_checkpoint ? 2U : 0U) +
                             rendered.rewrite_execution_boundaries.size() +
                             rendered.message_boundaries.size() + rendered.cache_boundaries.size() +
-                            rendered.media_token_runs.size() * 2U);
+                            rendered.media_token_runs.size() * 2U + rendered.generation_splits.size());
     if (rendered.rewrite_checkpoint) {
         byte_boundaries.push_back(rendered.rewrite_checkpoint->offset);
         byte_boundaries.push_back(rendered.rewrite_checkpoint->recovery_offset);
@@ -785,6 +811,7 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
         byte_boundaries.push_back(run.bytes.begin);
         byte_boundaries.push_back(run.bytes.end);
     }
+    byte_boundaries.insert(byte_boundaries.end(), rendered.generation_splits.begin(), rendered.generation_splits.end());
 
     BoundaryEncodedText tokenized = tokenizer.encode_with_boundaries(
         rendered.text, byte_boundaries, EncodeOptions{.max_tokens = maximum_tokens},
@@ -868,6 +895,14 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
             .item_index  = run.item_index,
             .frame_index = run.frame_index,
         });
+    }
+    // The tokenizer splits at each of them, so each is an exact frontier.
+    encoded.reply_frontiers.reserve(rendered.generation_splits.size());
+    for (std::size_t remaining = rendered.generation_splits.size(); remaining != 0; --remaining) {
+        const TokenBoundaryResult& result = tokenized.boundaries.at(boundary_index++);
+        if (result.exact_frontier) {
+            encoded.reply_frontiers.push_back(to_frontier(*result.exact_frontier, "reply frontier"));
+        }
     }
     if (boundary_index != tokenized.boundaries.size()) {
         throw std::logic_error("rendered token boundary result count changed during encoding");
@@ -997,8 +1032,30 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
 
     std::vector<PendingMedia> pending_items;
     pending_items.reserve(parts.size());
+    // Each pending item's source, to prepare it again when the flight it waited on was abandoned.
+    struct MediaSource {
+        ChatPart* part = nullptr;
+        ChatPartKind kind{};
+        MediaCacheKey key;
+    };
+    std::vector<MediaSource> sources;
+    sources.reserve(parts.size());
     ConcurrentMediaBudget request_budget(options_);
     std::exception_ptr preparation_error;
+    // The builder closes over this request's stack (its policy, budget and worker control): every flight it starts is
+    // awaited below before this function returns, on every path.
+    const auto builder_for = [this, &policy, &request_budget, &worker_control](const MediaSource& source) {
+        return [this, part = source.part, kind = source.kind, digest = source.key.digest, &policy, &request_budget,
+                &worker_control]() {
+            Prepared built = kind == ChatPartKind::Image
+                                 ? prepare_image(part->media.bytes, options_, policy, *media_cache_, request_budget,
+                                                 worker_control)
+                                 : prepare_video(part->media.bytes, options_, policy, *media_cache_, request_budget,
+                                                 worker_control);
+            built.item.content_digest = digest;
+            return PreparedMedia{std::move(built.item), std::move(built.payload)};
+        };
+    };
     const auto media_phase_started = Clock::now();
     for (ChatPart* part : parts) {
         try {
@@ -1006,23 +1063,14 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
             const auto digest =
                 sha256(part->media.bytes, [&control] { check_preparation_control(control); });
             const ChatPartKind kind = part->kind;
-            const MediaCacheKey key{
-                .digest   = digest,
-                .modality = kind == ChatPartKind::Image ? Modality::Image : Modality::Video,
+            const MediaSource source{
+                .part = part,
+                .kind = kind,
+                .key  = MediaCacheKey{.digest   = digest,
+                                      .modality = kind == ChatPartKind::Image ? Modality::Image : Modality::Video},
             };
-            PendingMedia pending = media_cache_->begin_prepare(
-                key, worker_control,
-                [this, part, kind, digest, &policy, &request_budget, &worker_control]() {
-                    Prepared built =
-                        kind == ChatPartKind::Image
-                            ? prepare_image(part->media.bytes, options_, policy, *media_cache_,
-                                            request_budget, worker_control)
-                            : prepare_video(part->media.bytes, options_, policy, *media_cache_,
-                                            request_budget, worker_control);
-                    built.item.content_digest = digest;
-                    return PreparedMedia{std::move(built.item), std::move(built.payload)};
-                });
-            pending_items.push_back(std::move(pending));
+            pending_items.push_back(media_cache_->begin_prepare(source.key, worker_control, builder_for(source)));
+            sources.push_back(source);
         } catch (...) {
             preparation_error = std::current_exception();
             stop_preparation.store(true, std::memory_order_relaxed);
@@ -1031,11 +1079,24 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     }
     MediaCacheRequestStats cache_stats;
     std::size_t patch_cursor = 0;
-    for (PendingMedia& pending : pending_items) {
+    for (std::size_t index = 0; index < pending_items.size(); ++index) {
+        PendingMedia& pending = pending_items[index];
         PreparedMedia media;
         try {
-            media = media_cache_->await(pending, preparation_error ? PreparationControl{} : control,
-                                        cache_stats);
+            for (;;) {
+                try {
+                    media = media_cache_->await(pending, preparation_error ? PreparationControl{} : control,
+                                                cache_stats);
+                    break;
+                } catch (const MediaFlightAbandoned&) {
+                    // Another request's flight failed for that request's own reasons: prepare it under this one's,
+                    // in place, so the drain below waits for the new flight too. Not once this request has failed:
+                    // it only drains then (and the flight may be its own, for media it holds twice).
+                    if (preparation_error) { break; }
+                    pending = media_cache_->begin_prepare(sources[index].key, worker_control,
+                                                          builder_for(sources[index]));
+                }
+            }
         } catch (...) {
             if (!preparation_error) {
                 preparation_error = std::current_exception();
@@ -1106,6 +1167,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     output.rewrite_execution_frontiers = std::move(encoded.rewrite_execution_frontiers);
     output.message_boundaries          = std::move(encoded.message_boundaries);
     output.cache_boundaries            = std::move(encoded.cache_boundaries);
+    output.reply_frontiers             = std::move(encoded.reply_frontiers);
     stats.prompt_tokens                = output.input_ids.size();
     enforce_media_resource_limits(stats, options_);
 

@@ -23,7 +23,9 @@ ownership contracts are defined in [Engine architecture](../docs/maintainer/engi
   causal-scoring evaluation;
 - root `test_*.py` — corpus measurement consumption, and the schema-version agreement between
   what Serve writes and what each Python reader accepts (the per-language consumer tests build
-  their fixtures from their own constant, so only that pin can see a one-sided bump).
+  their fixtures from their own constant, so only that pin can see a one-sided bump);
+- `test_ablate_tools.py` — `tools/ablate` (fitting refusal-ablation sidecars) end to end on CPU,
+  against the fake engine in `ablate_fakes.py`; skipped without the tool's `requirements.txt`.
 
 Tests are grouped by observable risk, not by mirroring every source file or class.
 `CMakeLists.txt` includes explicit registrations from `cmake/`, `artifact/`, `models/qwen3_5/`
@@ -62,7 +64,14 @@ real artifact and holds most of the device and its pinned host memory) gets `RUN
 `ctest -LE real` runs everything else. Tests that need a scratch file name it with
 `unique_temp_path()` (`tests/test_temp_path.h`, the process id in the name), so concurrent runs from
 other build trees or worktrees never share one. Assertions about elapsed time wait for the observed
-event with a generous bound rather than assuming a fixed sleep is enough on a loaded machine.
+event with a generous bound rather than assuming a fixed sleep is enough on a loaded machine; a check
+that two threads or the host and the device met waits on a flag or count the other side sets, never
+on a sleep. A few non-real entries run alone (`RUN_SERIAL`): the idle-latency checks, whose bounds of a
+few milliseconds hold only with the GPU to themselves, and entries whose memory or synchronization
+counts need it, each with its reason beside its registration. The twelve softmax attention entries,
+whose oracles use every host thread, take turns in three resource-lock chains (`tests/ops/tests.cmake`)
+balanced by their times at `-j 8`; together they and the serial entries set the run's length.
+`RUN_SERIAL` orders entries within one `ctest` run only: another program's load still reaches them.
 
 The chat-template reference test uses Python Jinja2.
 
@@ -75,7 +84,7 @@ ctest --test-dir build -R infernix_sampling_test --output-on-failure
 
 The op tests under `tests/ops` link into one executable per family (`infernix_ops_<family>_test`:
 `elementwise`, `recurrent`, `sampling`, `attention`, `projection`, `offloaded_moe`, `lossless`,
-`linear`, `linear_fused`) instead of one each, which saves a link of the Ops library per test. Each
+`linear`, `linear_fused`, `lora`) instead of one each, which saves a link of the Ops library per test. Each
 test keeps its own entry point (`INFERNIX_OP_TEST(name)`, `tests/ops/op_family.h`) and its CTest
 entries and names (`infernix_<name>_test`). The executable runs one test by name with that test's own
 arguments, `infernix_ops_<family>_test <name> [arguments]`, and `--list` names the family's tests.
@@ -90,6 +99,45 @@ INFERNIX_OP_REPORT_STATS=1 \
 Every participating comparison emits one `OP_ERROR_STATS` record containing the stable case label,
 actual error, active limit, and error-to-limit ratio. The switch changes reporting only; the same
 statistics still drive the normal verdict. Passing tests remain quiet without it.
+
+The `lora` family covers `--lora` ([LoRA adapters](../docs/lora.md)). `infernix_lora_mma_position_test`
+checks the hardware assumption the canonical term rests on: a BF16 tensor-core MMA element's result does not depend
+on its position in the fragment or on which operand role carries its inputs. `infernix_lora_test` checks
+`lora_shrink` against an FP64 oracle and its canonical bits (a column's `U` whatever the call's width and schedule),
+then every adapted Op, format and route at the 27B's shapes on zero base weights, where the output is the term
+alone against its FP64 oracle (through the SwiGLU, the residual add and the four-way attention split; an unadapted
+segment must stay exactly zero; rank 128, the wide instances, on every family; ranks 48, 64, 80 and 96 on the routes
+that stage the term's operands in shared memory), that a rank-32 adapter padded with zeros to 128 gives the narrow
+instances' bits through the wide ones on every route, that a column's bits under `A16ColumnInvariant` do not depend
+on the call's width with the term, and that a zero `B` (PEFT's initial adapter) on non-zero weights returns the
+no-adapter call's bits on every route. The fused dense MLP and fused-norm attention tests compare their adapter forms
+bit for bit with the separate Ops, at ranks 32 and 128 (both instance classes). `infernix_lora_test` also checks the
+Gated DeltaNet control's adapted kernel (`gdn_gating_proj` with the terms on `a` and `b` before their gates, ranks 32
+and 128 and an adapter of `a` alone) against an FP64 oracle and its column bits, and `infernix_lora_gdn_test` the
+Gated DeltaNet input projection's term (NVFP4, row-scaled FP8 and the Q4/Q5 pair at the 27B shapes): against the
+no-term call plus the FP64 term at every route and policy, a zero `B`'s bits, `A16ColumnInvariant` column bits, and
+the snapshot and record forms bit for bit against the projection with the term and the convolution over it. On the
+host, `infernix_artifact_peft_lora_test` covers the safetensors reader and PEFT configuration handling (patterns,
+rsLoRA, every refusal) and `infernix_qwen3_5_lora_binding_test` the module binding (the Gated DeltaNet modules
+included), ranks to 128 and its refusals (a rank above 128 by its wording).
+
+`--ablate` ([Ablation sidecars](../docs/ablate.md)): `infernix_direction_cut_test` checks the cut injects (the plain
+lane form and the fused MoE combine) at Flash-Next's shapes and the single-stream cut after a lane's write
+(`residual_delta_cut`) at the Qwen3.5 family's against an FP64 oracle (the latter also against the lane's ideal
+mathematics, with residual elements in the thousands), a column's bits whatever the call's width or the column's
+position, graph replay, that an inactive cut is the plain kernel bit for bit (a negligible one too, for the cut after
+the write) and that the fused combine equals `moe_combine` followed by the cut inject. On the host, `infernix_artifact_ablate_sidecar_test` covers the sidecar reader and every refusal.
+`infernix_qwen4_exp_ablate_real_test` (Flash-Next, the reproducible route) checks that a negligible cut keeps the
+plain run's bits on every cut path, that cuts of the last layer's lanes and of layer 0's move the first-token
+readouts, that a strong cut's decode agrees with its own prefill, and that a cut prompt reads the same bits at two
+prefill chunks of one grid. `infernix_qwen3_5_ablate_real_test` (with its `_moe_` and `_offloaded_` entries: the 27B,
+the 35B-A3B and the 122B-A10B, the reproducible route) checks the sidecar's layer range, that a negligible cut on
+every lane keeps the plain run's bits (readouts and greedy tokens), that single-lane cuts of the last and first layers
+move the readouts, the decode path's cut, that a strong cut keeps its bits across repeats, on two lanes and under each
+drafter (with drafts accepted), CausalScoring with a sidecar, and (with `INFERNIX_TEST_LORA` on the 27B) that a
+negligible cut keeps an adapter run's bits. `infernix_http_scoring_routes_test` covers a `--causal-scoring`
+server's routes over loopback HTTP (generation refused, `/v1/score` answered) and `infernix_score_schema_test` the
+`/v1/score` request and response.
 
 `infernix_softmax_attention_test --causal-only` runs both D256 geometries and all five KV types;
 `--kv-dtype bf16|int8|fp8|nvfp4|k8v4` selects the same complete causal suite for one type, and
@@ -250,6 +298,9 @@ The Python suites exercise conversion, encoded output and measurement tools with
 The maintained environment uses Python 3.11 with the dependencies for those suites. C++ binding and Engine tests
 cover consumption of their resulting representation.
 
+The launcher's web UI checks its pure helpers (duration formatting, the routes' wildcard rule, repository
+links) with `npm test` in `apps/launcher/web`, after `npm ci` there; no browser is needed.
+
 The real loading test accepts an explicit artifact path and optional component selection:
 
 ```bash
@@ -314,13 +365,29 @@ after the request published prefix-cache entries (the entries are withdrawn, als
 file), and `infernix_qwen4_exp_vision_lend_real_test` (an artifact with the vision tower) limits the
 expert frames a Vision window may be lent (the image request waits or is refused alone with
 `media_budget_exceeded`). The hybrid prefix test's `nonfinite-withdraw` scenario
-(`INFERNIX_HYBRID_REAL_SCENARIO`) checks the withdrawal on Qwen3.5.
+(`INFERNIX_HYBRID_REAL_SCENARIO`) checks the withdrawal on Qwen3.5, and its `pair-window`,
+`pair-window-dflash2` and `pair-window-mtp` scenarios compare a chat turn whose opener tap is taken inside
+its last pass with the cut one (the testing seam `set_pair_windows`), then sweep device-memory faults over
+paired turns, and `pair-window-restore` pairs a turn while its resume is still restoring from the Host
+(hybrid spec §7.10).
 `infernix_qwen4_exp_memory_exhausted_real_test` and `infernix_qwen3_5_memory_exhausted_real_test` (the
 dense `INFERNIX_TEST_ARTIFACT`) make the N-th CUDA call of the Engine's work report no device memory, over a
 sweep of N from binding through prefill into decode (`tests/memory_exhausted_recovery.h`): the request in
 flight fails with the retryable out-of-memory error, or completes with its reference tokens; the next
 request and a prefix-cached extension of the failed one return their cold tokens; a queued request
-completes; and eight failures in a row stop the Engine.
+completes; and eight failures in a row stop the Engine. After each swept failure no cached block stays
+pinned and no Device state slot is left reserved. `INFERNIX_TEST_OOM_SWEEP_STRIDE=S` adds every S-th count
+up to 4181 to the sweep (28: 166 counts, about 5 minutes on the NVFP4 27B and 15 on FP4-Local).
+`infernix_qwen4_exp_wide_plan_real_test` (scenarios: the expert banks, the SSD tier, MTP, DFlash2 with
+`INFERNIX_QWEN4_DFLASH2` naming the drafter, two lanes, causal scoring, `--a8-activations`, the packed BF16
+KV cache, a chat prompt's pair call, `--reproducible`, every other KV storage, a 48K prompt's 32,768-column
+MoE group, and a walk whose chunks a structural tap cuts below the prefill chunk) and
+`infernix_qwen4_exp_wide_plan_a4_real_test` (the expert-A4 routes, which only FP4-Local's W4A16 banks take)
+record every prefill call that runs in the wide workspace lent from the expert frames
+(`testing::record_wide_scopes`) and print its arena, the forward's plan for it (`Forward::plan_run` and its
+siblings, which sizes the arena) and its peak; a scope without a plan, given less than it, or peaking past
+it fails. An entry runs its scenarios one after another in one process (the executable takes any list of
+them), each with its own verdict line, and a failed scenario does not stop the rest.
 
 These tests start their Engines on one `EngineHost` per process (`tests/models/qwen4_exp/engine_host.h`).
 Each start after the first takes the SSD expert tier's page-locked slots, and the expert records the
@@ -377,7 +444,16 @@ INFERNIX_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
 ```
 
 `infernix_qwen3_5_native_transactions_test` also pauses a request before its first prefill chunk (an empty
-replay must be granted and complete at once). `infernix_serve_shutdown_real_test` starts `infernix-serve` and
+replay must be granted and complete at once), and runs the prefix cache's pause lifecycle on a Device-only
+cache: decode, prefill and long-prompt prefill pauses whose resumes must recompute exactly the tokens
+`pause_replay_tokens` predicted (none where the pause publishes the lane's state; with `dflash2` the long
+prompt's pause replays from its deepest tap, YE-01), a resume binding cancelled while its restore is staged
+and then resumed again, shutdown cleanup during a staged resume, each leaving no Device-pinned block, the
+tap retry (with every Device snapshot slot held the long prompt's first planned tap is skipped; once they
+return, the next boundary must take it, one skip and one retry counted, and a prompt departing past it must
+resume there), and the prompt-end tap: a prompt marked with its reply's first id as unechoed (`prompt_end_tap_token`) must leave
+a snapshot at its end that a prompt departing there resumes from, and a control marked with another id must
+not. `infernix_serve_shutdown_real_test` starts `infernix-serve` and
 stops it (Ctrl+Break on Windows, SIGTERM elsewhere) while a client streams: the stream must end with an error
 event, the prefix cache file must be saved and the process must exit 0 within 30 s.
 
@@ -396,13 +472,24 @@ endpoint, the mean log-probability difference stays within max(0.5, 4 x) (Qwen3.
 (Qwen4Exp) that of a resume from a prefill-made state. A stale state measured 3.99; the NVFP4 27B's
 decode-computed states differ from prefill-made ones by up to 0.185 over ten texts, since its prompt path
 takes 4-bit activations and its decode path 16 (the test's comment has the measurements). The Qwen4Exp entry runs DFlash2 only with `INFERNIX_QWEN4_DFLASH2`.
+Run directly, these entries and the startup-capture one need their arguments: with none they fail (exit 2), and
+when every named case is skipped they report a skip (77), never a pass with nothing checked.
 
-`infernix_qwen4_exp_startup_capture_real_test` (arguments `plain mtp dflash2`; TEMPORARY with
-`INFERNIX_TMP_STARTUP_CAPTURE`, Flash-Next design §19.3.37) runs two prompts, alone and then together, through an
+`infernix_qwen4_exp_startup_capture_real_test` (arguments `plain mtp dflash2`; Flash-Next design §19.3.37; the
+first-use Engine turns startup capture off through `testing::set_startup_capture`) runs two prompts, alone and then together, through an
 Engine that captures each CUDA graph at its first use and one that captures the graph set at startup: on the
 reproducible route the ids must be equal; on both routes no graph may be captured after the startup capture. It
 prints each Engine's construction time and free VRAM. It reads `INFERNIX_QWEN4_ARTIFACT`, `INFERNIX_QWEN4_NGRAM`,
 `INFERNIX_QWEN4_DFLASH2` (dflash2 skips without it) and `INFERNIX_QWEN4_KV`.
+
+`infernix_qwen4_exp_fork_route_real_test` (arguments `mtp dflash2`) starts an Engine per drafter with seven drafts and
+two lanes on the default expert layout and runs a code prompt alone and two together: at every width every decode or
+verification expert call of at most eight columns that has the fork route's side stream must take it (its jobs within
+the staging slots), and an eight-column call must have. It prints the counts per width. The rule needs every routed
+expert in RAM or VRAM: a drafter whose start was short of RAM (the rest read from the artifact, 64 staging slots by
+design) is skipped and reported, so give it the RAM of an exclusive-layout start (about 60 GiB free). It reads
+`INFERNIX_QWEN4_ARTIFACT`, `INFERNIX_QWEN4_NGRAM` and `INFERNIX_QWEN4_DFLASH2` (dflash2 skips without it); run it on
+a shared-bank artifact (NVFP4-QAD) and a dense-shared one.
 
 The entries above compare requests inside one Engine. `tools/reproducible_digest.py` compares two processes: it
 starts `infernix-serve --reproducible` twice with launch arguments of your choice (`--a`, `--b`: fewer expert frames
@@ -438,7 +525,10 @@ test (skipped without it, and for a tokenizer.json of another size).
 as history renders as the prompt's ids then the ids the model generated, so its endpoint serves the next
 turn: through the real Frontend and the maintained Qwen3.8 and Qwen3.6 templates, an empty reasoning's
 `<think>` "\n" plus the model's "\n" `</think>` stay 198 198 (one encoding of the whole text would make them
-271), a reply with reasoning and a thinking-off answer render as generated too.
+271), a reply with reasoning and a thinking-off answer render as generated too, and each history's latest
+reply frontier (where that reply's generated ids begin) is its generation prompt's end; a reasoning closed at
+once (`</think>` straight after the prompt) departs from its endpoint exactly there, and a prompt that opens
+the reasoning marks `</think>` as the first id the template will not echo (a thinking-off prompt marks none).
 
 The agent entry checks multi-turn continuation and branching. The preemption entry exercises
 Replay recovery and cancellation while paused or replaying; `INFERNIX_PREEMPTION_REAL_SCENARIO`
@@ -446,7 +536,11 @@ selects `all`, `replay`, `cancel-paused`, `cancel-replay`, `cache-replay` (the p
 each resume binding from a snapshot of its own prompt; skipped by `all` under a test constraint),
 `fairness` or `cache-fairness` (two long generations in one context of KV: bounded service turns
 must give each at least two recoveries with new output before either ends, and a short request
-submitted under pressure keeps its queue deadline). Native transaction tests cover pause and
+submitted under pressure keeps its queue deadline), or `conversations` (two greedy three-turn
+conversations that do not fit the 4,096-token pool together: the turns must pause each other at least
+once, every later turn must resume from its previous turn's whole context less one block, and on `none`
+and `mtp` Replay may recompute at most one prefill chunk per pause; skipped by `all` under a test
+constraint). Native transaction tests cover pause and
 Replay with the exact ledger splits, grammar-row failure and replayed sampling counts; their
 positional backend is `none`, `mtp`, `dflash` or `dflash2`. Each backend requires an artifact containing that component.
 Public-HTTP latency and output gaps are measured separately by the

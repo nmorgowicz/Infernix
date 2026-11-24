@@ -21,6 +21,11 @@
 //                Engine 2 loads the file and resumes turn 2 from it, generating what Engine 1 did.
 //                Between the turns, Engine 1's periodic save writes the file once and, with the Host
 //                tier unchanged, not again.
+//   restore fault (plain mode, own Engines) An activation fails with its Host restore staged
+//                (testing::set_restore_fault): later resumes restore from the Host tier again, the stop saves
+//                the Host tier and a restart restores it.
+//   write-through (plain mode, own Engine) The blocks below a tap are written to the Host tier when the tap is
+//                taken (testing::tap_block_writes), the rest at the lane's finish.
 //   one context  (MTP mode, own Engine with kv_capacity = max_context) A recomputed cached prefix
 //                replaces the cached copies instead of pinning them beside its pages: the request
 //                completes, equals its cold run, and the Engine keeps serving.
@@ -39,13 +44,17 @@
 //   SSD scale    (--ssd-scale only: timing) A 100K-token conversation resumed from the Host tier and, once
 //                pushed out of it, from the SSD tier (INFERNIX_TEST_SSD_DIR): times to first token.
 //
-//   infernix_qwen4_exp_prefix_cache_real_test [--mtp] [--plain] [--next-turn] [--ssd] [--ssd-scale]
+//   small tier   (own Engine) A Host tier smaller than one conversation's blocks and image: every turn still resumes
+//                past the previous turn's prompt (issue #77).
+//
+//   infernix_qwen4_exp_prefix_cache_real_test [--mtp] [--plain] [--next-turn] [--ssd] [--ssd-scale] [--small-tier]
 //   (default: all but --ssd-scale)
 
 #include "test_temp_path.h"
 #include "kv_cache_storage.h"
 #include "engine_host.h"
 #include "infernix/engine.h"
+#include "models/qwen4_exp/program/prefix/test_taps.h"
 
 #include <algorithm>
 #include <chrono>
@@ -390,6 +399,129 @@ int run_persistence(const char* artifact, const char* ngram) {
     return failures;
 }
 
+// Continuous write-through: a lane's blocks below a tap go to the Host tier when the tap is taken, and its release
+// writes only the blocks past its last tap. A is 1,500 tokens at chunk 512, so its one tap is the prompt tail's at
+// 1,024 (where B, which leaves A at 1,400, resumes): 16 blocks are written at the tap and the other 7 of A's 23
+// (1,500 prompt tokens and 8 outputs) at its finish.
+int run_write_through(const char* artifact, const char* ngram) {
+    std::printf("== continuous write-through\n");
+    namespace hooks = infernix::models::qwen4_exp::testing;
+    infernix::Engine engine(base_options(artifact, ngram), infernix::test::engine_host());
+    const std::vector<infernix::TokenId> a = synthetic_tokens(1500, 81);
+    std::vector<infernix::TokenId> b(a.begin(), a.begin() + 1400);
+    const std::vector<infernix::TokenId> suffix = synthetic_tokens(300, 82);
+    b.insert(b.end(), suffix.begin(), suffix.end());
+    const std::uint64_t taps_before      = hooks::tap_block_writes();
+    const infernix::RuntimeStats before  = engine.runtime_stats();
+    (void)generate(engine, a, 8, true);
+    // The release's writes are enqueued in A's finish, but the Engine publishes its RuntimeStats after the cycle's
+    // completions, so a read as soon as the result arrives can still see the cycle before: polled up to 2 s.
+    std::uint64_t written = 0;
+    for (int i = 0; i < 200; ++i) {
+        written = engine.runtime_stats().hybrid_host_block_writes - before.hybrid_host_block_writes;
+        if (written >= (1500 + 8) / 64) { break; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    const std::uint64_t at_taps = hooks::tap_block_writes() - taps_before;
+    const Run resumed                    = generate(engine, b, 8, true);
+    std::printf("        %llu blocks written at taps, %llu in all; B resumed at %u\n",
+                static_cast<unsigned long long>(at_taps), static_cast<unsigned long long>(written), resumed.reused);
+    int failures = 0;
+    failures += check(resumed.reused != 0 && resumed.reused % 64 == 0, "B resumes at A's tap, on a block boundary");
+    failures += check(at_taps == resumed.reused / 64,
+                      "the blocks below the last tap were written when it was taken (" + std::to_string(at_taps) +
+                          " of " + std::to_string(resumed.reused / 64) + ")");
+    failures += check(written == (1500 + 8) / 64 && written > at_taps,
+                      "the release wrote only the blocks past the tap (" + std::to_string(written - at_taps) + " of " +
+                          std::to_string(written) + ")");
+    return failures;
+}
+
+// A Host tier smaller than one conversation's blocks and image (issue #77): a turn's write-through used to evict the
+// snapshot its next turn resumes from, and that turn prefilled from the root. Each turn must resume past the whole of
+// the previous turn's prompt, whichever copy of its blocks is left.
+int run_small_host_tier(const char* artifact, const char* ngram) {
+    std::printf("== Host tier smaller than a conversation\n");
+    infernix::EngineOptions options = base_options(artifact, ngram);
+    options.max_context             = 16384;
+    options.kv_capacity             = infernix::KvCapacityPolicy::explicit_capacity(16384);
+    // 336 INT8 slabs: two tailed images take 250, which leaves 86 for the first prompt's 125 blocks.
+    options.context_cache.host_capacity_bytes = 300ULL << 20;
+    infernix::Engine engine(options, infernix::test::engine_host());
+    std::vector<infernix::TokenId> history = synthetic_tokens(8000, 91);
+    int failures                           = 0;
+    for (std::uint32_t turn = 0; turn < 6; ++turn) {
+        const auto prompt_tokens = static_cast<std::uint32_t>(history.size());
+        const Run run            = generate(engine, history, 8, true);
+        std::printf("        turn %u: prompt %u, resumed at %u\n", turn, prompt_tokens, run.reused);
+        // The cold turn's ladder taps fill this tier, so its endpoint may find no room and turn 1 resumes at its last
+        // tap, within a prefill chunk of the end. From then on each turn resumes at the previous turn's end.
+        if (turn != 0) {
+            failures += check(run.reused + (turn == 1 ? kChunk : 200U) >= prompt_tokens,
+                              "turn " + std::to_string(turn) + " resumes at the previous turn's end");
+        }
+        history.insert(history.end(), run.tokens.begin(), run.tokens.end());
+        const std::vector<infernix::TokenId> next = synthetic_tokens(150, 92 + turn);
+        history.insert(history.end(), next.begin(), next.end());
+    }
+    return failures;
+}
+
+// A failed activation (review 2026-11-14, D1): a device error while a resume's Host restore is staged left the
+// restore batch open, so every later resume that needed a restore failed ("a restore is already open") and the stop's
+// save refused, until a restart. testing::set_restore_fault fails the next activation at that point. Afterwards the
+// Engine must serve the same resume from a Host restore again, and the stop must save a file a restart restores.
+int run_restore_fault(const char* artifact, const char* ngram) {
+    std::printf("== restore fault (a failed activation)\n");
+    namespace hooks = infernix::models::qwen4_exp::testing;
+    const std::filesystem::path file = infernix::test::unique_temp_path("infernix_qwen4_exp_fault.cache");
+    std::error_code ignored;
+    std::filesystem::remove(file, ignored);
+    infernix::EngineOptions options             = base_options(artifact, ngram);
+    options.context_cache.hybrid.persistent_file     = file;
+    options.context_cache.hybrid.persistent_identity = "fault";
+    const std::vector<infernix::TokenId> a = synthetic_tokens(1500, 71);
+    std::vector<infernix::TokenId> b(a.begin(), a.begin() + 1400);
+    const std::vector<infernix::TokenId> suffix = synthetic_tokens(300, 72);
+    b.insert(b.end(), suffix.begin(), suffix.end());
+    const std::vector<infernix::TokenId> pressure = synthetic_tokens(3900, 73);
+    int failures = 0;
+    {
+        infernix::Engine engine(options, infernix::test::engine_host());
+        // A leaves its taps and blocks; the pressure prompt takes the lane's slot and the Device pages, so B's
+        // resume restores its image (and blocks) from the Host tier.
+        (void)generate(engine, a, 8, true);
+        (void)generate(engine, pressure, 1, true);
+        hooks::set_restore_fault();
+        try {
+            const Run failed = generate(engine, b, 16, true);
+            std::printf("        the faulted request was served from %u reused tokens\n", failed.reused);
+        } catch (const std::exception& error) {
+            std::printf("        the faulted request failed: %s\n", error.what());
+        }
+        failures += check(!hooks::take_restore_fault(), "the resume staged a Host restore and met the fault");
+        // The cache was emptied with the failed binding: the same sequence fills it and resumes again.
+        (void)generate(engine, a, 8, true);
+        (void)generate(engine, pressure, 1, true);
+        const infernix::RuntimeStats before = engine.runtime_stats();
+        const Run resumed                   = generate(engine, b, 16, true);
+        const infernix::RuntimeStats after  = engine.runtime_stats();
+        failures += check(resumed.reused > 0 && resumed.tokens.size() == 16,
+                          "after the fault a resume is served (reused " + std::to_string(resumed.reused) + ")");
+        failures += check(after.hybrid_host_image_restores > before.hybrid_host_image_restores,
+                          "after the fault a Host restore is staged and lands");
+    } // the stop saves the Host tier: it refuses while a restore batch is open
+    failures += check(std::filesystem::exists(file), "the stop saved the Host tier after the fault");
+    {
+        infernix::Engine engine(options, infernix::test::engine_host());
+        const infernix::LoadSummary::PrefixCacheRestore restore = engine.load_summary().prefix_cache;
+        failures += check(restore.restored && restore.snapshots > 0,
+                          "a restart restores the saved snapshots (" + restore.message + ")");
+    }
+    std::filesystem::remove(file, ignored);
+    return failures;
+}
+
 // The identical burst (candidates §15 NN-08; NInfer #414, root cause by oldfencetried on 2026-10-25: the worker
 // reserves resident permits before fresh admission, so an exact hit could pin a resident writer's partial tail
 // page while that writer still held its permit, its next write became a copy-on-write beyond its reservation,
@@ -593,13 +725,28 @@ int run_next_turn(const char* artifact, const char* ngram, bool reproducible) {
 
 } // namespace
 
-// The SSD tier's directory: INFERNIX_TEST_SSD_DIR (a drive to measure), else a temporary one.
-std::filesystem::path ssd_directory() {
-    if (const char* dir = std::getenv("INFERNIX_TEST_SSD_DIR"); dir != nullptr && *dir != '\0') { return dir; }
-    std::filesystem::path dir = infernix::test::unique_temp_path("qwen4_ssd_tier");
-    std::filesystem::create_directories(dir);
-    return dir;
-}
+// The SSD tier's directory: INFERNIX_TEST_SSD_DIR (a drive to measure), else a temporary one, which goes when the
+// scenario ends (declared before its Engines, it is destroyed after their stops).
+struct SsdDirectory {
+    std::filesystem::path path;
+    bool temporary = false;
+
+    SsdDirectory() {
+        if (const char* dir = std::getenv("INFERNIX_TEST_SSD_DIR"); dir != nullptr && *dir != '\0') {
+            path = dir;
+            return;
+        }
+        path      = infernix::test::unique_temp_path("qwen4_ssd_tier");
+        temporary = true;
+        std::filesystem::create_directories(path);
+    }
+    ~SsdDirectory() {
+        std::error_code ignored;
+        if (temporary) { std::filesystem::remove_all(path, ignored); }
+    }
+    SsdDirectory(const SsdDirectory&)            = delete;
+    SsdDirectory& operator=(const SsdDirectory&) = delete;
+};
 
 void print_ssd(const infernix::RuntimeStats& s) {
     std::printf("        SSD tier: %.1f MB written (%llu images, %llu blocks), %.1f MB read in %llu promotions, "
@@ -655,7 +802,8 @@ int run_ssd_tier(const char* artifact, const char* ngram, const char* drafter = 
         t3.insert(t3.end(), third.begin(), third.end());
         resident3 = generate(reference, t3, 32, true);
     }
-    const std::filesystem::path directory = ssd_directory();
+    const SsdDirectory ssd;
+    const std::filesystem::path& directory = ssd.path;
     // A prefix cache file keeps the SSD tier across the restart at the end (spec §5.5, candidates YK-02).
     const std::filesystem::path file =
         infernix::test::unique_temp_path(drafter != nullptr ? "infernix_qwen4_exp_ssd_dflash2.cache" : "infernix_qwen4_exp_ssd.cache");
@@ -727,7 +875,8 @@ int run_ssd_tier(const char* artifact, const char* ngram, const char* drafter = 
     // The restart: a new Engine on the same file and SSD directory takes the SSD copies back unread, and
     // turn 3 resumes at turn 2's endpoint from them.
     const auto endpoint2 = static_cast<std::uint32_t>(t2.size() + restored.tokens.size() - 1U);
-    infernix::Engine restarted(ssd_options(), infernix::test::engine_host());
+    first.emplace(ssd_options(), infernix::test::engine_host());
+    infernix::Engine& restarted = *first;
     const infernix::LoadSummary::PrefixCacheRestore restore = restarted.load_summary().prefix_cache;
     std::printf("        restart: restored %llu blocks and %llu snapshots, %llu and %llu of them on the SSD tier (%s%s)\n",
                 static_cast<unsigned long long>(restore.blocks), static_cast<unsigned long long>(restore.snapshots),
@@ -743,6 +892,10 @@ int run_ssd_tier(const char* artifact, const char* ngram, const char* drafter = 
     failures += check(third.tokens == resident3.tokens, "turn 3 after the restart equals the lane-resident resume (" +
                                                      first_difference(third.tokens, resident3.tokens) + ")");
     failures += check(restarted.runtime_stats().hybrid_ssd_failures == 0, "no SSD transfer failed after the restart");
+    // The stop saves the file again, so it goes after the Engine.
+    first.reset();
+    std::filesystem::remove(file, ignored);
+    failures += check(!std::filesystem::exists(file), "the prefix cache file is not left in the temp directory");
     return failures;
 }
 
@@ -755,7 +908,8 @@ int run_ssd_tier(const char* artifact, const char* ngram, const char* drafter = 
 int run_ssd_scale(const char* artifact, const char* ngram) {
     constexpr std::uint32_t kContext = 100'000;
     std::printf("== SSD tier at scale (%u-token conversations, Host tier 4 GiB, SSD tier 16 GiB)\n", kContext);
-    const std::filesystem::path directory = ssd_directory();
+    const SsdDirectory ssd;
+    const std::filesystem::path& directory = ssd.path;
     std::printf("        SSD directory %s\n", directory.string().c_str());
     infernix::EngineOptions options = base_options(artifact, ngram);
     options.max_context             = kContext + 1024;
@@ -834,17 +988,19 @@ int main(int argc, char** argv) {
         return 77;
     }
     const char* ngram = std::getenv("INFERNIX_QWEN4_NGRAM");
-    bool plain = true, mtp = true, next_turn = true, ssd = true, ssd_scale = false;
+    bool plain = true, mtp = true, next_turn = true, ssd = true, ssd_scale = false, small_tier = true;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
-        if (arg == "--mtp") { plain = false; next_turn = false; ssd = false; }
-        if (arg == "--plain") { mtp = false; next_turn = false; ssd = false; }
-        if (arg == "--next-turn") { plain = false; mtp = false; ssd = false; }
-        if (arg == "--ssd") { plain = false; mtp = false; next_turn = false; }
-        if (arg == "--ssd-scale") { plain = false; mtp = false; next_turn = false; ssd = false; ssd_scale = true; }
+        if (arg == "--mtp") { plain = false; next_turn = false; ssd = false; small_tier = false; }
+        if (arg == "--plain") { mtp = false; next_turn = false; ssd = false; small_tier = false; }
+        if (arg == "--next-turn") { plain = false; mtp = false; ssd = false; small_tier = false; }
+        if (arg == "--ssd") { plain = false; mtp = false; next_turn = false; small_tier = false; }
+        if (arg == "--ssd-scale") { plain = false; mtp = false; next_turn = false; ssd = false; small_tier = false; ssd_scale = true; }
+        if (arg == "--small-tier") { plain = false; mtp = false; next_turn = false; ssd = false; }
     }
     try {
         int failures = 0;
+        if (small_tier) { failures += run_small_host_tier(artifact, ngram); }
         if (ssd) { failures += run_ssd_tier(artifact, ngram); }
         if (const char* drafter = std::getenv("INFERNIX_QWEN4_DFLASH2"); ssd && drafter != nullptr) {
             failures += run_ssd_tier(artifact, ngram, drafter);
@@ -855,6 +1011,8 @@ int main(int argc, char** argv) {
         if (mtp) { failures += run_one_context(artifact, ngram); }
         if (mtp) { failures += run_identical_burst(artifact, ngram); }
         if (plain) { failures += run_persistence(artifact, ngram); }
+        if (plain) { failures += run_restore_fault(artifact, ngram); }
+        if (plain) { failures += run_write_through(artifact, ngram); }
         if (next_turn) {
             failures += run_next_turn(artifact, ngram, false);
             failures += run_next_turn(artifact, ngram, true);

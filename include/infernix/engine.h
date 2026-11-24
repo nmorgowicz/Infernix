@@ -194,10 +194,14 @@ public:
     // The device's memory now (the serving telemetry's `memory.device`): any thread, cheap enough to poll each second.
     [[nodiscard]] DeviceMemoryReading device_memory() const;
     [[nodiscard]] RuntimeStats runtime_stats() const;
+    // Each request the Engine holds, published with runtime_stats (the serving monitor).
+    [[nodiscard]] RequestMonitor request_monitor() const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     // Which instruction positions the active chat template renders; prompt preparation lowers an
     // instruction turn that arrived in an unsupported position to a role the template does render.
     [[nodiscard]] ChatTemplateRoleSupport chat_template_role_support() const;
+    // How Vision sizes an image (all zero without vision), for a caller that renders images itself.
+    [[nodiscard]] VisionImageBudget vision_image_budget() const;
     [[nodiscard]] bool is_available() const;
     // True once an execution failure has ended every request: the Engine refuses new work until
     // the process starts a new one. An orderly stop() is not a failure.

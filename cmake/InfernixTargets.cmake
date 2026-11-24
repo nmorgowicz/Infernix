@@ -10,14 +10,14 @@ function(infernix_cuda_archive target)
   set_target_properties(${target} PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-  target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+  target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${INFERNIX_CUDA_LINEINFO_FLAG}>)
 endfunction()
 
 function(infernix_cuda_non_rdc_archive target)
   set_target_properties(${target} PROPERTIES
     CUDA_SEPARABLE_COMPILATION OFF
     CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
-  target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+  target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${INFERNIX_CUDA_LINEINFO_FLAG}>)
 endfunction()
 
 # Runtime DLL staging for the apps and tests.
@@ -41,6 +41,10 @@ function(infernix_runtime_dll_list out_var)
       file(GLOB _infernix_dlls "${FFMPEG_VCPKG_TREE}/bin/${_infernix_dll_glob}")
       list(APPEND _list ${_infernix_dlls})
     endforeach()
+    # pdfium.dll comes from its own tree (cmake/Dependencies.cmake).
+    if(INFERNIX_HAVE_PDFIUM AND PDFium_LIBRARY)
+      list(APPEND _list "${PDFium_LIBRARY}")
+    endif()
     list(REMOVE_DUPLICATES _list)
   endif()
   # cuBLAS (the Gemma FP8 row GEMM): the DLLs of the toolkit this tree was configured with, never PATH's.

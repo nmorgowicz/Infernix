@@ -1,6 +1,7 @@
 #include "serve/http_server.h"
 
 #include "serve/anthropic_messages.h"
+#include "serve/http_stream_driver.h"
 #include "serve/http_transport.h"
 #include "serve/server_tools.h"
 
@@ -18,6 +19,15 @@
 
 namespace infernix::serve {
 namespace {
+
+// The 500 for an exception a request's handling did not expect, with its message (rendering names its Anthropic
+// type, api_error).
+ApiError anthropic_internal_error(const std::exception& exception) {
+    ApiError error;
+    error.status  = 500;
+    error.message = exception.what();
+    return error;
+}
 
 // One Messages response. A request that declares tool search tools may run several generations:
 // each that ends in searches only is followed by the searches' results and another generation,
@@ -78,67 +88,52 @@ void run_anthropic_response(GenerationBackend& service, AnthropicResponseState& 
                             const std::function<bool()>& is_cancelled,
                             const ContinuationPreparer& prepare_next,
                             const SegmentWriter& on_segment, const CallIdentifier& identify) {
-    for (;;) {
-        GenerationOutcome outcome   = service.run(prepared, sink, is_cancelled);
-        std::vector<ToolCall> calls = identify(outcome);
-        std::vector<std::optional<RequestJson>> results(calls.size());
-        std::vector<ChatTurn> result_turns;
-        bool client_calls = false;
-        if (outcome.finish_reason != infernix::FinishReason::Cancelled) {
-            for (std::size_t index = 0; index < calls.size(); ++index) {
-                if (state.executor.search_tool(calls[index].name) == nullptr) {
-                    client_calls = true;
+    // The protocol's part of run_server_tool_rounds: the searches the executor knows run, any other call is the
+    // client's, and each generation keeps its searches' result content for its segment.
+    struct Protocol {
+        AnthropicResponseState& state;
+        const SegmentWriter& on_segment;
+        const CallIdentifier& identify;
+        std::vector<std::optional<RequestJson>> results; // the current generation's, by call
+
+        ServerRoundCalls calls(const GenerationOutcome& outcome) {
+            ServerRoundCalls out;
+            out.calls = identify(outcome);
+            results.assign(out.calls.size(), std::nullopt);
+            if (outcome.finish_reason == infernix::FinishReason::Cancelled) { return out; }
+            for (std::size_t index = 0; index < out.calls.size(); ++index) {
+                if (state.executor.search_tool(out.calls[index].name) == nullptr) {
+                    out.client_calls = true;
                     continue;
                 }
-                AnthropicToolSearchResult executed = state.executor.execute(calls[index]);
+                AnthropicToolSearchResult executed = state.executor.execute(out.calls[index]);
                 results[index] = std::move(executed.content);
-                result_turns.push_back(std::move(executed.turn));
+                out.results.push_back(std::move(executed.turn));
             }
+            return out;
         }
-        // A generation continues only when its turn ended in searches alone; a search in a turn
-        // that also calls a client tool, or that the output limit cut, still runs, so the history
-        // the client sends back carries its result.
-        const bool turn_ended = outcome.finish_reason == infernix::FinishReason::StopToken ||
-                                outcome.finish_reason == infernix::FinishReason::None;
-        bool continues = !result_turns.empty() && !client_calls && turn_ended;
-        std::optional<std::string_view> stop_reason;
-        if (continues && state.rounds.size() + 1U >= kMaximumServerToolRounds) {
-            continues   = false;
-            stop_reason = "pause_turn";
+
+        [[nodiscard]] bool limit_reached() const noexcept { return false; }
+
+        void keep() {
+            state.round_results.push_back(std::move(results));
+            if (on_segment) { on_segment(state.round_segment(state.rounds.size() - 1U)); }
         }
-        ServerToolRound round{.outcome = std::move(outcome),
-                              .calls   = std::move(calls),
-                              .results = std::move(result_turns)};
-        std::optional<PreparedRequest> next;
-        if (continues) {
-            GenerationRequest extended = state.continuation;
-            append_server_round(extended, round, state.executor.names());
-            if (extended.max_tokens <= 0) {
-                continues   = false;
-                stop_reason = "max_tokens";
-            } else {
-                try {
-                    next.emplace(prepare_next(extended));
-                    state.continuation = std::move(extended);
-                } catch (const ApiException& error) {
-                    if (error.error().code != "context_length_exceeded") { throw; }
-                    continues   = false;
-                    stop_reason = "model_context_window_exceeded";
-                }
-            }
-        }
-        if (!continues) {
+
+        void end(ServerToolRound&& round, ServerRoundsEnd end) {
             state.final_outcome = std::move(round.outcome);
             state.final_calls   = std::move(round.calls);
             state.final_results = std::move(results);
-            state.stop_reason   = stop_reason;
-            return;
+            switch (end) {
+            case ServerRoundsEnd::Finished: state.stop_reason = std::nullopt; break;
+            case ServerRoundsEnd::RoundLimit: state.stop_reason = "pause_turn"; break;
+            case ServerRoundsEnd::OutputLimit: state.stop_reason = "max_tokens"; break;
+            case ServerRoundsEnd::ContextWindow: state.stop_reason = "model_context_window_exceeded"; break;
+            }
         }
-        state.rounds.push_back(std::move(round));
-        state.round_results.push_back(std::move(results));
-        if (on_segment) { on_segment(state.round_segment(state.rounds.size() - 1U)); }
-        prepared = std::move(*next);
-    }
+    } protocol{.state = state, .on_segment = on_segment, .identify = identify};
+    run_server_tool_rounds(service, prepared, sink, is_cancelled, prepare_next, state.continuation, state.rounds,
+                           state.executor.names(), protocol);
 }
 
 } // namespace
@@ -157,10 +152,7 @@ void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Respo
         operational_log_.http_failure(
             "anthropic_count_tokens",
             make_internal_request_failure(RequestFailurePhase::Http, exception.what()), request_id);
-        ApiError error;
-        error.status  = 500;
-        error.message = exception.what();
-        write_anthropic_error(res, error, request_id);
+        write_anthropic_error(res, anthropic_internal_error(exception), request_id);
     }
 }
 
@@ -169,6 +161,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
 
     std::shared_ptr<AnthropicResponseState> state;
     try {
+        require_generation();
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
         limits.claude_code_prompt = options_.claude_code_prompt;
@@ -183,10 +176,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         operational_log_.http_failure(
             "anthropic_messages",
             make_internal_request_failure(RequestFailurePhase::Http, exception.what()), request_id);
-        ApiError error;
-        error.status  = 500;
-        error.message = exception.what();
-        write_anthropic_error(res, error, request_id);
+        write_anthropic_error(res, anthropic_internal_error(exception), request_id);
         return;
     }
     const AnthropicMessagesRequest& request = state->request;
@@ -228,6 +218,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         make_anthropic_response_identity(request_id, request.model);
     metadata.response_id   = identity.message_id;
     const int input_tokens = prepared.prompt_tokens;
+    // Continuations after a search resolve the same documents; the first generation's sources serve them all.
+    const std::shared_ptr<const CitationRegistry> citations = prepared.citations;
 
     auto lifecycle = begin_request(make_request_log_context(
         req_id, "anthropic_messages", request.generation, metadata, prepared));
@@ -264,14 +256,22 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         } catch (const std::exception& exception) {
             lifecycle->failure(
                 make_internal_request_failure(RequestFailurePhase::Generation, exception.what()));
-            ApiError error;
-            error.status  = 500;
-            error.message = exception.what();
-            write_anthropic_error(res, error, request_id);
+            write_anthropic_error(res, anthropic_internal_error(exception), request_id);
             return;
         }
         const GenerationOutcome totals = state->totals();
         lifecycle->done(totals);
+        if (totals.finish_reason == infernix::FinishReason::Cancelled) {
+            // A message cannot carry a cancelled generation (the client left, or the server is stopping): the
+            // cancellation error the server gives elsewhere, not a render failure counted as internal.
+            ApiError error;
+            error.status  = 499;
+            error.type    = "request_cancelled";
+            error.code    = "client_disconnected";
+            error.message = "the request was cancelled before it finished";
+            write_anthropic_error(res, error, request_id);
+            return;
+        }
         try {
             set_ngram_generation_header(res, state->final_outcome.ngram_archive);
             const std::vector<AnthropicResponseSegment> segments = state->segments();
@@ -280,7 +280,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                                        ? make_anthropic_prewarm_response(identity, totals)
                                        : make_anthropic_messages_response(identity, segments, totals,
                                                                           state->stop_reason,
-                                                                          request.hide_thinking),
+                                                                          request.hide_thinking, citations.get()),
                                    prepared.lifetime);
         } catch (const ApiException& exception) {
             const ApiError error = normalize_anthropic_error(exception.error());
@@ -290,10 +290,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         } catch (const std::exception& exception) {
             lifecycle->response_failure(make_internal_request_failure(
                 RequestFailurePhase::ResponseRender, exception.what()));
-            ApiError error;
-            error.status  = 500;
-            error.message = exception.what();
-            write_anthropic_error(res, error, request_id);
+            write_anthropic_error(res, anthropic_internal_error(exception), request_id);
         }
         return;
     }
@@ -314,10 +311,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     } catch (const std::exception& exception) {
         lifecycle->failure(
             make_internal_request_failure(RequestFailurePhase::Generation, exception.what()));
-        ApiError error;
-        error.status  = 500;
-        error.message = exception.what();
-        write_anthropic_error(res, error, request_id);
+        write_anthropic_error(res, anthropic_internal_error(exception), request_id);
         return;
     }
 
@@ -329,7 +323,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         // the error event.
         auto encoder = std::make_shared<AnthropicMessagesStream>(
             identity, input_tokens, request.hide_thinking, request.tool_searches,
-            options_.claude_code_usage_compat);
+            options_.claude_code_usage_compat, citations);
 
         prepare_sse_response(res);
         res.set_chunked_content_provider(
@@ -343,22 +337,12 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 SseTransport transport(sink, stream->cancelled);
                 transport.set_heartbeat([&] { return encoder->ping(); });
                 const auto send_error = [&](const ApiError& error) {
-                    try {
+                    return end_stream_with_error(sink, *lifecycle, [&] {
                         if (!encoder->started()) {
                             render_and_write(transport, [&] { return encoder->start(); });
                         }
                         render_and_write(transport, [&] { return encoder->error(error); });
-                        sink.done();
-                        return true;
-                    } catch (const ClientDisconnected&) {
-                        lifecycle->response_failure(
-                            make_client_disconnected_failure(RequestFailurePhase::Transport));
-                        return false;
-                    } catch (const ResponseRenderFailure& exception) {
-                        lifecycle->response_failure(make_internal_request_failure(
-                            RequestFailurePhase::ResponseRender, exception.what()));
-                        return false;
-                    }
+                    });
                 };
 
                 try {
@@ -388,38 +372,13 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                             render_and_write(transport, [&] { return encoder->segment(segment); });
                         },
                         [&](const GenerationOutcome& outcome) { return encoder->identify_calls(outcome); });
-                } catch (const ClientDisconnected&) {
-                    lifecycle->failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                    return false;
-                } catch (const ResponseRenderFailure& exception) {
-                    lifecycle->failure(make_internal_request_failure(
-                        RequestFailurePhase::ResponseRender, exception.what()));
-                    ApiError error;
-                    error.status  = 500;
-                    error.message = exception.what();
-                    return send_error(error);
-                } catch (const ApiException& exception) {
-                    const ApiError error = normalize_anthropic_error(exception.error());
-                    lifecycle->failure(make_generation_request_failure(error));
-                    return send_error(error);
-                } catch (const std::exception& exception) {
-                    lifecycle->failure(make_internal_request_failure(
-                        RequestFailurePhase::Generation, exception.what()));
-                    ApiError error;
-                    error.status  = 500;
-                    error.message = exception.what();
-                    return send_error(error);
+                } catch (...) {
+                    return end_failed_stream_generation(*lifecycle, normalize_anthropic_error,
+                                                        anthropic_internal_error, send_error);
                 }
 
                 const GenerationOutcome totals = state->totals();
-                lifecycle->done(totals);
-                if (state->final_outcome.finish_reason == infernix::FinishReason::Cancelled ||
-                    stream->cancelled.load(std::memory_order_acquire)) {
-                    lifecycle->response_failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                    return false;
-                }
+                if (!record_stream_generation(*lifecycle, totals, stream->cancelled)) { return false; }
                 std::vector<std::string> terminal;
                 try {
                     terminal = encoder->finish(state->final_segment(), totals, state->stop_reason);
@@ -430,35 +389,15 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 } catch (const std::exception& exception) {
                     lifecycle->response_failure(make_internal_request_failure(
                         RequestFailurePhase::ResponseRender, exception.what()));
-                    ApiError error;
-                    error.status  = 500;
-                    error.message = exception.what();
-                    return send_error(error);
+                    return send_error(anthropic_internal_error(exception));
                 }
-                try {
-                    transport.write(terminal);
-                    sink.done();
-                    return true;
-                } catch (const ClientDisconnected&) {
-                    lifecycle->response_failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                    return false;
-                }
+                return write_stream_terminal(transport, sink, *lifecycle, terminal);
             },
-            [stream, lifecycle](bool successful) {
-                stream->cancelled.store(true, std::memory_order_release);
-                if (!successful || !stream->started.load(std::memory_order_acquire)) {
-                    lifecycle->failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                }
-            });
+            stream_release(stream, lifecycle));
     } catch (const std::exception& exception) {
         lifecycle->failure(
             make_internal_request_failure(RequestFailurePhase::ResponseRender, exception.what()));
-        ApiError error;
-        error.status  = 500;
-        error.message = exception.what();
-        write_anthropic_error(res, error, request_id);
+        write_anthropic_error(res, anthropic_internal_error(exception), request_id);
     }
 }
 

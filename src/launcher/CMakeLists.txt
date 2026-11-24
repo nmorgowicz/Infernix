@@ -20,6 +20,8 @@ add_custom_command(
   VERBATIM)
 
 add_library(infernix_launcher STATIC
+  ablation.cpp
+  activity.cpp
   args.cpp
   artifact_scan.cpp
   chats.cpp
@@ -27,13 +29,17 @@ add_library(infernix_launcher STATIC
   event_log.cpp
   events.cpp
   hf_hub.cpp
+  http_access.cpp
+  launch_plan.cpp
   launch_script.cpp
   launcher.cpp
   load_advice.cpp
   log_buffer.cpp
+  management_routes.cpp
   model_defaults.cpp
   process.cpp
   proxy.cpp
+  public_api.cpp
   router.cpp
   routing.cpp
   serve_help.cpp
