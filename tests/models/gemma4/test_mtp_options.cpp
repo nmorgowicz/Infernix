@@ -102,6 +102,33 @@ int run() {
         options.lora_path = "adapter";
         failures += refuses(options, "Gemma silently accepted a dense Qwen LoRA adapter");
     }
+    // The Q5-prefill opt-ins are valid options for every artifact (the native-Q5 trunk requirement is
+    // the artifact-dependent Engine refusal, which the incremental-score fixture skips on); an unknown
+    // mode is still refused here, and the parser names exactly the four modes.
+    for (const auto mode : {infernix::Gemma4Q5Prefill::A16, infernix::Gemma4Q5Prefill::Fp8,
+                            infernix::Gemma4Q5Prefill::Int8G32, infernix::Gemma4Q5Prefill::Int8G64}) {
+        auto options = mtp_options();
+        options.gemma4_q5_prefill = mode;
+        failures += check(normalize(options).gemma4_q5_prefill == mode, "normalization dropped a Q5-prefill mode");
+    }
+    {
+        auto options = mtp_options();
+        options.gemma4_q5_prefill = static_cast<infernix::Gemma4Q5Prefill>(99);
+        failures += refuses(options, "an unknown Q5-prefill mode validated");
+        bool parser_refused = false;
+        try { (void)infernix::parse_gemma4_q5_prefill("int4"); }
+        catch (const std::invalid_argument&) { parser_refused = true; }
+        failures += check(parser_refused, "the Q5-prefill parser accepted an unknown mode");
+    }
+    {
+        auto options = mtp_options();
+        options.artifact_path = "unused.infernix";
+        options.gemma4_q5_prefill = infernix::Gemma4Q5Prefill::Int8G32;
+        bool refused = false;
+        try { infernix::runtime::validate_engine_options(options, infernix::models::Architecture::Qwen3_5); }
+        catch (const std::invalid_argument&) { refused = true; }
+        failures += check(refused, "a non-Gemma family accepted a Q5-prefill opt-in");
+    }
     // Non-affine context-dependent reservation: workspace/table steps belong to each candidate,
     // not to one high-ceiling curve reused with a smaller KV count.
     const auto reservation = [](std::uint32_t context) {

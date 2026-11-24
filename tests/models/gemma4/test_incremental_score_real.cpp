@@ -3,6 +3,7 @@
 #include "infernix/engine.h"
 
 #include <algorithm>
+#include <cstring>
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
@@ -37,6 +38,16 @@ int main() {
     const char* artifact = std::getenv("INFERNIX_GEMMA4_ARTIFACT");
     if (!artifact) { return 77; }
     try {
+        // The four-mode plan needs a native Q5 (q5_g64_fp16) trunk artifact: the Engine refuses every
+        // non-A16 mode on anything else, correctly. Skip so a plan that selects this fixture for an
+        // artifact without native Q5 records a skip instead of a mid-suite failure.
+        try {
+            Engine probe(options(artifact, Gemma4Q5Prefill::Fp8));
+        } catch (const std::invalid_argument& error) {
+            if (std::strstr(error.what(), "needs an artifact with native Q5") == nullptr) { throw; }
+            std::cout << "skip: " << error.what() << "\n";
+            return 77;
+        }
         std::vector<float> a16_logits;
         for (const auto mode : {Gemma4Q5Prefill::A16, Gemma4Q5Prefill::Fp8,
                                 Gemma4Q5Prefill::Int8G32, Gemma4Q5Prefill::Int8G64}) {
