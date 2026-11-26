@@ -1006,6 +1006,11 @@ ModelMetadata Engine::model_metadata() const {
     return impl_->model_metadata;
 }
 
+bool Engine::supports_token_constraints() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return impl_->architecture != models::Architecture::Gemma4;
+}
+
 MemorySummary Engine::memory_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return std::visit(

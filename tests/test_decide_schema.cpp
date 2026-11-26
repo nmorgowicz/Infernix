@@ -440,12 +440,41 @@ void test_schedules_and_answers() {
     }
 }
 
+// A model that applies no token constraint refuses every generated type (and only those), naming the first such question.
+void test_generated_refusal() {
+    const auto refusal = [](const DecideRequest& request) {
+        try {
+            refuse_generated_questions(request);
+        } catch (const ApiException& error) { return error.error(); }
+        return ApiError{};
+    };
+    for (const DecideKind kind : {DecideKind::Number, DecideKind::Scalar, DecideKind::Point, DecideKind::Box}) {
+        DecideRequest request;
+        request.questions.push_back(generated(kind, 3));
+        const ApiError error = refusal(request);
+        check(error.status == 400 && error.code == "question_type_unsupported" && error.param == "questions.q",
+              "every generated type is refused as a 400 question_type_unsupported naming its question");
+    }
+    DecideRequest readouts;
+    for (const DecideKind kind : {DecideKind::Noul, DecideKind::Choice, DecideKind::Score}) {
+        DecideQuestion question = generated(kind, 0);
+        question.id             = "r" + std::to_string(static_cast<int>(kind));
+        readouts.questions.push_back(std::move(question));
+    }
+    check(refusal(readouts).code.empty(), "readout questions are never refused");
+    DecideQuestion late = generated(DecideKind::Scalar, 4);
+    late.id             = "late";
+    readouts.questions.push_back(std::move(late));
+    check(refusal(readouts).param == "questions.late", "a generated question after readouts still refuses the request");
+}
+
 } // namespace
 
 int main() {
     test_generated_validation();
     test_generated_prompts();
     test_schedules_and_answers();
+    test_generated_refusal();
     test_alphabet();
     test_validation();
     test_options_and_order();

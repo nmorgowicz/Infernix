@@ -75,6 +75,7 @@ void HttpServer::handle_decide(const httplib::Request& req, httplib::Response& r
         if (!request.model.empty()) {
             request.model = resolve_openai_model(request.model, public_model_id_, options_.any_model_name);
         }
+        if (!service_->supports_token_constraints()) { refuse_generated_questions(request); }
         const DecideEncoder encode = [this](std::string_view text) {
             return service_->tokenize_text(text);
         };

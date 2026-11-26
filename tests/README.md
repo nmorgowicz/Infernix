@@ -148,7 +148,11 @@ move the readouts, the decode path's cut, that a strong cut keeps its bits acros
 drafter (with drafts accepted), CausalScoring with a sidecar, and (with `INFERNIX_TEST_LORA` on the 27B) that a
 negligible cut keeps an adapter run's bits. `infernix_http_scoring_routes_test` covers a `--causal-scoring`
 server's routes over loopback HTTP (generation refused, `/v1/score` answered) and `infernix_score_schema_test` the
-`/v1/score` request and response.
+`/v1/score` request and response. `infernix_http_decide_refusal_test` runs `/v1/decide` over loopback HTTP against a
+backend whose model applies no token constraint (Gemma4): a `number` or `scalar` (and, in `infernix_decide_schema_test`,
+a `point` or `box`) is refused as HTTP 400 `question_type_unsupported` before any question of the request is asked, a
+readout beside it refuses the whole request, readouts answer exactly as a constraint-capable backend answers them and
+the server keeps answering after the refusals.
 
 `infernix_softmax_attention_test --causal-only` runs both D256 geometries and all five KV types;
 `--kv-dtype bf16|int8|fp8|nvfp4|k8v4` selects the same complete causal suite for one type, and

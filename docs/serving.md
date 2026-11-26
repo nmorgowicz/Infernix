@@ -1979,7 +1979,8 @@ curl http://127.0.0.1:8080/v1/decide -H 'Content-Type: application/json' -d '{
   (`"10"` one token, as Inkling 2's does) never writes a number that way, so the digits' share of the
   distribution collapses and the answer is noise (a spider's legs read 60 at a mass of 5e-9 on Inkling
   2): such a server refuses the generated types (`question_type_unsupported`, HTTP 400) and serves
-  the readout types.
+  the readout types. Gemma4 applies no token constraint, so it refuses them the same way (the request
+  as a whole, before any of its questions is asked) and serves `noul`, `choice` and `score`.
 - **Option order is part of the prompt**: each option is shown under the label at its position, so
   reordering options asks a different question.
 - **`answer_mass`** is the declared labels' share of the whole next-token distribution. Near 1 the

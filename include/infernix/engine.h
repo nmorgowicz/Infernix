@@ -190,6 +190,9 @@ public:
     [[nodiscard]] const EngineOptions& options() const;
     [[nodiscard]] LoadSummary load_summary() const;
     [[nodiscard]] ModelMetadata model_metadata() const;
+    // Whether the loaded model's program applies a request's ExecutionOptions::constraint. Gemma4's does not (it
+    // would generate its answer unconstrained), so a caller that needs the constraint checks this first.
+    [[nodiscard]] bool supports_token_constraints() const;
     [[nodiscard]] MemorySummary memory_summary() const;
     // The device's memory now (the serving telemetry's `memory.device`): any thread, cheap enough to poll each second.
     [[nodiscard]] DeviceMemoryReading device_memory() const;

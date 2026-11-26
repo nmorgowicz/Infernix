@@ -375,6 +375,23 @@ DecideRequest parse_decide_request(const RequestJson& body, std::size_t alphabet
     return request;
 }
 
+void refuse_generated_questions(const DecideRequest& request) {
+    for (const DecideQuestion& question : request.questions) {
+        if (!decide_generates(question.kind)) { continue; }
+        const char* type = "box";
+        switch (question.kind) {
+        case DecideKind::Number: type = "number"; break;
+        case DecideKind::Scalar: type = "scalar"; break;
+        case DecideKind::Point: type = "point"; break;
+        default: break;
+        }
+        refuse(question.id,
+               std::string("a ") + type + " is generated under a token constraint, which this model does not apply; "
+                   "readout questions (noul, choice, score) are served",
+               "question_type_unsupported");
+    }
+}
+
 std::vector<ChatTurn> decide_messages(const DecideRequest& request,
                                       const DecideQuestion& question,
                                       std::span<const DecideLabel> labels) {

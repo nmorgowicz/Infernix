@@ -109,6 +109,12 @@ struct DecideRequest {
 [[nodiscard]] DecideRequest parse_decide_request(const RequestJson& body,
                                                  std::size_t alphabet_size);
 
+// Refuses a request that asks a generated question (number, scalar, point, box) of a model that does not apply token
+// constraints (infernix::Engine::supports_token_constraints): its answer would be generated unconstrained, so none is
+// served. Throws ApiException (400, question_type_unsupported, param questions.<id>) naming the first such question;
+// readout questions are unaffected. Called before any question of the request is asked.
+void refuse_generated_questions(const DecideRequest& request);
+
 // The chat turns one question is asked as. JSON evidence rides in the system message after the
 // instruction, so every question over one state shares it as a prompt prefix; content parts stay
 // in the user turn, ahead of the question.

@@ -179,6 +179,9 @@ public:
     // Artifact-tokenizer encoding of raw text, with no template or special token added.
     [[nodiscard]] virtual std::vector<infernix::TokenId>
     tokenize_text(std::string_view text) const = 0;
+    // Whether the model applies a request's token constraint (infernix::Engine::supports_token_constraints):
+    // /v1/decide's generated questions need it.
+    [[nodiscard]] virtual bool supports_token_constraints() const { return true; }
 
     [[nodiscard]] virtual PreparedRequest
     prepare(const GenerationRequest& req, GenerationConsumerMode consumer_mode,
@@ -278,6 +281,10 @@ public:
     [[nodiscard]] std::vector<infernix::TokenId>
     tokenize_text(std::string_view text) const override {
         return engine_->tokenize_text(text);
+    }
+
+    [[nodiscard]] bool supports_token_constraints() const override {
+        return engine_->supports_token_constraints();
     }
 
     [[nodiscard]] PreparedRequest prepare(const GenerationRequest& req,
