@@ -2737,6 +2737,10 @@ frames' fixed 128 MiB reserve, and graphs past it take memory back from the elas
 the graphs find no Device memory at all, a Qwen3.5-family engine with
 `--kv-capacity auto` warns and starts once more with 1 GiB more headroom (a smaller KV capacity);
 an explicit `--kv-capacity` fails startup instead.
+On Gemma4 the allowance is 64 MiB (about 2.25 MiB per prepared graph), plus 128 MiB when the sliding-window ring
+is FP8 (`--gemma4-sliding-kv fp8`, with or without `--gemma4-key-only-kv`): the ring's kernels take about 122 MiB
+of Device memory at their first launch, whatever the chunk, and that launch falls inside graph preparation. The
+reservation, and so the automatic KV capacity, leaves that room; without CUDA Graphs (`--no-cuda-graph`) no allowance is planned.
 
 `server_start.engine.original_int8_prefill_kernel`, `prefill_split_workspace_mib`,
 `original_nvfp4_prefill_kernel` and `fast_paths` record `--use-original-int8-prefill-kernel`,
