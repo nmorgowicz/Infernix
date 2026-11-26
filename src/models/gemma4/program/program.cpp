@@ -47,8 +47,9 @@ constexpr std::uint64_t kGraphGuardMargin = 256ULL << 20;
 constexpr std::uint64_t kGraphAllowance = 64ULL << 20;
 // The FP8 sliding ring's kernels bring in about 122 MiB at their first launch, whatever the chunk, with or without CUDA
 // graphs (measured 2026-11-26: the graphs-off process grows by that much on its first requests, a graphs-on start inside
-// prepare_graphs' warm launches, where the graph-memory measurement window also sees it). It is reserved beside the
-// graph allowance so the KV sizing leaves it room; the key-only layout has no such term.
+// prepare_graphs' warm launches, where the graph-memory measurement window also sees it). Every FP8-ring plan reserves
+// it so the KV sizing leaves it room: inside graph_allowance beside the graphs, or as ring_launch_allowance without
+// them. The key-only layout and the BF16 ring have no such term.
 constexpr std::uint64_t kFp8RingFirstLaunchAllowance = 128ULL << 20;
 // MTP rounds: at most kMaxDraftTokens drafts (the CLI's range). One I32 slot block carries a round's
 // device inputs and outputs, so a captured round replays after one upload: the draft position, the
@@ -212,6 +213,8 @@ ProgramDevicePlan Program::plan_device(const Model& model, const ProgramOptions&
     plan.kv = global_page_bytes * plan.kv_pages + sliding_page_bytes * rings + 8ULL * plan.kv_pages;
     plan.kv_max = global_page_bytes * maximum_pages + sliding_page_bytes * rings + 8ULL * maximum_pages;
     plan.io = io_bytes(c, options.prefill_chunk, head_columns(options), geometry.draft.has_value());
+    const std::uint64_t ring_first_launch =
+        options.sliding_kv_cache == KvCacheStorage::Fp8E4M3Row256 ? kFp8RingFirstLaunchAllowance : 0ULL;
     if (options.use_cuda_graph) {
         plan.graph_bound = 1;
         for (const auto width : kGraphWidths) {
@@ -224,8 +227,10 @@ ProgramDevicePlan Program::plan_device(const Model& model, const ProgramOptions&
             std::find(kGraphWidths.begin(), kGraphWidths.end(), options.prefill_chunk) != kGraphWidths.end()) {
             ++plan.graph_bound; // the tail-free prefill graph
         }
-        plan.graph_allowance = kGraphAllowance +
-            (options.sliding_kv_cache == KvCacheStorage::Fp8E4M3Row256 ? kFp8RingFirstLaunchAllowance : 0ULL);
+        // The warm launches fall inside the graph-memory window, so the ring's allowance rides in graph_allowance.
+        plan.graph_allowance = kGraphAllowance + ring_first_launch;
+    } else {
+        plan.ring_launch_allowance = ring_first_launch;
     }
     plan.curve.main_page_tokens = kPage;
     plan.curve.minimum_main_page_groups = minimum_pages;

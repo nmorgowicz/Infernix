@@ -464,7 +464,8 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& supplied, DeviceContext&
     }
     device.synchronize();
     const auto memory = instance->program->memory_summary();
-    const auto allocated = request_plan.fixed_bytes() - request_plan.graph_allowance + memory.cuda_graph_measured_bytes;
+    const auto allocated = request_plan.fixed_bytes() - request_plan.graph_allowance -
+                           request_plan.ring_launch_allowance + memory.cuda_graph_measured_bytes;
     std::uint64_t shared_runtime_bytes = 0;
     if (const auto runtime_shortfall = runtime_guard.end(allocated); runtime_shortfall != 0) {
         if (!options.allow_shared_memory) {

@@ -203,12 +203,14 @@ struct ProgramDevicePlan {
     // KV includes global pools (BF16, or FP8 codes plus FP16 scales), the sliding rings (BF16, or FP8 codes plus
     // FP16 row scales) and both page tables.
     std::uint64_t kv = 0, kv_max = 0, workspace = 0, state = 0, io = 0;
-    std::uint64_t prepared_row_scales = 0, graph_allowance = 0;
+    // graph_allowance: the CUDA graphs' memory, plus the FP8 ring's first-launch memory when graph preparation's warm
+    // launches take it. ring_launch_allowance: that ring memory when there are no graphs (the first request takes it).
+    std::uint64_t prepared_row_scales = 0, graph_allowance = 0, ring_launch_allowance = 0;
     std::uint32_t graph_bound = 0;
     runtime::SequenceCapacityCurve curve;
     [[nodiscard]] const runtime::SequenceCapacityCurve& capacity_curve() const noexcept { return curve; }
     [[nodiscard]] std::uint64_t fixed_bytes() const noexcept {
-        return kv + workspace + state + io + prepared_row_scales + graph_allowance;
+        return kv + workspace + state + io + prepared_row_scales + graph_allowance + ring_launch_allowance;
     }
 };
 struct ProgramOptions {

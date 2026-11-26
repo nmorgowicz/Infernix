@@ -2,6 +2,12 @@ infernix_add_test(infernix_gemma4_loading_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_loading.cpp"
   LIBRARIES infernix_model_loading)
 
+# The device reservation Program::plan_device plans per route on a geometry-only model with the real FP8 head
+# dimensions: the FP8 ring's first-launch allowance with and without CUDA graphs, none on a BF16 ring. CPU only.
+infernix_add_test(infernix_gemma4_program_plan_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_program_plan.cpp"
+  LIBRARIES infernix_model_loading infernix_model_runtime)
+
 # Projections stored as GGUF blocks (a llama.cpp GGUF import) through the execution layer's project(): fused
 # segments of mixed ggml formats and the global output projection's input permutation, against a binary64
 # oracle over independently decoded blocks in source order; the permutation table on the real 31B geometry.
