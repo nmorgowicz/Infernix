@@ -82,6 +82,13 @@ struct PrefixIndexConfig {
     // Whether the host tier backs KV block bundles and snapshot tails. Without it the host tier
     // holds state images only: tails and blocks are unbacked and their loss removes dependants.
     bool host_blocks = true;
+    // Whether a block's Device copy outlives the sequence that computed it (a Device block pool: Qwen3.5, Qwen3.8-Flash-Next,
+    // Inkling 2). Then a block the Host tier cannot take stays Device-only and serves from there, so begin_host_fill takes
+    // only what no resume needs and keeps one image free. Without one (Gemma4: the sequence's own pages are the only
+    // Device copies and go with it) the Host write is the block's only persistence, and begin_host_fill takes its slab as
+    // a snapshot capture does at the highest claim: from dead blocks, then the lowest-valued retained snapshot, with no
+    // reserve.
+    bool device_blocks_persist = true;
     // SSD tier slabs (spec §5.7), each the size of a Host slab; 0: no SSD tier. Requires a Host
     // tier with host_blocks: every SSD transfer copies one Host slab.
     std::uint32_t ssd_slabs = 0;

@@ -119,6 +119,9 @@ PrefixCache::PrefixCache(const PrefixCacheConfig& config, const PrefixCacheGeome
     index.block_bytes           = host_.block_bytes;
     index.image_bytes           = host_.image_bytes;
     index.host_blocks           = true;
+    // The sequence's own pages are the only Device copies and go with it (sweep_device_copies): a block's Host write
+    // is its only persistence, so it may displace a retained snapshot (prefix_index.h).
+    index.device_blocks_persist = false;
     // The tier is fixed-size: every slab is page-locked at startup, none left to grow into.
     store_ = pc::HostSlabStore(host_.slab_bytes, host_.slabs, host_.slabs, pc::HostSlabStore::kChunkBytes,
                                "Gemma4 prefix cache Host tier");

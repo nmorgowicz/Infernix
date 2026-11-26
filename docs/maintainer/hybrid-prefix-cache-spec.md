@@ -1595,6 +1595,12 @@ Before 2026-11-23 these writes had an infinite claim: on a tier smaller than one
 plus an image (1 GiB holds 1,149 Flash-Next INT8 slabs, so about 65.5K tokens), a turn's own write-through
 evicted the snapshot its next turn needed, and that turn re-prefilled from the root (issue #77).
 
+A binding whose blocks have no Device copy after their sequence (`PrefixIndexConfig::device_blocks_persist` false:
+Gemma4, whose sequence's own pages are its only Device copies and go with it) has nothing to fall back on: a block
+it cannot place is lost at the sequence's release (`unbacked_node_losses`). Its block write therefore takes its slab
+as a capture at the highest claim does: dead blocks first, then the lowest-valued retained snapshot, with no image
+reserve.
+
 On Qwen3.8-Flash-Next a capture reserves its image before it lands, so when the tier has no room its own
 lineage gives way first. A tap, or an endpoint after the turn's tap, supersedes the snapshot the lane
 resumed from. An endpoint that is the turn's first capture does so unless the conversation is known not

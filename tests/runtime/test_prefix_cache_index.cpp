@@ -2634,6 +2634,60 @@ void test_block_writes_keep_resume_state() {
     index.check_invariants();
 }
 
+// A binding whose blocks have no Device copy after their sequence (Gemma4's own pages go with it): the Host write is the
+// block's only persistence, so it takes its slab as a capture at the highest claim does and keeps no reserve, where a
+// binding with a Device block pool leaves a block it cannot place Device-only and never evicts a retained snapshot.
+void test_block_writes_without_device_copies() {
+    for (const bool persists : {true, false}) {
+        RecordingBackend backend;
+        PrefixIndexConfig config     = small_config(8, 0);
+        config.device_blocks_persist = persists;
+        PrefixCacheIndex index(config, backend);
+        // A resume point: its four blocks and the image that reaches them fill the 8-slab tier.
+        const auto first = insert_sequence(index, backend, make_tokens(4U * kBlockTokens, 780));
+        auto image       = index.reserve_host_image(false, std::numeric_limits<double>::infinity());
+        require(image.has_value(), "the image fits the empty tier");
+        const PublishResult resume = index.publish_host_snapshot(first[3], 4U * kBlockTokens, {}, std::nullopt,
+                                                                 std::move(*image), SnapshotKind::Endpoint);
+        require(resume.created, "the resume point is published");
+        std::uint32_t written = 0;
+        for (const NodeRef node : first) {
+            index.pin_node(node);
+            if (!index.begin_host_fill(node)) {
+                index.unpin_node(node);
+                break;
+            }
+            index.complete_host_fill(node);
+            index.unpin_node(node);
+            ++written;
+        }
+        index.check_invariants();
+        const std::uint32_t free_after_blocks = index.stats().host_free_slabs;
+        const auto second = insert_sequence(index, backend, make_tokens(2U * kBlockTokens, 781));
+        index.pin_node(second[0]);
+        const auto slab = index.begin_host_fill(second[0]);
+        if (persists) {
+            // One image and its tail are not free: the writes wait, and the snapshot stays.
+            require(written == 0, "a block write keeps one image free where blocks persist on the Device (written " +
+                                      std::to_string(written) + ")");
+            require(!slab.has_value() && index.valid(resume.snapshot) && index.stats().host_snapshot_evictions == 0,
+                    "a block write never evicts a retained snapshot where blocks persist on the Device");
+        } else {
+            require(written == 4 && free_after_blocks == 0,
+                    "block writes keep no reserve without Device copies (written " + std::to_string(written) + ", free " +
+                        std::to_string(free_after_blocks) + ")");
+            require(slab.has_value(), "a block with no other copy takes the retained snapshot's slabs");
+            require(!index.valid(resume.snapshot) && index.stats().host_snapshot_evictions == 1,
+                    "the retained snapshot was the victim");
+            index.complete_host_fill(second[0]);
+        }
+        index.unpin_node(second[0]);
+        index.release_path(second);
+        index.release_path(first);
+        index.check_invariants();
+    }
+}
+
 void test_tap_planner() {
     TapPlannerConfig config;
     config.max_new_taps   = 8;
@@ -3350,6 +3404,7 @@ int main() {
         test_holds();
         test_publish_refusals_consume();
         test_block_writes_keep_resume_state();
+        test_block_writes_without_device_copies();
         test_tap_planner();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

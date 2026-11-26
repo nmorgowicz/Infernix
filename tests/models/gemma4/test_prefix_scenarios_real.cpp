@@ -252,6 +252,11 @@ void saturated_tier(Rig& rig) {
     expect(cache->hybrid_stats().host_snapshot_evictions > 0,
            title + ": distinct prompts filled the tier until it evicted (" + std::to_string(fills) + " prompts; " +
                describe_stats(cache->hybrid_stats()) + ")");
+    // A Gemma block has no Device copy once its sequence ends: the Host write is its only persistence, so a saturated
+    // tier makes room for it (a retained snapshot yields) and no written block is lost unbacked.
+    expect(cache->hybrid_stats().unbacked_node_losses == 0,
+           title + ": no block was lost for want of a Host slab while the tier filled (" +
+               describe_stats(cache->hybrid_stats()) + ")");
     expect_released(*cache, *rig.frontend, title + ": after filling");
     const auto before = cache->hybrid_stats();
     const Outcome first = run(*cache, *rig.frontend, a, kReply, true);
