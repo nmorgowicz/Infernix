@@ -43,7 +43,13 @@ constexpr std::uint32_t kPage = ops::kGemma4KvPageTokens;
 constexpr int kScoreTile = 128;
 constexpr std::array<std::uint32_t, 6> kGraphWidths{32, 64, 128, 256, 512, 1024};
 constexpr std::uint64_t kGraphGuardMargin = 256ULL << 20;
+// The driver state a graph set holds: about 2.25 MiB per graph measured (18 MiB for 8 graphs, 14 MiB for 6).
 constexpr std::uint64_t kGraphAllowance = 64ULL << 20;
+// The FP8 sliding ring's kernels bring in about 122 MiB at their first launch, whatever the chunk, with or without CUDA
+// graphs (measured 2026-11-26: the graphs-off process grows by that much on its first requests, a graphs-on start inside
+// prepare_graphs' warm launches, where the graph-memory measurement window also sees it). It is reserved beside the
+// graph allowance so the KV sizing leaves it room; the key-only layout has no such term.
+constexpr std::uint64_t kFp8RingFirstLaunchAllowance = 128ULL << 20;
 // MTP rounds: at most kMaxDraftTokens drafts (the CLI's range). One I32 slot block carries a round's
 // device inputs and outputs, so a captured round replays after one upload: the draft position, the
 // anchor and drafts (verify ids), the verify positions, the target argmaxes, the licensed tokens and
@@ -218,7 +224,8 @@ ProgramDevicePlan Program::plan_device(const Model& model, const ProgramOptions&
             std::find(kGraphWidths.begin(), kGraphWidths.end(), options.prefill_chunk) != kGraphWidths.end()) {
             ++plan.graph_bound; // the tail-free prefill graph
         }
-        plan.graph_allowance = kGraphAllowance;
+        plan.graph_allowance = kGraphAllowance +
+            (options.sliding_kv_cache == KvCacheStorage::Fp8E4M3Row256 ? kFp8RingFirstLaunchAllowance : 0ULL);
     }
     plan.curve.main_page_tokens = kPage;
     plan.curve.minimum_main_page_groups = minimum_pages;
