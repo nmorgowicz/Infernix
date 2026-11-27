@@ -26,6 +26,7 @@
 
 #include "prefix_real_support.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <string>
@@ -37,8 +38,12 @@ using namespace prefix_real;
 namespace ops = infernix::ops;
 namespace testing = infernix::runtime::testing;
 
-constexpr std::uint32_t kChunk   = 128;
-constexpr std::uint32_t kContext = 4096;
+// INFERNIX_GEMMA4_CHUNK (default 128) selects the prefill chunk; 1,024 or more runs the staged sliding ring's staging ring.
+const std::uint32_t kChunk = chunk_from_env(128);
+// The cancel scenarios advance four prefill calls (and wait for tap captures) of a long prompt, so at chunk C >= 1,024 they use
+// prompts of 5 C + 100 tokens (m, r) and 2 C (s) and a context of 8 C; at chunk 128 the sizes are the original ones.
+const bool kWide = kChunk >= 1024;
+const std::uint32_t kContext = std::max<std::uint32_t>(4096, 8 * kChunk);
 constexpr std::uint32_t kOut     = 8;
 constexpr auto kBf16 = infernix::KvCacheStorage::BFloat16;
 
@@ -72,9 +77,11 @@ void program_recovery(const char* artifact) {
     std::printf("== Program path\n");
     Rig rig(artifact, kContext);
     const g4::Frontend& frontend = *rig.frontend;
-    const Tokens p = tokens(1537, 17), q = tokens(700, 23), w = tokens(1400, 41), x = tokens(1000, 43),
-                 r = tokens(2100, 53), s = tokens(900, 61), m = tokens(1700, 19),
-                 e = concat(tokens(1537, 17), tokens(400, 99)); // p's prompt and 400 more tokens
+    const std::uint32_t p_size = kWide ? kChunk + 513 : 1537;
+    const Tokens p = tokens(p_size, 17), q = tokens(700, 23), w = tokens(kWide ? kChunk + 376 : 1400, 41), x = tokens(1000, 43),
+                 r = tokens(kWide ? 5 * kChunk + 100 : 2100, 53), s = tokens(kWide ? 2 * kChunk : 900, 61),
+                 m = tokens(kWide ? 5 * kChunk + 100 : 1700, 19),
+                 e = concat(tokens(p_size, 17), tokens(400, 99)); // p's prompt and 400 more tokens
     struct { Tokens p, q, w, x, r, s, m, e; } ref;
     {
         const auto cold = rig.program(kContext, kChunk, 0, kBf16, ops::Gemma4QkMode::BFloat16);
@@ -103,7 +110,7 @@ void program_recovery(const char* artifact) {
         const Outcome cold = same(m, ref.m, "the cold request after the cancel", false);
         expect(cold.reused == 0, "an opted-out request restores nothing");
         const Outcome warm = same(m, ref.m, "the request resumed from what the cancelled one published", true);
-        expect(warm.reused > 0 && warm.reused <= 512,
+        expect(warm.reused > 0 && warm.reused <= 4 * kChunk,
                "published state of a cancelled request stays valid and reusable (restored " + std::to_string(warm.reused) + ")");
     }
 
@@ -240,8 +247,8 @@ void program_recovery(const char* artifact) {
 
 void engine_recovery(const char* artifact) {
     std::printf("== Engine path\n");
-    infernix::Engine engine = start_engine(engine_options(artifact, kChunk, host_bytes_from_env(), 2304));
-    const Tokens p = tokens(1537, 17), w = tokens(1400, 41), cancelled = tokens(1800, 71), decoding = tokens(900, 73);
+    infernix::Engine engine = start_engine(engine_options(artifact, kChunk, host_bytes_from_env(), kWide ? kContext : 2304));
+    const Tokens p = tokens(kWide ? kChunk + 513 : 1537, 17), w = tokens(kWide ? kChunk + 376 : 1400, 41), cancelled = tokens(kWide ? 3 * kChunk : 1800, 71), decoding = tokens(900, 73);
     const Served ref_p = generate(engine, p, kOut, false), ref_w = generate(engine, w, kOut, false);
     (void)generate(engine, p, kOut, true);
     settled(engine, "baseline");
@@ -258,7 +265,7 @@ void engine_recovery(const char* artifact) {
     std::printf("-- cancel mid-prefill\n");
     {
         CancelSink sink;
-        sink.prompt_threshold = 600;
+        sink.prompt_threshold = kWide ? kChunk : 600;
         const auto result = generate_cancelled(engine, cancelled, kOut, sink);
         expect(result.finish_reason == infernix::FinishReason::Cancelled && result.generated_token_ids.empty(),
                "the request cancelled in its prefill ends cancelled with no output");
@@ -340,7 +347,7 @@ void engine_recovery(const char* artifact) {
 // Enable free-cache-resume so the decoded full blocks really enqueue release-time Host writes.
 void release_recovery(const char* artifact) {
     std::printf("== release-time device failures\n");
-    auto options = engine_options(artifact, kChunk, host_bytes_from_env(), 2304);
+    auto options = engine_options(artifact, kChunk, host_bytes_from_env(), kWide ? kContext : 2304);
     options.fast_path_exclusions.clear();
     infernix::Engine engine = start_engine(std::move(options));
     const Tokens queued = tokens(1000, 991);

@@ -308,7 +308,8 @@ void generation(const g4::execution::Parameters& parameters, DeviceContext& devi
     require(memory.gemma4_kv->global_payload_bytes == global_payload(parameters, g4::KvStorageModel::KeyOnly, pages) &&
                 2 * memory.gemma4_kv->global_payload_bytes == global_payload(parameters, g4::KvStorageModel::KeyEqualsValue, pages),
             "key-only global payload is not the K planes alone");
-    require(memory.kv_payload_bytes + 8ULL * pages == program.device_plan().kv, "planner and constructor disagree on key-only KV bytes");
+    require(memory.kv_payload_bytes + (program.device_plan().staging_pages != 0 ? 12ULL : 8ULL) * pages == program.device_plan().kv,
+            "planner and constructor disagree on key-only KV bytes");
     std::printf("METRIC %s plan kv bytes: K==V %llu key-only %llu (global payload %llu -> %llu)\n", label.c_str(),
                 static_cast<unsigned long long>(stored_kv), static_cast<unsigned long long>(program.device_plan().kv),
                 static_cast<unsigned long long>(global_payload(parameters, g4::KvStorageModel::KeyEqualsValue, pages)),

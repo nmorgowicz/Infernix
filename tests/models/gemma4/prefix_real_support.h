@@ -74,6 +74,12 @@ inline std::uint64_t host_bytes_from_env() {
     return (mib != nullptr && *mib != '\0' ? std::strtoull(mib, nullptr, 10) : 8192ULL) << 20U;
 }
 
+// The prefill chunk a test runs at: INFERNIX_GEMMA4_CHUNK, else `fallback`.
+inline std::uint32_t chunk_from_env(std::uint32_t fallback) {
+    const char* chunk = std::getenv("INFERNIX_GEMMA4_CHUNK");
+    return chunk != nullptr && *chunk != '\0' ? static_cast<std::uint32_t>(std::strtoul(chunk, nullptr, 10)) : fallback;
+}
+
 // ---- the Program path --------------------------------------------------------------------------
 
 struct Rig {

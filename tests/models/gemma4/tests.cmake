@@ -73,6 +73,16 @@ infernix_add_test(infernix_gemma4_fp8_ring_real_test
 set_tests_properties(infernix_gemma4_fp8_ring_real_test
   PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
+# The staged sliding ring (24 pages per layer plus one shared staging ring that wide prompt calls run on, from a
+# prefill chunk of 1,024) against the full-size ring on an explicit artifact (MTP for --phase mtp|all): the plan's
+# exact saving, and a scripted conversation (cold, regenerate, edit, return, branch, cancelled prefill) and greedy MTP
+# with 1/3/7 drafts whose tokens, speculative counters and every logits tile are bit-identical to the full-size ring.
+infernix_add_test(infernix_gemma4_staging_ring_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_staging_ring_real.cpp"
+  LIBRARIES infernix_engine infernix_model_runtime)
+set_tests_properties(infernix_gemma4_staging_ring_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 7200)
+
 # Tool-call body grammar (`call:NAME{k:v}`, `<|"|>` strings); CPU only, no model.
 infernix_add_test(infernix_gemma4_tool_parser_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_tool_parser.cpp"
