@@ -431,16 +431,67 @@ void ring_comparison_test(int first, int queries, float key_weight_low, float ke
     // 0.25 did not establish acceptance. Exact codec and represented-value FP64 checks above carry
     // correctness; model-level quality and adoption are reported separately.
 }
+
+// Measurement only (`--time`): event-timed launches of the tensor-core kernel on a 2,048-token chunk
+// with a full window, the FP8 instance and the BF16 instance over the same ring (median of 50 after
+// 10 warm-up launches, microseconds), as the prompt of a long request runs it on every sliding layer.
+void timing_test(int first, int tokens) {
+    const auto f = make_ring(first, tokens, false, 9001u + static_cast<std::uint32_t>(first * 7 + tokens));
+    std::vector<float> query(static_cast<std::size_t>(D) * QHeads * tokens);
+    fill_uniform(query, 9101 + tokens, -0.25f, 0.25f);
+    auto dq = to_device_bf16(query), dp = to_device_i32(f.positions), dt = to_device_i32(f.table);
+    auto dkc = to_device(f.k_codes), dvc = to_device(f.v_codes), dks = to_device(f.k_scales), dvs = to_device(f.v_scales);
+    auto dkb = to_device(f.k_values), dvb = to_device(f.v_values);
+    const std::size_t elements = query.size();
+    DeviceBuffer out(elements * 2);
+    Tensor qt(dq.p, DType::BF16, {D, QHeads, tokens}), pt(dp.p, DType::I32, {tokens});
+    Tensor tt(dt.p, DType::I32, {f.logical_pages});
+    Tensor kc(dkc.p, DType::U8, {D, 64, Heads, f.ring_pages}), vc(dvc.p, DType::U8, {D, 64, Heads, f.ring_pages});
+    Tensor ks(dks.p, DType::FP16, {1, 64, Heads, f.ring_pages}), vs(dvs.p, DType::FP16, {1, 64, Heads, f.ring_pages});
+    Tensor kb(dkb.p, DType::BF16, {D, 64, Heads, f.ring_pages}), vb(dvb.p, DType::BF16, {D, 64, Heads, f.ring_pages});
+    Tensor ot(out.p, DType::BF16, {D, QHeads, tokens});
+    const ops::Gemma4CacheView ring{ops::Gemma4KvFormat::Fp8E4m3Row256, &kc, &vc, &ks, &vs, &tt};
+    const ops::Gemma4CacheView expanded{ops::Gemma4KvFormat::BFloat16, &kb, &vb, nullptr, nullptr, &tt};
+    WorkspaceArena workspace(std::max<std::size_t>(256, ops::gemma4_attention_workspace_capacity_bytes(D, QHeads, Heads, tokens)));
+    cudaEvent_t begin, end;
+    cuda_check(cudaEventCreate(&begin), "cudaEventCreate");
+    cuda_check(cudaEventCreate(&end), "cudaEventCreate");
+    const auto median_us = [&](const ops::Gemma4CacheView& cache) {
+        std::vector<float> micros;
+        for (int launch = 0; launch < 60; ++launch) {
+            cuda_check(cudaEventRecord(begin, nullptr), "cudaEventRecord");
+            ops::gemma4_attention(qt, cache, pt, Window, 1.0f, ot, workspace, nullptr);
+            cuda_check(cudaEventRecord(end, nullptr), "cudaEventRecord");
+            cuda_check(cudaEventSynchronize(end), "cudaEventSynchronize");
+            float milliseconds = 0.0f;
+            cuda_check(cudaEventElapsedTime(&milliseconds, begin, end), "cudaEventElapsedTime");
+            if (launch >= 10) { micros.push_back(milliseconds * 1000.0f); }
+        }
+        std::sort(micros.begin(), micros.end());
+        return micros[micros.size() / 2];
+    };
+    const float bf16_us = median_us(expanded);
+    const float fp8_us = median_us(ring);
+    std::cout << "GEMMA4_FP8_RING_TIME first=" << first << " tokens=" << tokens << " window=" << Window
+              << " bf16_instance_us=" << bf16_us << " fp8_instance_us=" << fp8_us << " ratio=" << fp8_us / bf16_us << '\n';
+    cuda_check(cudaEventDestroy(begin), "cudaEventDestroy");
+    cuda_check(cudaEventDestroy(end), "cudaEventDestroy");
+}
 } // namespace
 
 INFERNIX_OP_TEST(gemma4_fp8_ring) {
-    for (int i = 1; i < argc; i += 2) {
+    bool timing = false;
+    for (int i = 1; i < argc; ++i) {
         const std::string_view key(argv[i]);
+        if (key == "--time") {
+            timing = true;
+            continue;
+        }
         if (key != "--split" || i + 1 >= argc || (std::string_view(argv[i + 1]) != "0" && std::string_view(argv[i + 1]) != "1")) {
-            std::cerr << "usage: gemma4_fp8_ring [--split 0|1]\n";
+            std::cerr << "usage: gemma4_fp8_ring [--split 0|1] [--time]\n";
             return 2;
         }
-        const std::string setting = std::string_view(argv[i + 1]) == "0" ? "1" : "0";
+        const std::string setting = std::string_view(argv[++i]) == "0" ? "1" : "0";
 #ifdef _WIN32
         if (_putenv_s("INFERNIX_TMP_GEMMA4_ATTN_SPLIT_K", setting.c_str()) != 0) { return 2; }
 #else
@@ -450,6 +501,10 @@ INFERNIX_OP_TEST(gemma4_fp8_ring) {
     std::cout << "temporary switches | " << temporary_switches::describe(temporary_switches::Scope::Gemma4) << '\n';
     int failures = validation_test();
     if (cuda_unavailable()) { std::cout << "SKIP: no usable CUDA device\n"; return failures ? 1 : 77; }
+    if (timing) {
+        timing_test(3 * 3072 + 101, 2048);
+        return failures ? 1 : 0;
+    }
     failures += qkv_test();
     // Decode and MTP verify widths, the widest decode width, then tensor-core chunks (partial and full
     // tiles, the chunk-128 and auto-chunk widths): before the window fills, mid-page window starts,

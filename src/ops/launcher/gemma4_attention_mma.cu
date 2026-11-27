@@ -44,8 +44,9 @@ __device__ __forceinline__ void stage_keys(__nv_bfloat16* dst, const __nv_bfloat
 // visible keys in Bc-key tiles; each row masks with its own position and the window. Used for
 // D256; D512 runs gemma4_attention_mma_d512.cu, one 8-warp CTA for both output halves.
 // FP8 (the opt-in D256 ring): K and V codes arrive by cp.async in the compact first half of their
-// BF16 tile and expand in place (gemma4_expand_quant_tile) to BF16(FP32(code) x FP32(scale)), the
-// values every Gemma FP8 reader consumes; QK and PV then run unchanged on the BF16 tiles.
+// BF16 tile, their 64 row scales in a small shared array, and expand in place
+// (gemma4_expand_quant_tile) to BF16(FP32(code) x FP32(scale)), the values every Gemma FP8 reader
+// consumes; QK and PV then run unchanged on the BF16 tiles.
 template <int D, int Bc, Gemma4KvFormat Fmt>
 __launch_bounds__(kThreads, 1) __global__
     void gemma4_attention_mma_kernel(const __nv_bfloat16* __restrict__ q,
@@ -73,6 +74,8 @@ __launch_bounds__(kThreads, 1) __global__
     __nv_bfloat16* k_s = q_s + kRows * D; // [Bc, D] swizzled
     __nv_bfloat16* v_s = k_s + Bc * D;    // [Bc, kSlice] swizzled
     __shared__ int range[3];              // first visible key, highest position, lowest position
+    __shared__ __align__(16) __half k_scale_s[kQuantKv ? Bc : 1]; // FP8 row scales of the K / V tile
+    __shared__ __align__(16) __half v_scale_s[kQuantKv ? Bc : 1];
 
     // Later tiles see more keys; start them first.
     const int q0     = (static_cast<int>(gridDim.x) - 1 - static_cast<int>(blockIdx.x)) * kRows;
@@ -168,12 +171,13 @@ __launch_bounds__(kThreads, 1) __global__
     };
     const bool all_rows = rows == kRows;
 
-    // Keys and the V column slice of tile `k0`: BF16 rows, or the compact FP8 codes
+    // Keys and the V column slice of tile `k0`: BF16 rows, or the compact FP8 codes and row scales
     // gemma4_expand_quant_tile expands after they arrive.
     const auto stage_key = [&](int mapped, int k0) {
         if constexpr (kQuantKv) {
             gemma4_stage_quant_codes<D, Bc, kThreads>(k_s, static_cast<const std::uint8_t*>(k_pages), kv_heads,
                                                       kvh, mapped, k0, last_key, tid);
+            gemma4_stage_quant_scales<Bc, kThreads>(k_scale_s, k_scales, kv_heads, kvh, mapped, k0, tid);
         } else {
             stage_keys<D, D, Bc>(k_s, static_cast<const __nv_bfloat16*>(k_pages), kv_heads, kvh, mapped, k0,
                                  last_key, 0, tid);
@@ -183,14 +187,16 @@ __launch_bounds__(kThreads, 1) __global__
         if constexpr (kQuantKv) {
             gemma4_stage_quant_codes<D, Bc, kThreads>(v_s, static_cast<const std::uint8_t*>(v_pages), kv_heads,
                                                       kvh, mapped, k0, last_key, tid);
+            gemma4_stage_quant_scales<Bc, kThreads>(v_scale_s, v_scales, kv_heads, kvh, mapped, k0, tid);
         } else {
             stage_keys<D, kSlice, Bc>(v_s, static_cast<const __nv_bfloat16*>(v_pages), kv_heads, kvh, mapped,
                                       k0, last_key, column, tid);
         }
     };
-    const auto expand = [&](__nv_bfloat16* tile, const __half* scales, int mapped, int k0) {
+    // FullTile: every row of the tile is mapped and at or before the last key, so no row is zeroed.
+    const auto expand = [&]<bool FullTile>(__nv_bfloat16* tile, const __half* row_scales, int mapped, int k0) {
         if constexpr (kQuantKv) {
-            gemma4_expand_quant_tile<D, Bc, kThreads, 1>(tile, scales, kv_heads, kvh, mapped, k0, last_key, tid);
+            gemma4_expand_quant_tile<D, Bc, kThreads, FullTile>(tile, row_scales, mapped, k0, last_key, tid);
             __syncthreads();
         }
     };
@@ -207,7 +213,7 @@ __launch_bounds__(kThreads, 1) __global__
 
         cp_wait<0>();
         __syncthreads();
-        expand(k_s, k_scales, physical, k0);
+        expand.template operator()<FullTile>(k_s, k_scale_s, physical, k0);
         stage_value(physical, k0);
         cp_commit();
 
@@ -251,7 +257,7 @@ __launch_bounds__(kThreads, 1) __global__
 
         cp_wait<0>();
         __syncthreads();
-        expand(v_s, v_scales, physical, k0);
+        expand.template operator()<FullTile>(v_s, v_scale_s, physical, k0);
         if (block + 1 < block_end) {
             physical = next_physical;
             stage_key(physical, (block + 1) * Bc);

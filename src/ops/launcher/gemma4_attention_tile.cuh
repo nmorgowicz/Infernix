@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/common/memory.cuh"
+#include "ops/common/math.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 #include "ops/kernel/gemma4_fp8_kv.cuh"
 #include "ops/softmax_attention/common/causal_tile_io.cuh"
@@ -152,32 +153,74 @@ __device__ __forceinline__ void gemma4_expand_quant_stage(
     }
 }
 
-// Expands the compact [Bc, Width] code tile gemma4_stage_quant_codes left in `tile` into the BF16
-// tile it occupies, in two halves so that at most half a tile waits in registers: the upper half's
-// BF16 rows lie past every code byte, so it expands straight from shared memory; the lower half is
-// read into registers first and written after a block barrier (its BF16 rows overwrite the upper
-// half's codes). The caller has waited for the codes and passed a block barrier; another barrier
-// must follow before any cross-thread read of the tile. Rows past `last` or of an unmapped page
-// expand to zeros.
-template <int Width, int Bc, int Threads, int ScaleStride>
-__device__ __forceinline__ void gemma4_expand_quant_tile(__nv_bfloat16* tile, const __half* scales,
-                                                         int kv_heads, int kv_head, int physical,
-                                                         int k0, int last, int tid) {
-    constexpr int Half = Bc / 2;
-    static_assert(Half * 2 == Bc && kPagedKVPageSize % Bc == 0);
-    Gemma4QuantStage<Width, Half, Threads> low;
-    gemma4_load_quant_stage<Width, Half, Threads, kGemma4KvFp8Group, ScaleStride>(
-        low, tile, scales, kv_heads, kv_head, physical, k0, last, tid);
-    {
-        const auto* upper_codes = reinterpret_cast<const std::uint8_t*>(tile) + Half * Width;
-        Gemma4QuantStage<Width, Half, Threads> high;
-        gemma4_load_quant_stage<Width, Half, Threads, kGemma4KvFp8Group, ScaleStride>(
-            high, reinterpret_cast<const __nv_bfloat16*>(upper_codes), scales, kv_heads, kv_head, physical,
-            k0 + Half, last, tid);
-        gemma4_expand_quant_stage<Width, Half, Threads, std::uint8_t>(high, tile + Half * Width, 0, tid);
+// The Bc FP16 row scales of keys [k0, k0 + Bc) of a [1,64,Hkv,pages] scale cache, by cp.async into
+// `dst`: the caller commits them with the codes gemma4_stage_quant_codes stages for the same tile.
+// An unmapped page stages nothing. Scales of rows past the last key are copied like any other and
+// never used (gemma4_expand_quant_tile zeroes those rows).
+template <int Bc, int Threads>
+__device__ __forceinline__ void gemma4_stage_quant_scales(__half* dst, const __half* scales, int kv_heads,
+                                                          int kv_head, int physical, int k0, int tid) {
+    constexpr int Vectors = Bc / 8;
+    static_assert(Vectors <= Threads && kPagedKVPageSize % Bc == 0);
+    if (physical >= 0 && tid < Vectors) {
+        const auto row = gemma4_kv_row(physical, kv_heads, kv_head, k0 & kPagedKVPageMask);
+        cp_async<16, Cache::cg>(dst + tid * 8, scales + row + tid * 8);
     }
+}
+
+// The two BF16 values of the E4M3 codes in the low 16 bits of `codes`: BF16(FP32(code) x scale), the
+// value gemma4_fp8_expand returns for each, two to a register.
+__device__ __forceinline__ std::uint32_t gemma4_expand_code_pair(std::uint32_t codes, float scale) {
+    const __half2 halves = __half2(__nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(codes), __NV_E4M3));
+    const float2 values  = __half22float2(halves);
+    return pack_bf16x2(__fmul_rn(values.x, scale), __fmul_rn(values.y, scale));
+}
+
+// Expands the compact [Bc, Width] code tile gemma4_stage_quant_codes left in `tile` into the BF16
+// tile it occupies, one 8-code chunk per thread and pass, with the row scales gemma4_stage_quant_scales
+// staged in `row_scales`. BF16 row j covers code rows 2j and 2j + 1: the BF16 rows of the last half of
+// the keys lie past every code byte and expand straight away; the codes of the first half are read
+// into registers, one block barrier separates every thread's reads from the first write, and the
+// first half's rows follow. Rows past `last` or of an unmapped page expand to zeros unless
+// `AllValid` (every row of the tile is mapped and at or before `last`). The caller has waited for
+// the codes and scales and passed a block barrier; another barrier must follow before any
+// cross-thread read of the tile.
+template <int Width, int Bc, int Threads, bool AllValid>
+__device__ __forceinline__ void gemma4_expand_quant_tile(__nv_bfloat16* tile, const __half* row_scales,
+                                                         int physical, int k0, int last, int tid) {
+    constexpr int ChunksPerRow = Width / 8;
+    constexpr int RowsPerPass  = Threads / ChunksPerRow;
+    constexpr int Passes       = Bc / RowsPerPass;
+    static_assert(Threads % ChunksPerRow == 0 && Passes % 2 == 0);
+    const int row_in_pass = tid / ChunksPerRow;
+    const int column      = (tid % ChunksPerRow) * 8;
+    const auto* codes     = reinterpret_cast<const std::uint8_t*>(tile);
+    const bool mapped     = physical >= 0;
+    const auto key_of     = [&](int pass) { return pass * RowsPerPass + row_in_pass; };
+    const auto read       = [&](int pass) {
+        return *reinterpret_cast<const uint2*>(codes + key_of(pass) * Width + column);
+    };
+    const auto write = [&](int pass, uint2 packed) {
+        const int key    = key_of(pass);
+        __nv_bfloat16* p = tile + key * Width + causal_swizzle(key, column);
+        if (AllValid || (mapped && k0 + key <= last)) {
+            const float scale = __half2float(row_scales[key]);
+            store_vec(p, make_int4(static_cast<int>(gemma4_expand_code_pair(packed.x, scale)),
+                                   static_cast<int>(gemma4_expand_code_pair(packed.x >> 16, scale)),
+                                   static_cast<int>(gemma4_expand_code_pair(packed.y, scale)),
+                                   static_cast<int>(gemma4_expand_code_pair(packed.y >> 16, scale))));
+        } else {
+            store_vec(p, make_int4(0, 0, 0, 0));
+        }
+    };
+#pragma unroll
+    for (int pass = Passes - 1; pass >= Passes / 2; --pass) { write(pass, read(pass)); }
+    uint2 rest[Passes / 2];
+#pragma unroll
+    for (int pass = 0; pass < Passes / 2; ++pass) { rest[pass] = read(pass); }
     __syncthreads();
-    gemma4_expand_quant_stage<Width, Half, Threads, std::uint8_t>(low, tile, 0, tid);
+#pragma unroll
+    for (int pass = Passes / 2 - 1; pass >= 0; --pass) { write(pass, rest[pass]); }
 }
 
 // Gemma4ValueSource::Key: expands a prefetched tile of K codes (keys k0 .. k0 + Bc - 1) as the V
