@@ -2739,9 +2739,9 @@ the graphs find no Device memory at all, a Qwen3.5-family engine with
 an explicit `--kv-capacity` fails startup instead.
 On Gemma4 the CUDA Graph allowance is 64 MiB (about 2.25 MiB per prepared graph). When the sliding-window ring is FP8
 (`--gemma4-sliding-kv fp8`, with or without `--gemma4-key-only-kv`) the reservation, and so the automatic KV capacity,
-also leaves 128 MiB for the ring's kernels, which take about 122 MiB of Device memory at their first launch, whatever
-the chunk. With CUDA Graphs that launch falls inside graph preparation and the 128 MiB is part of
-`cuda_graph_allowance_bytes` (192 MiB in all); with `--no-cuda-graph` the first request takes it, and the 128 MiB is
+also leaves 32 MiB for the ring's kernels, which take about 2 MiB of Device memory at their first launch, whatever
+the chunk. With CUDA Graphs that launch falls inside graph preparation and the 32 MiB is part of
+`cuda_graph_allowance_bytes` (96 MiB in all); with `--no-cuda-graph` the first request takes it, and the 32 MiB is
 reserved without being reported as a CUDA Graph allowance (`cuda_graph_allowance_bytes` is `0`).
 
 `server_start.engine.original_int8_prefill_kernel`, `prefill_split_workspace_mib`,

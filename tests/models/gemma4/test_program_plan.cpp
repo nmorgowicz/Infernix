@@ -20,7 +20,7 @@ using infernix::test::gemma4_fixture::ModelFixture;
 
 constexpr std::uint64_t kMiB = 1ULL << 20;
 constexpr std::uint64_t kGraphs = 64 * kMiB;
-constexpr std::uint64_t kRing = 128 * kMiB;
+constexpr std::uint64_t kRing = 32 * kMiB;
 
 int failures = 0;
 

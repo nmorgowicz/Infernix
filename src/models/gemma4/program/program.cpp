@@ -45,12 +45,12 @@ constexpr std::array<std::uint32_t, 6> kGraphWidths{32, 64, 128, 256, 512, 1024}
 constexpr std::uint64_t kGraphGuardMargin = 256ULL << 20;
 // The driver state a graph set holds: about 2.25 MiB per graph measured (18 MiB for 8 graphs, 14 MiB for 6).
 constexpr std::uint64_t kGraphAllowance = 64ULL << 20;
-// The FP8 sliding ring's kernels bring in about 122 MiB at their first launch, whatever the chunk, with or without CUDA
+// The FP8 sliding ring's kernels bring in about 2 MiB at their first launch, whatever the chunk, with or without CUDA
 // graphs (measured 2026-11-26: the graphs-off process grows by that much on its first requests, a graphs-on start inside
 // prepare_graphs' warm launches, where the graph-memory measurement window also sees it). Every FP8-ring plan reserves
-// it so the KV sizing leaves it room: inside graph_allowance beside the graphs, or as ring_launch_allowance without
-// them. The key-only layout and the BF16 ring have no such term.
-constexpr std::uint64_t kFp8RingFirstLaunchAllowance = 128ULL << 20;
+// 32 MiB for it so the KV sizing leaves it room: inside graph_allowance beside the graphs, or as ring_launch_allowance
+// without them. The key-only layout and the BF16 ring have no such term.
+constexpr std::uint64_t kFp8RingFirstLaunchAllowance = 32ULL << 20;
 // MTP rounds: at most kMaxDraftTokens drafts (the CLI's range). One I32 slot block carries a round's
 // device inputs and outputs, so a captured round replays after one upload: the draft position, the
 // anchor and drafts (verify ids), the verify positions, the target argmaxes, the licensed tokens and
