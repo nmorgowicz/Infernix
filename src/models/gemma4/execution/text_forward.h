@@ -74,16 +74,30 @@ struct Gemma4Embedding {
 
 using Gemma4CacheLayer = ops::Gemma4CacheView;
 
+// The shared one-layer staging ring of a persistent sliding ring smaller than chunk + window - 1 rows.
+// A sliding layer's prompt call of more than persistent_rows - (window - 1) tokens cannot run on its persistent
+// ring (the chunk's own rows would overwrite window rows it still attends to), so it runs on `staging`, a
+// ring of the layout the unstaged engine used: the window rows before the call are copied in from the
+// persistent ring, the call appends and attends there, and the rows the persistent ring keeps (the last
+// persistent_rows positions) are copied back. All bytes are copied, never re-encoded, so the call's
+// arithmetic is the unstaged ring's. Narrower calls (decode, MTP rounds, short prompt tails) use the
+// persistent ring directly.
+struct Gemma4RingStage {
+    ops::Gemma4CacheView staging;
+    int persistent_rows = 0;
+};
+
 // Embed ids into hidden [hidden,T] and run every layer, appending K/V at positions. With
 // final_hidden == false the last layer only writes its K/V (projection, norm, rope and cache append):
 // its attention, output projection and FFN are skipped, and hidden is then not the model's final
 // hidden state. Every layer's K/V is identical either way, because a layer's K/V depends only on the
-// layer below it. The caller must not read hidden afterwards.
+// layer below it. The caller must not read hidden afterwards. `stage` (optional) is the shared staging
+// ring of a smaller persistent sliding ring; prompt positions must then be contiguous from positions[0].
 void gemma4_layers(const Tensor& ids, Tensor& hidden, const Gemma4Embedding& token_embedding,
                    std::span<const Gemma4LayerWeights> layers,
                    std::span<const Gemma4CacheLayer> caches, const Tensor& positions,
                    ops::Fp8RowCublasContext& gemm, WorkspaceArena& workspace, cudaStream_t stream,
-                   bool final_hidden = true);
+                   bool final_hidden = true, const Gemma4RingStage* stage = nullptr);
 
 // Final norm, A16-only output head and logit softcap for hidden [hidden,C] into logits [vocab,C].
 // hidden is not modified. The Gemma FP8 vocabulary projection writes BF16 logits.

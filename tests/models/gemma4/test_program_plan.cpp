@@ -76,6 +76,47 @@ void check_route(const g4::Model& model, bool key_only, KvCacheStorage ring) {
           name + ": the graphs add exactly the graph allowance to the reservation (the ring term is not counted twice)");
 }
 
+// The staged sliding ring (24 persistent pages per layer plus one shared staging ring, from a chunk of 1,024): its plan
+// against the full-size ring's, exactly, and the unchanged plan below that chunk.
+void check_staging(const g4::Model& model, KvCacheStorage ring) {
+    const auto& c = model.config().text;
+    std::uint32_t sliding_layers = 0;
+    for (const auto kind : c.layer_types) { sliding_layers += kind == g4::LayerKind::Global ? 0U : 1U; }
+    for (const std::uint32_t chunk : {512U, 1024U, 2048U}) {
+        auto staged_options = route(false, ring, true);
+        staged_options.max_context   = 4096;
+        staged_options.prefill_chunk = chunk;
+        auto full_options = staged_options;
+        full_options.staged_sliding_ring = false;
+        const auto staged = g4::Program::plan_device(model, staged_options, c.vocab_size);
+        const auto full   = g4::Program::plan_device(model, full_options, c.vocab_size);
+        const std::uint32_t full_pages = (chunk + c.sliding_window - 1 + 63) / 64;
+        const std::string name = "staging/" + std::string(ring == KvCacheStorage::Fp8E4M3Row256 ? "fp8-ring" : "bf16-ring") +
+                                 "/chunk " + std::to_string(chunk);
+        check(full.staging_pages == 0 && full.ring_pages == full_pages, name + ": the reference plan has the full-size ring");
+        if (chunk < 1024) {
+            check(staged.staging_pages == 0 && staged.ring_pages == full_pages && staged.kv == full.kv &&
+                      staged.fixed_bytes() == full.fixed_bytes(),
+                  name + ": below a chunk of 1,024 the plan is unchanged");
+            continue;
+        }
+        const auto layout = g4::kv_layer_layout(staged_options.kv_layout(), false, c.head_dim, c.num_key_value_heads);
+        const std::int64_t saving =
+            (static_cast<std::int64_t>(sliding_layers) * (full_pages - 24) - full_pages) *
+                static_cast<std::int64_t>(layout.page_bytes()) -
+            4LL * staged.kv_pages;
+        check(staged.ring_pages == 24 && staged.staging_pages == full_pages, name + ": 24 + " + std::to_string(full_pages) + " pages");
+        check(static_cast<std::int64_t>(full.kv) - static_cast<std::int64_t>(staged.kv) == saving,
+              name + ": the planned KV saving is the arithmetic " + std::to_string(saving) + " B");
+        check(staged.curve.minimum_device_reservation_bytes ==
+                  staged.fixed_bytes() - staged.curve.bytes_per_additional_main_page_group *
+                                             (staged.kv_pages - staged.curve.minimum_main_page_groups),
+              name + ": the capacity curve's minimum reservation is the fixed bytes less the extra page groups");
+        check(staged.curve.bytes_per_additional_main_page_group == full.curve.bytes_per_additional_main_page_group + 4,
+              name + ": one more 4-byte table entry per page group");
+    }
+}
+
 void run() {
     for (const bool key_only : {false, true}) {
         ModelFixture fixture(false, infernix::QType::BF16, 256, 512);
@@ -91,6 +132,16 @@ void run() {
         check_route(*model, key_only, KvCacheStorage::BFloat16);
         check_route(*model, key_only, KvCacheStorage::Fp8E4M3Row256);
     }
+    // The staged ring needs a full-size ring above 24 pages: a fixture whose positions reach 4,096.
+    ModelFixture long_fixture(false, infernix::QType::BF16, 256, 512);
+    auto& long_config = long_fixture.file.root["components"]["text"]["config"];
+    long_config["max_position_embeddings"] = 4096;
+    long_config["sliding_window"] = 1024;
+    long_fixture.file.write();
+    infernix::artifact::Reader long_reader(long_fixture.file.entry);
+    const auto long_model = g4::plan_model(g4::plan_load(long_reader));
+    check_staging(*long_model, KvCacheStorage::BFloat16);
+    check_staging(*long_model, KvCacheStorage::Fp8E4M3Row256);
 }
 
 } // namespace

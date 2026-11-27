@@ -51,6 +51,11 @@ constexpr std::uint64_t kGraphAllowance = 64ULL << 20;
 // 32 MiB for it so the KV sizing leaves it room: inside graph_allowance beside the graphs, or as ring_launch_allowance
 // without them. The key-only layout and the BF16 ring have no such term.
 constexpr std::uint64_t kFp8RingFirstLaunchAllowance = 32ULL << 20;
+// A staged sliding ring keeps 24 pages (1,536 rows) per layer: the 1,023-row window plus 513 rows, so decode, MTP rounds
+// and prompt calls up to 513 tokens run on it directly; wider prompt calls run on one shared staging ring of the full
+// size pages_for(chunk + window - 1). It pays from a chunk of 1,024 (a chunk of 512 already needs only 24 pages).
+constexpr std::uint32_t kStagedRingPages = 24;
+constexpr std::uint32_t kStagingMinimumChunk = 1024;
 // MTP rounds: at most kMaxDraftTokens drafts (the CLI's range). One I32 slot block carries a round's
 // device inputs and outputs, so a captured round replays after one upload: the draft position, the
 // anchor and drafts (verify ids), the verify positions, the target argmaxes, the licensed tokens and
@@ -77,6 +82,14 @@ std::uint64_t aligned(std::uint64_t bytes) { return (bytes + 255) & ~std::uint64
 std::uint32_t pages_for(std::uint32_t tokens) { return (tokens + kPage - 1) / kPage; }
 std::uint32_t ring_pages(std::uint32_t chunk, std::uint32_t window) {
     return pages_for(chunk + window - 1);
+}
+// The persistent ring's pages per layer and the shared staging ring's (0: none), given the full-size ring `full`.
+struct RingShape { std::uint32_t persistent = 0, staging = 0; };
+RingShape ring_shape(const ProgramOptions& o, std::uint32_t window, std::uint32_t full, bool uniform_sliding) {
+    const bool staged = o.staged_sliding_ring && uniform_sliding && o.prefill_chunk >= kStagingMinimumChunk &&
+                        full > kStagedRingPages && window != 0 &&
+                        (window - 1) + 64U <= kStagedRingPages * kPage;
+    return staged ? RingShape{kStagedRingPages, full} : RingShape{full, 0};
 }
 std::uint64_t io_bytes(const TextConfig& c, std::uint32_t chunk, std::uint32_t columns, bool mtp) {
     // Each item is a separate aligned arena allocation. Head and distribution staging are shared
@@ -175,6 +188,9 @@ ProgramDevicePlan Program::plan_device(const Model& model, const ProgramOptions&
     const auto rings = std::min(maximum_pages, ring_pages(options.prefill_chunk, c.sliding_window));
     std::uint64_t global_page_bytes = 0;
     std::uint64_t sliding_page_bytes = 0;
+    std::uint64_t sliding_layer_bytes = 0;
+    int sliding_head_dim = 0, sliding_kv_heads = 0;
+    bool uniform_sliding = true;
     for (const auto& layer : geometry.layers) {
         // Global layers follow the requested format (FP8 codes plus FP16 scales); rings follow the sliding format.
         const std::uint64_t bytes =
@@ -182,9 +198,22 @@ ProgramDevicePlan Program::plan_device(const Model& model, const ProgramOptions&
                 kv_layer_layout(options.kv_layout(), layer.global_layer, layer.head_dim, layer.kv_heads))
                 .page_bytes();
         (layer.global_layer ? global_page_bytes : sliding_page_bytes) += bytes;
+        if (!layer.global_layer) {
+            if (sliding_layer_bytes == 0) {
+                sliding_layer_bytes = bytes; sliding_head_dim = layer.head_dim; sliding_kv_heads = layer.kv_heads;
+            } else if (bytes != sliding_layer_bytes || layer.head_dim != sliding_head_dim ||
+                       layer.kv_heads != sliding_kv_heads) {
+                uniform_sliding = false;
+            }
+        }
         plan.workspace = std::max<std::uint64_t>(plan.workspace,
             gemma4_layer_workspace_bytes(layer, static_cast<int>(options.prefill_chunk)));
     }
+    const auto shape = ring_shape(options, c.sliding_window, rings, uniform_sliding);
+    plan.ring_pages = shape.persistent;
+    plan.staging_pages = shape.staging;
+    // Two page tables (global and ring), three when a staging ring has its own.
+    const std::uint64_t table_bytes = shape.staging != 0 ? 12ULL : 8ULL;
     // One logits tile and the sampler share the arena, not concurrent layer intermediates. The
     // arena is sized for the 64-wide sampler, which serves requests with top_k above 20.
     plan.workspace = std::max<std::uint64_t>(plan.workspace,
@@ -210,8 +239,10 @@ ProgramDevicePlan Program::plan_device(const Model& model, const ProgramOptions&
     if (plan.kv_pages < minimum_pages) {
         throw std::invalid_argument("Gemma4 KV capacity is below the sliding-ring capacity curve minimum");
     }
-    plan.kv = global_page_bytes * plan.kv_pages + sliding_page_bytes * rings + 8ULL * plan.kv_pages;
-    plan.kv_max = global_page_bytes * maximum_pages + sliding_page_bytes * rings + 8ULL * maximum_pages;
+    plan.kv = global_page_bytes * plan.kv_pages + sliding_page_bytes * shape.persistent +
+              sliding_layer_bytes * shape.staging + table_bytes * plan.kv_pages;
+    plan.kv_max = global_page_bytes * maximum_pages + sliding_page_bytes * shape.persistent +
+                  sliding_layer_bytes * shape.staging + table_bytes * maximum_pages;
     plan.io = io_bytes(c, options.prefill_chunk, head_columns(options), geometry.draft.has_value());
     const std::uint64_t ring_first_launch =
         options.sliding_kv_cache == KvCacheStorage::Fp8E4M3Row256 ? kFp8RingFirstLaunchAllowance : 0ULL;
@@ -235,10 +266,10 @@ ProgramDevicePlan Program::plan_device(const Model& model, const ProgramOptions&
     plan.curve.main_page_tokens = kPage;
     plan.curve.minimum_main_page_groups = minimum_pages;
     plan.curve.maximum_main_page_groups = maximum_pages;
-    plan.curve.bytes_per_additional_main_page_group = static_cast<std::size_t>(global_page_bytes + 8);
-    const auto without_global_tables = plan.fixed_bytes() - (global_page_bytes + 8) * plan.kv_pages;
+    plan.curve.bytes_per_additional_main_page_group = static_cast<std::size_t>(global_page_bytes + table_bytes);
+    const auto without_global_tables = plan.fixed_bytes() - (global_page_bytes + table_bytes) * plan.kv_pages;
     plan.curve.minimum_device_reservation_bytes = static_cast<std::size_t>(
-        without_global_tables + (global_page_bytes + 8) * minimum_pages);
+        without_global_tables + (global_page_bytes + table_bytes) * minimum_pages);
     return plan;
 }
 
@@ -280,9 +311,14 @@ struct ProgramImpl {
     DeviceArena io;
     DeviceBuffer global_table_storage, ring_table_storage;
     Tensor global_table, ring_table;
+    // The shared staging ring (plan.staging_pages != 0): one layer's K/V pages in the layout of the full-size ring, its own
+    // block table (logical page % staging pages), and the descriptor the wide prompt calls of every sliding layer use.
+    DeviceBuffer staging_table_storage, staging_keys, staging_values, staging_key_scales, staging_value_scales;
+    Tensor staging_table, staging_key_view, staging_value_view, staging_key_scale_view, staging_value_scale_view;
+    Gemma4RingStage ring_stage;
     std::vector<DeviceBuffer> keys, values, key_scales, value_scales;
     std::vector<Tensor> key_views, value_views, key_scale_views, value_scale_views;
-    std::uint64_t global_payload_bytes = 0, sliding_payload_bytes = 0;
+    std::uint64_t global_payload_bytes = 0, sliding_payload_bytes = 0, staging_payload_bytes = 0;
     std::vector<Gemma4CacheLayer> caches;
     Tensor ids, positions, hidden, head, counts, mask, step, distribution_ids, distribution_values;
     ops::SamplingConfig* sampling_device = nullptr;
@@ -426,8 +462,8 @@ struct ProgramImpl {
         host_mask.resize((c.vocab_size + 31) / 32);
         if (options.causal_scoring) { host_logits.resize(static_cast<std::size_t>(c.vocab_size)); }
         ledger.reserve(capacity() + 1ULL);
-        const auto ring_count = std::min(plan.kv_pages, ring_pages(options.prefill_chunk, c.sliding_window));
-        ring_pages_ = static_cast<std::uint32_t>(ring_count);
+        const auto ring_count = plan.ring_pages;
+        ring_pages_ = ring_count;
         std::vector<std::int32_t> table(plan.kv_pages);
         std::iota(table.begin(), table.end(), 0);
         global_table_storage.copy_from_host(table.data(), table.size() * sizeof(std::int32_t));
@@ -469,6 +505,7 @@ struct ProgramImpl {
                 }
             }
         }
+        if (plan.staging_pages != 0) { create_staging_ring(); }
         // Every reserve() above is complete; the descriptors now point at stable Tensor storage.
         for (std::size_t i = 0; i < layers; ++i) {
             const auto& layer = p.layers[i];
@@ -520,6 +557,45 @@ struct ProgramImpl {
         }
         catch (...) { (void)settle_after_memory_exhausted(); throw; }
     }
+    // The staging ring's pages and descriptor: one layer's worth of the layout every sliding layer shares. Never-written
+    // rows read as finite zeros, as in the rings; its payload counts as sliding KV.
+    void create_staging_ring() {
+        const auto& layers = parameters.layers;
+        const auto sliding = std::find_if(layers.begin(), layers.end(), [](const auto& l) { return !l.global_layer; });
+        if (sliding == layers.end()) { throw std::logic_error("Gemma4 staging ring without a sliding layer"); }
+        const std::uint32_t pages = plan.staging_pages;
+        const auto layout = kv_layer_layout(options.kv_layout(), false, sliding->head_dim, sliding->kv_heads);
+        std::vector<std::int32_t> table(plan.kv_pages);
+        std::iota(table.begin(), table.end(), 0);
+        for (auto& page : table) { page %= static_cast<int>(pages); }
+        staging_table_storage = DeviceBuffer(table.size() * sizeof(std::int32_t));
+        staging_table_storage.copy_from_host(table.data(), table.size() * sizeof(std::int32_t));
+        staging_table = Tensor(staging_table_storage.p, DType::I32, {static_cast<int>(plan.kv_pages)});
+        const std::initializer_list<std::int32_t> shape{
+            sliding->head_dim, static_cast<int>(kPage), sliding->kv_heads, static_cast<int>(pages)};
+        const std::initializer_list<std::int32_t> scale_shape{
+            layout.scale_groups, static_cast<int>(kPage), sliding->kv_heads, static_cast<int>(pages)};
+        staging_keys = DeviceBuffer(layout.code_page_bytes * pages); staging_keys.fill(0);
+        staging_values = DeviceBuffer(layout.code_page_bytes * pages); staging_values.fill(0);
+        staging_key_view = Tensor(staging_keys.p, layout.code_dtype, shape);
+        staging_value_view = Tensor(staging_values.p, layout.code_dtype, shape);
+        const bool scaled = layout.scale_groups != 0;
+        if (scaled) {
+            staging_key_scales = DeviceBuffer(layout.scale_page_bytes * pages); staging_key_scales.fill(0);
+            staging_value_scales = DeviceBuffer(layout.scale_page_bytes * pages); staging_value_scales.fill(0);
+            staging_key_scale_view = Tensor(staging_key_scales.p, DType::FP16, scale_shape);
+            staging_value_scale_view = Tensor(staging_value_scales.p, DType::FP16, scale_shape);
+        }
+        staging_payload_bytes = layout.page_bytes() * pages;
+        sliding_payload_bytes += staging_payload_bytes;
+        ring_stage.staging = {.format = scaled ? ops::Gemma4KvFormat::Fp8E4m3Row256 : ops::Gemma4KvFormat::BFloat16,
+            .k_pages = &staging_key_view, .v_pages = &staging_value_view,
+            .k_scales = scaled ? &staging_key_scale_view : nullptr,
+            .v_scales = scaled ? &staging_value_scale_view : nullptr,
+            .block_table = &staging_table, .qk_mode = ops::Gemma4QkMode::BFloat16};
+        ring_stage.persistent_rows = static_cast<int>(ring_pages_ * kPage);
+    }
+    const Gemma4RingStage* stage() const noexcept { return plan.staging_pages != 0 ? &ring_stage : nullptr; }
     const TextConfig& config() const noexcept { return parameters.model.config().text; }
     // Key-only global layers: 1 / c for global layer `layer`, after checking on the loaded weights
     // that its key-norm weight is one finite nonzero BF16 constant c equal to the converter's
@@ -580,7 +656,7 @@ struct ProgramImpl {
         auto pos = positions.slice(0, 0, static_cast<int>(width));
         auto out = hidden_columns(0, static_cast<int>(width));
         gemma4_layers(input, out, parameters.embedding, parameters.layers, caches, pos,
-            gemm, workspace, stream, final_hidden);
+            gemm, workspace, stream, final_hidden, stage());
     }
     void head_body(int first, int n, int output_first = 0) {
         workspace.reset();
@@ -2033,16 +2109,20 @@ MemoryUsage Program::memory_usage() const noexcept {
     const auto& storage = p.parameters.model.storage_stats();
     // The materialized arena plus the row scales Parameters prepared from the FP8 projections.
     out.device.weights = storage.device_capacity_bytes + p.parameters.derived_device_bytes();
-    // KV: every global and ring payload (codes and FP16 scales) and both page tables, all reserved at construction.
+    // KV: every global and ring payload (codes and FP16 scales), the staging ring when there is one, and the page tables, all
+    // reserved at construction.
     out.device.kv = p.plan.kv;
     if (p.occupied) {
         // The live request's tokens: global pages up to its frontier and the rings' filled share.
         const std::uint32_t pages = p.plan.kv_pages;
         const std::uint32_t used = std::min(pages, pages_for(std::max(p.fed, p.physical_written)));
-        const std::uint32_t rings = std::min(pages, ring_pages(p.options.prefill_chunk, p.config().sliding_window));
+        const std::uint32_t rings = std::min(pages, p.ring_pages_);
         std::uint64_t bytes = 8ULL * used;
         if (pages != 0) { bytes += p.global_payload_bytes * used / pages; }
-        if (rings != 0) { bytes += p.sliding_payload_bytes * std::min(rings, used) / rings; }
+        if (rings != 0) {
+            bytes += (p.sliding_payload_bytes - p.staging_payload_bytes) * std::min(rings, used) / rings +
+                     p.staging_payload_bytes;
+        }
         out.device.kv_used = std::min<std::uint64_t>(bytes, out.device.kv);
     }
     out.device.state = p.plan.io; // call inputs and outputs (hidden, head, sampler and distribution buffers)

@@ -37,7 +37,8 @@ using namespace prefix_real;
 namespace ops = infernix::ops;
 namespace testing = infernix::runtime::testing;
 
-constexpr std::uint32_t kChunk   = 128;
+// INFERNIX_GEMMA4_CHUNK (default 128) selects the prefill chunk; 1,024 or more runs the staged sliding ring's staging ring.
+const std::uint32_t kChunk = chunk_from_env(128);
 constexpr std::uint32_t kContext = 4096;
 constexpr std::uint32_t kOut     = 8;
 constexpr auto kBf16 = infernix::KvCacheStorage::BFloat16;

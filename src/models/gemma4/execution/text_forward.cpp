@@ -4,6 +4,7 @@
 #include "infernix/ops/embedding.h"
 #include "infernix/ops/gemma4_attention.h"
 #include "infernix/ops/gemma4_qkv_prep.h"
+#include "infernix/ops/gemma4_ring_copy.h"
 #include "infernix/ops/gemma4_residual_norm.h"
 #include "infernix/ops/geglu.h"
 #include "infernix/ops/logit_softcap.h"
@@ -103,7 +104,8 @@ namespace {
 void layer_body(Tensor& x, Tensor& hidden_n, const Gemma4LayerWeights& weights,
                 const void* next_input_norm, const Tensor& positions,
                 const ops::Gemma4CacheView& cache, ops::Fp8RowCublasContext& gemm,
-                WorkspaceArena& workspace, cudaStream_t stream, bool kv_only) {
+                WorkspaceArena& workspace, cudaStream_t stream, bool kv_only,
+                const Gemma4RingStage* stage = nullptr) {
     const int tokens = x.ne[1];
     const int hidden = weights.hidden;
     const int dim = weights.head_dim;
@@ -126,14 +128,27 @@ void layer_body(Tensor& x, Tensor& hidden_n, const Gemma4LayerWeights& weights,
     project(hidden_n, weights.qkv, weights.qkv_ggml, weights.qkv_policy, qkv, gemm, workspace, stream,
             weights.q5_routes);
     Tensor qn_heads(qn.data, DType::BF16, {dim, weights.q_heads, tokens});
+    // A prompt call too wide for the persistent ring runs on the staging ring: window rows in, the call's
+    // rows appended and attended there, the persistent ring's share of them copied back.
+    const bool staged = stage != nullptr && !weights.global_layer && weights.window > 1 &&
+                        tokens + (weights.window - 1) > stage->persistent_rows;
+    const ops::Gemma4CacheView& kv = staged ? stage->staging : cache;
+    if (staged) {
+        ops::gemma4_ring_copy(cache, stage->staging, positions, ops::Gemma4RingCopyRows::Window, tokens,
+                              weights.window - 1, stage->persistent_rows, stream);
+    }
     ops::gemma4_qkv_prep(qkv, norm_weight(weights.q_norm, dim), norm_weight(weights.k_norm, dim),
                          positions, weights.rotary_dim, weights.rope_theta, weights.rms_eps,
-                         weights.global_layer, qn_heads, cache, stream);
+                         weights.global_layer, qn_heads, kv, stream);
+    if (staged) {
+        ops::gemma4_ring_copy(stage->staging, cache, positions, ops::Gemma4RingCopyRows::Tail, tokens,
+                              weights.window - 1, stage->persistent_rows, stream);
+    }
     if (kv_only) { return; } // the layer's K/V is written; nothing downstream reads its output
     auto attn = workspace.alloc(DType::BF16, {q_rows, tokens});
     auto projected = workspace.alloc(DType::BF16, {hidden, tokens});
     Tensor attn_heads(attn.data, DType::BF16, {dim, weights.q_heads, tokens});
-    ops::gemma4_attention(qn_heads, cache, positions, weights.window, 1.0f, attn_heads,
+    ops::gemma4_attention(qn_heads, kv, positions, weights.window, 1.0f, attn_heads,
                           workspace, stream);
     project(attn, weights.o_proj, weights.o_ggml, weights.o_policy, projected, gemm, workspace, stream,
             weights.q5_routes);
@@ -181,7 +196,7 @@ void gemma4_layers(const Tensor& ids, Tensor& hidden, const Gemma4Embedding& tok
                    std::span<const Gemma4LayerWeights> layers,
                    std::span<const Gemma4CacheLayer> caches, const Tensor& positions,
                    ops::Fp8RowCublasContext& gemm, WorkspaceArena& workspace, cudaStream_t stream,
-                   bool final_hidden) {
+                   bool final_hidden, const Gemma4RingStage* stage) {
     if (layers.size() != caches.size()) {
         throw std::invalid_argument("gemma4_layers: one cache per layer");
     }
@@ -196,7 +211,7 @@ void gemma4_layers(const Tensor& ids, Tensor& hidden, const Gemma4Embedding& tok
         const bool last = layer + 1 == layers.size();
         const void* next = last ? nullptr : layers[layer + 1].input_norm;
         layer_body(hidden, hidden_n, layers[layer], next, positions, caches[layer], gemm,
-                   workspace, stream, last && !final_hidden);
+                   workspace, stream, last && !final_hidden, stage);
     }
 }
 

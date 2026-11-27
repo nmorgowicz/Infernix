@@ -200,8 +200,11 @@ struct ContextProgress {
 };
 struct ProgramDevicePlan {
     std::uint32_t kv_pages = 0;
+    // The sliding rings' pages per layer (persistent), and, when the prompt chunk is wide enough that a smaller persistent
+    // ring pays (ProgramOptions::staged_sliding_ring), the pages of the one shared staging ring a wide prompt call runs on.
+    std::uint32_t ring_pages = 0, staging_pages = 0;
     // KV includes global pools (BF16, or FP8 codes plus FP16 scales), the sliding rings (BF16, or FP8 codes plus
-    // FP16 row scales) and both page tables.
+    // FP16 row scales), the shared staging ring when staged, and the page tables.
     std::uint64_t kv = 0, kv_max = 0, workspace = 0, state = 0, io = 0;
     // graph_allowance: the CUDA graphs' memory, plus the FP8 ring's first-launch memory when graph preparation's warm
     // launches take it. ring_launch_allowance: that ring memory when there are no graphs (the first request takes it).
@@ -250,6 +253,10 @@ struct ProgramOptions {
     // All host staging/copies are absent when unset; the span lives only for the callback.
     std::function<void(std::uint32_t first_predictor, std::uint32_t width,
                        std::span<const std::uint16_t>)> logits_observer;
+    // Sliding rings of the prompt chunk's full size (pages_for(chunk + window - 1)) are kept at 24 pages per layer, plus
+    // one shared staging ring of the full size, when the chunk is at least 1,024 and that is smaller. Not a serving
+    // flag: false is the full-size ring on every layer, the reference the staged route is compared against.
+    bool staged_sliding_ring = true;
 };
 class Program {
 public:

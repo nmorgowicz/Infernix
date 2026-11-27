@@ -207,7 +207,7 @@ void exits(g4::Program& p, const g4::Frontend& frontend, const Tokens& prompt, s
 }
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     const char* artifact = std::getenv("INFERNIX_GEMMA4_ARTIFACT");
     if (artifact == nullptr || *artifact == '\0') { std::puts("skip: INFERNIX_GEMMA4_ARTIFACT is not set"); return 77; }
     try {
@@ -216,9 +216,14 @@ int main() {
         load.speculative = infernix::SpeculativeBackend::Mtp;
         auto model = g4::load_model(artifact, load, device);
         const g4::execution::Parameters parameters(*model, device.stream);
-        constexpr std::uint32_t chunk = 64;
+        // --chunk N (default 64): a chunk of 1,024 or more runs the prompt calls wider than 513 tokens on the staged ring's
+        // staging ring (ProgramOptions::staged_sliding_ring); the prompts below wrap the full-size ring either way.
+        std::uint32_t chunk = 64;
+        for (int i = 1; i + 1 < argc; ++i) {
+            if (std::string(argv[i]) == "--chunk") { chunk = static_cast<std::uint32_t>(std::stoul(argv[i + 1])); }
+        }
         const auto wrap = ((chunk + model->config().text.sliding_window - 1 + 63) / 64) * 64;
-        const auto capacity = wrap + 256;
+        const auto capacity = std::max(wrap + 256, 3 * chunk + 64);
         g4::Frontend frontend(model->resources(), {.max_context = capacity});
         for (const auto drafts : {1U, 7U}) {
             g4::ProgramOptions options;

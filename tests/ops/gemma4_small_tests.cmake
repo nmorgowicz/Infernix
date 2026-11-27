@@ -3,6 +3,7 @@
 set(infernix_gemma4_small_op_tests
   geglu
   gemma4_qkv_prep
+  gemma4_ring_copy
   gemma4_residual_norm
   logit_softcap
   residual_scale)
