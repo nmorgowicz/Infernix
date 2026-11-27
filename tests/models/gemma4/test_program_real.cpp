@@ -408,7 +408,7 @@ Tokens fp8_run(const g4::execution::Parameters& parameters, DeviceContext& devic
             "global FP8 payload does not include the code and scale planes");
     require(memory.kv_payload_bytes == kv.global_payload_bytes + kv.sliding_payload_bytes,
             "kv_payload_bytes disagrees with the Gemma payload split");
-    require(memory.kv_payload_bytes + 8ULL * pages == program.device_plan().kv,
+    require(memory.kv_payload_bytes + (program.device_plan().staging_pages != 0 ? 12ULL : 8ULL) * pages == program.device_plan().kv,
             "planner and constructor disagree on FP8 KV bytes");
     require(memory.cuda_graph_measured_bytes <= memory.cuda_graph_allowance_bytes,
             "CUDA graph preparation exceeded its allowance");

@@ -331,12 +331,17 @@ g4::SequenceHandle bind(g4::Program& program, const g4::RequestBasePlan& plan, g
     return *progress.sequence;
 }
 
-std::uint64_t sliding_payload(const g4::execution::Parameters& p, KvCacheStorage sliding, std::uint32_t ring_pages) {
+// The sliding payload: every sliding layer's `ring_pages` pages, plus the shared staging ring (one layer's pages) when staged.
+std::uint64_t sliding_payload(const g4::execution::Parameters& p, KvCacheStorage sliding, std::uint32_t ring_pages,
+                              std::uint32_t staging_pages = 0) {
     std::uint64_t bytes = 0;
+    bool staging_added = staging_pages == 0;
     for (const auto& layer : p.layers) {
         if (!layer.global_layer) {
-            bytes += g4::kv_layer_layout({kFp8, g4::KvStorageModel::KeyEqualsValue, sliding}, false, layer.head_dim,
-                                         layer.kv_heads).page_bytes() * ring_pages;
+            const auto page = g4::kv_layer_layout({kFp8, g4::KvStorageModel::KeyEqualsValue, sliding}, false, layer.head_dim,
+                                                  layer.kv_heads).page_bytes();
+            bytes += page * ring_pages;
+            if (!staging_added) { bytes += page * staging_pages; staging_added = true; }
         }
     }
     return bytes;
@@ -365,10 +370,11 @@ void generation(const g4::execution::Parameters& parameters, DeviceContext& devi
     require(memory.gemma4_kv && memory.gemma4_kv->sliding == kFp8 && memory.gemma4_kv->global == kFp8 &&
                 memory.gemma4_kv->global_key_only == (storage == g4::KvStorageModel::KeyOnly),
             "memory summary does not report the FP8 ring");
-    require(memory.gemma4_kv->sliding_payload_bytes == sliding_payload(parameters, kFp8, ring_pages) &&
-                bf16_sliding == sliding_payload(parameters, kBf16, ring_pages),
+    const auto& plan_pages = program.device_plan();
+    require(memory.gemma4_kv->sliding_payload_bytes == sliding_payload(parameters, kFp8, plan_pages.ring_pages, plan_pages.staging_pages) &&
+                bf16_sliding == sliding_payload(parameters, kBf16, plan_pages.ring_pages, plan_pages.staging_pages),
             "the sliding payload is not the rings' codes and row scales");
-    require(memory.kv_payload_bytes + 8ULL * pages == program.device_plan().kv,
+    require(memory.kv_payload_bytes + (plan_pages.staging_pages != 0 ? 12ULL : 8ULL) * pages == program.device_plan().kv,
             "planner and constructor disagree on FP8-ring KV bytes");
     require(bf16_kv - program.device_plan().kv == bf16_sliding - memory.gemma4_kv->sliding_payload_bytes,
             "the plan's KV saving is not the ring saving");
