@@ -5,7 +5,9 @@ sliding K/V storage, FP8 attention QK, one lane, `--prefill-chunk auto`, MTP wit
 BF16-rounded logits, a host-only prefix cache (no device snapshot slots, 8192 MiB host context), any model name
 accepted, listening on `0.0.0.0:8001`. Every field can be changed; `--gemma4-qk bf16` omits the QK flag so the
 engine default applies without changing ring storage. Omitted ring storage follows global KV, except the
-`q5-quality` fidelity profile, which pins BF16 storage; an explicit ring always wins.
+`q5-quality` fidelity profile, which pins BF16 storage; an explicit ring always wins. A launcher generated for an
+existing mixed Q4/Q5 artifact with `--profile` omitted selects `q5-quality` but keeps the ring following global KV
+(FP8 with FP8 globals): at class B the BF16 ring costs mixed-A about 13k tokens (`artifact_profile`).
 This module imports nothing from the other `gemma4_build*` modules.
 """
 
@@ -39,7 +41,8 @@ DEFAULT_VRAM_HEADROOM_MIB = 1024
 SMALL_VRAM_HEADROOM_MIB = 64  # memory-16gb default; any value >= 0 (docs/weight-conversion.md, 16 GB profile)
 SERVE_PROFILES = ("default", "memory-16gb", "q5-quality", "q5-long-context")
 # Fidelity-first tiers pin the BF16 sliding ring regardless of global KV (operator, 2026-11-28): the FP8 ring
-# buys them no class-C capacity and measurably costs KL. An explicit --gemma4-sliding-kv always wins.
+# measurably costs KL, and the pin costs plain Q5 capacity (no measured 32 GB MTP d1 start reached 131k with either
+# ring). An explicit --gemma4-sliding-kv always wins.
 FIDELITY_PROFILES = ("q5-quality",)
 MAX_TOP_K = 64  # Gemma4's sampler ceiling (Qwen stays at 20)
 REASONING_LOOPS = ("stop", "conclude")  # --reasoning-loop; "off" is the server default and emits no flag
@@ -66,6 +69,11 @@ class ArtifactInfo:
     max_context: int
     iq3_xxs: bool = False
     q5: bool = False
+    q4: bool = False  # Q4 trunk cells beside the Q5 ones: a mixed Q4/Q5 artifact (q4q5-mixed-a/-b)
+
+    @property
+    def mixed_q4q5(self) -> bool:
+        return self.q5 and self.q4
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,7 +307,8 @@ def launcher_lines(
         lines.append("rem FP8 sliding K/V ring: lower memory, lossy K/V storage; --gemma4-sliding-kv bf16 preserves BF16 storage independently of QK precision.")
     elif profile.profile in FIDELITY_PROFILES:
         lines.append("rem BF16 sliding K/V ring (q5-quality fidelity default): exact K/V storage; costs about "
-                     "587 MiB more startup reservation than FP8 at chunk 2048. --gemma4-sliding-kv fp8 restores "
+                     "587 MiB more startup reservation than FP8 at chunk 2048 (Q5 auto context in measured 32 GB "
+                     "starts: 98,688 tokens BF16 ring, 101,632-104,128 FP8 ring). --gemma4-sliding-kv fp8 restores "
                      "the smaller ring.")
     if profile.gemma4_q5_prefill != "a16":
         lines.append(f"rem Q5 prefill {profile.gemma4_q5_prefill} (lossy; int8-g64 is the Q5 profile default): calls of 64+ columns; narrow decode/MTP verification stays A16. Artifact unchanged.")
@@ -356,20 +365,37 @@ def artifact_info(path: Path) -> ArtifactInfo:
         if config.get("architectures") != ["Gemma4ForCausalLM"]:
             raise ValueError(f"{path} is not a Gemma 4 text artifact")
         objects = {obj.id: obj for obj in artifact.objects}
-        q5 = any(
-            objects[object_id].format == "q5_g64_fp16"
+        trunk = {
+            objects[object_id].format
             for name, binding in artifact.directory.bindings.items()
             if name.startswith("text/layers/")
             for object_id, _, _ in binding_parts(binding, objects, name)
-        )
+        }
         return ArtifactInfo(
             mtp="mtp" in components,
             vision="vision" in components,
             iq3_xxs=sum(obj.bytes for obj in artifact.objects if getattr(obj, "format", None) == "ggml_iq3_xxs")
             > sum(obj.bytes for obj in artifact.objects if getattr(obj, "format", None) == "ggml_iq3_s"),
             max_context=int(config["max_position_embeddings"]),
-            q5=q5,
+            q5="q5_g64_fp16" in trunk,
+            q4=any(str(fmt).startswith("q4_") for fmt in trunk),
         )
+
+
+def artifact_profile(info: ArtifactInfo, **fields) -> ServeProfile:
+    """The profile of a launcher generated for an existing artifact; `fields` are `ServeProfile` arguments where
+    an omitted `profile` or `gemma4_sliding_kv` is None or absent.
+
+    An omitted profile is `q5-quality` for an artifact with native Q5 trunk cells, else `default`. A mixed Q4/Q5
+    artifact keeps that profile but its omitted ring follows global KV instead of the fidelity BF16 pin: at class B
+    (24 GB, 1.9 GiB desktop overhead, chunk 512, MTP d1 `--plan` rows) mixed-A resolves 64,256 tokens with the FP8
+    ring and 51,264 with BF16 against the 65,536 class minimum. An explicit profile or ring is never rewritten.
+    """
+    omitted = fields.get("profile") is None
+    fields["profile"] = ("q5-quality" if info.q5 else "default") if omitted else fields["profile"]
+    if omitted and info.mixed_q4q5 and fields.get("gemma4_sliding_kv") is None:
+        fields["gemma4_sliding_kv"] = fields.get("kv_dtype", "fp8")
+    return ServeProfile(**fields)
 
 
 def write_launcher(
@@ -391,7 +417,7 @@ def write_launcher(
     if out.exists() and not overwrite:
         raise FileExistsError(f"Launcher already exists: {out}")
     info = info or artifact_info(artifact)
-    profile = profile or ServeProfile(profile="q5-quality" if info.q5 else "default")
+    profile = profile or artifact_profile(info)
     if profile.chat_template is not None and not profile.chat_template.is_file():
         raise ValueError(f"--chat-template file not found: {profile.chat_template}")
     if profile.context != "auto" and profile.context > info.max_context:

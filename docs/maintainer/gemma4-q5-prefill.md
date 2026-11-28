@@ -10,13 +10,17 @@ and receipt identifiers (`item2a-http-v1/clean`, `item2d-*.receipt.json`, ...) k
   diode default route, context-512 block KL only) builds best-medium with Q5 `o` and
   `down` in all layers from two GPTQ passes on the same tree and calibration; it keeps the `default` serve profile at build
   time and takes `--gemma4-q5-prefill` for its Q5 cells only. `launcher --artifact` on the finished mixed file detects its
-  native Q5 cells and selects `q5-quality` (Q5 cells INT8 g64, Q4 cells keep A8); `--profile default` selects the builder's settings.
+  native Q5 cells and selects `q5-quality` (Q5 cells INT8 g64, Q4 cells keep A8) with an FP8 ring following global FP8 KV
+  (class B: 64,256 versus 51,264 tokens with the BF16 ring; [ring evidence](gemma4-benchmarks.md#fp8-sliding-ring));
+  `--profile default` selects the builder's settings.
 - Launcher profiles: omitted `--profile` selects `q5-quality` for a `q5-g64` build or a native-Q5 artifact.
   `q5-quality` and `q5-long-context` both select `--gemma4-q5-prefill int8-g64`, auto context, chunk 2048,
-  1024 MiB headroom, top-k 64, MTP d1 and a host-only prefix cache; both retain their names and now share
-  FP8 ring storage with global FP8 KV. Neither adds implicit key-only KV. Explicit ring flags win;
-  global BF16 resolves an omitted builder ring to BF16; BF16 QK changes compute only.
-  `--profile default` keeps general compute/context/chunk settings, with the same compatible FP8-ring policy.
+  1024 MiB headroom, top-k 64, MTP d1 and a host-only prefix cache. `q5-quality` pins BF16 ring storage regardless of
+  global KV (it costs plain Q5 capacity: 98,688 BF16-ring versus 101,632-104,128 FP8-ring measured auto tokens on a
+  32 GB card, no measured start reaching 131k); `q5-long-context` uses FP8 ring storage with global FP8 KV. Neither adds implicit
+  key-only KV. Explicit ring flags win;
+  global BF16 resolves an omitted builder ring to BF16 for the other profiles; BF16 QK changes compute only.
+  `--profile default` keeps general compute/context/chunk settings, with the compatible FP8-ring policy.
 - Engine, CLI and perplexity: `--gemma4-q5-prefill` accepts `a16|fp8|int8-g32|int8-g64`; the default `a16`
   preserves stored A16Only/AllowA8 policy. Native ring default remains BF16; compatible global-FP8
   roleplay builder/profile routes use FP8. Explicit fidelity settings are not rewritten; BF16 storage

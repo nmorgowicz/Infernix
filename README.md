@@ -768,12 +768,15 @@ python -m tools.convert.gemma4_build serve-check --launcher <dir>\serve-<name>.c
 The explicit higher-quality `q5-g64` preset builds native GPTQ5 group64 with own-model Hessians,
 FP8 vocabulary and the BF16-source assistant in one A16Only artifact. Select prefill compute separately:
 `--gemma4-q5-prefill a16|fp8|int8-g32|int8-g64`. Q5 builds and existing native-Q5 launcher generation
-select `q5-quality` when `--profile` is omitted: **INT8 g64 prefill, FP8 ring with global FP8 KV,
-auto context, chunk2048 and top-k64**. `q5-long-context` remains available with the same ring policy; neither enables key-only KV.
+select `q5-quality` when `--profile` is omitted: **INT8 g64 prefill, BF16 sliding ring pinned regardless of global
+KV (fidelity-first), auto context, chunk2048 and top-k64**. The pin costs capacity: no measured Q5 MTP d1 start on a
+32 GB card reached 131k with either ring, and measured auto starts resolved 98,688 tokens with the BF16 ring against 101,632-104,128
+with the FP8 ring. `q5-long-context` keeps the FP8 ring with global FP8 KV; neither enables key-only KV, and
+a launcher for a mixed Q4/Q5 artifact keeps the FP8 ring (mixed-A at class B: 64,256 versus 51,264 tokens).
 Explicit compute/ring/option choices win; explicit `--profile default` and other tiers retain the
 general settings (`a16`, 131k, auto chunk). FP8 QK remains the roleplay/prose default, not a
 maximum-fidelity promise: coding/tool or fidelity-first launchers should explicitly use
-`--gemma4-qk bf16` (plus `--gemma4-q5-prefill a16` for A16 projections and `--gemma4-sliding-kv bf16` for BF16 storage).
+`--gemma4-qk bf16` (plus `--gemma4-q5-prefill a16` for A16 projections; the BF16 ring is already `q5-quality`'s pinned default).
 See [Q5 creation and the lower-VRAM ladder](docs/weight-conversion.md#native-gptq5-group64-explicit-a16a8-permissions)
 for commands, costs and bounded evidence. Diode short KL is 0.0331 A16 / 0.0336 g64 versus 0.0941
 best-medium; neither that nor the plain incremental sample qualifies long-context INT8 quality.

@@ -94,9 +94,10 @@ by the references linked from the [documentation map](../docs/README.md).
 ### Gemma sliding-ring memory policy
 
 The `python -m tools.convert.gemma4_build` build and `launcher` commands accept
-`--gemma4-sliding-kv bf16|fp8`. Compatible global-FP8 roleplay routes default to FP8 rings,
-including general and the retained `q5-quality`/`q5-long-context` names. Explicit BF16 ring wins;
-global BF16 resolves an omitted ring to BF16. BF16 QK changes compute only, not storage.
+`--gemma4-sliding-kv bf16|fp8`. Compatible global-FP8 roleplay routes default to FP8 rings, including general and
+`q5-long-context`; `q5-quality` pins the BF16 ring regardless of global KV (below), except that a launcher generated
+for a mixed Q4/Q5 artifact (mixed-A) with `--profile` omitted keeps the ring following global KV. Explicit BF16 ring
+wins; global BF16 resolves an omitted ring to BF16. BF16 QK changes compute only, not storage.
 Native Engine/CLI defaults remain BF16. For an existing artifact, generate a BF16-storage opt-out:
 
 ```text
@@ -114,7 +115,11 @@ fidelity still changes. See [measurements and remaining-evidence registration](.
 `--gemma4-q5-prefill a16|fp8|int8-g32|int8-g64` is independent of stored weights. Q5 builds and
 existing native-Q5 launcher generation select `q5-quality` when `--profile` is omitted: **INT8 g64**
 prefill, BF16 sliding ring pinned regardless of global KV (2026-11-28 fidelity follow-up), auto context,
-chunk2048, top-k64, no implicit key-only KV.
+chunk2048, top-k64, no implicit key-only KV. The pin costs plain-Q5 capacity: no measured Q5 MTP d1 start on a 32 GB
+card reached 131k with either ring, and measured auto starts resolved 98,688 tokens with the BF16 ring against
+101,632-104,128 with the FP8 ring (87,616-89,216 BF16-ring in the same-session adoption starts).
+A launcher for a mixed Q4/Q5 artifact keeps the FP8 ring: at class B mixed-A resolves 64,256 tokens with it versus
+51,264 with BF16 (1.9 GiB desktop overhead, `--plan`, chunk 512).
 `q5-long-context` keeps the compatible FP8-ring policy. Explicit compute/ring choices win; explicit
 `--profile default` and other tiers retain A16 artifact policy. Narrow decode/MTP stays A16.
 FP8 QK remains the roleplay/prose choice, measurably less faithful than BF16; maximum-fidelity/coding/tools

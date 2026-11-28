@@ -668,12 +668,26 @@ unit scale). It requires `--kv-dtype fp8` and combines with `--gemma4-key-only-k
 
 **Current policy (2026-11-28, amended same day).** Compatible Gemma 31B global-FP8 roleplay builder/profile/generated-launcher
 routes select FP8 ring storage, including general and `q5-long-context`; the `q5-quality` fidelity profile pins
-**BF16** ring storage regardless of global KV (operator follow-up: the FP8 ring buys it no class-C capacity —
-131k fits both rings — while the shipped-Q5 rows below name its measured KL cost; an explicit
-`--gemma4-sliding-kv fp8` restores FP8). Explicit `--gemma4-sliding-kv bf16` wins elsewhere; an omitted
+**BF16** ring storage regardless of global KV (operator follow-up: the shipped-Q5 rows below name the FP8 ring's
+measured KL cost; an explicit `--gemma4-sliding-kv fp8` restores FP8). Explicit `--gemma4-sliding-kv bf16` wins elsewhere; an omitted
 builder ring with global BF16 resolves BF16. `--gemma4-qk bf16` changes compute only, not storage.
 Native Engine/CLI default stays BF16. Existing explicit fidelity configurations are preserved;
 no key-only globals are newly implicit (the explicitly selected `memory-16gb` contract is unchanged).
+
+**Capacity cost of the pin and the mixed-A exception.** The BF16 ring is not free for Q5 on class C: no measured Q5
+start with MTP d1 reached 131,072 tokens with either ring. Real auto-context starts: BF16 ring 98,688 tokens
+(fidelity launcher, head build, native `sliding bf16 (1.22 GiB)`; adoption record, fidelity follow-up) versus FP8 ring
+101,632-104,128 (adoption record real-start table: 103,936 `q5-quality` before the pin, 104,128 `q5-long-context`,
+101,632 shipped Q5 launcher); the adoption starts with an explicit BF16 ring resolved 87,616 and 89,216, and the
+paired study's real Q5 start resolved 99,200 BF16 / 112,768 FP8 (R14; its `--plan` rows at 28,930 MiB gave 109,504 /
+123,072, MTP off 120,256 / 131,072). Auto capacity is fitted from the free VRAM at each start, so these differ by run.
+Derived class-C sizing (R15, not starts) is less favorable to the pin: with MTP d1 the FP8 ring reaches 131,072 through
+1.9 GiB desktop overhead (130,944 at 2.1) while the BF16 ring reaches it only at about 1.5 GiB or less (126,784 at 1.7).
+Mixed-A is the class-B (24 GB) tier and needs 65,536: `--plan --max-context auto` (chunk 512, MTP d1, ordinary FP8
+global KV) resolves 64,256 tokens with the FP8 ring and 51,264 with the BF16 ring at 1.9 GiB desktop overhead
+(73,728 / 60,736 at 1.5 GiB, 68,992 / 56,000 at 1.7 GiB, 59,584 / 46,528 at 2.1 GiB; paired study R15). Fresh mixed-A
+launchers therefore keep the FP8 ring (an omitted ring follows global KV for a mixed Q4/Q5 artifact even though the
+launcher selects `q5-quality`); an explicit `--profile q5-quality` or `--gemma4-sliding-kv bf16` still gives BF16.
 
 The [final paired six-tier study](https://github.com/nmorgowicz-org/llama-local-tooling/blob/research/tooling-reorganization/docs/plans/20261127-gemma4-sliding-kv-paired-study.md)
 uses engine `05e9a87a`, the fixed FP8 prompt kernel and shared staging layout. At matched fixed capacity,

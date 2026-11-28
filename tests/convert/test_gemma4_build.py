@@ -1834,6 +1834,8 @@ def test_launcher_detects_native_q5_trunk_from_directory_not_names_or_receipts(t
     plan = build.parse_launcher(out)
     assert plan.gemma4_q5_prefill == ("int8-g64" if q5 else "a16")
     assert plan.context == ("auto" if q5 else 131072)
+    assert plan.gemma4_sliding_kv == ("bf16" if q5 else "fp8")  # plain Q5 keeps the fidelity pin; no Q4 cells here
+    assert not info.mixed_q4q5
 
 
 def test_launcher_on_a_mixed_q4_q5_artifact_detects_native_q5_and_keeps_the_explicit_general_profile(tmp_path):
@@ -1849,21 +1851,74 @@ def test_launcher_on_a_mixed_q4_q5_artifact_detects_native_q5_and_keeps_the_expl
     with ArtifactWriter(artifact, specs, components=components, bindings=bindings, uses=[]) as writer:
         for obj in plan_objects(specs):
             writer.write_object(obj.id, bytes(obj.bytes))
-    assert launcher.artifact_info(artifact).q5
+    info = launcher.artifact_info(artifact)
+    assert info.q5 and info.q4 and info.mixed_q4q5
     server = tmp_path / "infernix-serve.exe"
     server.write_bytes(b"x")
 
     def generated(*flags):
-        out = tmp_path / f"mixed-{len(flags)}.cmd"
+        out = tmp_path / f"mixed-{'_'.join(flags).replace('-', '') or 'detected'}.cmd"
         assert cli.main(["launcher", "--artifact", str(artifact), "--serve", str(server), "--out", str(out), *flags]) == 0
         return build.parse_launcher(out)
 
     detected = generated()
     assert detected.gemma4_q5_prefill == "int8-g64" and detected.context == "auto" and detected.prefill_chunk == "2048"
+    assert detected.gemma4_sliding_kv == "fp8" and detected.kv_dtype == "fp8"  # mixed-A keeps its 64k class-B ring
+    assert "--gemma4-sliding-kv fp8" in (tmp_path / "mixed-detected.cmd").read_text(encoding="utf-8")
+    assert generated("--gemma4-sliding-kv", "bf16").gemma4_sliding_kv == "bf16"
+    bf16_globals = generated("--kv-dtype", "bf16", "--gemma4-qk", "bf16")
+    assert bf16_globals.gemma4_sliding_kv == "bf16" and bf16_globals.kv_dtype == "bf16"
+    assert generated("--profile", "q5-quality").gemma4_sliding_kv == "bf16"  # an explicit fidelity profile pins BF16
     general = generated("--profile", "default")
     assert general.gemma4_q5_prefill == "a16" and general.context == 131072
     chosen = generated("--profile", "default", "--gemma4-q5-prefill", "int8-g64", "--context", "auto")
     assert chosen.gemma4_q5_prefill == "int8-g64" and chosen.context == "auto"
+
+
+@pytest.mark.parametrize("q5, q4, profile, kv, expected", [
+    (True, True, None, "fp8", "fp8"),    # mixed-A with FP8 globals: the FP8 ring keeps its 64,256-token class-B capacity
+    (True, True, None, "bf16", "bf16"),  # BF16 globals cannot carry an FP8 ring
+    (True, False, None, "fp8", "bf16"),  # plain Q5 g64 keeps the q5-quality fidelity pin
+    (True, False, None, "bf16", "bf16"),
+    (True, True, "q5-quality", "fp8", "bf16"),  # an explicit fidelity profile is never rewritten
+    (True, False, "q5-long-context", "fp8", "fp8"),
+    (False, True, None, "fp8", "fp8"),   # Q4-only roleplay tiers unchanged
+    (False, False, None, "fp8", "fp8"),
+    (False, False, "default", "fp8", "fp8"),
+])
+def test_artifact_profile_ring_pin_applies_to_plain_q5_only(q5, q4, profile, kv, expected):
+    info = launcher.ArtifactInfo(True, False, 262144, q5=q5, q4=q4)
+    resolved = launcher.artifact_profile(info, profile=profile, kv_dtype=kv, gemma4_qk=kv)
+    assert resolved.gemma4_sliding_kv == expected
+    assert resolved.profile == (profile or ("q5-quality" if q5 else "default"))
+    for ring in ("bf16", "fp8"):  # an explicit ring always wins, wherever the artifact would have pinned another
+        if ring == "fp8" and kv != "fp8":
+            continue
+        assert launcher.artifact_profile(
+            info, profile=profile, kv_dtype=kv, gemma4_qk=kv, gemma4_sliding_kv=ring).gemma4_sliding_kv == ring
+
+
+@pytest.mark.parametrize("q4, expected", [(True, "fp8"), (False, "bf16")])
+def test_write_launcher_without_a_profile_encodes_the_artifact_ring_in_the_command(tmp_path, q4, expected):
+    artifact, server, out = tmp_path / "m.ninfer", tmp_path / "s.exe", tmp_path / "m.cmd"
+    artifact.write_bytes(b"x")
+    server.write_bytes(b"x")
+    info = launcher.ArtifactInfo(True, False, 262144, q5=True, q4=q4)
+    launcher.write_launcher(out, artifact, server, info=info)
+    parsed = build.parse_launcher(out)
+    assert parsed.gemma4_sliding_kv == expected and parsed.effective_profile()["gemma4_sliding_kv"] == expected
+    assert parsed.kv_dtype == "fp8" and parsed.gemma4_q5_prefill == "int8-g64"
+
+
+def test_mixed_a_build_serve_settings_resolve_an_fp8_ring_and_plain_q5_a_bf16_ring(env):
+    def ring(preset, *options):
+        return cli.resolve_config(cli.build_parser().parse_args(env.argv(preset, *options)))[1].gemma4_sliding_kv
+
+    assert ring("q4q5-mixed-a") == "fp8" and ring("q4q5-mixed-a", "--gemma4-qk", "bf16") == "fp8"
+    assert ring("q4q5-mixed-a", "--gemma4-sliding-kv", "bf16") == "bf16"
+    assert ring("q4q5-mixed-a", "--kv-dtype", "bf16", "--gemma4-qk", "bf16") == "bf16"
+    assert ring("q5-g64") == "bf16" and ring("q5-g64", "--gemma4-sliding-kv", "fp8") == "fp8"
+    assert ring("best-medium") == "fp8" and ring("q5-g64", "--profile", "q5-long-context") == "fp8"
 
 
 MIXED_RECIPE = ("--q5-gptq-source", "gptq-q5", "--q5-unit", "o", "--q5-unit", "down")

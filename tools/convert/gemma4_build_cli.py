@@ -119,9 +119,11 @@ BF16 sliding ring, auto context, chunk 2048, top-k 64, alias gemma4-q5. Explicit
 the general settings above. Mixed-A builds also default to auto context when neither --profile nor --context
 is supplied; all other general settings remain unchanged. See docs/weight-conversion.md for the lower-VRAM option ladder.
 Omitted ring storage follows --kv-dtype (fp8 by default, bf16 with global BF16 KV), except q5-quality,
-which pins BF16 ring storage regardless of global KV (fidelity-first; the FP8 ring buys it no class-C
-capacity and measurably costs KL). Explicit --gemma4-sliding-kv always wins; --gemma4-qk bf16 changes
-compute, not storage.
+which pins BF16 ring storage regardless of global KV (fidelity-first; the FP8 ring measurably costs KL, and the pin
+costs plain Q5 capacity: no measured 32 GB MTP d1 start reached 131k with either ring). `launcher` on a mixed Q4/Q5 artifact (mixed-A)
+with --profile omitted selects q5-quality but keeps the ring following global KV: at class B the BF16 ring would cost
+it about 13k tokens (64,256 FP8 vs 51,264 BF16 at 1.9 GiB desktop overhead).
+Explicit --gemma4-sliding-kv always wins; --gemma4-qk bf16 changes compute, not storage.
 """
 
 
@@ -173,7 +175,8 @@ def add_serve_arguments(parser: argparse.ArgumentParser, *, prefix: str) -> None
         help="omitted: q5-quality for q5-g64 builds/native Q5 artifacts, default for other tiers. "
         "Explicit default keeps the general 131k roleplay settings. Q5 profiles default to int8-g64 "
         "prefill, auto context, chunk 2048, top-k 64 and no key-only KV; q5-quality pins the BF16 "
-        "sliding ring, q5-long-context follows global KV (FP8 with global FP8). "
+        "sliding ring (an omitted-profile launcher for a mixed Q4/Q5 artifact keeps the FP8 ring), "
+        "q5-long-context follows global KV (FP8 with global FP8). "
         "memory-16gb: IQ3_XXS, key-only FP8 globals/ring, chunk 128")
     add("--context", type=context_value,
         help=f"{prefix} --max-context: positive tokens or auto (general default 131072; implicit mixed-A/Q5/memory-16gb: auto)")
@@ -196,7 +199,8 @@ def add_serve_arguments(parser: argparse.ArgumentParser, *, prefix: str) -> None
         help="experimental global key-only FP8 KV (default off; memory-16gb enables it)")
     add("--gemma4-sliding-kv", choices=("bf16", "fp8"), default=None,
         help="sliding K/V ring storage: omitted follows --kv-dtype (fp8 by default, bf16 with global BF16 KV), "
-        "except the q5-quality fidelity profile, which defaults to bf16 regardless of global KV; fp8 uses lower "
+        "except the q5-quality fidelity profile, which defaults to bf16 regardless of global KV (a launcher "
+        "for a mixed Q4/Q5 artifact with --profile omitted still follows global KV); fp8 uses lower "
         "memory with lossy K/V storage and requires --kv-dtype fp8. Explicit bf16 preserves BF16 storage for "
         "every profile, independently of --gemma4-qk")
     add("--gemma4-q5-prefill", choices=("a16", "fp8", "int8-g32", "int8-g64"), default=None,
@@ -232,7 +236,7 @@ def add_serve_arguments(parser: argparse.ArgumentParser, *, prefix: str) -> None
     add("--cuda-bin", type=Path, help="directory the launcher puts on PATH (if the DLLs are not beside the exe)")
 
 
-def serve_kwargs(args: argparse.Namespace, *, default_profile: str = "default") -> dict:
+def serve_kwargs(args: argparse.Namespace, *, default_profile: str | None = "default") -> dict:
     """Explicit arguments plus profile selection; ServeProfile owns unspecified-field defaults."""
     return {
         "profile": args.profile if args.profile is not None else default_profile,
@@ -327,7 +331,8 @@ def launcher_parser() -> argparse.ArgumentParser:
         description="Write a Windows .cmd that starts infernix-serve on a .ninfer with the operator profile: FP8 KV "
         "cache and sliding K/V storage, FP8 attention QK, --prefill-chunk auto, MTP with one draft token, BF16 logits, a host-only prefix "
         "cache, 0.0.0.0:8001, alias 131k. Native-Q5 artifacts instead default to q5-quality: int8-g64 prefill, "
-        "BF16 ring, auto context, chunk 2048, top-k 64, alias gemma4-q5. Explicit --profile default keeps "
+        "BF16 ring, auto context, chunk 2048, top-k 64, alias gemma4-q5; a mixed Q4/Q5 artifact keeps the ring "
+        "following global KV (FP8). Explicit --profile default keeps "
         "the general profile. Explicit --gemma4-sliding-kv bf16 preserves BF16 storage; an omitted ring follows "
         "global KV, except q5-quality, which pins BF16. "
         "MTP and vision are detected; every setting can be changed.",
@@ -559,7 +564,7 @@ def run_launcher(args: argparse.Namespace) -> int:
         raise ValueError("no infernix-serve found in apps/Release or build*/apps/Release; build it "
                          "(build_native.bat) or pass --serve")
     info = launcher_tools.artifact_info(args.artifact.resolve())
-    profile = launcher_tools.ServeProfile(**serve_kwargs(args, default_profile="q5-quality" if info.q5 else "default"))
+    profile = launcher_tools.artifact_profile(info, **serve_kwargs(args, default_profile=None))
     if args.profile == "memory-16gb" and (not info.iq3_xxs or info.vision):
         raise ValueError("--profile memory-16gb requires a text-only IQ3_XXS artifact; build with "
                          "--profile memory-16gb or select its IQ3_XXS .ninfer")
