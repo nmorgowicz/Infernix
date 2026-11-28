@@ -442,12 +442,13 @@ std::string usage_text(const char* argv0) {
            "  --no-cuda-graph          disable CUDA-graph decode rounds\n"
            "\n"
            "SAMPLING\n"
-           "  --temperature F          sampling temperature (0-2)\n"
+           "  --temperature F          sampling temperature (0-10)\n"
            "  --top-p F                nucleus probability (0-1)\n"
-           "  --top-k N                Gemma4 0..64, Qwen 0..20; 0 uses Gemma preset or Qwen 20\n"
+           "  --top-k N                candidate count; above the model's ceiling (Gemma4 64, Qwen 20)\n"
+           "                             it is clamped; 0 uses Gemma preset or Qwen 20\n"
            "  --min-p F                minimum token probability (0-1)\n"
-           "  --presence-penalty F     -2 to 2\n"
-           "  --frequency-penalty F    -2 to 2\n"
+           "  --presence-penalty F     -5 to 5\n"
+           "  --frequency-penalty F    -5 to 5\n"
            "  --seed N                 fixed random seed\n"
            "  --greedy                 force temperature 0 (exact argmax)\n"
            "  --stop-token-id N...     stop token ids\n"
@@ -743,21 +744,23 @@ Options parse_options(int argc, char** argv) {
                 .channel = arg == "--stop" ? OutputChannel::Content : OutputChannel::Reasoning,
             });
         } else if (arg == "--temperature") {
-            options.sampling.temperature = parse_float(value(arg), "temperature", 0.0F, 2.0F);
+            options.sampling.temperature =
+                parse_float(value(arg), "temperature", 0.0F, kMaxSamplingTemperature);
         } else if (arg == "--top-p") {
             options.sampling.top_p = parse_float(value(arg), "top-p", 0.0F, 1.0F);
         } else if (arg == "--top-k") {
+            // Above the loaded model's ceiling Engine clamps it, as it does a request's top_k.
             const std::uint32_t top_k = parse_u32(value(arg), "top-k", true);
-            if (top_k > 64) { throw std::invalid_argument("--top-k must be in [0,64]"); }
-            options.sampling.top_k = static_cast<std::int32_t>(top_k);
+            options.sampling.top_k    = static_cast<std::int32_t>(
+                std::min<std::uint32_t>(top_k, std::numeric_limits<std::int32_t>::max()));
         } else if (arg == "--min-p") {
             options.sampling.min_p = parse_float(value(arg), "min-p", 0.0F, 1.0F);
         } else if (arg == "--presence-penalty") {
             options.sampling.presence_penalty =
-                parse_float(value(arg), "presence-penalty", -2.0F, 2.0F);
+                parse_float(value(arg), "presence-penalty", -kMaxSamplingPenalty, kMaxSamplingPenalty);
         } else if (arg == "--frequency-penalty") {
             options.sampling.frequency_penalty =
-                parse_float(value(arg), "frequency-penalty", -2.0F, 2.0F);
+                parse_float(value(arg), "frequency-penalty", -kMaxSamplingPenalty, kMaxSamplingPenalty);
         } else if (arg == "--seed") {
             options.sampling.seed = parse_u64(value(arg), "seed");
         } else if (arg == "--greedy") {

@@ -109,10 +109,21 @@ int test_model_aliases() {
         failures += check(chat && chat->status == 200 &&
                               Json::parse(chat->body).at("model") == "131k" && backend.top_k == 64,
                           "Chat must accept top-k 64 and report the served alias, not the requested name");
-        body["top_k"] = 65;
+        body["top_k"] = 100;
         const auto wide = client.Post("/v1/chat/completions", body.dump(), "application/json");
-        failures += check(wide && wide->status == 400,
-                          "Chat must refuse top-k outside the generic domain");
+        failures += check(wide && wide->status == 200 && backend.top_k == 100,
+                          "Chat must accept a top-k above the engine ceiling and leave the clamp to Engine");
+        body["top_k"] = -1;
+        const auto negative = client.Post("/v1/chat/completions", body.dump(), "application/json");
+        failures += check(negative && negative->status == 400, "Chat must refuse a negative top-k");
+        body["top_k"]       = 64;
+        body["temperature"] = 5;
+        const auto hot = client.Post("/v1/chat/completions", body.dump(), "application/json");
+        failures += check(hot && hot->status == 200, "Chat must accept temperature 5");
+        body["temperature"] = 10.5;
+        const auto too_hot = client.Post("/v1/chat/completions", body.dump(), "application/json");
+        failures += check(too_hot && too_hot->status == 400, "Chat must refuse temperature above 10");
+        body.erase("temperature");
         body["top_k"] = 20;
         body["model"] = "other-name";
         const auto other = client.Post("/v1/chat/completions", body.dump(), "application/json");

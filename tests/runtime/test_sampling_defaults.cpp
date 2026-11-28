@@ -104,13 +104,65 @@ int main() {
                           overridden.frequency_penalty == -1.0F && overridden.seed == 123,
                       "explicit zero sampling overrides were not normalized to the target cap");
 
-    overrides.top_k = 21;
-    failures += check(throws_invalid([&] {
-                          (void)infernix::runtime::resolve_sampling(
-                              dense, infernix::SamplingMode::Thinking, overrides, false);
-                      }),
-                      "top_k beyond the executable candidate domain was accepted");
+    // A top_k above the model's ceiling is clamped to it, never refused; an in-range value and the
+    // zero default are untouched; a negative value is still refused.
+    infernix::ModelSamplingDefaults wide;
+    wide.thinking = wide.non_thinking = {.temperature = 1.0F, .top_k = 64, .top_p = 0.95F};
+    wide.max_top_k                    = 64;
+    const auto resolved_top_k         = [](const infernix::ModelSamplingDefaults& model, int top_k) {
+        infernix::SamplingOverrides request;
+        request.top_k = top_k;
+        return infernix::runtime::resolve_sampling(model, infernix::SamplingMode::Thinking, request, false)
+            .top_k;
+    };
+    failures += check(resolved_top_k(dense, 1) == 1 && resolved_top_k(dense, 20) == 20 &&
+                          resolved_top_k(dense, 21) == 20 && resolved_top_k(dense, 100) == 20,
+                      "a Qwen top_k was not passed through in range and clamped to 20 above it");
+    failures += check(resolved_top_k(wide, 1) == 1 && resolved_top_k(wide, 40) == 40 &&
+                          resolved_top_k(wide, 64) == 64 && resolved_top_k(wide, 65) == 64 &&
+                          resolved_top_k(wide, 100) == 64 && resolved_top_k(wide, 500) == 64 &&
+                          resolved_top_k(wide, std::numeric_limits<std::int32_t>::max()) == 64,
+                      "a Gemma top_k was not passed through in range and clamped to 64 above it");
+    failures += check(resolved_top_k(wide, 0) == 64 && resolved_top_k(dense, 0) == 20,
+                      "top_k 0 no longer resolves to the model's default candidate width");
+    failures += check(throws_invalid([&] { (void)resolved_top_k(wide, -1); }),
+                      "a negative top_k was accepted");
     overrides.top_k = 0;
+
+    // Temperature and the presence/frequency penalties accept their documented bounds exactly and
+    // refuse anything beyond them; the sampler takes the same values for every model.
+    const auto resolved_with = [&](infernix::SamplingOverrides request) {
+        return infernix::runtime::resolve_sampling(wide, infernix::SamplingMode::Thinking, request, false);
+    };
+    for (const float temperature : {0.0F, 1.0F, 2.0F, 2.5F, 5.0F, infernix::kMaxSamplingTemperature}) {
+        infernix::SamplingOverrides request;
+        request.temperature = temperature;
+        failures += check(resolved_with(request).temperature == temperature,
+                          "a temperature inside [0, kMaxSamplingTemperature] was not preserved");
+    }
+    for (const float temperature : {-0.01F, 10.01F, 100.0F}) {
+        infernix::SamplingOverrides request;
+        request.temperature = temperature;
+        failures += check(throws_invalid([&] { (void)resolved_with(request); }),
+                          "a temperature outside [0, kMaxSamplingTemperature] was accepted");
+    }
+    for (const float penalty : {-infernix::kMaxSamplingPenalty, -2.5F, 0.0F, 3.0F, infernix::kMaxSamplingPenalty}) {
+        infernix::SamplingOverrides request;
+        request.presence_penalty  = penalty;
+        request.frequency_penalty = -penalty;
+        const auto resolved       = resolved_with(request);
+        failures += check(resolved.presence_penalty == penalty && resolved.frequency_penalty == -penalty,
+                          "a penalty inside +-kMaxSamplingPenalty was not preserved");
+    }
+    for (const float penalty : {-5.01F, 5.01F, 50.0F}) {
+        infernix::SamplingOverrides presence;
+        presence.presence_penalty = penalty;
+        infernix::SamplingOverrides frequency;
+        frequency.frequency_penalty = penalty;
+        failures += check(throws_invalid([&] { (void)resolved_with(presence); }) &&
+                              throws_invalid([&] { (void)resolved_with(frequency); }),
+                          "a penalty outside +-kMaxSamplingPenalty was accepted");
+    }
 
     overrides.temperature = std::numeric_limits<float>::quiet_NaN();
     failures += check(throws_invalid([&] {

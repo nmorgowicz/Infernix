@@ -1034,7 +1034,7 @@ struct ModelSamplingDefaults {
     SamplingPreset thinking;
     SamplingPreset non_thinking;
     // Largest top_k this model's sampling pipeline serves: 20 for the fast pipeline (Qwen), 64 for
-    // the wide one (Gemma 4). An explicit top_k above it is rejected; a request's top_k of 0
+    // the wide one (Gemma 4). An explicit top_k above it is clamped to it; a request's top_k of 0
     // resolves to the model's default candidate width (20, or the preset's top_k of a wide model).
     std::int32_t max_top_k = 20;
 
@@ -1042,6 +1042,12 @@ struct ModelSamplingDefaults {
         return mode == SamplingMode::Thinking ? thinking : non_thinking;
     }
 };
+
+// Largest request temperature and largest presence/frequency penalty magnitude the sampler accepts
+// (every endpoint, process flag and Engine call): twice the highest front-end temperature slider
+// (5) and 2.5 times the front-end penalty sliders (+-2).
+inline constexpr float kMaxSamplingTemperature = 10.0F;
+inline constexpr float kMaxSamplingPenalty     = 5.0F;
 
 // Public request-side overrides. std::nullopt means "use the registered model/mode default";
 // explicit zero remains a real override (including temperature=0 for exact argmax).

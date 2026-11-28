@@ -365,8 +365,8 @@ The endpoint supports:
 - nonnegative `max_completion_tokens` and the legacy `max_tokens` spelling; zero performs prompt
   processing without generation. As an extension (OpenAI rejects it), `-1` means no explicit limit:
   the field is treated as omitted, so the other spelling or `--default-max-tokens` applies;
-- `temperature`, `top_p`, presence/frequency penalties, and signed integer `seed`;
-- the compatible `top_k` (`0..64` for Gemma4, `0..20` for Qwen; zero uses Gemma4's preset candidate width, normally `64`, or Qwen's `20`) and `min_p` (`0..1`) sampler extensions;
+- `temperature` (`0..10`), `top_p`, presence/frequency penalties (`-5..5`), and signed integer `seed` ([Sampler ranges](#sampler-ranges));
+- the compatible `top_k` (any non-negative integer: above the loaded model's ceiling, `64` for Gemma4 and `20` for Qwen, it is clamped to the ceiling and not refused; zero uses Gemma4's preset candidate width, normally `64`, or Qwen's `20`) and `min_p` (`0..1`) sampler extensions;
 - up to four non-empty stop strings, applied to the answer only: not to reasoning, and not inside a
   tool call the model opened with its `<tool_call>` token (between it and `</tool_call>`), whose
   arguments are the tool's data (as on the Responses and Messages endpoints);
@@ -1171,7 +1171,7 @@ wire response contains typed `output` Items.
 | `max_output_tokens` | non-negative integer; omission executes with `--default-max-tokens` but remains `null` in the Response object. `-1` (an extension) is treated as omitted |
 | `stream` | boolean; `true` selects Responses SSE rather than a JSON body |
 | `store` | boolean, default `true`; controls local retrieval and continuation state |
-| `temperature` | finite number in `[0,2]` |
+| `temperature` | finite number in `[0,10]` |
 | `top_p` | finite number in `[0,1]` |
 | `metadata` | at most 16 string pairs; keys at most 64 characters and values at most 512 |
 | `client_metadata` | Codex client extension; an object or `null`, accepted as opaque tracing metadata with no generation effect |
@@ -2232,12 +2232,12 @@ are refused; source vision objects may be retained by conversion but are not tex
 | `--cors` | permissive browser CORS headers | off |
 | `--usage-chunk-choice` | give the streamed usage chunk a zero-delta choice, for strict client parsers that reject the OpenAI-conformant empty `choices` array | off |
 | `--claude-code-usage-compat` | Anthropic streaming only: report a provisional `0` as `message_start`'s `input_tokens` (its cache-read split stays exact, terminal usage unchanged), so a Claude Code version that keeps the start value when the terminal `message_delta` corrects it to `0` cannot count the prompt twice (see [Anthropic Messages](#anthropic-messages)) | off |
-| `--temperature F` | process-level temperature override | unset |
+| `--temperature F` | process-level temperature override (`0..10`) | unset |
 | `--top-p F` | process-level top-p override | unset |
-| `--top-k N` | process-level top-k override (`0..64` for Gemma4, `0..20` for Qwen; zero uses Gemma4's preset candidate width, normally `64`, or Qwen's `20`) | unset |
+| `--top-k N` | process-level top-k override (any non-negative integer, clamped to the loaded model's ceiling like a request's: `64` for Gemma4, `20` for Qwen; zero uses Gemma4's preset candidate width, normally `64`, or Qwen's `20`) | unset |
 | `--min-p F` | process-level min-p override | unset |
-| `--presence-penalty F` | process-level presence-penalty override | unset |
-| `--frequency-penalty F` | process-level frequency-penalty override | unset |
+| `--presence-penalty F` | process-level presence-penalty override (`-5..5`) | unset |
+| `--frequency-penalty F` | process-level frequency-penalty override (`-5..5`) | unset |
 | `--seed N` | fixed seed when a request omits one | fresh random seed per request |
 | `--greedy` | force exact argmax for all requests | off |
 
@@ -2253,7 +2253,7 @@ Qwen3.6-27B and Qwen3.8-27B use `1.0/0.95/20/0/0` for
 temperature/top-p/top-k/min-p/presence penalty in thinking mode and `0.7/0.80/20/0/1.5` in
 non-thinking mode; Qwen3.8-Flash-Next uses the same values. Qwen3.6-35B-A3B differs only in its
 thinking presence penalty, which is `1.5`. Frequency penalty is `0` for all registered presets.
-Gemma4 uses `1.0/0.95/64/0/0` in both thinking and non-thinking modes. Generic option and request parsers accept up to `64`; the loaded model enforces its own ceiling, so Qwen still refuses values above `20`.
+Gemma4 uses `1.0/0.95/64/0/0` in both thinking and non-thinking modes.
 Gemma's standalone measurement commands are in
 [HTTP tail and MTP campaigns](maintainer/gemma4-benchmarks.md#http-tail-and-mtp-campaigns).
 An artifact that carries its checkpoint's recommended presets (the text resource `sampling.json`,
@@ -2266,6 +2266,20 @@ regex or choice) does not take the registered presence and frequency penalties: 
 format repeats its quotes, separators and keys by construction, and a penalty on them made sampled
 answers pick legal neighbouring tokens that change the content (a JSON string opened by `",`, so
 the value starts with a comma). A penalty from a process flag or the request still applies.
+
+### Sampler ranges
+
+Every endpoint, process flag and direct Engine call shares one set of sampler ranges:
+
+| Field | Accepted | Outside the range |
+|---|---|---|
+| `temperature` | finite, `0..10` (`0` is exact argmax); Messages accepts the same range although Anthropic's own API stops at `1` | HTTP 400, `param: "temperature"` |
+| `top_k` | integer `>= 0`; the loaded model's ceiling is `64` (Gemma4) or `20` (Qwen); a larger value is **clamped to the ceiling** and the request succeeds; `0` keeps meaning the model's default candidate width | negative: HTTP 400, `param: "top_k"` |
+| `top_p`, `min_p` | finite, `0..1` | HTTP 400 |
+| `presence_penalty`, `frequency_penalty` | finite, `-5..5` | HTTP 400 |
+| `repetition_penalty` (Chat) | only `1` | HTTP 400, `repetition_penalty_not_supported` |
+
+A clamped `top_k` is not reported in the response; the request log's resolved sampler (`request_start`) carries the value actually used. No other sampler (DRY, Adaptive-P, n-sigma, dynamic temperature, XTC, mirostat) is implemented, and such fields are not read.
 
 For `C=--max-concurrency`, total Device StateImage capacity is `C+H`, where `H` is
 `--device-snapshot-slots` (0 with `--no-prefix-reuse`). The Host budget is startup-fixed context

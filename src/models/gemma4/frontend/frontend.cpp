@@ -240,9 +240,10 @@ SamplingPreset sampling_preset(const Json& values, SamplingPreset preset) {
         // The checkpoint's profile is top 64, the model's whole candidate range.
         preset.top_k = std::min<std::int32_t>(value, kMaxTopK);
     }
-    if (preset.temperature < 0 || preset.top_p <= 0 || preset.top_p > 1 ||
-        preset.min_p < 0 || preset.min_p > 1 || std::abs(preset.presence_penalty) > 2 ||
-        std::abs(preset.frequency_penalty) > 2) {
+    if (preset.temperature < 0 || preset.temperature > kMaxSamplingTemperature || preset.top_p <= 0 ||
+        preset.top_p > 1 || preset.min_p < 0 || preset.min_p > 1 ||
+        std::abs(preset.presence_penalty) > kMaxSamplingPenalty ||
+        std::abs(preset.frequency_penalty) > kMaxSamplingPenalty) {
         throw std::invalid_argument("gemma4 sampling preset is outside supported bounds");
     }
     return preset;

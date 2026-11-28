@@ -721,12 +721,13 @@ std::string serve_usage_text(const char* argv0) {
            "\n"
            "SAMPLING (defaults come from the loaded model + thinking mode; server flags\n"
            "and request fields override individual values)\n"
-           "  --temperature F            sampling temperature (0-2)\n"
+           "  --temperature F            sampling temperature (0-10)\n"
            "  --top-p F                  nucleus probability (0-1)\n"
-           "  --top-k N                  Gemma4 0..64, Qwen 0..20; 0 uses Gemma preset or Qwen 20\n"
+           "  --top-k N                  candidate count; above the model's ceiling (Gemma4 64,\n"
+           "                               Qwen 20) it is clamped; 0 uses Gemma preset or Qwen 20\n"
            "  --min-p F                  minimum token probability (0-1)\n"
-           "  --presence-penalty F       -2 to 2\n"
-           "  --frequency-penalty F      -2 to 2\n"
+           "  --presence-penalty F       -5 to 5\n"
+           "  --frequency-penalty F      -5 to 5\n"
            "  --seed N                   fixed random seed\n"
            "  --greedy                   force temperature 0 (exact argmax)\n"
            "  --no-thinking              disable the thinking mode (enabled by default)\n"
@@ -1412,24 +1413,26 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--claude-code-usage-compat") {
             options.claude_code_usage_compat = true;
         } else if (arg == "--temperature") {
-            options.sampling_overrides.temperature =
-                parse_float_in(require_value("--temperature"), "temperature", 0.0f, 2.0f);
+            options.sampling_overrides.temperature = parse_float_in(
+                require_value("--temperature"), "temperature", 0.0f, infernix::kMaxSamplingTemperature);
         } else if (arg == "--top-p") {
             options.sampling_overrides.top_p =
                 parse_float_in(require_value("--top-p"), "top-p", 0.0f, 1.0f);
         } else if (arg == "--top-k") {
-            const int top_k = parse_nonnegative_int(require_value("--top-k"), "top-k");
-            if (top_k > 64) { throw std::invalid_argument("top-k must be in [0,64]"); }
-            options.sampling_overrides.top_k = top_k;
+            // Above the loaded model's ceiling Engine clamps it, as it does a request's top_k.
+            options.sampling_overrides.top_k =
+                parse_nonnegative_int(require_value("--top-k"), "top-k");
         } else if (arg == "--min-p") {
             options.sampling_overrides.min_p =
                 parse_float_in(require_value("--min-p"), "min-p", 0.0f, 1.0f);
         } else if (arg == "--presence-penalty") {
-            options.sampling_overrides.presence_penalty = parse_float_in(
-                require_value("--presence-penalty"), "presence-penalty", -2.0f, 2.0f);
+            options.sampling_overrides.presence_penalty =
+                parse_float_in(require_value("--presence-penalty"), "presence-penalty",
+                               -infernix::kMaxSamplingPenalty, infernix::kMaxSamplingPenalty);
         } else if (arg == "--frequency-penalty") {
-            options.sampling_overrides.frequency_penalty = parse_float_in(
-                require_value("--frequency-penalty"), "frequency-penalty", -2.0f, 2.0f);
+            options.sampling_overrides.frequency_penalty =
+                parse_float_in(require_value("--frequency-penalty"), "frequency-penalty",
+                               -infernix::kMaxSamplingPenalty, infernix::kMaxSamplingPenalty);
         } else if (arg == "--seed") {
             options.sampling_overrides.seed = parse_u64(require_value("--seed"), "seed");
         } else if (arg == "--greedy") {

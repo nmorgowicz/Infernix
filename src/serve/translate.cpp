@@ -65,25 +65,27 @@ infernix::SamplingOverrides resolve_sampling_overrides(const SamplingParams& req
         !finite(sampling.presence_penalty) || !finite(sampling.frequency_penalty)) {
         invalid_sampling("sampling parameters must be finite", "sampling");
     }
-    if (sampling.temperature && (*sampling.temperature < 0.0F || *sampling.temperature > 2.0F)) {
-        invalid_sampling("temperature must be in [0,2]", "temperature");
+    if (sampling.temperature &&
+        (*sampling.temperature < 0.0F || *sampling.temperature > infernix::kMaxSamplingTemperature)) {
+        invalid_sampling("temperature must be in [0,10]", "temperature");
     }
     if (sampling.top_p && (*sampling.top_p < 0.0F || *sampling.top_p > 1.0F)) {
         invalid_sampling("top_p must be in [0,1]", "top_p");
     }
-    if (sampling.top_k && (*sampling.top_k < 0 || *sampling.top_k > 64)) {
-        invalid_sampling("top_k must be in [0,64]", "top_k");
+    // A top_k above the loaded model's ceiling is not refused here: Engine clamps it to the ceiling.
+    if (sampling.top_k && *sampling.top_k < 0) {
+        invalid_sampling("top_k must not be negative", "top_k");
     }
     if (sampling.min_p && (*sampling.min_p < 0.0F || *sampling.min_p > 1.0F)) {
         invalid_sampling("min_p must be in [0,1]", "min_p");
     }
     if (sampling.presence_penalty &&
-        (*sampling.presence_penalty < -2.0F || *sampling.presence_penalty > 2.0F)) {
-        invalid_sampling("presence_penalty must be in [-2,2]", "presence_penalty");
+        std::fabs(*sampling.presence_penalty) > infernix::kMaxSamplingPenalty) {
+        invalid_sampling("presence_penalty must be in [-5,5]", "presence_penalty");
     }
     if (sampling.frequency_penalty &&
-        (*sampling.frequency_penalty < -2.0F || *sampling.frequency_penalty > 2.0F)) {
-        invalid_sampling("frequency_penalty must be in [-2,2]", "frequency_penalty");
+        std::fabs(*sampling.frequency_penalty) > infernix::kMaxSamplingPenalty) {
+        invalid_sampling("frequency_penalty must be in [-5,5]", "frequency_penalty");
     }
     if (server.greedy) { sampling.temperature = 0.0F; }
     return sampling;

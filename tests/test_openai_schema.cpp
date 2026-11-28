@@ -1016,16 +1016,49 @@ int test_stops_and_ranges() {
     failures +=
         check(api_error([&] { (void)parse(body); }).param == "stop", "empty stop string rejected");
 
-    body                                  = base_request();
-    for (const int top_k : {0, 20, 21, 64}) {
+    body = base_request();
+    // The translator forwards any non-negative top_k; the loaded model's ceiling clamps it in Engine.
+    for (const int top_k : {0, 20, 21, 64, 65, 100, 500}) {
         body["top_k"] = top_k;
         failures += check(options(parse(body).generation).execution.sampling.top_k == top_k,
-                          "common Engine translator preserves the generic [0,64] sampler domain");
+                          "common Engine translator forwards a non-negative top_k for Engine to clamp");
     }
-    body["top_k"]                         = 65;
+    body["top_k"]                         = -1;
     const GenerationRequest invalid_top_k = parse(body).generation;
     failures += check(api_error([&] { (void)options(invalid_top_k); }).param == "top_k",
-                      "Engine translator owns sampler value range");
+                      "Engine translator refuses a negative top_k");
+    body = base_request();
+    for (const double temperature : {0.0, 0.7, 2.0, 5.0, 10.0}) {
+        body["temperature"] = temperature;
+        failures += check(options(parse(body).generation).execution.sampling.temperature ==
+                              static_cast<float>(temperature),
+                          "temperature inside [0,10] must reach Engine unchanged");
+    }
+    for (const double temperature : {-0.1, 10.5, 100.0}) {
+        body["temperature"]                     = temperature;
+        const GenerationRequest bad_temperature = parse(body).generation;
+        failures += check(api_error([&] { (void)options(bad_temperature); }).param == "temperature",
+                          "temperature outside [0,10] rejected by the common Engine translator");
+    }
+    body = base_request();
+    for (const double penalty : {-5.0, -2.5, 0.0, 3.0, 5.0}) {
+        body["presence_penalty"]  = penalty;
+        body["frequency_penalty"] = -penalty;
+        const auto sampling = options(parse(body).generation).execution.sampling;
+        failures += check(sampling.presence_penalty == static_cast<float>(penalty) &&
+                              sampling.frequency_penalty == static_cast<float>(-penalty),
+                          "penalties inside [-5,5] must reach Engine unchanged");
+    }
+    for (const char* field : {"presence_penalty", "frequency_penalty"}) {
+        for (const double penalty : {-5.5, 5.5, 50.0}) {
+            body                                = base_request();
+            body[field]                         = penalty;
+            const GenerationRequest bad_penalty = parse(body).generation;
+            failures += check(api_error([&] { (void)options(bad_penalty); }).param == field,
+                              "penalty outside [-5,5] rejected by the common Engine translator");
+        }
+    }
+    body                                  = base_request();
     body["top_k"]                         = 5;
     body["min_p"]                         = 1.1;
     const GenerationRequest invalid_min_p = parse(body).generation;

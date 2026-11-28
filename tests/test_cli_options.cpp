@@ -89,10 +89,10 @@ int run_tests() {
                           (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x",
                                        "--prefill-chunk", "0"});
                       }), "explicit CLI prefill zero must not mean auto");
-    for (const char* top_k : {"0", "20", "21", "64"}) {
+    for (const char* top_k : {"0", "20", "21", "64", "65", "100", "500"}) {
         failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--top-k", top_k})
                                   .sampling.top_k == std::stoi(top_k),
-                          "generic CLI top-k parser must accept the full Gemma domain");
+                          "CLI top-k parser must keep any non-negative value for Engine to clamp");
     }
     const auto choice = parse({"infernix", "model.ninfer", "--prompt", "hello", "--choice", "",
                                "--choice", "a|b", "--choice", "你好"});
@@ -531,11 +531,24 @@ int run_tests() {
                                        "--log-level", "verbose"});
                       }),
                       "CLI accepted an unknown log level");
-    failures +=
-        check(rejects([] {
-                  (void)parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--top-k", "65"});
-              }),
-              "CLI accepted top_k beyond the executable candidate domain");
+    failures += check(rejects([] {
+                          (void)parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--top-k", "-1"});
+                      }),
+                      "CLI accepted a negative top_k");
+    const auto extreme = parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--temperature", "10",
+                                "--presence-penalty", "-5", "--frequency-penalty", "5"});
+    failures += check(extreme.sampling.temperature == 10.0F && extreme.sampling.presence_penalty == -5.0F &&
+                          extreme.sampling.frequency_penalty == 5.0F,
+                      "CLI sampling flags did not accept the documented temperature and penalty bounds");
+    for (const char* beyond : {"--temperature=10.01", "--presence-penalty=5.01", "--frequency-penalty=-5.01"}) {
+        const std::string flag(beyond);
+        const auto split = flag.find('=');
+        failures += check(rejects([&] {
+                              (void)parse({"infernix-cli", "model.ninfer", "--prompt", "hello",
+                                           flag.substr(0, split), flag.substr(split + 1)});
+                          }),
+                          "CLI sampling flag accepted a value beyond its bound");
+    }
     // --expert-state: absent keeps the default (the artifact path + .expert-state), "off" disables.
     failures += check(!parse({"infernix-cli", "model.ninfer", "--prompt", "x"}).expert_state.has_value(),
                       "CLI expert state must default to the artifact's file");

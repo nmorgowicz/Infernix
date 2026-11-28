@@ -2069,15 +2069,17 @@ void parse_generation_fields(const Json& body, GenerationRequest& request) {
     request.sampling.top_p       = optional_number(body, "top_p");
     request.sampling.top_k       = optional_int(body, "top_k");
     if (request.sampling.temperature &&
-        (*request.sampling.temperature < 0.0 || *request.sampling.temperature > 1.0)) {
-        bad_request("temperature must be in [0,1]", "temperature");
+        (*request.sampling.temperature < 0.0 ||
+         *request.sampling.temperature > static_cast<double>(infernix::kMaxSamplingTemperature))) {
+        bad_request("temperature must be in [0,10]", "temperature");
     }
     if (request.sampling.top_p &&
         (*request.sampling.top_p < 0.0 || *request.sampling.top_p > 1.0)) {
         bad_request("top_p must be in [0,1]", "top_p");
     }
-    if (request.sampling.top_k && (*request.sampling.top_k < 0 || *request.sampling.top_k > 64)) {
-        bad_request("top_k must be in [0,64]", "top_k");
+    // Above the loaded model's ceiling top_k is clamped to it by Engine, not refused.
+    if (request.sampling.top_k && *request.sampling.top_k < 0) {
+        bad_request("top_k must not be negative", "top_k");
     }
 }
 

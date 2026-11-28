@@ -1,5 +1,6 @@
 #include "runtime/contract/sampling.h"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -16,8 +17,8 @@ void validate(const ResolvedSamplingParameters& sampling, std::int32_t max_top_k
         !std::isfinite(sampling.frequency_penalty)) {
         throw std::invalid_argument("sampling parameters must be finite");
     }
-    if (sampling.temperature < 0.0F || sampling.temperature > 2.0F) {
-        throw std::invalid_argument("temperature must be in [0,2]");
+    if (sampling.temperature < 0.0F || sampling.temperature > kMaxSamplingTemperature) {
+        throw std::invalid_argument("temperature must be in [0,10]");
     }
     if (sampling.top_k < 1 || sampling.top_k > max_top_k) {
         throw std::invalid_argument("resolved top_k must be in [1," + std::to_string(max_top_k) + "]");
@@ -28,11 +29,11 @@ void validate(const ResolvedSamplingParameters& sampling, std::int32_t max_top_k
     if (sampling.min_p < 0.0F || sampling.min_p > 1.0F) {
         throw std::invalid_argument("min_p must be in [0,1]");
     }
-    if (sampling.presence_penalty < -2.0F || sampling.presence_penalty > 2.0F) {
-        throw std::invalid_argument("presence_penalty must be in [-2,2]");
+    if (std::fabs(sampling.presence_penalty) > kMaxSamplingPenalty) {
+        throw std::invalid_argument("presence_penalty must be in [-5,5]");
     }
-    if (sampling.frequency_penalty < -2.0F || sampling.frequency_penalty > 2.0F) {
-        throw std::invalid_argument("frequency_penalty must be in [-2,2]");
+    if (std::fabs(sampling.frequency_penalty) > kMaxSamplingPenalty) {
+        throw std::invalid_argument("frequency_penalty must be in [-5,5]");
     }
 }
 
@@ -57,10 +58,13 @@ ResolvedSamplingParameters resolve_sampling(const ModelSamplingDefaults& default
     };
     // Zero keeps its public meaning (use the model's default candidate width), then runtimes see
     // only concrete values: the 20-wide pipeline's cap, or for a model with a wider ceiling the
-    // preset's top_k (64 for Gemma 4) when it carries one.
+    // preset's top_k (64 for Gemma 4) when it carries one. A top_k above the model's ceiling is
+    // clamped to it: front ends send sliders that reach 100 and beyond, and the ceiling is the
+    // sampler's candidate width, which no request can widen.
     if (resolved.top_k == 0) {
         resolved.top_k = defaults.max_top_k > kFastTopK && preset.top_k > 0 ? preset.top_k : kFastTopK;
     }
+    resolved.top_k = std::min(resolved.top_k, defaults.max_top_k);
     validate(resolved, defaults.max_top_k);
     return resolved;
 }

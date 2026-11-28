@@ -1753,8 +1753,8 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
     }
 
     if (const std::optional<double> temperature = optional_number(body, "temperature")) {
-        if (*temperature < 0.0 || *temperature > 2.0) {
-            bad_request("temperature must be in [0,2]", "temperature");
+        if (*temperature < 0.0 || *temperature > static_cast<double>(infernix::kMaxSamplingTemperature)) {
+            bad_request("temperature must be in [0,10]", "temperature");
         }
         out.prompt.generation.sampling.temperature = *temperature;
     }

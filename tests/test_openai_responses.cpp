@@ -151,19 +151,32 @@ int test_basic_request_and_resolution() {
         parse_openai_responses_create_request(body, limits());
 
     int failures = 0;
-    for (const int top_k : {0, 20, 21, 64}) {
+    for (const int top_k : {0, 20, 21, 64, 65, 100, 500}) {
         GenerationRequest generation;
         generation.sampling.top_k = top_k;
         failures += check(to_request_options(generation, {}, {}, true).execution.sampling.top_k == top_k,
-                          "request translation narrowed the Gemma sampling domain");
+                          "request translation must forward a non-negative top_k for Engine to clamp");
     }
-    for (const int top_k : {-1, 65}) {
+    {
         GenerationRequest generation;
-        generation.sampling.top_k = top_k;
+        generation.sampling.top_k = -1;
         failures += check(api_error([&] {
                               (void)to_request_options(generation, {}, {}, true);
                           }).param == "top_k",
-                          "request translation accepted top-k outside the generic domain");
+                          "request translation accepted a negative top_k");
+    }
+    for (const double temperature : {0.0, 2.5, 10.0}) {
+        const Json hot = {{"model", "m"}, {"input", "hello"}, {"temperature", temperature}};
+        failures += check(parse_openai_responses_create_request(hot, limits())
+                                  .prompt.generation.sampling.temperature == temperature,
+                          "Responses temperature inside [0,10] must be preserved");
+    }
+    for (const double temperature : {-0.1, 10.5}) {
+        const Json hot = {{"model", "m"}, {"input", "hello"}, {"temperature", temperature}};
+        failures += check(api_error([&] {
+                              (void)parse_openai_responses_create_request(hot, limits());
+                          }).param == "temperature",
+                          "Responses temperature outside [0,10] was accepted");
     }
     failures += check(request.prompt.model == "qwen3.6-27b", "model parsed");
     failures += check(request.prompt.input_turns.size() == 1 &&

@@ -332,12 +332,12 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--reasoning-loop off\|stop\|conclude` | end the reply or close the thinking when it keeps repeating whole passages, or one line with only its numbers changing (Inkling 2 has no guard and refuses `stop` and `conclude` at startup) | `off` |
 | `--reasoning-effort none\|minimal\|low\|medium\|high\|xhigh\|max` | pass an effort value to the selected template | template default |
 | `--greedy` | exact argmax decoding | off |
-| `--temperature F` | sampling temperature override | registered model/mode default |
+| `--temperature F` | sampling temperature override (`0..10`) | registered model/mode default |
 | `--top-p F` | nucleus-threshold override | registered model/mode default |
-| `--top-k N` | top-k-threshold override (`0..64` for Gemma4, `0..20` for Qwen; zero uses Gemma4's preset candidate width, normally `64`, or Qwen's `20`; the loaded model enforces its ceiling) | registered model/mode default |
+| `--top-k N` | top-k-threshold override (any non-negative integer; above the loaded model's ceiling, `64` for Gemma4 and `20` for Qwen, it is clamped to the ceiling; zero uses Gemma4's preset candidate width, normally `64`, or Qwen's `20`) | registered model/mode default |
 | `--min-p F` | min-p-threshold override | registered model/mode default |
-| `--presence-penalty F` | presence-penalty override | registered model/mode default; `0` with an output constraint |
-| `--frequency-penalty F` | frequency-penalty override | registered model/mode default (`0`) |
+| `--presence-penalty F` | presence-penalty override (`-5..5`) | registered model/mode default; `0` with an output constraint |
+| `--frequency-penalty F` | frequency-penalty override (`-5..5`) | registered model/mode default (`0`) |
 | `--seed N` | sampling seed | `0` |
 | `--log-colours on\|off` | colour the statistics output on stderr | on when stderr is a terminal |
 

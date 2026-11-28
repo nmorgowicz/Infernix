@@ -146,10 +146,10 @@ int main() {
                       "last prefill chunk option must replace both numeric and auto state");
     failures += check(!parse_error({"infernix-serve", "model.ninfer", "--prefill-chunk", "0"}).empty(),
                       "explicit prefill chunk zero must not mean auto");
-    for (const char* top_k : {"0", "20", "21", "64"}) {
+    for (const char* top_k : {"0", "20", "21", "64", "65", "100", "500"}) {
         failures += check(parse({"infernix-serve", "model.ninfer", "--top-k", top_k})
                                   .sampling_overrides.top_k == std::stoi(top_k),
-                          "generic serve top-k parser must accept the full Gemma domain");
+                          "serve top-k parser must keep any non-negative value for Engine to clamp");
     }
     failures += check(parse({"infernix-serve", "model.ninfer"}).rope_yarn_factor == 1.0F,
                       "serving YaRN must default off");
@@ -1310,12 +1310,25 @@ int main() {
                           sampling.sampling_overrides.frequency_penalty == -0.5F &&
                           sampling.sampling_overrides.seed == 0,
                       "server sampling flags did not preserve explicit values and zeros");
-    bool oversized_top_k_rejected = false;
-    try {
-        (void)parse({"infernix-serve", "model.ninfer", "--top-k", "65"});
-    } catch (const std::invalid_argument&) { oversized_top_k_rejected = true; }
-    failures += check(oversized_top_k_rejected,
-                      "server accepted top_k beyond the executable candidate domain");
+    failures += check(!parse_error({"infernix-serve", "model.ninfer", "--top-k", "-1"}).empty(),
+                      "server accepted a negative top_k");
+    const ServeOptions extreme =
+        parse({"infernix-serve", "model.ninfer", "--temperature", "10", "--presence-penalty", "-5",
+               "--frequency-penalty", "5"});
+    failures += check(extreme.sampling_overrides.temperature == 10.0F &&
+                          extreme.sampling_overrides.presence_penalty == -5.0F &&
+                          extreme.sampling_overrides.frequency_penalty == 5.0F,
+                      "server sampling flags did not accept the documented temperature and penalty bounds");
+    for (const std::vector<std::string>& beyond :
+         {std::vector<std::string>{"--temperature", "10.01"},
+          std::vector<std::string>{"--temperature", "-0.1"},
+          std::vector<std::string>{"--presence-penalty", "5.01"},
+          std::vector<std::string>{"--frequency-penalty", "-5.01"}}) {
+        std::vector<std::string> arguments{"infernix-serve", "model.ninfer"};
+        arguments.insert(arguments.end(), beyond.begin(), beyond.end());
+        failures += check(!parse_error(arguments).empty(),
+                          "server sampling flag accepted a value beyond its bound");
+    }
 
     GenerationRequest request;
     request.max_tokens   = 1;

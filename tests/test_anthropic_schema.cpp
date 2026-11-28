@@ -154,19 +154,26 @@ int test_envelope_and_field_policy() {
                           "a cache pre-warm accepted a forced tool call");
     }
 
-    body                = base_request();
-    body["temperature"] = 1.01;
-    failures += check(api_param([&] { (void)parse(body); }) == "temperature",
-                      "Anthropic temperature range was not enforced");
-    body          = base_request();
-    for (const int top_k : {0, 20, 21, 64}) {
+    body = base_request();
+    for (const double temperature : {0.0, 1.01, 5.0, 10.0}) {
+        body["temperature"] = temperature;
+        failures += check(parse(body).generation.sampling.temperature == temperature,
+                          "Anthropic temperature inside [0,10] must be preserved");
+    }
+    for (const double temperature : {-0.1, 10.01, 100.0}) {
+        body["temperature"] = temperature;
+        failures += check(api_param([&] { (void)parse(body); }) == "temperature",
+                          "Anthropic temperature range was not enforced");
+    }
+    body = base_request();
+    for (const int top_k : {0, 20, 21, 64, 65, 100, 500}) {
         body["top_k"] = top_k;
         failures += check(parse(body).generation.sampling.top_k == top_k,
-                          "Anthropic parser must preserve the full Gemma sampling domain");
+                          "Anthropic parser must forward any non-negative top_k for Engine to clamp");
     }
-    body["top_k"] = 65;
+    body["top_k"] = -1;
     failures += check(api_param([&] { (void)parse(body); }) == "top_k",
-                      "Engine top_k range was not enforced");
+                      "a negative top_k was accepted");
     body                  = base_request();
     body["output_config"] = Json{{"format", Json{{"type", "json_schema"}}}};
     failures += check(api_param([&] { (void)parse(body); }) == "output_config.format.schema",
