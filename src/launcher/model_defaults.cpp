@@ -112,6 +112,16 @@ Args default_args(const LibraryScan& scan, const ScannedModel& model) {
     return args;
 }
 
+void apply_model_launch_defaults(Args& args, const ScannedModel& model) {
+    if (model_kind(model) != ModelKind::Gemma4 || has_flag(args, "--gemma4-sliding-kv") ||
+        flag_value(args, "--kv-dtype") != "fp8") {
+        return;
+    }
+    args.reserve(args.size() + 2);
+    args.emplace_back("--gemma4-sliding-kv");
+    args.emplace_back("fp8");
+}
+
 std::string default_alias(const LibraryScan& scan, const ScannedModel& model) {
     const std::string base = stem_of(model);
     int index              = 1;

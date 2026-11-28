@@ -148,6 +148,11 @@ void classify_family(ScannedModel& model) {
         model.family_label = "Inkling 2 Mini";
         return;
     }
+    if (model.model_type == "gemma4_text") {
+        model.family       = "gemma4";
+        model.family_label = model.model_type;
+        return;
+    }
     model.family       = "unknown";
     model.family_label = model.model_type.empty() ? "Unknown" : model.model_type;
 }

@@ -398,6 +398,25 @@ void test_library() {
     check(model.recipe == "qwen3_8_flash_next_dense8", "recipe from provenance");
     check(model.bytes == 3000 + 4096 + 4096, "payload plus framing");
 
+    // Gemma 4 is a runnable family: the load path refuses "unknown" ones.
+    Json gemma_directory = {{"components",
+                             {{"text",
+                               {{"config",
+                                 {{"model_type", "gemma4_text"},
+                                  {"hidden_size", 5376},
+                                  {"num_hidden_layers", 60},
+                                  {"vocab_size", 262144},
+                                  {"max_position_embeddings", 262144}}}}}}},
+                            {"objects", Json::array()},
+                            {"files", Json::array({{{"path", nullptr}, {"payload_bytes", 1000}}})},
+                            {"metadata", {{"name", "Gemma-4-31B-Test"}}}};
+    const std::array<std::uint8_t, 16> gemma_id{3};
+    ParsedEntry gemma_entry =
+        parse_artifact_directory("Z:/models/gemma.ninfer", gemma_id, gemma_directory, 4096);
+    check(gemma_entry.model.has_value() && gemma_entry.model->family == "gemma4" &&
+              gemma_entry.model->model_type == "gemma4_text",
+          "a gemma4_text artifact is the runnable gemma4 family, not unknown");
+
     Json drafter_directory = {
         {"components",
          {{"dflash2",
@@ -605,6 +624,53 @@ void test_option_support() {
     check(strip_unsupported_options(defaults, inkling).empty(), "Inkling's defaults hold only what it takes");
     Json library_row = option_support_json(inkling);
     check(library_row["context_auto"].get<bool>() && library_row["unsupported"].is_array(), "the form's view");
+}
+
+void test_gemma4_launch_defaults() {
+    ScannedModel gemma;
+    gemma.model_type = "gemma4_text";
+    LibraryScan scan;
+    Args draft = default_args(scan, gemma);
+    check(!has_flag(draft, "--gemma4-sliding-kv"), "the form keeps an automatic ring unset, not an explicit FP8 override");
+    Args launch = draft;
+    apply_model_launch_defaults(launch, gemma);
+    check(flag_value(launch, "--gemma4-sliding-kv") == "fp8", "a Gemma FP8-global launch resolves an omitted ring to FP8");
+    const Args resolved = launch;
+    apply_model_launch_defaults(launch, gemma);
+    check(launch == resolved, "resolving launch defaults twice does not duplicate options");
+    Args equal_form = {"--kv-dtype=fp8"};
+    apply_model_launch_defaults(equal_form, gemma);
+    check(flag_value(equal_form, "--gemma4-sliding-kv") == "fp8", "the one-argument global-KV form also resolves FP8");
+
+    Args bf16_global = draft;
+    set_flag(bf16_global, "--kv-dtype", "bf16");
+    const Args native_bf16 = bf16_global;
+    apply_model_launch_defaults(bf16_global, gemma);
+    check(bf16_global == native_bf16, "changing the automatic draft to BF16 global KV keeps the native BF16 ring");
+    Args native;
+    apply_model_launch_defaults(native, gemma);
+    check(native.empty(), "omitting global KV keeps the native BF16 defaults");
+
+    for (const Args& explicit_ring : {
+             Args{"--kv-dtype", "fp8", "--gemma4-sliding-kv", "bf16"},
+             Args{"--kv-dtype=fp8", "--gemma4-sliding-kv=bf16"},
+             Args{"--kv-dtype", "bf16", "--gemma4-sliding-kv", "fp8"}}) {
+        Args kept = explicit_ring;
+        apply_model_launch_defaults(kept, gemma);
+        check(kept == explicit_ring, "an explicit ring, including an incompatible request, is never silently rewritten");
+    }
+    Args bf16_qk = {"--kv-dtype=fp8", "--gemma4-qk", "bf16", "--top-k", "64"};
+    apply_model_launch_defaults(bf16_qk, gemma);
+    check(flag_value(bf16_qk, "--gemma4-sliding-kv") == "fp8" &&
+              flag_value(bf16_qk, "--gemma4-qk") == "bf16" && flag_value(bf16_qk, "--top-k") == "64",
+          "BF16 QK coexists with the default FP8 ring, without changing sampling");
+    for (const char* type : {"qwen3_5_text", "qwen3_5_moe_text", "qwen4_exp_text", "inkling2_loop_text", "unknown"}) {
+        ScannedModel other;
+        other.model_type = type;
+        Args args = {"--kv-dtype", "fp8"};
+        apply_model_launch_defaults(args, other);
+        check(args == Args{"--kv-dtype", "fp8"}, "other model families receive no Gemma ring default");
+    }
 }
 
 // A part file an artifact header names outside the artifact's folder (audit 2026-11-17 LN-10: an absolute path or
@@ -1691,6 +1757,7 @@ int main(int argc, char** argv) {
     test_serve_log_files();
     test_library();
     test_option_support();
+    test_gemma4_launch_defaults();
     test_library_part_paths();
     test_scan_folder();
     test_library_adapters();

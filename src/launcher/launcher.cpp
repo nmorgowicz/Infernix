@@ -790,6 +790,7 @@ AblationRun Launcher::ablation_run_for(const std::string& config_id) {
     Args args                = effective_args(id, *model, scan);
     strip_managed_flags(args, takes);
     remove_flag(args, "--ablate", takes); // a fit measures the plain model
+    apply_model_launch_defaults(args, *model);
     AblationRun run;
     run.config_id  = id;
     run.model_name = effective_alias(id, *model, scan);
@@ -839,6 +840,7 @@ Router::Loaded Launcher::load_model(const std::string& key) {
     const TakesValue takes   = [&serve](std::string_view flag) { return serve.takes_value(flag); };
     Args args                = effective_args(key, *model, scan);
     strip_managed_flags(args, takes);
+    apply_model_launch_defaults(args, *model);
     const std::string alias = effective_alias(key, *model, scan);
 
     LaunchSpec spec;

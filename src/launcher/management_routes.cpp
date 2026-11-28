@@ -6,6 +6,7 @@
 
 #include "launcher/http_access.h"
 #include "launcher/launch_script.h"
+#include "launcher/model_defaults.h"
 #include "launcher/process.h"
 #include "launcher/route_support.h"
 #include "launcher/sha256.h"
@@ -419,6 +420,7 @@ void Launcher::register_config_routes(const std::string& api) {
                     with_config(q, [&](const ConfigRef& ref, const LibraryScan& scan) {
                         const std::string alias = effective_alias(ref.id, *ref.model, scan);
                         Args args               = effective_args(ref.id, *ref.model, scan);
+                        apply_model_launch_defaults(args, *ref.model);
                         const std::string text  = write_launch_script(shell, path_utf8(serve_executable()),
                                                                       path_utf8(ref.model->path), args,
                                                                       effective_env(ref.id), alias);

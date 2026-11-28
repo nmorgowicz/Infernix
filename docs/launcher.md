@@ -221,6 +221,15 @@ only when the installed `infernix-serve` lists its option.
 [`tests/test_launcher_option_coverage.py`](../tests/test_launcher_option_coverage.py) fails when an
 option of the server has no control.
 
+For Gemma 4, **Gemma 4 sliding KV → Automatic (follows global KV)** resolves an omitted ring to
+FP8 when global KV is FP8, otherwise to the server's BF16 ring. The saved/form argument list keeps
+Automatic unset, so changing global KV to BF16 does not leave an inferred FP8 ring pinned in the
+configuration. The preview, **Will it fit?** plan and launched child all apply the same resolution.
+An explicit `--gemma4-sliding-kv bf16` always wins, independently of QK arithmetic: BF16 QK can use
+an FP8 ring. Other model families are unchanged. This is a launcher default; a raw Engine/CLI/
+`infernix-serve` command that omits `--gemma4-sliding-kv` still uses BF16 ring storage.
+
+
 **⋮** beside **All options** and **Duplicate** holds the rest: a new configuration, import and
 export of a launch script, copying the command line, **Restore defaults** and deleting a named
 configuration.

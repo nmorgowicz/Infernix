@@ -88,12 +88,12 @@ const CONTEXT: FormSection = {
       kind: "select",
       flag: "--gemma4-sliding-kv",
       label: "Gemma 4 sliding KV",
-      help: "BF16 rings by default. FP8 saves memory but changes numerics and needs FP8 global KV.",
+      help: "Automatic follows global KV storage: FP8 rings with FP8 global KV, otherwise BF16. Explicit BF16 preserves ring storage independently of QK precision; BF16 QK can use an FP8 ring. FP8 needs FP8 global KV and changes numerics.",
       options: [
         { value: "bf16", label: "BF16" },
         { value: "fp8", label: "FP8 (approximate)" },
       ],
-      unsetLabel: "BF16 (default)",
+      unsetLabel: "Automatic (follows global KV)",
       more: true,
     },
     {

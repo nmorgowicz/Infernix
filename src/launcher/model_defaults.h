@@ -20,6 +20,10 @@ namespace infernix::launcher {
 // Launch parameters, without the artifact path and the managed flags.
 [[nodiscard]] Args default_args(const LibraryScan& scan, const ScannedModel& model);
 
+// Resolve omitted launch options for the command, never the saved/form draft. Gemma's omitted
+// sliding ring follows FP8 global KV; explicit ring choices and other model families are kept.
+void apply_model_launch_defaults(Args& args, const ScannedModel& model);
+
 // The artifact's file name without its part numbering and extension; unique within the library
 // (a numeric suffix separates two artifacts that would share one).
 [[nodiscard]] std::string default_alias(const LibraryScan& scan, const ScannedModel& model);

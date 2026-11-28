@@ -5,6 +5,7 @@
 
 #include "launcher/launch_script.h"
 #include "launcher/load_advice.h"
+#include "launcher/model_defaults.h"
 #include "launcher/option_support.h"
 #include "launcher/process.h"
 #include "launcher/route_support.h"
@@ -87,6 +88,7 @@ Json Launcher::fit_plan_json(const std::string& config_id, const ScannedModel& m
     Args own               = args;
     strip_managed_flags(own, takes);
     strip_unsupported_options(own, model, takes); // the plan of what a load would run
+    apply_model_launch_defaults(own, model);
     argv.insert(argv.end(), own.begin(), own.end());
     std::error_code ignored;
     std::filesystem::create_directories(options_.data_dir / "plans", ignored);
@@ -227,6 +229,7 @@ Json Launcher::preview_json(const std::string& config_id, const ScannedModel& mo
         for (const std::string& flag : unsupported) { list += (list.empty() ? "" : ", ") + flag; }
         warnings.push_back(model.family_label + " does not take these options, so they are left out: " + list);
     }
+    apply_model_launch_defaults(args, model);
     if (serve.found && !serve.options.empty()) {
         for (const std::string& arg : args) {
             if (!arg.starts_with("--")) { continue; }
