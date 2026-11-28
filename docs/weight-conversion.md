@@ -607,21 +607,22 @@ verification stays A16. Do not rebuild or duplicate weights to change compute.
 Omitting `--profile` selects `q5-quality` for `--preset q5-g64` and for `launcher` when the artifact
 directory contains native Q5 weights; the filename/HF model name is not used. Explicit `--profile default`
 retains the historical general settings, including `a16`, 131072 context and automatic chunk.
-Q4/IQ3 and `memory-16gb` defaults do not change. Direct Python callers use
+Compute/context/chunk settings of Q4/IQ3 and `memory-16gb` retain their contracts; the compatible global-FP8 ring policy below applies across profiles. Direct Python callers use
 `ServeSettings(profile="q5-quality")` or `ServeProfile(profile="q5-long-context")`; unspecified fields
 resolve in the same place as the CLI. `write_launcher(..., profile=None)` detects the artifact.
 
 | Serving profile | Prefill compute | Sliding ring | Context / chunk | Global KV |
 |---|---|---|---|---|
-| `q5-quality` (Q5 default) | INT8 g64 | BF16 | auto / 2048 | normal stored FP8 K/V |
+| `q5-quality` (Q5 default) | INT8 g64 | FP8 with global FP8 KV | auto / 2048 | normal stored FP8 K/V |
 | `q5-long-context` | INT8 g64 | FP8 | auto / 2048 | normal stored FP8 K/V |
 
 Both retain 1024 MiB headroom, thinking on, top-k 64, MTP d1, BF16 logits and an 8192 MiB host-only
-prefix cache. **“Quality” means the higher-quality Q5 tier with BF16 rings, not maximum-fidelity
-arithmetic:** FP8 global QK remains the existing roleplay/prose choice, faster on long prompts but
-measurably less faithful. For coding/tools or fidelity-first use, explicitly add `--gemma4-qk bf16`;
-also add `--gemma4-q5-prefill a16` to avoid the lossy projection choice. No coding/tool configuration
-is silently migrated. Explicit BF16 ring, QK, compute, sampling and capacity overrides win.
+prefix cache. **“Quality” means the higher-quality Q5 weight tier, not BF16 storage or maximum-fidelity
+arithmetic.** Both profile names remain available with the same current FP8-ring policy; neither is removed.
+FP8 global QK remains the roleplay/prose compute choice, faster on long prompts but measurably less faithful.
+For coding/tools or fidelity-first use, explicitly add `--gemma4-qk bf16`, `--gemma4-q5-prefill a16`
+for A16 projections and `--gemma4-sliding-kv bf16` for BF16 storage. QK does not select storage.
+No existing explicit fidelity configuration is rewritten. Explicit ring, QK, compute, sampling and capacity overrides win.
 Neither Q5 profile implicitly enables key-only KV. Auto context fits actual available resident
 VRAM at startup (minimum 9216), not a promise of 131k; read startup and `/v1/models`.
 
@@ -633,9 +634,9 @@ verified A16Only file and `<serve>` is the absolute `infernix-serve` executable 
 
 | Choice | Cost / limit |
 |---|---|
-| `q5-quality` | Recommended balance; BF16 ring, chunk 2048. |
-| `q5-long-context` | FP8 ring saves about 1191 MiB at chunk 2048; measured short-protocol KL increases and prefill slows up to 12.5% in the ring study. Not long-context quality qualification. |
-| Chunk 1536 | Measured BF16-ring reservation saving **884.129 MiB = 478.875 workspace + 400 ring + 5.254 other sequence reservation** versus 2048. Not all KV and not measured extra token capacity; g64's +0.64% long-prompt median is inconclusive, not a speed gain. FP8-ring combinations do not inherit that exact saving. |
+| `q5-quality` | Recommended Q5 balance; FP8 ring with global FP8 KV, chunk 2048. |
+| `q5-long-context` | Retained name, same current FP8-ring policy. At fixed capacity the staged ring saves ~587 MiB reservation /620 MiB process at chunk2048 versus BF16. Current paired speed is near parity, not the old up-to-12.5% prefill loss; numerical fidelity still changes ([evidence](maintainer/gemma4-benchmarks.md#fp8-sliding-ring)). |
+| Chunk 1536 | Smaller workspace can leave more room. The historical BF16-ring **884.129 MiB = 478.875 workspace + 400 ring + 5.254 other** reservation saving predates shared staging; it is not today's ring saving or extra-token/speed qualification. |
 | `--no-mtp` | Leaves the embedded assistant unloaded; forfeits speculative decode speed for more room. |
 | Shorter `--context 16384` | Limits conversation capacity; explicit context must fit unchanged. Auto already chooses what fits. |
 | Explicit `--gemma4-key-only-kv` | Experimental extra global capacity; changes attention arithmetic and has measured fidelity/long-context speed costs. Never implicit. |
@@ -1026,10 +1027,17 @@ file carries the assistant, `--logits-dtype bf16`, a host-only prefix cache (`--
 --host-context-mib 8192`), `--any-model-name`, and `0.0.0.0:8001`. The server binary is
 `apps/Release/infernix-serve.exe` (or a `build*/apps/Release` of the checkout) unless `--serve` names another.
 Every setting has a flag; `--gemma4-qk bf16` omits the QK flag.
-Sliding rings are BF16 for the general profile, `q5-quality` and native commands; `memory-16gb` and `q5-long-context`
-default to the FP8 ring, and an explicit `--gemma4-sliding-kv bf16` overrides it. FP8 requires `--kv-dtype fp8`.
-The FP8 ring saves 446 MiB at chunk 128 or 1,191 MiB at chunk 2048, but short-context KL increases and prefill slows:
-see the [FP8-ring measurements and limits](maintainer/gemma4-benchmarks.md#fp8-sliding-ring-experimental-off-by-default).
+Compatible global-FP8 roleplay builder/profile/generated-launcher routes default to FP8 rings, including general,
+`q5-quality` and `q5-long-context`. Explicit `--gemma4-sliding-kv bf16` wins; global `--kv-dtype bf16`
+resolves an omitted ring to BF16. `--gemma4-qk bf16` changes compute only, not ring storage.
+Native Engine/CLI ring default stays BF16. FP8 storage requires global FP8 KV; no new key-only policy is implicit.
+Current staged-ring BF16→FP8 savings at fixed capacity: ~587 MiB reservation /620 MiB process at chunk2048,
+~563 /596 MiB at chunk512. Current paired BF16/FP8 speed is near parity, not the historical old-kernel penalty;
+short RP, 32k, shipped-Q5 and mixed-A/Q5 65k fidelity costs remain ([measurements and limits](maintainer/gemma4-benchmarks.md#fp8-sliding-ring)).
+Use actual available VRAM; card-range planning uses 1.5–2.1 GiB desktop overhead, usually 1.5–1.7 GiB,
+not a mandatory fixed deduction. Plans/derived budgets are not actual starts or physical smaller-card guarantees.
+The [adoption record](https://github.com/nmorgowicz-org/llama-local-tooling/blob/research/tooling-reorganization/docs/plans/20261128-gemma4-fp8-ring-adoption.md)
+holds the measurements and real-start gates.
 Planning/fallback commands preserve the selected ring, and `serve-check` records the effective selection.
 `--gemma4-q5-prefill a16|fp8|int8-g32|int8-g64` defaults to `int8-g64` for Q5 profiles and `a16`
 for others. Non-`a16` selections are forwarded to every serve command; `serve-check` records them.

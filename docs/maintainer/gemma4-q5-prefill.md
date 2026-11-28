@@ -13,18 +13,23 @@ and receipt identifiers (`item2a-http-v1/clean`, `item2d-*.receipt.json`, ...) k
   native Q5 cells and selects `q5-quality` (Q5 cells INT8 g64, Q4 cells keep A8); `--profile default` selects the builder's settings.
 - Launcher profiles: omitted `--profile` selects `q5-quality` for a `q5-g64` build or a native-Q5 artifact.
   `q5-quality` and `q5-long-context` both select `--gemma4-q5-prefill int8-g64`, auto context, chunk 2048,
-  1024 MiB headroom, top-k 64, MTP d1 and a host-only prefix cache; `q5-quality` keeps the BF16 sliding ring,
-  `q5-long-context` uses the FP8 ring. Neither enables key-only KV. Explicit flags win; explicit
-  `--profile default` keeps the general profile.
+  1024 MiB headroom, top-k 64, MTP d1 and a host-only prefix cache; both retain their names and now share
+  FP8 ring storage with global FP8 KV. Neither adds implicit key-only KV. Explicit ring flags win;
+  global BF16 resolves an omitted builder ring to BF16; BF16 QK changes compute only.
+  `--profile default` keeps general compute/context/chunk settings, with the same compatible FP8-ring policy.
 - Engine, CLI and perplexity: `--gemma4-q5-prefill` accepts `a16|fp8|int8-g32|int8-g64`; the default `a16`
-  preserves the artifact's stored A16Only/AllowA8 policy. The general profile, Q4 and IQ3 tiers pass no flag
-  (`a16`). `memory-16gb` (IQ3_XXS only) defaults to the FP8 ring; other rings default to BF16.
-- Chunk 2048 is retained; chunk 1536 saves a measured 884 MiB of reservation but is not faster.
+  preserves stored A16Only/AllowA8 policy. Native ring default remains BF16; compatible global-FP8
+  roleplay builder/profile routes use FP8. Explicit fidelity settings are not rewritten; BF16 storage
+  requires `--gemma4-sliding-kv bf16`, independently of `--gemma4-qk bf16`.
+- Chunk 2048 is retained; the historical 884 MiB reservation saving at chunk1536 predates shared staging and is not a current ring-memory or speed claim.
 - The plain text60 tree and the Q5 A8-tagged artifact used in some measurements below were deleted later;
   they are reproducible (`tools/gptq/make_text_tree.py`; the A8 behavior as the one A16Only artifact with
   `--gemma4-q5-prefill fp8`, bit-identical to it on the bounded incremental protocol below).
 - Open caveats that remain: INT8 long-context quality and the diode artifact's incremental quality are
   unmeasured; g32 shows a resolved incremental NLL increase; no blanket numerical-equivalence claim is made.
+- Current-layout ring costs/benefits and remaining-evidence registration are summarized in
+  [sliding-ring evidence](gemma4-benchmarks.md#fp8-sliding-ring). Old FP8-kernel speed penalties below
+  are historical, not the current near-parity BF16/FP8 comparison.
 
 ## Scope and implementation diagnosis
 
@@ -972,6 +977,10 @@ artifact-identity.json,launcher-smoke.json,owned-stage-sha256.json,work/logs}`; 
 `infernix-port-p3-20261112/item3-*.receipt.json`.
 
 ## Q5 recommended-profile adoption (2026-11-18)
+
+This section records the **2026-11-18 adoption and its original BF16/FP8 split**, not today's ring policy.
+The current-state note above and [ring evidence](gemma4-benchmarks.md#fp8-sliding-ring) supersede default
+descriptions only; original measurements, acceptance results and limitations below remain historical.
 
 The measured recommendation is a **Q5-specific launcher default**, not a new
 native Engine/CLI/perplexity precision default (those keep `a16`, artifact policy). Historical opt-in/default statements above describe

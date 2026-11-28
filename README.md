@@ -745,12 +745,14 @@ Each repository's model card gives its files, requirements, recommended command,
 ### Gemma 4 31B (dense, text)
 
 Serves grouped-Q4 weights (`q4_g32`/`q4_g128`/`q4_g256`, FP16 scales; W4A8 prefill), native GPTQ5 group64
-(A16, optional FP8/INT8 prefill), or imported IQ3 GGUF projection blocks (AllowA8 prefill and decode), FP8 global KV with BF16 sliding rings (the FP8 ring is the default only of the `q5-long-context` and `memory-16gb` launcher profiles and key-only global
-KV only of `memory-16gb`; both are experimental opt-ins elsewhere), optional FP8 attention QK, MTP with Google's separate assistant, a host-only prefix cache
-and up to 131,072 tokens on one 32 GB card. Text generation and public causal scoring use native Gemma weights,
-tokenizer/template, sliding rings and global attention, not a Qwen model cast. By default K **and V** of the sliding
-layers stay BF16 (`--gemma4-sliding-kv fp8` halves the ring), and the head's BF16 rounding is preserved, so select
-`--logits-dtype bf16`; unrounded FP32 head sums are not implemented.
+(A16, optional FP8/INT8 prefill), or imported IQ3 GGUF projection blocks (AllowA8 prefill and decode).
+Compatible global-FP8 roleplay builder/profile/generated-launcher routes select FP8 sliding rings;
+native Engine/CLI ring default stays BF16. Explicit `--gemma4-sliding-kv bf16` wins; global BF16
+resolves an omitted builder ring to BF16. BF16 QK is compute, not storage. Key-only globals remain
+specific to explicit `memory-16gb` or the explicit key-only flag. MTP uses Google's separate assistant,
+with a host-only prefix cache and up to 131,072 tokens subject to actual free memory. Native Gemma
+tokenizer/template, rings and attention are not a Qwen model cast. The head preserves BF16 rounding:
+select `--logits-dtype bf16`; unrounded FP32 head sums are not implemented.
 
 **Build a file and a launcher** (conversion, GPTQ and the launcher all live in this checkout; GPTQ runs in its own
 pinned environment, see [`tools/gptq/README.md`](tools/gptq/README.md)):
@@ -766,12 +768,12 @@ python -m tools.convert.gemma4_build serve-check --launcher <dir>\serve-<name>.c
 The explicit higher-quality `q5-g64` preset builds native GPTQ5 group64 with own-model Hessians,
 FP8 vocabulary and the BF16-source assistant in one A16Only artifact. Select prefill compute separately:
 `--gemma4-q5-prefill a16|fp8|int8-g32|int8-g64`. Q5 builds and existing native-Q5 launcher generation
-select `q5-quality` when `--profile` is omitted: **INT8 g64 prefill, BF16 rings, auto context, chunk
-2048 and top-k 64**. `q5-long-context` uses FP8 rings for more room. Neither enables key-only KV.
+select `q5-quality` when `--profile` is omitted: **INT8 g64 prefill, FP8 ring with global FP8 KV,
+auto context, chunk2048 and top-k64**. `q5-long-context` remains available with the same ring policy; neither enables key-only KV.
 Explicit compute/ring/option choices win; explicit `--profile default` and other tiers retain the
 general settings (`a16`, 131k, auto chunk). FP8 QK remains the roleplay/prose default, not a
 maximum-fidelity promise: coding/tool or fidelity-first launchers should explicitly use
-`--gemma4-qk bf16` (and `--gemma4-q5-prefill a16` for A16 projection arithmetic).
+`--gemma4-qk bf16` (plus `--gemma4-q5-prefill a16` for A16 projections and `--gemma4-sliding-kv bf16` for BF16 storage).
 See [Q5 creation and the lower-VRAM ladder](docs/weight-conversion.md#native-gptq5-group64-explicit-a16a8-permissions)
 for commands, costs and bounded evidence. Diode short KL is 0.0331 A16 / 0.0336 g64 versus 0.0941
 best-medium; neither that nor the plain incremental sample qualifies long-context INT8 quality.

@@ -424,7 +424,7 @@ at chunk 128, KV 0.0197 MiB per token); prefill workspace 274; graph allowance 6
 server-added 14,176. The engine's ledger shows 103-146 MiB past the plan at startup (modules loaded at first use, graph state)
 plus about 3 KiB per context token (23.2 against 20.2 MiB per 1k tokens). Scaling with chunk (plan, 9,216 tokens): ring+KV 1,081 / 1,181 /
 1,381 / 1,781 MiB and workspace 274 / 306 / 370 / 765 MiB at chunk 128 / 256 / 512 / 1024, so minimum reservation 1,264 / 1,400 / 1,672 / 2,482 MiB.
-Chunks are multiples of 128: 64 is not supported. The measurements of this section use the BF16 sliding ring (`memory-16gb` now defaults to the FP8 ring: see [Adoption decision](#adoption-decision-and-coverage-limits)); `--gemma4-sliding-kv fp8` halves it ([FP8 sliding ring](#fp8-sliding-ring-experimental-off-by-default));
+Chunks are multiples of 128: 64 is not supported. The measurements of this section use the BF16 sliding ring (`memory-16gb` now defaults to the FP8 ring: see [current policy](#fp8-sliding-ring)); `--gemma4-sliding-kv fp8` halves its payload ([FP8 sliding ring](#fp8-sliding-ring));
 `--no-cuda-graph` saves the 24 MiB graph state at about -15-20 % decode.
 
 **Context ladder** (explicit context and KV capacity, headroom 0, 48-token request at near-capacity prompt; `fit` = starts, answers, no spill;
@@ -473,7 +473,7 @@ no quality rating follows. Rates belong to the RTX 5090.
 (the engine plan with ring, workspace and graphs), 1,169 MiB are available after weights: **short by about 253 MiB** with no headroom and no
 margin, 512 MiB at the profile default; MTP adds 464 MiB of weights (short about 717 MiB). This historical result
 used BF16 rings. The later [FP8-ring ladder](#fp8-ring-desktop-ladders-2026-11-18) demonstrates conservative
-9,216/12,288-token starts without MTP; `memory-16gb` now defaults to the FP8 ring on the strength of that ladder, accepting the measured fidelity and prefill costs.
+9,216/12,288-token starts without MTP; that 2026-11-18 decision adopted FP8 for `memory-16gb` with the then-measured fidelity/prefill costs. Current policy and current-kernel evidence are [separate below](#fp8-sliding-ring).
 Smaller weight tiers and unsupported chunk 64 were not implemented by that study; `--no-cuda-graph` saved 24 MiB at
 about -15-20 % decode, and moving the display to an iGPU was not tested.
 The vocabulary/output head (FP8, ~1.3 GiB) cannot leave the device without paging.
@@ -595,7 +595,7 @@ driver and summaries are in `prefill-earlyexit-20261116/default-20261117/`.
 
 `--gemma4-key-only-kv` (explicit opt-in; omission keeps the default K==V FP8 layout) stores only the
 FP8 K codes and scales of the global (D512) layers and rebuilds V in attention. It requires `--kv-dtype fp8`; other
-formats are refused. The sliding ring follows `--gemma4-sliding-kv` (BF16 by default).
+formats are refused. The sliding ring follows `--gemma4-sliding-kv` (native BF16; compatible global-FP8 roleplay builder/profile routes select FP8, independently of key-only KV).
 
 **Why V can be rebuilt.** Gemma 4's global layers have no V projection: `gemma4_qkv_prep` forms V as the raw K row after
 the weightless norm, and K as the same row times the key-norm weight, then RoPE on the 128-wide rotated prefix (pairs
@@ -659,14 +659,46 @@ Camp evidence: `iq3xs-20261115/konly-20261117/` (drivers, raw requests/responses
 The rebuild (a sine and cosine per rotated pair and key) costs more than the halved V read saves at these lengths;
 outputs differ from K==V FP8 (a different lossy V) but are identical across AB and BA runs of the same arm.
 
-## FP8 sliding ring (experimental, off by default)
+## FP8 sliding ring
 
 `--gemma4-sliding-kv fp8` (`bf16` keeps the BF16 ring) stores the sliding (D256) layers'
 K and V ring as FP8 E4M3 codes with one FP16 scale per 256-value row, the codec of the global FP8 path (amax / 448, FP16
 rounded and bounded scale, round-to-nearest-even saturating codes; a row with any nonfinite value stores NaN codes and a
 unit scale). It requires `--kv-dtype fp8` and combines with `--gemma4-key-only-kv` and `--gemma4-qk fp8`.
 
-Current default: BF16 for the general profile, `q5-quality` and native commands; FP8 for `memory-16gb` and `q5-long-context` (see [Adoption decision](#adoption-decision-and-coverage-limits)). The measurements below were made while the FP8 ring was opt-in only.
+**Current policy (2026-11-28).** Compatible Gemma 31B global-FP8 roleplay builder/profile/generated-launcher
+routes select FP8 ring storage, including general, `q5-quality` and `q5-long-context`. Both Q5 names
+remain supported with the same ring policy. Explicit `--gemma4-sliding-kv bf16` wins; an omitted
+builder ring with global BF16 resolves BF16. `--gemma4-qk bf16` changes compute only, not storage.
+Native Engine/CLI default stays BF16. Existing explicit fidelity configurations are preserved;
+no key-only globals are newly implicit (the explicitly selected `memory-16gb` contract is unchanged).
+
+The [final paired six-tier study](https://github.com/nmorgowicz-org/llama-local-tooling/blob/research/tooling-reorganization/docs/plans/20261127-gemma4-sliding-kv-paired-study.md)
+uses engine `05e9a87a`, the fixed FP8 prompt kernel and shared staging layout. At matched fixed capacity,
+BF16→FP8 saves about **587 MiB reservation /620 MiB process at chunk2048**, **563 /596 MiB at chunk512**.
+The current payload at chunk2048 is **1248 MiB BF16 /628.9 MiB FP8**, including shared staging;
+the extra 32 MiB FP8 first-launch allowance explains why reservation saving is smaller than payload saving.
+Current BF16/FP8 timing is near parity (full per-tier ranges, clock/fault caveats and exceptions in the study);
+the adoption run's MTP-on chunk2048 timing (three cold starts per arm, ABBAAB) is also near parity: FP8/BF16
+medians span 0.956-1.066 for prefill and 0.958-1.036 for decode, with the lowest FP8 medians about -4% (IQ3_XXS 32k
+prefill, Q5 64.5k decode) inside overlapping start ranges.
+The [kernel fix](https://github.com/nmorgowicz-org/llama-local-tooling/blob/research/tooling-reorganization/docs/plans/20261126-gemma4-fp8-ring-attention-stack.md)
+sped up **old FP8 versus fixed FP8**, not FP8 versus current BF16; the historical up-to-12.5% loss below
+must not be quoted as today's penalty. Numerical costs remain, measured as paired full-vocabulary KL against an own-Q8 reference
+(FP8/BF16 point ratios; resolved means the cluster interval excludes zero): short RP-dev at chunk2048 +2.4% to +6.6% for best-small/best-medium/mixed-A/Q5
+(resolved), IQ3_XXS/IQ3_XS unresolved; EN47 resolved +2.7% to +7.7% except IQ3_XS; 32k resolved +2.0% to +5.9% for IQ3_XXS/best-medium/mixed-A/Q5;
+65k eight-window costs resolved for mixed-A and Q5 on shard0 and for Q5 only on shard1, others include zero. The shipped Q5 profile
+(INT8-g64 with FP8 QK) costs +10.2% on RP-dev, +6.6% on EN47, +6.8% at 32k and +3.9% at 65k (shard0, all resolved), larger than the BF16-QK
+Q5 cells at 32k and RP-dev. Pooled MTP acceptance intervals include zero for all six tiers; Q5 sampled MTP decode is about 1.3% lower.
+No human-rated roleplay, population loop-rate or fidelity-equivalence claim follows.
+
+Card planning spans **1.5–2.1 GiB desktop overhead**, usually **1.5–1.7 GiB**; actual free memory is accepted,
+not replaced with a fixed deduction. Plans/derived capacity rows are not real starts or physical smaller-card
+qualification. The [adoption record](https://github.com/nmorgowicz-org/llama-local-tooling/blob/research/tooling-reorganization/docs/plans/20261128-gemma4-fp8-ring-adoption.md)
+holds these measurements, the exact commands, identities and the real-start gates.
+
+**Historical evidence below (2026-11-18, before the kernel fix and shared staging).**
+Its layouts, speed losses, adoption limits and failed criteria retain their original instrument and date.
 
 **What runs.** `gemma4_qkv_prep` quantizes each sliding K and V row once as it writes its ring slot. The decode SIMT
 kernel (T < 64: decode, MTP verify and the drafter) expands codes on load; the D256 tensor-core prefill kernel stages
@@ -678,7 +710,7 @@ formats. Host snapshot images hold the FP8 codes and row scales. The memory summ
 (`sliding fp8`), the request log's `memory.gemma4_kv.sliding`, the perplexity report's `execution.gemma4_sliding_kv`
 and the prefill signature (`/s-fp8`) report the layout; `--plan`, the capacity curve and `auto` sizing count its bytes.
 
-**Bytes (layout, confirmed by the real test's accounting).** A ring row is 258 of BF16's 512 bytes (50.39 %). 31B ring
+**Historical pre-staging bytes (layout, confirmed by that real test's accounting).** A ring row is 258 of BF16's 512 bytes (50.39 %). Original 31B ring:
 (50 layers x 16 KV heads): 900 -> 454 MiB at chunk 128 (18 pages), 2,400 -> 1,209 MiB at chunk 2048 (48 pages). One
 Host snapshot image 838,041,856 -> 422,297,856 B (Host floor 320 -> 162 slabs of 2,641,920 B).
 
@@ -742,9 +774,10 @@ requests/responses, server logs, `results.json`).
 | ~65k | 3,337-3,399 -> 3,102-3,113 (-8 %) | 70.5-71.2 -> 71.0-71.1 | 95.5-95.7 -> 91.5-92.0 (-4 %; 320/444 -> 312/452) | 22,971-23,074 -> 21,996-22,001 |
 | ~122k | 2,310-2,332 -> 2,212-2,213 (-4 %) | 61.3-62.8 -> 62.3-63.1 | 79.6-80.1 -> 77.3 (-3 %; 323/441 -> 317/447) | 23,040-23,078 -> 22,014-22,022 |
 
-The in-place expansion of each staged tile (a register round trip and two barriers per K and V tile) costs prefill more
-than the halved ring read saves; plain decode is unchanged within the AB/BA spread; MTP rounds lose 2-4 %, partly through
-different acceptance (a different lossy ring). Outputs differ from the BF16 ring but are identical across AB and BA runs
+In that historical kernel, expansion of each staged tile cost prefill more than the halved ring read saved;
+the later spill fix supersedes this present-day performance diagnosis. Historical plain decode was unchanged
+within AB/BA spread; MTP rounds lost 2-4%, partly through different acceptance (a different lossy ring).
+Outputs differed from BF16 but were identical across AB and BA runs
 of the same arm. Paging counters (Pages/sec, which include file-backed reads) spiked in single rows of both arms with
 no visible rate change in those rows.
 
@@ -835,14 +868,14 @@ not rerun; the serving/perplexity binaries used for the measurements were not re
 
 ### Adoption decision and coverage limits
 
-The initial 2026-11-18 recommendation was BF16 for every default. The measured memory/fidelity/speed trade was then
-accepted for **`memory-16gb` IQ3_XXS**, which now defaults to the FP8 ring, and for the explicit
-`q5-long-context` profile ([Q5 adoption](gemma4-q5-prefill.md#q5-recommended-profile-adoption-2026-11-18)).
-The general profile, `q5-quality` and native rings remain BF16. Explicit
-`--gemma4-sliding-kv bf16` overrides either FP8-ring profile. Planning and fallback stages
-preserve the selection ([usage](../../tools/README.md#gemma-sliding-ring-memory-opt-in)). No quality gate changes.
-The short plain-GPTQ5 KL increase of 9.3-11.2 % exceeds the plan's order-of-magnitude warning relative
-to key-only's historical +0.45 %, and the speed gates above fail.
+The initial **2026-11-18** recommendation was BF16 for every default. The then-measured memory/fidelity/speed
+trade was accepted for `memory-16gb` IQ3_XXS and the explicit `q5-long-context` profile
+([historical Q5 adoption](gemma4-q5-prefill.md#q5-recommended-profile-adoption-2026-11-18)).
+At that point general/`q5-quality`/native rings remained BF16. Explicit BF16 storage overrides and
+planning/fallback preservation remain part of the contract ([current usage](../../tools/README.md#gemma-sliding-ring-memory-policy)).
+The historical short plain-GPTQ5 KL increase of 9.3-11.2% exceeded that plan's warning relative to key-only's
+historical +0.45%, and the historical speed gates failed. The current decision/evidence above does not
+rewrite those failures or relax their original criteria.
 
 **Retained failed synthetic criterion, not a pass.** The precommit `fp8ring-ops-first` experiment required
 BF16-versus-FP8 ring relative RMS below **0.10**; five of six high-key-norm cases failed (maximum **0.139054**).
@@ -851,7 +884,7 @@ first appears in `e03a5e26`. That commit raised the cutoff to **0.25**, after ob
 that relaxed gross-error tripwire does **not** pass the original criterion or qualify quality. The completion
 change removes the unjustified bound altogether and keeps these comparisons as measurements. The original
 0.10 failure remains the result; exact codec checks and the unchanged FP64 represented-value attention
-criterion establish kernel correctness only; the independent KL/speed findings did not support making the FP8 ring a general default.
+criterion establish kernel correctness only; those historical KL/speed findings did not support a general FP8-ring default at that time.
 The earlier successful Op receipts ran the 0.25 revision; they are not relabelled as an original-criterion pass.
 Retained random-token diagnostics report final-position KL 1.15148 (chunk 128) / 0.489734 (2048) between
 the rings, changed argmaxes and causal-score differences; their NLL is ~19.8, so they are adversarial

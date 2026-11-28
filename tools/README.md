@@ -91,32 +91,33 @@ Recipes, mixed sources, custom methods, resources and sharding are described in 
 [conversion guide](../docs/weight-conversion.md). Numeric formats, layouts and framing are defined
 by the references linked from the [documentation map](../docs/README.md).
 
-### Gemma sliding-ring memory opt-in
+### Gemma sliding-ring memory policy
 
-The existing `python -m tools.convert.gemma4_build` build and `launcher` commands accept
-`--gemma4-sliding-kv bf16|fp8`. General/`q5-quality` defaults stay **BF16**; `q5-long-context` and
-`memory-16gb` use FP8 rings. Explicit `--gemma4-sliding-kv bf16` overrides either profile.
-For an existing artifact, generate an explicitly experimental launcher:
+The `python -m tools.convert.gemma4_build` build and `launcher` commands accept
+`--gemma4-sliding-kv bf16|fp8`. Compatible global-FP8 roleplay routes default to FP8 rings,
+including general and the retained `q5-quality`/`q5-long-context` names. Explicit BF16 ring wins;
+global BF16 resolves an omitted ring to BF16. BF16 QK changes compute only, not storage.
+Native Engine/CLI defaults remain BF16. For an existing artifact, generate a BF16-storage opt-out:
 
 ```text
-py -3.11 -m tools.convert.gemma4_build launcher --artifact <model.ninfer> --serve <absolute-infernix-serve-path> --out <new-launcher.cmd> --gemma4-sliding-kv fp8
+py -3.11 -m tools.convert.gemma4_build launcher --artifact <model.ninfer> --serve <absolute-infernix-serve-path> --out <new-launcher.cmd> --gemma4-sliding-kv bf16
 ```
 
-This needs a server with the FP8-ring implementation and `--kv-dtype fp8`; it composes with
-`--gemma4-key-only-kv`. Add `--profile memory-16gb` only for its supported text-only IQ3_XXS artifact.
+FP8 rings need a compatible server and global `--kv-dtype fp8`; key-only globals are a separate explicit
+choice. Add `--profile memory-16gb` only for its supported IQ3_XXS/key-only contract; no other profile newly adds key-only.
 Every planning/fallback stage preserves the ring option, and `serve-check` records it in its effective profile.
 The tooling checkout's thin `infernix_gemma.py` frontend forwards the same flag unchanged.
-The ring saves 446 MiB at chunk 128 or 1,191 MiB at chunk 2048, but measured short-context KL increases and
-prefill slows; it is not a free quality/speed improvement. See the
-[measured trade-offs](../docs/maintainer/gemma4-benchmarks.md#fp8-sliding-ring-experimental-off-by-default).
+Current staged-ring savings are ~587 MiB reservation /620 MiB process at chunk2048 and ~563 /596 MiB
+at chunk512. Current BF16/FP8 speed is near parity, not the historical old-kernel penalty; numerical
+fidelity still changes. See [measurements and remaining-evidence registration](../docs/maintainer/gemma4-benchmarks.md#fp8-sliding-ring).
 
 `--gemma4-q5-prefill a16|fp8|int8-g32|int8-g64` is independent of stored weights. Q5 builds and
 existing native-Q5 launcher generation select `q5-quality` when `--profile` is omitted: **INT8 g64**
-prefill, BF16 ring, auto context, chunk 2048, top-k 64, no implicit key-only KV. `q5-long-context`
-changes the ring to FP8. Explicit compute/ring choices win; explicit `--profile default` and other
-tiers retain the historical A16 artifact policy. Narrow decode/MTP stays A16.
+prefill, FP8 ring with global FP8 KV, auto context, chunk2048, top-k64, no implicit key-only KV.
+`q5-long-context` keeps the same ring policy. Explicit compute/ring choices win; explicit
+`--profile default` and other tiers retain A16 artifact policy. Narrow decode/MTP stays A16.
 FP8 QK remains the roleplay/prose choice, measurably less faithful than BF16; fidelity-first/coding/tools
-can explicitly select `--gemma4-qk bf16 --gemma4-q5-prefill a16`.
+can explicitly select `--gemma4-qk bf16 --gemma4-q5-prefill a16`, adding `--gemma4-sliding-kv bf16` for BF16 storage.
 See the [Q5 defaults and lower-VRAM ladder](../docs/weight-conversion.md#native-gptq5-group64-explicit-a16a8-permissions)
 for exact commands, measured costs and quality limits. Q5 is not resident-fit on a 16 GB card.
 
