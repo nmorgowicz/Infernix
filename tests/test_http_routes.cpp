@@ -114,8 +114,12 @@ int test_model_aliases() {
         failures += check(wide && wide->status == 200 && backend.top_k == 100,
                           "Chat must accept a top-k above the engine ceiling and leave the clamp to Engine");
         body["top_k"] = -1;
+        const auto disabled = client.Post("/v1/chat/completions", body.dump(), "application/json");
+        failures += check(disabled && disabled->status == 200 && backend.top_k == -1,
+                          "Chat must accept top-k -1 (disabled) and leave its meaning to Engine");
+        body["top_k"] = -2;
         const auto negative = client.Post("/v1/chat/completions", body.dump(), "application/json");
-        failures += check(negative && negative->status == 400, "Chat must refuse a negative top-k");
+        failures += check(negative && negative->status == 400, "Chat must refuse a top-k below -1");
         body["top_k"]       = 64;
         body["temperature"] = 5;
         const auto hot = client.Post("/v1/chat/completions", body.dump(), "application/json");

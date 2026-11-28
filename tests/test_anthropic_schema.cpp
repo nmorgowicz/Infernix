@@ -172,8 +172,11 @@ int test_envelope_and_field_policy() {
                           "Anthropic parser must forward any non-negative top_k for Engine to clamp");
     }
     body["top_k"] = -1;
+    failures += check(parse(body).generation.sampling.top_k == -1,
+                      "Anthropic parser must forward top_k -1 (disabled) for Engine to resolve as 0");
+    body["top_k"] = -2;
     failures += check(api_param([&] { (void)parse(body); }) == "top_k",
-                      "a negative top_k was accepted");
+                      "a top_k below -1 was accepted");
     body                  = base_request();
     body["output_config"] = Json{{"format", Json{{"type", "json_schema"}}}};
     failures += check(api_param([&] { (void)parse(body); }) == "output_config.format.schema",

@@ -160,10 +160,13 @@ int test_basic_request_and_resolution() {
     {
         GenerationRequest generation;
         generation.sampling.top_k = -1;
+        failures += check(to_request_options(generation, {}, {}, true).execution.sampling.top_k == -1,
+                          "request translation must forward top_k -1 (disabled) for Engine to resolve as 0");
+        generation.sampling.top_k = -2;
         failures += check(api_error([&] {
                               (void)to_request_options(generation, {}, {}, true);
                           }).param == "top_k",
-                          "request translation accepted a negative top_k");
+                          "request translation accepted a top_k below -1");
     }
     for (const double temperature : {0.0, 2.5, 10.0}) {
         const Json hot = {{"model", "m"}, {"input", "hello"}, {"temperature", temperature}};

@@ -73,8 +73,9 @@ infernix::SamplingOverrides resolve_sampling_overrides(const SamplingParams& req
         invalid_sampling("top_p must be in [0,1]", "top_p");
     }
     // A top_k above the loaded model's ceiling is not refused here: Engine clamps it to the ceiling.
-    if (sampling.top_k && *sampling.top_k < 0) {
-        invalid_sampling("top_k must not be negative", "top_k");
+    // -1 ("disabled" in vLLM and SillyTavern) is accepted and means the same as 0.
+    if (sampling.top_k && *sampling.top_k < -1) {
+        invalid_sampling("top_k must be -1 or greater", "top_k");
     }
     if (sampling.min_p && (*sampling.min_p < 0.0F || *sampling.min_p > 1.0F)) {
         invalid_sampling("min_p must be in [0,1]", "min_p");

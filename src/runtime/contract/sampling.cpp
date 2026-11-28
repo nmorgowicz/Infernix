@@ -56,12 +56,13 @@ ResolvedSamplingParameters resolve_sampling(const ModelSamplingDefaults& default
         .frequency_penalty = overrides.frequency_penalty.value_or(preset.frequency_penalty),
         .seed              = overrides.seed.value_or(0),
     };
-    // Zero keeps its public meaning (use the model's default candidate width), then runtimes see
+    // Zero keeps its public meaning (use the model's default candidate width), as does -1, the
+    // "disabled" value of vLLM and SillyTavern's text-completion slider. Then runtimes see
     // only concrete values: the 20-wide pipeline's cap, or for a model with a wider ceiling the
     // preset's top_k (64 for Gemma 4) when it carries one. A top_k above the model's ceiling is
     // clamped to it: front ends send sliders that reach 100 and beyond, and the ceiling is the
     // sampler's candidate width, which no request can widen.
-    if (resolved.top_k == 0) {
+    if (resolved.top_k == 0 || resolved.top_k == -1) {
         resolved.top_k = defaults.max_top_k > kFastTopK && preset.top_k > 0 ? preset.top_k : kFastTopK;
     }
     resolved.top_k = std::min(resolved.top_k, defaults.max_top_k);

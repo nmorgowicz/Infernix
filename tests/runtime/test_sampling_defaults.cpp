@@ -125,8 +125,12 @@ int main() {
                       "a Gemma top_k was not passed through in range and clamped to 64 above it");
     failures += check(resolved_top_k(wide, 0) == 64 && resolved_top_k(dense, 0) == 20,
                       "top_k 0 no longer resolves to the model's default candidate width");
-    failures += check(throws_invalid([&] { (void)resolved_top_k(wide, -1); }),
-                      "a negative top_k was accepted");
+    // -1 is the "disabled" value of vLLM and SillyTavern's slider: the same as 0. Below it is refused.
+    failures += check(resolved_top_k(wide, -1) == 64 && resolved_top_k(dense, -1) == 20,
+                      "top_k -1 did not resolve like 0 to the model's default candidate width");
+    failures += check(throws_invalid([&] { (void)resolved_top_k(wide, -2); }) &&
+                          throws_invalid([&] { (void)resolved_top_k(dense, -100); }),
+                      "a top_k below -1 was accepted");
     overrides.top_k = 0;
 
     // Temperature and the presence/frequency penalties accept their documented bounds exactly and

@@ -366,7 +366,7 @@ The endpoint supports:
   processing without generation. As an extension (OpenAI rejects it), `-1` means no explicit limit:
   the field is treated as omitted, so the other spelling or `--default-max-tokens` applies;
 - `temperature` (`0..10`), `top_p`, presence/frequency penalties (`-5..5`), and signed integer `seed` ([Sampler ranges](#sampler-ranges));
-- the compatible `top_k` (any non-negative integer: above the loaded model's ceiling, `64` for Gemma4 and `20` for Qwen, it is clamped to the ceiling and not refused; zero uses Gemma4's preset candidate width, normally `64`, or Qwen's `20`) and `min_p` (`0..1`) sampler extensions;
+- the compatible `top_k` (any integer `>= -1`: above the loaded model's ceiling, `64` for Gemma4 and `20` for Qwen, it is clamped to the ceiling and not refused; zero and `-1` ("disabled" in vLLM and SillyTavern's text-completion slider) use Gemma4's preset candidate width, normally `64`, or Qwen's `20`) and `min_p` (`0..1`) sampler extensions;
 - up to four non-empty stop strings, applied to the answer only: not to reasoning, and not inside a
   tool call the model opened with its `<tool_call>` token (between it and `</tool_call>`), whose
   arguments are the tool's data (as on the Responses and Messages endpoints);
@@ -2274,7 +2274,7 @@ Every endpoint, process flag and direct Engine call shares one set of sampler ra
 | Field | Accepted | Outside the range |
 |---|---|---|
 | `temperature` | finite, `0..10` (`0` is exact argmax); Messages accepts the same range although Anthropic's own API stops at `1` | HTTP 400, `param: "temperature"` |
-| `top_k` | integer `>= 0`; the loaded model's ceiling is `64` (Gemma4) or `20` (Qwen); a larger value is **clamped to the ceiling** and the request succeeds; `0` keeps meaning the model's default candidate width | negative: HTTP 400, `param: "top_k"` |
+| `top_k` | integer `>= -1`; the loaded model's ceiling is `64` (Gemma4) or `20` (Qwen); a larger value is **clamped to the ceiling** and the request succeeds; `0` and `-1` both mean the model's default candidate width (the process flags `--top-k` take `0` or more) | below `-1`: HTTP 400, `param: "top_k"` |
 | `top_p`, `min_p` | finite, `0..1` | HTTP 400 |
 | `presence_penalty`, `frequency_penalty` | finite, `-5..5` | HTTP 400 |
 | `repetition_penalty` (Chat) | only `1` | HTTP 400, `repetition_penalty_not_supported` |

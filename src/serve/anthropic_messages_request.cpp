@@ -2077,9 +2077,9 @@ void parse_generation_fields(const Json& body, GenerationRequest& request) {
         (*request.sampling.top_p < 0.0 || *request.sampling.top_p > 1.0)) {
         bad_request("top_p must be in [0,1]", "top_p");
     }
-    // Above the loaded model's ceiling top_k is clamped to it by Engine, not refused.
-    if (request.sampling.top_k && *request.sampling.top_k < 0) {
-        bad_request("top_k must not be negative", "top_k");
+    // Above the loaded model's ceiling top_k is clamped to it by Engine, not refused; -1 means 0.
+    if (request.sampling.top_k && *request.sampling.top_k < -1) {
+        bad_request("top_k must be -1 or greater", "top_k");
     }
 }
 

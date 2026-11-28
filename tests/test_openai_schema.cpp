@@ -1023,10 +1023,13 @@ int test_stops_and_ranges() {
         failures += check(options(parse(body).generation).execution.sampling.top_k == top_k,
                           "common Engine translator forwards a non-negative top_k for Engine to clamp");
     }
-    body["top_k"]                         = -1;
+    body["top_k"] = -1;
+    failures += check(options(parse(body).generation).execution.sampling.top_k == -1,
+                      "common Engine translator forwards top_k -1 (disabled) for Engine to resolve as 0");
+    body["top_k"]                         = -2;
     const GenerationRequest invalid_top_k = parse(body).generation;
     failures += check(api_error([&] { (void)options(invalid_top_k); }).param == "top_k",
-                      "Engine translator refuses a negative top_k");
+                      "Engine translator refuses a top_k below -1");
     body = base_request();
     for (const double temperature : {0.0, 0.7, 2.0, 5.0, 10.0}) {
         body["temperature"] = temperature;
