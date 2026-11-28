@@ -4,7 +4,8 @@ The default `ServeProfile` is the operator roleplay profile: 131,072 context (al
 sliding K/V storage, FP8 attention QK, one lane, `--prefill-chunk auto`, MTP with one draft token when the artifact carries the assistant,
 BF16-rounded logits, a host-only prefix cache (no device snapshot slots, 8192 MiB host context), any model name
 accepted, listening on `0.0.0.0:8001`. Every field can be changed; `--gemma4-qk bf16` omits the QK flag so the
-engine default applies without changing ring storage. Omitted ring storage follows global KV; explicit BF16 wins.
+engine default applies without changing ring storage. Omitted ring storage follows global KV, except the
+`q5-quality` fidelity profile, which pins BF16 storage; an explicit ring always wins.
 This module imports nothing from the other `gemma4_build*` modules.
 """
 
@@ -37,6 +38,9 @@ DEFAULT_HOST_CONTEXT_MIB = 8192
 DEFAULT_VRAM_HEADROOM_MIB = 1024
 SMALL_VRAM_HEADROOM_MIB = 64  # memory-16gb default; any value >= 0 (docs/weight-conversion.md, 16 GB profile)
 SERVE_PROFILES = ("default", "memory-16gb", "q5-quality", "q5-long-context")
+# Fidelity-first tiers pin the BF16 sliding ring regardless of global KV (operator, 2026-11-28): the FP8 ring
+# buys them no class-C capacity and measurably costs KL. An explicit --gemma4-sliding-kv always wins.
+FIDELITY_PROFILES = ("q5-quality",)
 MAX_TOP_K = 64  # Gemma4's sampler ceiling (Qwen stays at 20)
 REASONING_LOOPS = ("stop", "conclude")  # --reasoning-loop; "off" is the server default and emits no flag
 # Libraries infernix binaries load from their own directory: FFmpeg (vcpkg) and the staged cuBLAS.
@@ -104,7 +108,7 @@ class ServeProfile:
             "context": "auto" if small or q5 else DEFAULT_CONTEXT,
             "prefill_chunk": "128" if small else "2048" if q5 else DEFAULT_PREFILL_CHUNK,
             "vram_headroom_mib": SMALL_VRAM_HEADROOM_MIB if small else DEFAULT_VRAM_HEADROOM_MIB,
-            "gemma4_sliding_kv": self.kv_dtype,
+            "gemma4_sliding_kv": "bf16" if self.profile in FIDELITY_PROFILES else self.kv_dtype,
             "gemma4_q5_prefill": "int8-g64" if q5 else "a16",
             "mtp_fallback": small,
         }
@@ -293,6 +297,10 @@ def launcher_lines(
         lines.append("rem Experimental key-only global FP8 KV. Default launches do not enable it.")
     if profile.gemma4_sliding_kv == "fp8":
         lines.append("rem FP8 sliding K/V ring: lower memory, lossy K/V storage; --gemma4-sliding-kv bf16 preserves BF16 storage independently of QK precision.")
+    elif profile.profile in FIDELITY_PROFILES:
+        lines.append("rem BF16 sliding K/V ring (q5-quality fidelity default): exact K/V storage; costs about "
+                     "587 MiB more startup reservation than FP8 at chunk 2048. --gemma4-sliding-kv fp8 restores "
+                     "the smaller ring.")
     if profile.gemma4_q5_prefill != "a16":
         lines.append(f"rem Q5 prefill {profile.gemma4_q5_prefill} (lossy; int8-g64 is the Q5 profile default): calls of 64+ columns; narrow decode/MTP verification stays A16. Artifact unchanged.")
     if profile.context == "auto":

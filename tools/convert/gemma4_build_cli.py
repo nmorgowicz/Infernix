@@ -115,11 +115,13 @@ sliding K/V storage, FP8 attention QK, one lane, --prefill-chunk auto, MTP with 
 prefix cache of 8192 MiB, listening on 0.0.0.0:8001. The server accepts any API key. With --model-match any (the
 default) it also accepts any model name; with exact, OpenAI-style requests must use the --alias model name.
 For Q5 builds/native-Q5 artifacts, omitted --profile selects q5-quality instead: int8-g64 prefill,
-FP8 rings, auto context, chunk 2048, top-k 64, alias gemma4-q5. Explicit --profile default keeps
+BF16 sliding ring, auto context, chunk 2048, top-k 64, alias gemma4-q5. Explicit --profile default keeps
 the general settings above. Mixed-A builds also default to auto context when neither --profile nor --context
 is supplied; all other general settings remain unchanged. See docs/weight-conversion.md for the lower-VRAM option ladder.
-Omitted ring storage follows --kv-dtype (fp8 by default, bf16 with global BF16 KV). Explicit
---gemma4-sliding-kv bf16 preserves BF16 ring storage; --gemma4-qk bf16 changes compute, not storage.
+Omitted ring storage follows --kv-dtype (fp8 by default, bf16 with global BF16 KV), except q5-quality,
+which pins BF16 ring storage regardless of global KV (fidelity-first; the FP8 ring buys it no class-C
+capacity and measurably costs KL). Explicit --gemma4-sliding-kv always wins; --gemma4-qk bf16 changes
+compute, not storage.
 """
 
 
@@ -170,7 +172,8 @@ def add_serve_arguments(parser: argparse.ArgumentParser, *, prefix: str) -> None
     add("--profile", choices=launcher_tools.SERVE_PROFILES, default=None,
         help="omitted: q5-quality for q5-g64 builds/native Q5 artifacts, default for other tiers. "
         "Explicit default keeps the general 131k roleplay settings. Q5 profiles default to int8-g64 "
-        "prefill, FP8 rings with FP8 global KV, auto context, chunk 2048, top-k 64 and no key-only KV. "
+        "prefill, auto context, chunk 2048, top-k 64 and no key-only KV; q5-quality pins the BF16 "
+        "sliding ring, q5-long-context follows global KV (FP8 with global FP8). "
         "memory-16gb: IQ3_XXS, key-only FP8 globals/ring, chunk 128")
     add("--context", type=context_value,
         help=f"{prefix} --max-context: positive tokens or auto (general default 131072; implicit mixed-A/Q5/memory-16gb: auto)")
@@ -181,7 +184,8 @@ def add_serve_arguments(parser: argparse.ArgumentParser, *, prefix: str) -> None
     add("--port", type=int, default=launcher_tools.DEFAULT_PORT,
         help=f"{prefix} --port (default {launcher_tools.DEFAULT_PORT})")
     add("--kv-dtype", choices=launcher_tools.KV_DTYPES, default="fp8",
-        help=f"{prefix} global KV storage (default fp8, qualified; omitted sliding storage follows this choice)")
+        help=f"{prefix} global KV storage (default fp8, qualified; an omitted sliding ring follows this choice, "
+        "except q5-quality, which always pins BF16)")
     add("--model-match", choices=launcher_tools.MODEL_MATCHES, default=launcher_tools.DEFAULT_MODEL_MATCH,
         help="any (default) passes --any-model-name so OpenAI requests may send any model name, as a gateway that "
         "forwards several names needs; exact accepts only --alias and emits no flag")
@@ -191,9 +195,10 @@ def add_serve_arguments(parser: argparse.ArgumentParser, *, prefix: str) -> None
     add("--gemma4-key-only-kv", action="store_true",
         help="experimental global key-only FP8 KV (default off; memory-16gb enables it)")
     add("--gemma4-sliding-kv", choices=("bf16", "fp8"), default=None,
-        help="sliding K/V ring storage: omitted follows --kv-dtype (fp8 by default, bf16 with global BF16 KV); "
-        "fp8 uses lower memory with lossy K/V storage and requires --kv-dtype fp8. Explicit bf16 preserves "
-        "BF16 storage for every profile, independently of --gemma4-qk")
+        help="sliding K/V ring storage: omitted follows --kv-dtype (fp8 by default, bf16 with global BF16 KV), "
+        "except the q5-quality fidelity profile, which defaults to bf16 regardless of global KV; fp8 uses lower "
+        "memory with lossy K/V storage and requires --kv-dtype fp8. Explicit bf16 preserves BF16 storage for "
+        "every profile, independently of --gemma4-qk")
     add("--gemma4-q5-prefill", choices=("a16", "fp8", "int8-g32", "int8-g64"), default=None,
         help="Gemma4 native Q5 trunk calls of 64+ columns: fp8 row-E4M3 bake or int8-g32/g64 groupwise INT8 "
         "activations; Q5 profiles default to int8-g64 (lossy speed/fidelity balance), others to a16 "
@@ -322,8 +327,9 @@ def launcher_parser() -> argparse.ArgumentParser:
         description="Write a Windows .cmd that starts infernix-serve on a .ninfer with the operator profile: FP8 KV "
         "cache and sliding K/V storage, FP8 attention QK, --prefill-chunk auto, MTP with one draft token, BF16 logits, a host-only prefix "
         "cache, 0.0.0.0:8001, alias 131k. Native-Q5 artifacts instead default to q5-quality: int8-g64 prefill, "
-        "FP8 ring, auto context, chunk 2048, top-k 64, alias gemma4-q5. Explicit --profile default keeps "
-        "the general profile. Explicit --gemma4-sliding-kv bf16 preserves BF16 storage; omitted ring follows global KV. "
+        "BF16 ring, auto context, chunk 2048, top-k 64, alias gemma4-q5. Explicit --profile default keeps "
+        "the general profile. Explicit --gemma4-sliding-kv bf16 preserves BF16 storage; an omitted ring follows "
+        "global KV, except q5-quality, which pins BF16. "
         "MTP and vision are detected; every setting can be changed.",
     )
     parser.add_argument("--artifact", required=True, type=Path)

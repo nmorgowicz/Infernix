@@ -1554,7 +1554,7 @@ def test_sliding_ring_profile_selection_survives_all_stages(env, tmp_path, monke
     artifact.write_bytes(b"x")
     out = tmp_path / "ring.cmd"
     option = ([] if selection is None else ["--gemma4-sliding-kv", selection]) + ["--gemma4-qk", qk]
-    expected = selection or "fp8"
+    expected = selection or ("bf16" if profile == "q5-quality" else "fp8")  # the fidelity pin, operator 2026-11-28
     assert cli.main(["launcher", "--artifact", str(artifact), "--serve", str(env.server), "--out", str(out),
                      "--profile", profile, *option, "--allow-shared-memory"]) == 0
     parsed = build.parse_launcher(out)
@@ -1570,6 +1570,42 @@ def test_sliding_ring_profile_selection_survives_all_stages(env, tmp_path, monke
     preset = "q5-g64" if profile.startswith("q5-") else "iq3-xxs"
     args = cli.build_parser().parse_args(env.argv(preset, "--profile", profile, *option))
     assert cli.resolve_config(args)[1].gemma4_sliding_kv == expected
+
+
+@pytest.mark.parametrize("profile, expected", [
+    ("default", "fp8"), ("memory-16gb", "fp8"), ("q5-long-context", "fp8"), ("q5-quality", "bf16"),
+])
+def test_fidelity_profile_pins_the_bf16_ring_and_other_tiers_keep_the_fp8_ring(
+        env, tmp_path, monkeypatch, profile, expected):
+    """Operator 2026-11-28: the q5-quality fidelity tier pins BF16 ring storage; roleplay/balanced/context
+    tiers keep the adopted FP8 ring; an explicit --gemma4-sliding-kv wins over both."""
+    monkeypatch.setattr(launcher, "artifact_info",
+                        lambda path: launcher.ArtifactInfo(True, False, 262144, True, True))
+    artifact = tmp_path / "tier.ninfer"
+    artifact.write_bytes(b"x")
+    out = tmp_path / "tier.cmd"
+    assert cli.main(["launcher", "--artifact", str(artifact), "--serve", str(env.server), "--out", str(out),
+                     "--profile", profile]) == 0
+    parsed = build.parse_launcher(out)
+    assert parsed.kv_dtype == "fp8" and parsed.gemma4_sliding_kv == expected
+    assert parsed.effective_profile()["gemma4_sliding_kv"] == expected
+    assert f"--gemma4-sliding-kv {expected}" in out.read_text(encoding="utf-8")
+    flipped = "fp8" if expected == "bf16" else "bf16"
+    override = tmp_path / "override.cmd"
+    assert cli.main(["launcher", "--artifact", str(artifact), "--serve", str(env.server), "--out", str(override),
+                     "--profile", profile, "--gemma4-sliding-kv", flipped]) == 0
+    assert build.parse_launcher(override).gemma4_sliding_kv == flipped
+    preset = "iq3-xxs" if profile == "memory-16gb" else "q5-g64"
+    args = cli.build_parser().parse_args(env.argv(preset, "--profile", profile))
+    assert cli.resolve_config(args)[1].gemma4_sliding_kv == expected
+
+
+def test_q5_quality_launcher_documents_the_bf16_ring_pin(tmp_path):
+    lines = launcher.launcher_lines("S", "A", launcher.ServeProfile(profile="q5-quality"), mtp=True, vision=False)
+    text = "\n".join(lines)
+    assert "--gemma4-sliding-kv bf16" in text
+    assert "BF16 sliding K/V ring" in text and "--gemma4-sliding-kv fp8 restores" in text
+    assert "rem FP8 sliding K/V ring" not in text
 
 
 @pytest.mark.parametrize("profile", ["default", "q5-quality", "q5-long-context"])
@@ -1620,7 +1656,8 @@ def test_resumed_builder_rewrites_ring_profile_without_reconverting_artifact(env
     initial, _, _ = make_builder(env, cfg, profile=profile, gemma4_sliding_kv="bf16", gemma4_qk="bf16")
     initial.run()
     artifact_bytes = cfg.artifact.read_bytes()
-    for selection, expected in ((None, "fp8"), ("bf16", "bf16")):
+    omitted = "bf16" if profile == "q5-quality" else "fp8"  # the fidelity pin, operator 2026-11-28
+    for selection, expected in ((None, omitted), ("bf16", "bf16")):
         resumed, runner, _ = make_builder(env, cfg, profile=profile, gemma4_sliding_kv=selection, gemma4_qk="bf16")
         assert resumed.fingerprint == initial.fingerprint  # launch policy does not change artifact identity
         resumed.run()
@@ -1695,7 +1732,8 @@ def test_q5_preset_builds_own_hessians_and_one_a16_artifact(env):
 def test_q5_profiles_recommend_int8_and_preserve_explicit_ring_choices(env, profile):
     args = cli.build_parser().parse_args(env.argv("q5-g64", "--profile", profile))
     cfg, serve, _ = cli.resolve_config(args)
-    assert cfg.preset.bits == 5 and serve.gemma4_sliding_kv == "fp8"
+    assert cfg.preset.bits == 5
+    assert serve.gemma4_sliding_kv == ("bf16" if profile == "q5-quality" else "fp8")
     assert serve.gemma4_q5_prefill == "int8-g64" and not serve.gemma4_key_only_kv
     assert serve.context == "auto" and serve.prefill_chunk == "2048"
     assert serve.draft_tokens == "1" and not serve.mtp_fallback
@@ -1736,7 +1774,7 @@ def test_q5_defaults_and_overrides_agree_for_build_api_and_launcher(env, tmp_pat
     api_out = tmp_path / "api.cmd"
     launcher.write_launcher(api_out, artifact, env.server)
     assert build.parse_launcher(api_out).gemma4_q5_prefill == "int8-g64"
-    assert build.parse_launcher(api_out).gemma4_sliding_kv == "fp8"
+    assert build.parse_launcher(api_out).gemma4_sliding_kv == "bf16"  # q5-quality fidelity pin
 
 
 @pytest.mark.parametrize("profile", ["q5-quality", "q5-long-context"])

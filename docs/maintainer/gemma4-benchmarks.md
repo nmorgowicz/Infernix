@@ -666,9 +666,11 @@ K and V ring as FP8 E4M3 codes with one FP16 scale per 256-value row, the codec 
 rounded and bounded scale, round-to-nearest-even saturating codes; a row with any nonfinite value stores NaN codes and a
 unit scale). It requires `--kv-dtype fp8` and combines with `--gemma4-key-only-kv` and `--gemma4-qk fp8`.
 
-**Current policy (2026-11-28).** Compatible Gemma 31B global-FP8 roleplay builder/profile/generated-launcher
-routes select FP8 ring storage, including general, `q5-quality` and `q5-long-context`. Both Q5 names
-remain supported with the same ring policy. Explicit `--gemma4-sliding-kv bf16` wins; an omitted
+**Current policy (2026-11-28, amended same day).** Compatible Gemma 31B global-FP8 roleplay builder/profile/generated-launcher
+routes select FP8 ring storage, including general and `q5-long-context`; the `q5-quality` fidelity profile pins
+**BF16** ring storage regardless of global KV (operator follow-up: the FP8 ring buys it no class-C capacity —
+131k fits both rings — while the shipped-Q5 rows below name its measured KL cost; an explicit
+`--gemma4-sliding-kv fp8` restores FP8). Explicit `--gemma4-sliding-kv bf16` wins elsewhere; an omitted
 builder ring with global BF16 resolves BF16. `--gemma4-qk bf16` changes compute only, not storage.
 Native Engine/CLI default stays BF16. Existing explicit fidelity configurations are preserved;
 no key-only globals are newly implicit (the explicitly selected `memory-16gb` contract is unchanged).

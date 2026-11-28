@@ -113,11 +113,13 @@ fidelity still changes. See [measurements and remaining-evidence registration](.
 
 `--gemma4-q5-prefill a16|fp8|int8-g32|int8-g64` is independent of stored weights. Q5 builds and
 existing native-Q5 launcher generation select `q5-quality` when `--profile` is omitted: **INT8 g64**
-prefill, FP8 ring with global FP8 KV, auto context, chunk2048, top-k64, no implicit key-only KV.
-`q5-long-context` keeps the same ring policy. Explicit compute/ring choices win; explicit
+prefill, BF16 sliding ring pinned regardless of global KV (2026-11-28 fidelity follow-up), auto context,
+chunk2048, top-k64, no implicit key-only KV.
+`q5-long-context` keeps the compatible FP8-ring policy. Explicit compute/ring choices win; explicit
 `--profile default` and other tiers retain A16 artifact policy. Narrow decode/MTP stays A16.
-FP8 QK remains the roleplay/prose choice, measurably less faithful than BF16; fidelity-first/coding/tools
-can explicitly select `--gemma4-qk bf16 --gemma4-q5-prefill a16`, adding `--gemma4-sliding-kv bf16` for BF16 storage.
+FP8 QK remains the roleplay/prose choice, measurably less faithful than BF16; maximum-fidelity/coding/tools
+launchers can explicitly select `--gemma4-qk bf16 --gemma4-q5-prefill a16` (the BF16 ring is already
+`q5-quality`'s pinned default), and `--gemma4-sliding-kv fp8` restores the smaller FP8 ring.
 See the [Q5 defaults and lower-VRAM ladder](../docs/weight-conversion.md#native-gptq5-group64-explicit-a16a8-permissions)
 for exact commands, measured costs and quality limits. Q5 is not resident-fit on a 16 GB card.
 
