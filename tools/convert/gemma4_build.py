@@ -725,13 +725,13 @@ PROFILE_BUNDLES = {
         "balanced": {
             "preset": "best-medium", "profile": "default", "assistant_encoding": None, "flags": [],
             "context": 131072, "max_context": 131072,
-            "measured": "the unchanged medium default at the full 131k target",
+            "measured": "the medium preset at the full 131k target (historical BF16-ring capacity anchor)",
         },
         "quality": {
             "preset": "q4q5-mixed-a", "profile": "default", "assistant_encoding": None,
             "flags": ["--gemma4-key-only-kv"], "context": 131072, "max_context": 131072,
-            "measured": "mixed-A reaches 131k with FP8 ring or key-only (an explicit ordinary-KV sacrifice); "
-                        "q5-g64 needs key-only to meet 131k with study margin; both fidelity options, not defaults",
+            "measured": "mixed-A historically reaches 131k with FP8 ring (now the launcher default) or key-only "
+                        "globals (explicit); q5-g64 used key-only to meet 131k with the study margin",
         },
     },
 }
@@ -1317,7 +1317,7 @@ def render_summary(info: dict) -> str:
         "## Serve it",
         "",
         f"The launcher runs `infernix-serve` with {serve['kv'].upper()} KV cache and {serve['qk'].upper()} attention "
-        "QK, one lane, a host-only prefix cache and BF16-rounded logits:",
+        f"QK, {serve['sliding_kv'].upper()} sliding K/V storage, one lane, a host-only prefix cache and BF16-rounded logits:",
         "",
         "```bat",
         info["serve_command"] if info["serve_command"] else "REM no launcher; see docs/serving.md",
@@ -1423,7 +1423,7 @@ def build_info(builder: "Builder") -> dict:
         "launcher": launchers["main"],
         "launchers": launchers,
         "serve_command": serve,
-        "serve": {"kv": settings.kv_dtype, "qk": settings.gemma4_qk},
+        "serve": {"kv": settings.kv_dtype, "qk": settings.gemma4_qk, "sliding_kv": settings.gemma4_sliding_kv},
         "alias": settings.model_id,
         "revision": receipt.get("revision"),
         "python": sys.version.split()[0],
@@ -1695,6 +1695,8 @@ class Builder:
 
     def step_key(self, step: Step) -> str:
         args = step.argv[1:] if step.argv else [step.id]
+        if step.id == "finalize":
+            args = [*args, "--gemma4-sliding-kv", self.serve.gemma4_sliding_kv]
         return hashlib.sha256(json.dumps([self.fingerprint, step.id, args, step.env]).encode()).hexdigest()
 
     # -- output
@@ -1870,7 +1872,7 @@ class LauncherCommand:
             "logits_dtype": self.logits_dtype, "host_context_mib": self.host_context_mib,
             "device_snapshot_slots": self.device_snapshot_slots,
             **({"gemma4_key_only_kv": True} if self.gemma4_key_only_kv else {}),
-            **({"gemma4_sliding_kv": self.gemma4_sliding_kv} if self.gemma4_sliding_kv != "bf16" else {}),
+            "gemma4_sliding_kv": self.gemma4_sliding_kv,
             **({"gemma4_q5_prefill": self.gemma4_q5_prefill} if self.gemma4_q5_prefill != "a16" else {}),
         }
 

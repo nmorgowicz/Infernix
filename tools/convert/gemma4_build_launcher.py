@@ -1,10 +1,11 @@
 """Windows launcher for `infernix-serve` on a Gemma 4 31B artifact, the server binary search, and binary checks.
 
-The default `ServeProfile` is the operator roleplay profile: 131,072 context (alias `131k`), FP8 KV cache, FP8
-attention QK, one lane, `--prefill-chunk auto`, MTP with one draft token when the artifact carries the assistant,
+The default `ServeProfile` is the operator roleplay profile: 131,072 context (alias `131k`), FP8 global KV and
+sliding K/V storage, FP8 attention QK, one lane, `--prefill-chunk auto`, MTP with one draft token when the artifact carries the assistant,
 BF16-rounded logits, a host-only prefix cache (no device snapshot slots, 8192 MiB host context), any model name
 accepted, listening on `0.0.0.0:8001`. Every field can be changed; `--gemma4-qk bf16` omits the QK flag so the
-engine default applies. This module imports nothing from the other `gemma4_build*` modules.
+engine default applies without changing ring storage. Omitted ring storage follows global KV; explicit BF16 wins.
+This module imports nothing from the other `gemma4_build*` modules.
 """
 
 from __future__ import annotations
@@ -103,7 +104,7 @@ class ServeProfile:
             "context": "auto" if small or q5 else DEFAULT_CONTEXT,
             "prefill_chunk": "128" if small else "2048" if q5 else DEFAULT_PREFILL_CHUNK,
             "vram_headroom_mib": SMALL_VRAM_HEADROOM_MIB if small else DEFAULT_VRAM_HEADROOM_MIB,
-            "gemma4_sliding_kv": "fp8" if small or self.profile == "q5-long-context" else "bf16",
+            "gemma4_sliding_kv": self.kv_dtype,
             "gemma4_q5_prefill": "int8-g64" if q5 else "a16",
             "mtp_fallback": small,
         }
@@ -213,7 +214,7 @@ def serve_groups(
         ["--max-context", str(profile.context), "--kv-capacity", "auto", "--vram-headroom-mib",
          str(profile.vram_headroom_mib), "--kv-dtype", profile.kv_dtype]
         + (["--gemma4-key-only-kv"] if profile.gemma4_key_only_kv else [])
-        + (["--gemma4-sliding-kv", "fp8"] if profile.gemma4_sliding_kv == "fp8" else [])
+        + ["--gemma4-sliding-kv", profile.gemma4_sliding_kv]
         + (["--gemma4-q5-prefill", profile.gemma4_q5_prefill] if profile.gemma4_q5_prefill != "a16" else [])
         + (["--gemma4-qk", "fp8"] if profile.gemma4_qk == "fp8" else []),
         ["--max-concurrency", "1", "--prefill-chunk", profile.prefill_chunk, "--logits-dtype", profile.logits_dtype]
@@ -291,7 +292,7 @@ def launcher_lines(
     if profile.gemma4_key_only_kv:
         lines.append("rem Experimental key-only global FP8 KV. Default launches do not enable it.")
     if profile.gemma4_sliding_kv == "fp8":
-        lines.append("rem Experimental FP8 sliding K/V ring: lower memory, measurable fidelity and prefill cost; explicit bf16 overrides the profile.")
+        lines.append("rem FP8 sliding K/V ring: lower memory, lossy K/V storage; --gemma4-sliding-kv bf16 preserves BF16 storage independently of QK precision.")
     if profile.gemma4_q5_prefill != "a16":
         lines.append(f"rem Q5 prefill {profile.gemma4_q5_prefill} (lossy; int8-g64 is the Q5 profile default): calls of 64+ columns; narrow decode/MTP verification stays A16. Artifact unchanged.")
     if profile.context == "auto":

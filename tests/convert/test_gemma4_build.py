@@ -707,13 +707,14 @@ def test_deliverables_summary_and_the_launcher_carry_the_operator_profile(env):
     assert "`131k`" in summary and "mean KL 0.1213" in summary
     receipt = json.loads((env.out / f"{cfg.name}.gemma4-build.json").read_text())
     assert receipt["schema"] == build.BUILD_SCHEMA and receipt["sha256"] == digest and receipt["mtp"] is True
-    assert receipt["serve"] == {"kv": "fp8", "qk": "fp8"}
+    assert receipt["serve"] == {"kv": "fp8", "qk": "fp8", "sliding_kv": "fp8"}
     plan = build.parse_launcher(env.out / f"serve-{cfg.name}.cmd")
     assert plan.server == env.server.resolve() and plan.artifact == cfg.artifact.resolve()
     assert plan.effective_profile() == {
         "host": "0.0.0.0", "port": 8001, "model_id": "131k", "model_match": "any", "max_context": 131072,
         "kv_dtype": "fp8", "gemma4_qk": "fp8", "prefill_chunk": "auto", "draft_tokens": "1",
         "logits_dtype": "bf16", "host_context_mib": 8192, "device_snapshot_slots": 0,
+        "gemma4_sliding_kv": "fp8",
     }
     flags = list(plan.flags)
     assert flags[flags.index("--spec") + 1] == "mtp" and flags[flags.index("--max-concurrency") + 1] == "1"
@@ -936,6 +937,7 @@ def test_the_default_launcher_is_the_operator_roleplay_profile(tmp_path):
         "host": "0.0.0.0", "port": 8001, "model_id": "131k", "model_match": "any", "max_context": 131072,
         "kv_dtype": "fp8", "gemma4_qk": "fp8", "prefill_chunk": "auto", "draft_tokens": "1",
         "logits_dtype": "bf16", "host_context_mib": 8192, "device_snapshot_slots": 0,
+        "gemma4_sliding_kv": "fp8",
     }
     flags = list(plan.flags)
     assert flags[flags.index("--kv-capacity") + 1] == "auto" and flags[flags.index("--vram-headroom-mib") + 1] == "1024"
@@ -966,6 +968,7 @@ def test_launcher_settings_flow_into_the_parsed_profile(tmp_path):
         "host": "127.0.0.1", "port": 8080, "model_id": "160k", "model_match": "any", "max_context": 65536,
         "kv_dtype": "bf16", "gemma4_qk": "bf16", "prefill_chunk": "2048", "draft_tokens": "2",
         "logits_dtype": "fp32", "host_context_mib": 4096, "device_snapshot_slots": 0,
+        "gemma4_sliding_kv": "bf16",
     }
     assert "--gemma4-qk" not in plan.flags and "--vision" in plan.flags
     assert plan.flags[plan.flags.index("--top-k") + 1] == "64"
@@ -1375,6 +1378,7 @@ def test_serve_check_passes_every_check_and_writes_a_receipt(tmp_path, capsys):
     assert engine["kv_line"].startswith("fake KV server")
     assert engine["profile"]["gemma4_qk"] == "fp8" and engine["profile"]["host_context_mib"] == 8192
     assert engine["profile"]["device_snapshot_slots"] == 0 and engine["profile"]["draft_tokens"] == "1"
+    assert engine["profile"]["gemma4_sliding_kv"] == "bf16"  # omitted flag keeps the native default
 
 
 def test_serve_check_probes_loopback_when_the_launcher_binds_all_interfaces(tmp_path, capsys):
@@ -1541,30 +1545,99 @@ def test_memory_profile_shared_memory_option_is_the_last_resort_stage(tmp_path, 
     assert "--allow-shared-memory" not in plain.read_text(encoding="utf-8")
 
 
-@pytest.mark.parametrize("profile", ["default", "memory-16gb"])
+@pytest.mark.parametrize("profile", ["default", "memory-16gb", "q5-quality", "q5-long-context"])
 @pytest.mark.parametrize("selection", [None, "bf16", "fp8"])
-def test_sliding_ring_profile_selection_survives_all_stages(env, tmp_path, monkeypatch, profile, selection):
+@pytest.mark.parametrize("qk", ["bf16", "fp8"])
+def test_sliding_ring_profile_selection_survives_all_stages(env, tmp_path, monkeypatch, profile, selection, qk):
     monkeypatch.setattr(launcher, "artifact_info", lambda path: launcher.ArtifactInfo(True, False, 262144, True))
     artifact = tmp_path / "iq3.ninfer"
     artifact.write_bytes(b"x")
     out = tmp_path / "ring.cmd"
-    option = [] if selection is None else ["--gemma4-sliding-kv", selection]
-    expected = selection or ("fp8" if profile == "memory-16gb" else "bf16")
+    option = ([] if selection is None else ["--gemma4-sliding-kv", selection]) + ["--gemma4-qk", qk]
+    expected = selection or "fp8"
     assert cli.main(["launcher", "--artifact", str(artifact), "--serve", str(env.server), "--out", str(out),
                      "--profile", profile, *option, "--allow-shared-memory"]) == 0
     parsed = build.parse_launcher(out)
     assert parsed.gemma4_sliding_kv == expected
-    assert parsed.effective_profile().get("gemma4_sliding_kv", "bf16") == expected
+    assert parsed.effective_profile()["gemma4_sliding_kv"] == expected
+    assert parsed.gemma4_qk == qk
+    direct = launcher.ServeProfile(profile=profile, gemma4_sliding_kv=selection, gemma4_qk=qk)
+    argv = launcher.serve_argv(env.server, artifact, direct, mtp=True, vision=False)
+    assert argv[argv.index("--gemma4-sliding-kv") + 1] == expected
     text = out.read_text(encoding="utf-8")
     for command in text.split(f'"{env.server.resolve()}" "{artifact.resolve()}"')[1:]:
-        assert ("--gemma4-sliding-kv fp8" in command) == (expected == "fp8")
-    args = cli.build_parser().parse_args(env.argv("iq3-xxs", "--profile", profile, *option))
+        assert f"--gemma4-sliding-kv {expected}" in command
+    preset = "q5-g64" if profile.startswith("q5-") else "iq3-xxs"
+    args = cli.build_parser().parse_args(env.argv(preset, "--profile", profile, *option))
     assert cli.resolve_config(args)[1].gemma4_sliding_kv == expected
 
 
-def test_fp8_sliding_ring_launcher_refuses_bf16_globals(env, capsys):
-    assert cli.main(env.argv("draft", "--dry-run", "--gemma4-qk", "bf16", "--kv-dtype", "bf16",
-                             "--gemma4-sliding-kv", "fp8"), probes=FakeProbes()) == 1
+@pytest.mark.parametrize("profile", ["default", "q5-quality", "q5-long-context"])
+@pytest.mark.parametrize("selection", [None, "bf16"])
+def test_bf16_global_kv_defaults_to_bf16_ring_across_consumers(env, tmp_path, monkeypatch, profile, selection):
+    options = ["--profile", profile, "--kv-dtype", "bf16", "--gemma4-qk", "bf16"]
+    options += [] if selection is None else ["--gemma4-sliding-kv", selection]
+    preset = "q5-g64" if profile.startswith("q5-") else "draft"
+    settings = cli.resolve_config(cli.build_parser().parse_args(env.argv(preset, *options)))[1]
+    direct = build.ServeSettings(profile=profile, kv_dtype="bf16", gemma4_qk="bf16",
+                                 gemma4_sliding_kv=selection, server_exe=env.server)
+    assert settings == direct and settings.gemma4_sliding_kv == "bf16"
+    artifact = tmp_path / "model.ninfer"
+    artifact.write_bytes(b"x")
+    monkeypatch.setattr(launcher, "artifact_info", lambda path: launcher.ArtifactInfo(True, False, 262144, q5=True))
+    out = tmp_path / "bf16.cmd"
+    assert cli.main(["launcher", "--artifact", str(artifact), "--serve", str(env.server),
+                     "--out", str(out), *options]) == 0
+    parsed = build.parse_launcher(out)
+    assert parsed.gemma4_sliding_kv == "bf16" and parsed.kv_dtype == "bf16" and parsed.gemma4_qk == "bf16"
+    assert parsed.effective_profile()["gemma4_sliding_kv"] == "bf16"
+    assert list(parsed.flags) == launcher.serve_argv(env.server, artifact, direct, mtp=True, vision=False)[2:]
+
+
+def test_native_omitted_ring_and_explicit_storage_have_unambiguous_profile_identities(tmp_path):
+    out = tmp_path / "native.cmd"
+    out.write_text('"S" "A" --kv-dtype fp8 --gemma4-qk bf16\n', encoding="utf-8")
+    native = build.parse_launcher(out)
+    assert native.gemma4_sliding_kv == "bf16"
+    profiles = {}
+    for ring in ("bf16", "fp8"):
+        plan = lines_profile(launcher.launcher_lines(
+            "S", "A", launcher.ServeProfile(gemma4_sliding_kv=ring, gemma4_qk="bf16"),
+            mtp=False, vision=False), tmp_path)
+        profiles[ring] = plan.effective_profile()
+        assert profiles[ring]["gemma4_sliding_kv"] == ring
+    assert build.fingerprint_of(profiles["bf16"]) != build.fingerprint_of(profiles["fp8"])
+    assert {k: v for k, v in profiles["bf16"].items() if k != "gemma4_sliding_kv"} == {
+        k: v for k, v in profiles["fp8"].items() if k != "gemma4_sliding_kv"}
+
+
+@pytest.mark.parametrize("profile,preset", [
+    ("default", "draft"), ("memory-16gb", "iq3-xxs"),
+    ("q5-quality", "q5-g64"), ("q5-long-context", "q5-g64"),
+])
+def test_resumed_builder_rewrites_ring_profile_without_reconverting_artifact(env, profile, preset):
+    cfg = env.config(preset)
+    initial, _, _ = make_builder(env, cfg, profile=profile, gemma4_sliding_kv="bf16", gemma4_qk="bf16")
+    initial.run()
+    artifact_bytes = cfg.artifact.read_bytes()
+    for selection, expected in ((None, "fp8"), ("bf16", "bf16")):
+        resumed, runner, _ = make_builder(env, cfg, profile=profile, gemma4_sliding_kv=selection, gemma4_qk="bf16")
+        assert resumed.fingerprint == initial.fingerprint  # launch policy does not change artifact identity
+        resumed.run()
+        assert not runner.calls and cfg.artifact.read_bytes() == artifact_bytes
+        parsed = build.parse_launcher(cfg.out_dir / f"serve-{cfg.name}.cmd")
+        assert parsed.gemma4_sliding_kv == expected and parsed.gemma4_qk == "bf16"
+        receipt = json.loads((cfg.out_dir / f"{cfg.name}.gemma4-build.json").read_text())
+        assert receipt["serve"]["sliding_kv"] == expected
+        assert f"--gemma4-sliding-kv {expected}" in receipt["serve_command"]
+        assert f"{expected.upper()} sliding K/V storage" in (cfg.out_dir / "BUILD-SUMMARY.md").read_text()
+
+
+@pytest.mark.parametrize("profile", ["default", "q5-quality", "q5-long-context"])
+def test_fp8_sliding_ring_launcher_refuses_bf16_globals(env, capsys, profile):
+    preset = "q5-g64" if profile.startswith("q5-") else "draft"
+    assert cli.main(env.argv(preset, "--profile", profile, "--dry-run", "--gemma4-qk", "bf16",
+                             "--kv-dtype", "bf16", "--gemma4-sliding-kv", "fp8"), probes=FakeProbes()) == 1
     assert "--gemma4-sliding-kv fp8 needs --kv-dtype fp8" in capsys.readouterr().err
     with pytest.raises(ValueError, match="--gemma4-sliding-kv must be"):
         launcher.check_serve_settings(launcher.ServeProfile(gemma4_sliding_kv="int8"))
@@ -1618,11 +1691,11 @@ def test_q5_preset_builds_own_hessians_and_one_a16_artifact(env):
     assert "Q5 A16" in steps["score-run"].title
 
 
-@pytest.mark.parametrize("profile, ring", [("q5-quality", "bf16"), ("q5-long-context", "fp8")])
-def test_q5_profiles_recommend_int8_and_preserve_explicit_ring_choices(env, profile, ring):
+@pytest.mark.parametrize("profile", ["q5-quality", "q5-long-context"])
+def test_q5_profiles_recommend_int8_and_preserve_explicit_ring_choices(env, profile):
     args = cli.build_parser().parse_args(env.argv("q5-g64", "--profile", profile))
     cfg, serve, _ = cli.resolve_config(args)
-    assert cfg.preset.bits == 5 and serve.gemma4_sliding_kv == ring
+    assert cfg.preset.bits == 5 and serve.gemma4_sliding_kv == "fp8"
     assert serve.gemma4_q5_prefill == "int8-g64" and not serve.gemma4_key_only_kv
     assert serve.context == "auto" and serve.prefill_chunk == "2048"
     assert serve.draft_tokens == "1" and not serve.mtp_fallback
@@ -1663,6 +1736,7 @@ def test_q5_defaults_and_overrides_agree_for_build_api_and_launcher(env, tmp_pat
     api_out = tmp_path / "api.cmd"
     launcher.write_launcher(api_out, artifact, env.server)
     assert build.parse_launcher(api_out).gemma4_q5_prefill == "int8-g64"
+    assert build.parse_launcher(api_out).gemma4_sliding_kv == "fp8"
 
 
 @pytest.mark.parametrize("profile", ["q5-quality", "q5-long-context"])
@@ -1691,7 +1765,7 @@ def test_q5_profile_explicit_fidelity_and_memory_choices_survive_generation(env,
 def test_non_q5_presets_keep_the_general_profile(env, preset):
     settings = cli.resolve_config(cli.build_parser().parse_args(env.argv(preset)))[1]
     assert settings == build.ServeSettings(server_exe=env.server)
-    assert settings.gemma4_q5_prefill == "a16" and settings.gemma4_sliding_kv == "bf16"
+    assert settings.gemma4_q5_prefill == "a16" and settings.gemma4_sliding_kv == "fp8"
 
 
 @pytest.mark.parametrize("parameter, q5", [
@@ -1892,7 +1966,7 @@ def test_mixed_build_launcher_and_receipt_preserve_context_precedence(env, monke
                             "gptq-q5-check", "convert"]
     plan = build.parse_launcher(cfg.out_dir / f"serve-{cfg.name}.cmd")
     assert plan.context == expected_context and plan.gemma4_q5_prefill == (compute or "a16")
-    assert plan.prefill_chunk == "auto" and plan.draft_tokens == "1" and plan.gemma4_sliding_kv == "bf16"
+    assert plan.prefill_chunk == "auto" and plan.draft_tokens == "1" and plan.gemma4_sliding_kv == "fp8"
     assert not plan.gemma4_key_only_kv and "--top-k" not in plan.flags and "--allow-shared-memory" not in plan.flags
     expected_argv = launcher.serve_argv(server, cfg.artifact, expected, mtp=True, vision=False)
     assert list(plan.flags) == expected_argv[2:]
