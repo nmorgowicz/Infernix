@@ -24,6 +24,22 @@ using DirectR1T3W2K17408 = Q5A16DirectSimtSchedule<1, 3, 2, 8, 16, 17408, true>;
 using DirectR1T4W2K17408 = Q5A16DirectSimtSchedule<1, 4, 2, 8, 16, 17408, true>;
 
 using DirectR2T4W2G8B4         = Q5A16DirectSimtSchedule<2, 4, 2, 8, 4>;
+
+// Q5 decode-kernel work (2026-11-28): bit-identical scheduling candidates for the gemma4 trunk
+// decode arms (K fixed per shape, one warp may share its x load across kRowsPerWarp rows).
+// W=2, G=8 (the trunk's per-lane K map) and the T-token blocking are frozen by bit-identity;
+// StaticK, RowsPerWarp and BlockRows are free.
+using RowsM1T4K21504 = Q5A16DirectRowsSchedule<2, 4, 2, 8, 1, 4, 21504>;
+using RowsM2T4K21504 = Q5A16DirectRowsSchedule<2, 4, 2, 8, 2, 4, 21504>;
+using RowsM1T1K21504 = Q5A16DirectRowsSchedule<1, 1, 2, 8, 1, 4, 21504>;
+using RowsM2T1K21504 = Q5A16DirectRowsSchedule<1, 1, 2, 8, 2, 4, 21504>;
+using RowsR4M2T4K21504 = Q5A16DirectRowsSchedule<4, 4, 2, 8, 2, 4, 21504>;
+using RowsM1T4K8192  = Q5A16DirectRowsSchedule<2, 4, 2, 8, 1, 4, 8192>;
+using RowsM2T4K8192  = Q5A16DirectRowsSchedule<2, 4, 2, 8, 2, 4, 8192>;
+using RowsM2T1K8192  = Q5A16DirectRowsSchedule<1, 1, 2, 8, 2, 4, 8192>;
+using RowsM1T4K16384 = Q5A16DirectRowsSchedule<2, 4, 2, 8, 1, 4, 16384>;
+using RowsM2T4K16384 = Q5A16DirectRowsSchedule<2, 4, 2, 8, 2, 4, 16384>;
+using RowsM2T1K16384 = Q5A16DirectRowsSchedule<1, 1, 2, 8, 2, 4, 16384>;
 using SlicedR16T8W4S2          = Q5A16SlicedKMmaSchedule<16, 8, 4, 2, Cache::cg, Cache::ca, 2>;
 using SlicedR16T16W4S2         = Q5A16SlicedKMmaSchedule<16, 16, 4, 2, Cache::cg, Cache::ca, 2>;
 using SlicedR16T32W4S2         = Q5A16SlicedKMmaSchedule<16, 32, 4, 2, Cache::cg, Cache::ca, 2>;

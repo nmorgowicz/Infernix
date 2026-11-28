@@ -56,6 +56,61 @@ void launch_q5_a16_direct_r2_t4_w2_g8_b4(const Tensor& x, const Weight& w, Tenso
     launch_q5_a16_direct_simt_instance<q5_instances::DirectR2T4W2G8B4>(x, w, out, stream);
 }
 
+void launch_q5_a16_rows_m1_t4_k21504(const Tensor& x, const Weight& w, Tensor& out,
+                                     cudaStream_t stream) {
+    launch_q5_a16_direct_simt_instance<q5_instances::RowsM1T4K21504>(x, w, out, stream);
+}
+
+void launch_q5_a16_rows_m2_t4_k21504(const Tensor& x, const Weight& w, Tensor& out,
+                                     cudaStream_t stream) {
+    launch_q5_a16_direct_simt_instance<q5_instances::RowsM2T4K21504>(x, w, out, stream);
+}
+
+void launch_q5_a16_rows_m1_t1_k21504(const Tensor& x, const Weight& w, Tensor& out,
+                                     cudaStream_t stream) {
+    launch_q5_a16_direct_simt_instance<q5_instances::RowsM1T1K21504>(x, w, out, stream);
+}
+
+void launch_q5_a16_rows_m2_t1_k21504(const Tensor& x, const Weight& w, Tensor& out,
+                                     cudaStream_t stream) {
+    launch_q5_a16_direct_simt_instance<q5_instances::RowsM2T1K21504>(x, w, out, stream);
+}
+
+void launch_q5_a16_rows_r4_m2_t4_k21504(const Tensor& x, const Weight& w, Tensor& out,
+                                        cudaStream_t stream) {
+    launch_q5_a16_direct_simt_instance<q5_instances::RowsR4M2T4K21504>(x, w, out, stream);
+}
+
+void launch_q5_a16_rows_m1_t4_k8192(const Tensor& x, const Weight& w, Tensor& out,
+                                    cudaStream_t stream) {
+    launch_q5_a16_direct_simt_instance<q5_instances::RowsM1T4K8192>(x, w, out, stream);
+}
+
+void launch_q5_a16_rows_m2_t4_k8192(const Tensor& x, const Weight& w, Tensor& out,
+                                    cudaStream_t stream) {
+    launch_q5_a16_direct_simt_instance<q5_instances::RowsM2T4K8192>(x, w, out, stream);
+}
+
+void launch_q5_a16_rows_m2_t1_k8192(const Tensor& x, const Weight& w, Tensor& out,
+                                    cudaStream_t stream) {
+    launch_q5_a16_direct_simt_instance<q5_instances::RowsM2T1K8192>(x, w, out, stream);
+}
+
+void launch_q5_a16_rows_m1_t4_k16384(const Tensor& x, const Weight& w, Tensor& out,
+                                     cudaStream_t stream) {
+    launch_q5_a16_direct_simt_instance<q5_instances::RowsM1T4K16384>(x, w, out, stream);
+}
+
+void launch_q5_a16_rows_m2_t4_k16384(const Tensor& x, const Weight& w, Tensor& out,
+                                     cudaStream_t stream) {
+    launch_q5_a16_direct_simt_instance<q5_instances::RowsM2T4K16384>(x, w, out, stream);
+}
+
+void launch_q5_a16_rows_m2_t1_k16384(const Tensor& x, const Weight& w, Tensor& out,
+                                     cudaStream_t stream) {
+    launch_q5_a16_direct_simt_instance<q5_instances::RowsM2T1K16384>(x, w, out, stream);
+}
+
 void launch_q5_a16_direct_r2_t4_w4_g4_b4(const Tensor& x, const Weight& w, Tensor& out,
                                          cudaStream_t stream) {
     launch_q5_a16_direct_simt_instance<q5_instances::DirectR2T4W4G4B4>(x, w, out, stream);

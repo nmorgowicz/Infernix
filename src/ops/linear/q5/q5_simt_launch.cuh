@@ -70,7 +70,7 @@ void launch_q5_a16_direct_simt(const Q5LinearOperands& operands, Output output, 
             throw std::invalid_argument("Q5 exact direct SIMT token count differs from schedule");
     }
     for_each_token_slice(operands.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
-        const dim3 grid(div_up(operands.rows, Schedule::kBlockRows),
+        const dim3 grid(div_up(operands.rows, Schedule::kBlockRows * Schedule::kRowsPerWarp),
                         div_up(count, Schedule::kBlockTokens));
         const dim3 block(Schedule::kThreads);
         const auto* x     = operands.x + std::int64_t(offset) * operands.k;
